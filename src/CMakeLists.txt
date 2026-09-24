@@ -14,7 +14,7 @@ halo_module(core
   DEPS nlohmann_json::nlohmann_json Threads::Threads)
 
 # Modules are added below as they land (model, tensor, tokenizer, template, ...).
-foreach(mod IN ITEMS tensor model tokenizer template memory hardware kv_cache state
+foreach(mod IN ITEMS tensor model tokenizer template memory hardware kv_cache state models
                      sampling speculative runtime scheduler profiling api autotune)
   halo_selected(${mod} _sel)
   if(_sel AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${mod}/CMakeLists.txt)
