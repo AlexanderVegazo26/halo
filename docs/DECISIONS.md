@@ -1,0 +1,155 @@
+# HALO — Engineering Decisions & Ground Truth
+
+This file records (a) facts measured or read from primary sources that correct the
+PRD v1.1 / TRD (file header says v1.2), and (b) the decisions HALO's implementation
+follows because of them. Where this file and the PRD/TRD disagree, **this file wins**
+until the PRD/TRD are revised. Every fact carries its source.
+
+Sources used (fetched 2026-09-23):
+
+- **[CFG]** `Qwen/Qwen3.8-27B/config.json` (HF)
+- **[HF]** `transformers` 5.17.0 `models/qwen3_5/modeling_qwen3_5.py` (reference semantics)
+- **[LCPP]** llama.cpp commit `bd4f514db` — `src/models/qwen35.cpp`, `conversion/qwen.py`,
+  `src/models/delta-net-base.cpp`. Same commit as the target machine's llama.cpp build.
+- **[GGUF]** Real GGUF headers fetched by HTTP Range (no weights) — see
+  `python/tools/fetch_reference.py`: ggml-org `Qwen3.8-27B-Q4_K_M.gguf`,
+  ggml-org `mtp-Qwen3.8-27B-Q4_0.gguf`, unsloth `Qwen3.8-27B-UD-Q4_K_XL.gguf`.
+- **[HW]** `docs/strix-halo-qwen38-engine-report.md` — measured on the actual EVO-X2.
+
+---
+
+## D-001 — Development host is not the target (status: fact)
+
+Development happens on a Windows laptop (Ryzen 7 4800H, RTX 3060, 63 GB) with a WSL2
+Ubuntu 24.04 toolchain (clang 18, CMake 3.28, Mesa lavapipe). Consequences:
+
+- **No performance number produced on the dev host is a HALO performance claim.** PR-004
+  targets can only be measured on the EVO-X2.
+- Vulkan shaders are validated for **correctness** on lavapipe (CPU Vulkan 1.3); speed is
+  unmeasured until run on RADV/gfx1151.
+- HIP kernels are compile-checked at best; execution is unverified until run on gfx1151.
+- Phase-0 (TRD §68 steps 1–11) is **blocked on hardware access**; HALO ships the harness.
+
+## D-002 — Memory topology: 96 GiB carveout, not small-carveout + large-GTT (fact, [HW])
+
+The PRD/TRD model assumes a 0.5–2 GB BIOS carveout and a ~120 GB GTT pool. The actual
+EVO-X2 is configured with **96 GiB of VRAM carveout** (`amdgpu: 98304M of VRAM memory
+ready`) and **~32 GiB OS-visible RAM**.
+
+Decision: the memory planner is **tier-discovery-driven, never assumption-driven**. Tier
+sizes come from sysfs (`mem_info_vram_total`, `mem_info_gtt_total`, `/proc/meminfo`).
+Placement policy prefers VRAM (carveout) for everything when it fits, falling back to GTT.
+The "state must live in a tiny carveout" reasoning in TRD §13.3 is inapplicable on this
+unit. Both topologies are supported and unit-tested with sysfs fixtures.
+
+## D-003 — DeltaNet state is ~6× larger than the TRD states, and fp32 (fact, [CFG][HF][LCPP])
+
+Real config: `linear_num_key_heads=16`, `linear_num_value_heads=48`,
+`linear_key_head_dim=128`, `linear_value_head_dim=128`, `linear_conv_kernel_dim=4`,
+`mamba_ssm_dtype=float32`. The recurrent state is per **value** head, `d_k × d_v`:
+
+- recurrent state = 48 layers × 48 heads × 128 × 128 × 4 B = **144 MiB / sequence (fp32)**
+- conv state = 48 layers × 3 × 10240 channels × 4 B ≈ **5.6 MiB / sequence**
+
+TRD §2.2's 24 MiB (and §69's 38 MB) are wrong. State format default is **fp32** (the
+reference dtype); fp16/bf16 state is an experiment gated on long-context divergence (TRD §16).
+
+## D-004 — Exact Qwen3.8 ("qwen35") layer semantics (fact, [HF][LCPP])
+
+Per decoder layer: `x += mixer(rmsnorm(x))`; `x += ffn(rmsnorm(x))`.
+RMSNorm in HF is zero-centered (`x̂·(1+w)`); **GGUF stores `w+1`**, so HALO uses plain
+`x̂·w` for every GGUF norm **except** `ssm_norm` (stored as-is, also plain `x̂·w`).
+
+**Full-attention layer** (layers where `(il+1) % 4 == 0`):
+- `attn_q` outputs `n_head × (2·256)`; per head the first 256 are Q, the next 256 are the
+  output gate.
+- Q and K get per-head RMSNorm (`attn_q_norm`, `attn_k_norm`, dim 256).
+- RoPE on the first 64 of 256 dims (`rope.dimension_count=64`), theta 1e7, NeoX-style
+  (rotate-half) layout. M-RoPE sections `[11,11,10]` are interleaved, but **for text-only
+  input all three position components are equal, so M-RoPE ≡ standard 1-D RoPE** — HALO
+  v1 implements 1-D RoPE and rejects multimodal positions.
+- GQA 24 Q / 4 KV heads, scale `1/sqrt(256)`, causal softmax.
+- `out = o_proj(attn · sigmoid(gate))`.
+
+**Gated DeltaNet layer**:
+1. `qkv = attn_qkv(x)` (10240 = 2048 q + 2048 k + 6144 v), `z = attn_gate(x)` (6144),
+   `b = ssm_beta(x)` (48), `a = ssm_alpha(x)` (48).
+2. Causal depthwise conv1d (kernel 4, no bias) over the 10240 qkv channels, then SiLU.
+   Conv state holds the previous 3 inputs.
+3. Split q[16×128], k[16×128], v[48×128]; L2-normalize q and k per head (eps 1e-6);
+   q *= 1/sqrt(128).
+4. `beta = sigmoid(b)`; `g = ssm_a · softplus(a + ssm_dt.bias)` where GGUF `ssm_a = -exp(A_log)`.
+5. **Head mapping — GGUF tiled order:** the converter reorders V heads from grouped
+   (`[K0: v0..v2, K1: v0..v2, …]`) to tiled (`[K0v0, K1v0, …, K15v0, K0v1, …]`). In GGUF,
+   value head `j` uses key head `j % 16`. (HF grouped order would be `j / 3`.) This applies
+   to `attn_qkv` V rows, `attn_gate`, `ssm_alpha/beta`, `ssm_a`, `ssm_dt`, conv V channels,
+   and `ssm_out` columns — all already reordered in the file.
+6. Per value head, per token (recurrent form; chunked form must be numerically equivalent):
+   `S ← S·exp(g)`; `kv = Sᵀk`; `δ = (v − kv)·β`; `S ← S + k δᵀ`; `o = Sᵀq`.
+   `S` is `d_k × d_v` = 128 × 128.
+7. `o = rmsnorm(o; ssm_norm) · silu(z)` per head (dim 128); `out = ssm_out(o)`.
+
+**FFN**: `down(silu(gate(x)) · up(x))`, 5120 → 17408 → 5120.
+
+**Head**: `logits = output(rmsnorm(x; output_norm))`. Untied (`token_embd` ≠ `output`).
+
+## D-005 — MTP / NextN drafter (fact, [LCPP]; HF transformers does not implement it)
+
+One MTP block (`nextn_predict_layers=1`) stored as `blk.64.*`:
+`h' = eh_proj(concat(rmsnorm(embed(tok); enorm), rmsnorm(h; hnorm)))` — **embedding first,
+hidden second** — then one full-attention block (same structure as D-004 attention layer,
+with its own KV cache), then `rmsnorm(·; nextn.shared_head_norm)` and the shared LM head
+(`output` unless `nextn.shared_head_head` exists). `h` is the trunk's **final
+output-normed** hidden state (`t_h_nextn` in llama.cpp) for the position of `tok`'s
+predecessor. llama.cpp is the only executable reference; HALO's MTP golden tests compare
+against a NumPy port of that graph.
+
+## D-006 — Two MTP packagings must both load (fact, [GGUF][HW])
+
+- **Embedded**: unsloth UD files (the one on the EVO-X2) — `block_count=65`,
+  `nextn_predict_layers=1`, `blk.64.*` in the same file.
+- **Separate file**: ggml-org pack — main file `block_count=64` without MTP; the
+  `mtp-*.gguf` file has `block_count=65`, only `blk.64.*` + its **own** `token_embd`,
+  `output`, `output_norm` copies (Q4_0 in the Q4_0 pack).
+
+Decision: `--mtp <file>` is optional; if absent, HALO uses embedded `blk.64` when present.
+When a separate MTP file carries its own embeddings/head, HALO uses the **trunk's** tensors
+by default (saves ~1.7 GB of duplicate reads) and records the choice in the plan.
+
+## D-007 — Real quantization mix (fact, [GGUF])
+
+| File | Types present |
+|---|---|
+| ggml-org Q4_K_M (18.97 GB) | Q4_K (FFN, embed), Q8_0 (attn/GDN projections), Q6_K (LM head, attn_output), F32 |
+| unsloth UD-Q4_K_XL (17.56 GB) | Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ4_NL, IQ4_XS, F32 |
+| ggml-org mtp Q4_0 | Q4_0, F32 |
+
+The LM head is **Q6_K (~1.04 GB/token read)** in both main files — not Q4 (PRD's 0.7 GB).
+Decision: the CPU reference dequantizes F32, F16, BF16, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K,
+IQ3_S, IQ4_NL, IQ4_XS. Dequantization is differentially tested against `gguf-py` on real
+blocks range-fetched from the published files. IQ lookup grids are taken from ggml (MIT).
+
+## D-008 — Tokenizer (fact, [GGUF])
+
+`tokenizer.ggml.model=gpt2`, `pre=qwen35`, 248,320 tokens, 247,587 merges. BOS 248044,
+EOS 248046, `add_bos_token=False`; pad differs per file (248044 ggml-org, 248055 unsloth).
+The chat template ships in GGUF (`tokenizer.chat_template`, 8952 chars ggml-org /
+9993 chars unsloth). HALO renders the template embedded in the loaded file.
+
+## D-009 — Baselines already measured on the EVO-X2 (fact, [HW])
+
+llama.cpp HIP (`bd4f514db`), UD-Q4_K_XL, MTP draft n=2, f16 KV, 131k ctx, 8 slots:
+decode **18–21 tok/s**, cold prefill **330–430 tok/s** (12k–24k prompts), cached 24k
+TTFT **0.22 s (331×)**, 4-stream aggregate 22.7 tok/s, 8-stream 30.2 tok/s. HIP works on
+this unit (HIP 7.15). These are the numbers PR-004 progress is judged against until
+Phase 0 re-measures them in HALO's harness. Note the PR-004 "≥45 tok/s" target exceeds the
+TRD's own naive roofline (~15 tok/s at 17 GB/256 GB/s) and must be re-derived from a
+measured roofline (TRD §2.3).
+
+## D-010 — Build & dependency choices (decision)
+
+- C++20, clang, CMake + Ninja. Dependencies pinned by FetchContent tag:
+  nlohmann/json, cpp-httplib (HTTP/SSE server), minja (Jinja subset, if it renders the
+  shipped template — verified by golden tests), GoogleTest. SQLite from the system.
+- Python (uv, 3.12) for reference generation, golden data, benchmarks — never in serving.
+- The build tree lives on the Linux filesystem (`~/halo-build`), sources on `/mnt/c`.

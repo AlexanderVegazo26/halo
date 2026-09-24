@@ -1,0 +1,5 @@
+foreach(tool IN ITEMS halo)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${tool}/CMakeLists.txt)
+    add_subdirectory(${tool})
+  endif()
+endforeach()
