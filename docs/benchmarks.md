@@ -1,8 +1,8 @@
 # HALO benchmarks: harness, records, workloads
 
-Status: Milestone 1 of WS-J (the `halo_profiling` library). Baseline adapters (TRD §51)
-and the autotuner / profile database (TRD §56–§58) are later milestones and are not
-described here yet.
+Status: WS-J Milestone 1 (the `halo_profiling` library) and Milestone 3 (the autotuner
+and profile database, `halo_autotune`; see the last section). Baseline adapters (TRD §51,
+Milestone 2) are not described here yet.
 
 > **D-001.** A number produced on the development host (WSL, CPU reference kernels, or a
 > fake engine in unit tests) exercises the harness only. It is never a HALO performance
@@ -201,3 +201,197 @@ stored:
 - A value that cannot be derived is `NaN`.
 
 `from_engine_stats()` fills the counters the Engine contract exposes.
+
+## Autotuner and profile database (TRD §55–§58, §64)
+
+Two libraries:
+
+- **`halo_autotune`**: the profile key, the SQLite database, the runtime lookup, the cost model and the tuner.
+  - It depends on core, profiling, hardware and SQLite, and **not** on any backend.
+  - The runtime links this library.
+- **`halo_autotune_cpu`**: TunableOps over the CPU reference kernels.
+  - It links `halo_backend_cpu`.
+  - It is built only when the `cpu` backend is selected.
+
+### Profile key (TRD §57), `profile_key.h`
+
+`make_profile_key(HardwareState, model_hash, pack_id, isa_target)` builds the key from an
+M1 hardware-state snapshot. The tuner and the runtime must both use it.
+
+| Field | Class | Source |
+|---|---|---|
+| HALO_VERSION | version-tolerant | CMake `PROJECT_VERSION` |
+| MODEL_HASH | **must match** | caller (SHA-256 of the trunk GGUF) |
+| PACK_ID | **must match** | caller (hash over trunk + MTP file hashes) |
+| GPU_DEVICE | **must match** | PCI `vendor:device`, or `cpu` for a CPU-only key |
+| GPU_ARCH | **must match** | KFD `gfx_target`; empty for a CPU-only key |
+| DRIVER_VERSION | version-tolerant | `driver_version`, else `mesa_version`; neither is discovered today, so this field is empty |
+| ROCM_VERSION | version-tolerant | `/opt/rocm/.info/version` |
+| VULKAN_VERSION | version-tolerant | the RADV ICD `api_version` |
+| KERNEL_VERSION | version-tolerant | `osrelease` |
+| OS | version-tolerant | os-release `PRETTY_NAME` |
+| POWER_MODE | **must match** | the M1 power-mode string |
+| ISA_TARGET | **must match** | caller (`gfx1151`, `gfx11-generic`, or a CPU ISA label) |
+
+- **Exact match:** every field is equal.
+- **Compatible match:** only version-tolerant fields differ. The match is flagged with the
+  list of differing fields (TRD §56 step 2).
+- **Rejected:** any must-match field differs, including the power mode.
+
+The power-mode rule matches M1 `check_comparable`:
+
+- The platform (BIOS/EC) part must be known.
+- The GPU parts must be known whenever the key names a GPU.
+- A CPU-only key, such as the WSL dev host with no amdgpu sysfs, may carry unknown GPU parts.
+
+### Database (TRD §58), `db.h`
+
+Schema v1 has exactly these tables:
+
+- `hardware_profile`
+- `tier_bandwidth`
+- `model_profile`
+- `operator_profile`
+- `kernel_candidate`
+- `benchmark_run`
+- `winning_configuration`
+- `schema_version`
+
+The file header carries `application_id` 0x48414C4F ("HALO").
+
+- **Writes:** values are only ever bound to prepared statements. Writes run in BEGIN
+  IMMEDIATE transactions with RAII rollback.
+- **Connection settings:** WAL journal, a 5 s busy timeout, and foreign keys on.
+- **Open checks:** `PRAGMA quick_check` runs on every open.
+- **Creation:** a read-write open of a missing or empty file creates v1.
+- **Forward migration:** `OpenOptions::migrations` is the hook. Each step runs in one
+  transaction together with its version bump. A migration that throws leaves the old
+  version in place.
+
+Every failure throws `ProfileDbError`, which derives from `halo::Error`. Its `kind()` is one of:
+
+| Kind | When |
+|---|---|
+| `corrupt` | the file is not SQLite, or is damaged |
+| `not_halo_db` | the file is valid SQLite but not a HALO database, or is empty on a read-only open |
+| `foreign_version` | the schema is newer than this build, or older on a read-only open |
+| `busy` | the database stays locked past the busy timeout |
+| `io` | a read-only open of a missing file, or a write through a read-only handle |
+| `constraint` | a constraint rejected the write |
+| `internal` | any other SQLite error |
+
+`winning_configuration` keeps one winner per (hardware profile, model profile, operator,
+backend), so tuning Vulkan and HIP for the same operator keeps both winners.
+
+`benchmark_run` holds two kinds of rows:
+
+- tuning measurements (`kind = 'tune'`)
+- M2 baseline and bench records (`kind = 'baseline' | 'bench'`), stored with their full
+  `halo.bench.record/1` JSON
+
+`latest_run(kind, backend, pack, context, mode)` answers "latest baseline for (backend,
+pack, context, mode)". Timestamps are UTC ISO-8601 at second resolution; ties go to the
+highest row id.
+
+Concurrency:
+
+- A `ProfileDb` is not thread-safe; use one per thread.
+- Several processes may share the file, relying on SQLite locking and the busy timeout.
+- A read-only open needs a writable directory, because SQLite creates a `-shm` file.
+
+### Kernel selection (TRD §56) and "never per-request"
+
+`ProfileLookup::open(path)` is the runtime entry point.
+
+- It opens the database read-only and copies every winning configuration into memory.
+- After that no SQL runs. `find()` and `select_kernel()` are const and thread-safe.
+- Nothing in `lookup.h` accepts a TunableOp, a Clock or a writable database, so the runtime
+  cannot measure or persist.
+
+Every answer says which §56 step produced it:
+
+| Answer | Step |
+|---|---|
+| `exact` | step 1 |
+| `compatible` | step 2, with the differing fields |
+| `heuristic` | step 3: cost model only, nothing measured |
+| `none` | no answer; run `halo tune` |
+
+A stored winner that is not among the current candidates is skipped with a note (for
+example, a winner that uses more threads than are now available).
+
+Steps 4 (microbenchmark) and 5 (persist) exist only in `autotune::tune()`.
+
+### Cost model (TRD §55), `cost_model.h`
+
+`T = max(T_compute, T_memory) + T_sync + T_launch`, where:
+
+- **`T_memory`** = bytes / tier bandwidth. The bandwidth is the **median** read bandwidth
+  from the measured `TierBandwidth`, scaled by min(1, parallelism / measured threads).
+- **`T_compute`** = flops / (GFLOP/s per thread × parallelism). The per-thread rate comes
+  from `calibrate_gflops_per_thread` on a HALO kernel measurement; there is no built-in
+  constant.
+
+The `memory_bound` flag is the model's own estimate. The CPU path has no occupancy or stall
+counters to verify it, which TRD §55 would require.
+
+### Tuner (TRD §58), `tuner.h`
+
+A TunableOp provides:
+
+- `key`
+- `backend`
+- `candidates`
+- `run`, which may return a device-measured time
+- optionally `validate` (a correctness gate) and `cost` (inputs for the cost model)
+
+| Strategy | What it measures |
+|---|---|
+| EXHAUSTIVE | every candidate |
+| RANDOM | a seeded draw without replacement (SplitMix64 partial Fisher–Yates, not `std::shuffle`) |
+| GRID | per dimension, every `grid_stride`-th sorted value plus the last |
+| HEURISTIC (default) | the `heuristic_keep` candidates the cost model predicts best |
+| BAYESIAN | nothing: returns `Error(Unsupported)` |
+
+The default strategy is HEURISTIC, which needs a `CostModel` (measured tier bandwidth plus a
+calibrated GFLOP/s per thread); without one `tune()` fails with `Error(Config)`. A caller with
+no calibration should pass `--strategy exhaustive`.
+
+How a winner is chosen:
+
+- Each candidate gets the TRD §50 methodology: 5 warm-up runs plus 20 measured. Fewer runs
+  need `allow_nonconformant`.
+- Unstable candidates (M1 classifier, default cv ≤ 0.05) are rejected.
+- Invalid candidates (failed `validate`) are rejected and never timed.
+- The winner has the smallest **median** in ns. Ties go to the smallest canonical candidate
+  string (`name=value;…`).
+- If no candidate is eligible, the runs are still recorded and the existing winner stays in
+  place.
+
+The CPU TunableOps:
+
+- **`CpuMatmulTunable`** tunes the thread count. `validate` requires output bit-identical to
+  the 1-thread result.
+- **`CpuGdnChunkedTunable`** tunes chunk size × thread count. `validate` requires output
+  within a tolerance of the recurrent form.
+
+### Intended `halo tune` flags (for WS-I to wire)
+
+```
+halo tune --model PATH [--mtp PATH] --power-mode LABEL --isa-target gfx1151|gfx11-generic|<cpu-isa>
+          [--db PATH (default ~/.cache/halo/profiles.db)] [--backend cpu|vulkan|hip]
+          [--strategy heuristic|exhaustive|grid|random] [--seed N] [--random-budget N]
+          [--grid-stride N] [--heuristic-keep N] [--warmup 5] [--iterations 20]
+          [--max-cv 0.05] [--ops MATMUL,GATED_DELTANET,...] [--report FILE.json]
+```
+
+The CLI flow (TRD §64):
+
+1. Call `capture_hardware_state`.
+2. Measure the tier bandwidths and store each with `record_tier_bandwidth`.
+3. Inspect the model and compute `MODEL_HASH` and `PACK_ID`.
+4. Build the key with `make_profile_key`.
+5. Build TunableOps for the model's operator shapes.
+6. Call `tune()` and write the `TuneReport` JSON.
+
+At start-up the runtime calls `ProfileLookup::open`, then `select_kernel` for each operator.
