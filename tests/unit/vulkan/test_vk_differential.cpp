@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -127,13 +128,13 @@ GdnOut run_vk(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, const GdnDa
     hv::Buffer state = upload(ctx, std::span<const float>(d.s0), hv::MemoryUsage::HostVisible);
     hv::Buffer out = hv::Buffer::create(ctx, d.T * d.c.v_cols() * 4, hv::MemoryUsage::HostCached);
     hv::GdnDecodeArgs a;
-    a.q = &q;
-    a.k = &k;
-    a.v = &v;
-    a.g = &g;
-    a.beta = &beta;
-    a.state = &state;
-    a.out = &out;
+    a.q = q;
+    a.k = k;
+    a.v = v;
+    a.g = g;
+    a.beta = beta;
+    a.state = state;
+    a.out = out;
     a.n_v = d.c.n_v;
     a.n_k = d.c.n_k;
     a.d_k = d.c.d_k;
@@ -266,6 +267,107 @@ TEST(VkDiffGdn, InKernelL2NormAtOtherWorkgroupSizes) {
         gdn_differential(ctx, k_small, 6, QkInput::Raw, true, 0.25f, 42 + wg, "small dims T=6 l2" + w, false,
                          hv::OpsOptions{.gdn_workgroup = wg});
     }
+}
+
+namespace {
+
+// The fused-projection layout of the model forward (code review S-1): one token row holds
+// [q | k | v | pad], another buffer holds [g | beta | pad]; out rows are strided; the state
+// sits in place at an odd element offset of an arena. Vulkan reads everything through
+// views with no copies. Checked against halo::cpu on strided views of the SAME host arrays
+// (and CPU views == CPU dense, bitwise), and bitwise against the Vulkan dense run.
+void fused_qkv_case(const std::shared_ptr<hv::Context>& ctx, const GdnCase& c, std::size_t T, std::uint64_t seed,
+                    const std::string& what) {
+    hv::Ops ops(ctx);
+    const GdnData d = make_gdn(c, T, QkInput::Raw, seed);
+    const std::size_t qc = c.qk_cols(), vc = c.v_cols(), nv = c.n_v, S = c.state_n();
+    // lead = 1: every q/k/v/g/beta view starts off the device offset alignment, so each
+    // shader-side remainder push constant is non-zero (a 0 remainder would hide a shader
+    // that ignores it).
+    const std::size_t lead = 1;
+    const std::uint64_t align = ctx->info().min_storage_buffer_offset_alignment;
+    std::cout << "[vk-views] minStorageBufferOffsetAlignment = " << align << "\n";
+    if (align <= 4) std::cout << "[vk-views] NOTE: fp32 remainders are always 0 on this device\n";
+    const std::size_t row = lead + 2 * qc + vc + 3, gb_row = lead + 2 * nv + 1, o_off = 2, o_row = vc + 5, s_off = 7;
+    std::vector<float> fused(T * row, std::numeric_limits<float>::quiet_NaN());
+    std::vector<float> gb(T * gb_row, std::numeric_limits<float>::quiet_NaN());
+    for (std::size_t t = 0; t < T; ++t) {
+        std::copy_n(d.q.begin() + t * qc, qc, fused.begin() + t * row + lead);
+        std::copy_n(d.k.begin() + t * qc, qc, fused.begin() + t * row + lead + qc);
+        std::copy_n(d.v.begin() + t * vc, vc, fused.begin() + t * row + lead + 2 * qc);
+        std::copy_n(d.g.begin() + t * nv, nv, gb.begin() + t * gb_row + lead);
+        std::copy_n(d.beta.begin() + t * nv, nv, gb.begin() + t * gb_row + lead + nv);
+    }
+    std::vector<float> arena(s_off + S + 5, -3.0f);
+    std::copy(d.s0.begin(), d.s0.end(), arena.begin() + static_cast<std::ptrdiff_t>(s_off));
+    const float guard = 4321.0f;
+    const std::size_t out_n = o_off + T * o_row + 1;
+
+    hv::Buffer bf = upload(ctx, std::span<const float>(fused));
+    hv::Buffer bgb = upload(ctx, std::span<const float>(gb));
+    hv::Buffer barena = upload(ctx, std::span<const float>(arena), hv::MemoryUsage::HostVisible);
+    hv::Buffer bout = upload(ctx, std::span<const float>(std::vector<float>(out_n, guard)), hv::MemoryUsage::HostCached);
+    hv::GdnDecodeArgs a;
+    const std::uint64_t rs = row * 4;
+    a.q = hv::BufferView(bf, lead * 4, 0, rs);
+    a.k = hv::BufferView(bf, (lead + qc) * 4, 0, rs);
+    a.v = hv::BufferView(bf, (lead + 2 * qc) * 4, 0, rs);
+    a.g = hv::BufferView(bgb, lead * 4, 0, gb_row * 4);
+    a.beta = hv::BufferView(bgb, (lead + nv) * 4, 0, gb_row * 4);
+    a.state = hv::BufferView(barena, s_off * 4, S * 4);
+    a.out = hv::BufferView(bout, o_off * 4, 0, o_row * 4);
+    a.n_v = c.n_v;
+    a.n_k = c.n_k;
+    a.d_k = c.d_k;
+    a.d_v = c.d_v;
+    a.n_tokens = static_cast<std::uint32_t>(T);
+    hv::Stream s(ctx);
+    ops.gated_delta_rule_decode(s, a);
+    s.submit_and_wait();
+    const auto out_all = download<float>(bout, out_n);
+    const auto arena_after = download<float>(barena, arena.size());
+    GdnOut vk{std::vector<float>(T * vc), std::vector<float>(arena_after.begin() + static_cast<std::ptrdiff_t>(s_off),
+                                                           arena_after.begin() + static_cast<std::ptrdiff_t>(s_off + S))};
+    for (std::size_t t = 0; t < T; ++t) {
+        std::copy_n(out_all.begin() + static_cast<std::ptrdiff_t>(o_off + t * o_row), vc, vk.out.begin() + t * vc);
+    }
+    // Guards: out padding and the arena outside the state are untouched.
+    for (std::size_t i = 0; i < out_n; ++i) {
+        const bool inside = i >= o_off && (i - o_off) / o_row < T && (i - o_off) % o_row < vc;
+        if (!inside) EXPECT_EQ(out_all[i], guard) << what << ": out guard " << i;
+    }
+    for (std::size_t i = 0; i < arena.size(); ++i) {
+        if (i < s_off || i >= s_off + S) EXPECT_EQ(arena_after[i], -3.0f) << what << ": arena guard " << i;
+    }
+
+    // halo::cpu on strided views of the same fused arrays.
+    GdnOut cpu_v{std::vector<float>(T * o_row, 0.0f), d.s0};
+    const float* fr = fused.data() + lead;
+    const float* gr = gb.data() + lead;
+    const hc::GdnInputs in{hc::ConstRows(fr, T, qc, row), hc::ConstRows(fr + qc, T, qc, row),
+                           hc::ConstRows(fr + 2 * qc, T, vc, row), hc::ConstRows(gr, T, nv, gb_row),
+                           hc::ConstRows(gr + nv, T, nv, gb_row)};
+    hc::gated_delta_rule_recurrent(c.cpu(), in, cpu_v.state, hc::Rows(cpu_v.out.data(), T, vc, o_row), hc::GdnQkParams{});
+    const GdnOut cpu = run_cpu(d, hc::GdnQkParams{});
+    std::vector<float> cpu_v_dense(T * vc);
+    for (std::size_t t = 0; t < T; ++t) std::copy_n(cpu_v.out.begin() + t * o_row, vc, cpu_v_dense.begin() + t * vc);
+    EXPECT_TRUE(std::equal(cpu_v_dense.begin(), cpu_v_dense.end(), cpu.out.begin())) << what << ": cpu views != dense";
+    EXPECT_TRUE(std::equal(cpu_v.state.begin(), cpu_v.state.end(), cpu.state.begin())) << what;
+    check_gdn(d, vk, cpu, gdn_scales(d, true, 1.0 / std::sqrt(double(c.d_k))), what);
+
+    // Bitwise vs the same kernel on dense copies.
+    const GdnOut dense = run_vk(ctx, ops, d, true, std::nullopt);
+    EXPECT_EQ(std::memcmp(vk.out.data(), dense.out.data(), vk.out.size() * 4), 0) << what << ": view out != dense out";
+    EXPECT_EQ(std::memcmp(vk.state.data(), dense.state.data(), vk.state.size() * 4), 0)
+        << what << ": view state != dense state";
+}
+
+}  // namespace
+
+TEST(VkDiffGdn, FusedQkvRowReadThroughViewsWithoutCopies) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    fused_qkv_case(ctx, k_small, 6, 51, "fused qkv small dims T=6");
+    fused_qkv_case(ctx, k_real, 2, 52, "fused qkv real dims T=2");
 }
 
 TEST(VkDiffGdn, NonFiniteQScaleIsRejectedLikeCpu) {

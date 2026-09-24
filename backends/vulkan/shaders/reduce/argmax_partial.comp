@@ -17,6 +17,8 @@ layout(push_constant) uniform Push {
     uint n;
     uint chunk;
     uint groups;
+    uint x_off;  // element remainder of the logits view (code review S-1)
+    uint p_off;  // word remainder of the scratch view
 } pc;
 
 const uint NONE = 0xFFFFFFFFu;
@@ -43,7 +45,7 @@ void main() {
     uint bi = NONE;
     uint nan_seen = 0u;
     for (uint i = begin + tid; i < end; i += WG) {
-        const float v = logits[i];
+        const float v = logits[pc.x_off + i];
         if (isnan(v)) {
             nan_seen = 1u;
             continue;
@@ -68,8 +70,8 @@ void main() {
         barrier();
     }
     if (tid == 0u) {
-        partials[3u * grp] = s_idx[0];
-        partials[3u * grp + 1u] = floatBitsToUint(s_val[0]);
-        partials[3u * grp + 2u] = s_nan[0];
+        partials[pc.p_off + 3u * grp] = s_idx[0];
+        partials[pc.p_off + 3u * grp + 1u] = floatBitsToUint(s_val[0]);
+        partials[pc.p_off + 3u * grp + 2u] = s_nan[0];
     }
 }

@@ -40,7 +40,8 @@ TEST(VkSha256, Fips180KnownAnswers) {
 
 TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
     const std::set<std::string> expected{"rms_norm",        "matvec_f32",           "matvec_q8_0",
-                                         "matvec_q4_k",     "matvec_q6_k",          "gated_delta_rule_decode",
+                                         "matvec_q4_k",     "matvec_q5_k",          "matvec_q6_k",
+                                         "matvec_iq4_xs",   "gated_delta_rule_decode",
                                          "argmax_partial", "argmax_final"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
@@ -256,11 +257,13 @@ TEST(VkShapes, MatvecRowBytesFollowGgmlBlockSizes) {
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::F32, 5120), 5120u * 4);
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q8_0, 5120), 5120u / 32 * 34);
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q4_K, 5120), 5120u / 256 * 144);
+    EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q5_K, 5120), 5120u / 256 * 176);
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q6_K, 5120), 5120u / 256 * 210);
+    EXPECT_EQ(hv::matvec_row_bytes(halo::DType::IQ4_XS, 5120), 5120u / 256 * 136);
     EXPECT_THROW((void)hv::matvec_row_bytes(halo::DType::Q8_0, 33), halo::Error);
     EXPECT_THROW((void)hv::matvec_row_bytes(halo::DType::Q4_K, 128), halo::Error);
     try {
-        (void)hv::matvec_row_bytes(halo::DType::IQ4_XS, 256);
+        (void)hv::matvec_row_bytes(halo::DType::Q3_K, 256);
         FAIL() << "expected throw";
     } catch (const halo::Error& e) {
         EXPECT_EQ(e.code(), halo::ErrorCode::Unsupported);

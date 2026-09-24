@@ -1,0 +1,66 @@
+#version 450
+// QUANT_GEMV, ggml IQ4_XS weights: y[r] = sum_c W[r,c] * x[c]. (Unsloth UD mixes, D-014.)
+// W, x, y are host views (code review S-1): row r of W starts at w_off + r * w_stride.
+// block_iq4_xs (ggml-common.h, MIT), 136 bytes / 256 values:
+//   fp16 d; uint16 scales_h; uint8 scales_l[4]; uint8 qs[128]
+// Dequantization as ggml-quants.c dequantize_row_iq4_xs (MIT) / halo::tensor: sub-block
+// ib = i/32 has the 6-bit scale ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xF) |
+// (((scales_h >> 2*ib) & 3) << 4), dl = d * (ls - 32); element j < 16 of the sub-block is
+// the low nibble of qs[16*ib + j], element 16 + j its high nibble; value =
+// dl * kvalues_iq4nl[nibble].
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint w_off;     // sub-alignment remainder of the W view (bytes)
+    uint w_stride;  // row stride of W (bytes)
+    uint x_off;     // element remainders of the x / y views (code review S-1)
+    uint y_off;
+} pc;
+
+HALO_DEFINE_BYTE_READERS(wq)
+
+const uint QK_K = 256u;
+const uint BLOCK_BYTES = 136u;
+
+// ggml kvalues_iq4nl (ggml-common.h, MIT)
+const int KVALUES[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_off = pc.w_off + row * pc.w_stride;
+
+    float acc = 0.0;
+    for (uint c = tid; c < pc.cols; c += WG) {
+        const uint bo = row_off + (c / QK_K) * BLOCK_BYTES;
+        const uint i = c % QK_K;
+        const uint ib = i / 32u;
+        const uint j = i % 32u;
+        const float d = read_f16(bo);
+        const uint scales_h = read_u8(bo + 2u) | (read_u8(bo + 3u) << 8);
+        const uint ls = ((read_u8(bo + 4u + ib / 2u) >> (4u * (ib % 2u))) & 0xFu) | (((scales_h >> (2u * ib)) & 3u) << 4);
+        const float dl = d * float(int(ls) - 32);
+        const uint qb = read_u8(bo + 8u + 16u * ib + (j % 16u));
+        const uint nib = j < 16u ? (qb & 0xFu) : (qb >> 4);
+        acc += (dl * float(KVALUES[nib])) * x[pc.x_off + c];
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) y[pc.y_off + row] = red[0];
+}

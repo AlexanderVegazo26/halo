@@ -87,7 +87,9 @@ const char* name_of(ref::WType t) {
         case ref::WType::F32: return "f32";
         case ref::WType::Q8_0: return "q8_0";
         case ref::WType::Q4_K: return "q4_k";
+        case ref::WType::Q5_K: return "q5_k";
         case ref::WType::Q6_K: return "q6_k";
+        case ref::WType::IQ4_XS: return "iq4_xs";
     }
     return "?";
 }
@@ -209,7 +211,8 @@ TEST_P(VkMatvec, RealisticScalesMatchWithSmallRelativeError) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Types, VkMatvec,
-                         ::testing::Values(ref::WType::F32, ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q6_K),
+                         ::testing::Values(ref::WType::F32, ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q5_K,
+                                           ref::WType::Q6_K, ref::WType::IQ4_XS),
                          [](const auto& info) { return std::string(name_of(info.param)); });
 
 TEST(VkOps, MatvecQ6KBeyondWorkgroupCountLimitUses2DGrid) {
@@ -411,15 +414,18 @@ GdnBuffers gdn_upload(const std::shared_ptr<hv::Context>& ctx, const GdnRow& r, 
             hv::Buffer::create(ctx, out_elems * 4, hv::MemoryUsage::HostCached)};
 }
 
+// View of `buf` starting at float element `elem` (to its end).
+hv::BufferView f32_view(const hv::Buffer& buf, std::uint64_t elem) { return {buf, elem * 4}; }
+
 hv::GdnDecodeArgs gdn_args(GdnBuffers& b, hv::Buffer& state, const GdnDims& d, std::uint32_t T) {
     hv::GdnDecodeArgs a;
-    a.q = &b.q;
-    a.k = &b.k;
-    a.v = &b.v;
-    a.g = &b.g;
-    a.beta = &b.beta;
-    a.state = &state;
-    a.out = &b.out;
+    a.q = b.q;
+    a.k = b.k;
+    a.v = b.v;
+    a.g = b.g;
+    a.beta = b.beta;
+    a.state = state;
+    a.out = b.out;
     a.n_v = d.n_v;
     a.n_k = d.n_k;
     a.d_k = d.d_k;
@@ -541,11 +547,11 @@ void gdn_multi_row(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, st
 
     GdnBuffers b = gdn_upload(ctx, all, std::size_t{T} * d.n_v * d.d_v);
     hv::GdnDecodeArgs a = gdn_args(b, state_in, d, T);
-    a.state_offset = S;
-    a.state_out = &state_out;
-    a.state_out_offset = 3;
-    a.state_slots = K > 0 ? &slots : nullptr;
-    a.slots_offset = 5;
+    a.state = f32_view(state_in, S);
+    a.state_out = f32_view(state_out, 3);
+
+    if (K > 0) a.state_slots = f32_view(slots, 5);
+
     a.n_slots = K;
     hv::Stream s(ctx);
     ops.gated_delta_rule_decode(s, a);
@@ -619,7 +625,7 @@ TEST(VkGdn, SameBufferDisjointRegionsAndInPlaceAgree) {
     GdnBuffers b1 = gdn_upload(ctx, r, std::size_t{d.n_v} * d.d_v);
     GdnBuffers b2 = gdn_upload(ctx, r, std::size_t{d.n_v} * d.d_v);
     hv::GdnDecodeArgs a1 = gdn_args(b1, shared, d, 1);
-    a1.state_out_offset = S;
+    a1.state_out = f32_view(shared, S);
     hv::GdnDecodeArgs a2 = gdn_args(b2, inplace, d, 1);
     hv::Stream s(ctx);
     ops.gated_delta_rule_decode(s, a1);
@@ -668,10 +674,10 @@ TEST(VkGdn, StateRegionsBeyondMaxStorageBufferRange) {
     arena.upload(std::span<const float>(s0), base * 4);
     GdnBuffers b = gdn_upload(ctx, concat(rows), std::size_t{T} * d.n_v * d.d_v);
     hv::GdnDecodeArgs a = gdn_args(b, arena, d, T);
-    a.state_offset = base;
-    a.state_out_offset = base + S;
-    a.state_slots = &arena;
-    a.slots_offset = base + 2 * S;
+    a.state = f32_view(arena, base);
+    a.state_out = f32_view(arena, base + S);
+    a.state_slots = f32_view(arena, base + 2 * S);
+
     a.n_slots = K;
     hv::Stream s(ctx);
     ops.gated_delta_rule_decode(s, a);
@@ -706,30 +712,30 @@ TEST(VkGdn, ValidatesRegionsAndSizes) {
     auto base = [&] { return gdn_args(b, state, d, 2); };
     EXPECT_NO_THROW(ops.gated_delta_rule_decode(s, base()));
     auto a = base();
-    a.state_out_offset = S / 2;  // partial overlap with [0, S)
+    a.state_out = f32_view(state, S / 2);  // partial overlap with [0, S)
     EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
     a = base();
-    a.state_offset = 2 * S + 1;  // input region past the end
+    a.state = f32_view(state, 2 * S + 1);  // input region past the end
     EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
     a = base();
     a.n_slots = 1;  // slots without a buffer
     EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
     a = base();
-    a.state_slots = &state;  // slots overlapping the state region
+    a.state_slots = f32_view(state, S / 2);  // slots overlapping the state region
     a.n_slots = 1;
-    a.slots_offset = S / 2;
+
     EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
-    a.slots_offset = S;  // disjoint in the same buffer: allowed
+    a.state_slots = f32_view(state, S);  // disjoint in the same buffer: allowed
     EXPECT_NO_THROW(ops.gated_delta_rule_decode(s, a));
     a = base();
-    a.state_slots = &slots;
+    a.state_slots = slots;
     a.n_slots = 3;  // only min(T, n_slots) = 2 slots are written -> fits in 2*S
     EXPECT_NO_THROW(ops.gated_delta_rule_decode(s, a));
     a = base();
     a.n_tokens = 3;  // inputs sized for T = 2
     EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
     a = base();
-    a.out = &state;  // output aliasing state
+    a.out = state;  // output aliasing state
     EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
     a = base();
     a.d_k = 512;  // > gdn_max_dk

@@ -42,15 +42,19 @@ inline void store_u16(std::uint8_t* p, std::uint16_t v) { std::memcpy(p, &v, 2);
 inline constexpr std::size_t k_q8_0_bytes = 34;   // fp16 d; int8 qs[32]
 inline constexpr std::size_t k_q4_k_bytes = 144;  // fp16 d, dmin; u8 scales[12]; u8 qs[128]
 inline constexpr std::size_t k_q6_k_bytes = 210;  // u8 ql[128]; u8 qh[64]; i8 scales[16]; fp16 d
+inline constexpr std::size_t k_q5_k_bytes = 176;  // fp16 d, dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]
+inline constexpr std::size_t k_iq4_xs_bytes = 136;  // fp16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]
 
-enum class WType { F32, Q8_0, Q4_K, Q6_K };
+enum class WType { F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS };
 
 [[nodiscard]] inline halo::DType dtype(WType t) {
     switch (t) {
         case WType::F32: return halo::DType::F32;
         case WType::Q8_0: return halo::DType::Q8_0;
         case WType::Q4_K: return halo::DType::Q4_K;
+        case WType::Q5_K: return halo::DType::Q5_K;
         case WType::Q6_K: return halo::DType::Q6_K;
+        case WType::IQ4_XS: return halo::DType::IQ4_XS;
     }
     return halo::DType::F32;
 }
@@ -61,7 +65,9 @@ inline std::size_t block_bytes(WType t) {
         case WType::F32: return 4;
         case WType::Q8_0: return k_q8_0_bytes;
         case WType::Q4_K: return k_q4_k_bytes;
+        case WType::Q5_K: return k_q5_k_bytes;
         case WType::Q6_K: return k_q6_k_bytes;
+        case WType::IQ4_XS: return k_iq4_xs_bytes;
     }
     return 0;
 }
@@ -83,7 +89,7 @@ struct Weights {
 
 // Random valid weights: random payload bytes, fp16 scale fields sanitized to finite normal.
 // `max_exp` bounds the scale exponent (fp16 exponent field, bias 15). `mag` is |w|, except
-// for Q4_K where it is |d*sc*q| + |dmin*m| (d*sc*q - dmin*m can cancel, and the rounding
+// for Q4_K / Q5_K where it is |d*sc*q| + |dmin*m| (d*sc*q - dmin*m can cancel, and the rounding
 // error is relative to the parts): both parts come from halo::tensor, by dequantizing
 // copies of the blocks with dmin = 0 and with d = 0 respectively.
 inline Weights random_weights(WType t, std::uint32_t rows, std::uint32_t cols, std::mt19937& rng,
@@ -113,17 +119,19 @@ inline Weights random_weights(WType t, std::uint32_t rows, std::uint32_t cols, s
         switch (t) {
             case WType::Q8_0: store_u16(blk, random_normal_fp16(rng, 1, max_exp)); break;
             case WType::Q4_K:
+            case WType::Q5_K:
                 store_u16(blk, random_normal_fp16(rng, 1, max_exp));
                 store_u16(blk + 2, random_normal_fp16(rng, 1, max_exp));
                 break;
             case WType::Q6_K: store_u16(blk + 208, random_normal_fp16(rng, 1, max_exp)); break;
+            case WType::IQ4_XS: store_u16(blk, random_normal_fp16(rng, 1, max_exp)); break;
             case WType::F32: break;
         }
     }
     const std::span<const std::uint8_t> payload(w.bytes.data(), raw);
     w.deq = dequantize(t, payload, n);
     w.mag.resize(n);
-    if (t == WType::Q4_K) {
+    if (t == WType::Q4_K || t == WType::Q5_K) {
         std::vector<std::uint8_t> scaled(payload.begin(), payload.end());
         std::vector<std::uint8_t> offset = scaled;
         for (std::size_t b = 0; b < nb; ++b) {

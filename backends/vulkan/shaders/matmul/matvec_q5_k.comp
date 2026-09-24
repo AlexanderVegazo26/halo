@@ -1,11 +1,12 @@
 #version 450
-// QUANT_GEMV, ggml Q4_K weights: y[r] = sum_c W[r,c] * x[c].
+// QUANT_GEMV, ggml Q5_K weights: y[r] = sum_c W[r,c] * x[c]. (Unsloth UD mixes, D-014.)
 // W, x, y are host views (code review S-1): row r of W starts at w_off + r * w_stride.
-// block_q4_K (ggml-common.h, MIT), 144 bytes / 256 values:
-//   fp16 d; fp16 dmin; uint8 scales[12] (6-bit scales + mins); uint8 qs[128] (4-bit)
-// Dequantization ported from ggml-quants.c dequantize_row_q4_K / get_scale_min_k4 (MIT):
-//   for chunk c in 0..3 (64 values): sub-blocks 2c (low nibbles) and 2c+1 (high nibbles)
-//   of qs[32c .. 32c+31];  value = d*sc[sub] * q - dmin*m[sub].
+// block_q5_K (ggml-common.h, MIT), 176 bytes / 256 values:
+//   fp16 d; fp16 dmin; uint8 scales[12] (6-bit scales + mins, as Q4_K); uint8 qh[32]
+//   (5th bits); uint8 qs[128] (low 4 bits)
+// Dequantization as ggml-quants.c dequantize_row_q5_K (MIT) / halo::tensor: for chunk c in
+// 0..3 (64 values), sub-blocks 2c (low nibbles of qs[32c+l], 5th bit = qh[l] bit 2c) and
+// 2c+1 (high nibbles, qh[l] bit 2c+1); value = d*sc[sub] * (q + 16*bit) - dmin*m[sub].
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
@@ -18,8 +19,8 @@ layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Push {
     uint rows;
     uint cols;
-    uint w_off;     // sub-alignment remainder of the W view (f32: elements, quantized: bytes)
-    uint w_stride;  // row stride of W (same unit)
+    uint w_off;     // sub-alignment remainder of the W view (bytes)
+    uint w_stride;  // row stride of W (bytes)
     uint x_off;     // element remainders of the x / y views (code review S-1)
     uint y_off;
 } pc;
@@ -27,7 +28,7 @@ layout(push_constant) uniform Push {
 HALO_DEFINE_BYTE_READERS(wq)
 
 const uint QK_K = 256u;
-const uint BLOCK_BYTES = 144u;
+const uint BLOCK_BYTES = 176u;
 
 // get_scale_min_k4(j, q, &d, &m) with q = block scales at byte offset `so`.
 void scale_min_k4(uint j, uint so, out uint sc, out uint m) {
@@ -60,8 +61,9 @@ void main() {
         uint sc;
         uint m;
         scale_min_k4(2u * chunk + hi, bo + 4u, sc, m);
-        const uint qb = read_u8(bo + 16u + 32u * chunk + l);
-        const uint q = hi == 1u ? (qb >> 4) : (qb & 0xFu);
+        const uint qb = read_u8(bo + 48u + 32u * chunk + l);
+        const uint bit = (read_u8(bo + 16u + l) >> (2u * chunk + hi)) & 1u;
+        const uint q = (hi == 1u ? (qb >> 4) : (qb & 0xFu)) + 16u * bit;
         const float d1 = d * float(sc);
         const float m1 = dmin * float(m);
         acc += (d1 * float(q) - m1) * x[pc.x_off + c];

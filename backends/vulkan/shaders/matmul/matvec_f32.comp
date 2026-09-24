@@ -1,5 +1,6 @@
 #version 450
-// MATMUL (decode GEMV), fp32 weights: y[r] = sum_c W[r*cols + c] * x[c].
+// MATMUL (decode GEMV), fp32 weights: y[r] = sum_c W[r, c] * x[c].
+// W, x, y are host views (code review S-1): row r of W starts at w_off + r * w_stride.
 // One workgroup per output row; strided per-thread partial sums, then a fixed-order
 // shared-memory tree reduction.
 #include "halo_common.glsl"
@@ -14,6 +15,10 @@ layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Push {
     uint rows;
     uint cols;
+    uint w_off;     // sub-alignment remainder of the W view (f32: elements, quantized: bytes)
+    uint w_stride;  // row stride of W (same unit)
+    uint x_off;     // element remainders of the x / y views (code review S-1)
+    uint y_off;
 } pc;
 
 shared float red[WG];
@@ -22,15 +27,15 @@ void main() {
     const uint row = halo_group_id();
     if (row >= pc.rows) return;
     const uint tid = gl_LocalInvocationID.x;
-    const uint base = row * pc.cols;
+    const uint base = pc.w_off + row * pc.w_stride;
 
     float acc = 0.0;
-    for (uint c = tid; c < pc.cols; c += WG) acc += wt[base + c] * x[c];
+    for (uint c = tid; c < pc.cols; c += WG) acc += wt[base + c] * x[pc.x_off + c];
     red[tid] = acc;
     barrier();
     for (uint s = WG / 2u; s > 0u; s >>= 1) {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    if (tid == 0u) y[row] = red[0];
+    if (tid == 0u) y[pc.y_off + row] = red[0];
 }

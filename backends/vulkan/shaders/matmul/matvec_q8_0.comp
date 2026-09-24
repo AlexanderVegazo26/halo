@@ -1,5 +1,6 @@
 #version 450
 // QUANT_GEMV, ggml Q8_0 weights: y[r] = sum_c W[r,c] * x[c].
+// W, x, y are host views (code review S-1): row r of W starts at w_off + r * w_stride.
 // block_q8_0 (ggml-common.h, MIT): { fp16 d; int8 qs[32]; } = 34 bytes / 32 values,
 // value = d * qs[i]. Each row is cols/32 consecutive blocks; rows are back to back.
 // Correctness-first: one workgroup per row, each thread dequantizes individual elements.
@@ -15,6 +16,10 @@ layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Push {
     uint rows;
     uint cols;
+    uint w_off;     // sub-alignment remainder of the W view (f32: elements, quantized: bytes)
+    uint w_stride;  // row stride of W (same unit)
+    uint x_off;     // element remainders of the x / y views (code review S-1)
+    uint y_off;
 } pc;
 
 HALO_DEFINE_BYTE_READERS(wq)
@@ -28,14 +33,14 @@ void main() {
     const uint row = halo_group_id();
     if (row >= pc.rows) return;
     const uint tid = gl_LocalInvocationID.x;
-    const uint row_off = row * (pc.cols / QK) * BLOCK_BYTES;
+    const uint row_off = pc.w_off + row * pc.w_stride;
 
     float acc = 0.0;
     for (uint c = tid; c < pc.cols; c += WG) {
         const uint bo = row_off + (c / QK) * BLOCK_BYTES;
         const float d = read_f16(bo);
         const float q = float(read_i8(bo + 2u + (c % QK)));
-        acc += (q * d) * x[c];
+        acc += (q * d) * x[pc.x_off + c];
     }
     red[tid] = acc;
     barrier();
@@ -43,5 +48,5 @@ void main() {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    if (tid == 0u) y[row] = red[0];
+    if (tid == 0u) y[pc.y_off + row] = red[0];
 }

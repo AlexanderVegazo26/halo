@@ -25,7 +25,9 @@ set(HALO_VK_SHADERS
   matmul/matvec_f32
   matmul/matvec_q8_0
   matmul/matvec_q4_k
+  matmul/matvec_q5_k
   matmul/matvec_q6_k
+  matmul/matvec_iq4_xs
   linear_attn/gated_delta_rule_decode
   reduce/argmax_partial
   reduce/argmax_final

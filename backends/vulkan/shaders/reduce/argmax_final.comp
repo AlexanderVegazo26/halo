@@ -13,6 +13,8 @@ layout(std430, binding = 1) writeonly buffer Result { uint result[]; };
 
 layout(push_constant) uniform Push {
     uint count;
+    uint p_off;  // word remainders of the scratch / result views (code review S-1)
+    uint r_off;
 } pc;
 
 const uint NONE = 0xFFFFFFFFu;
@@ -33,9 +35,9 @@ void main() {
     uint bi = NONE;
     uint nan_seen = 0u;
     for (uint p = tid; p < pc.count; p += WG) {
-        const uint ii = partials[3u * p];
-        const float vv = uintBitsToFloat(partials[3u * p + 1u]);
-        nan_seen |= partials[3u * p + 2u];
+        const uint ii = partials[pc.p_off + 3u * p];
+        const float vv = uintBitsToFloat(partials[pc.p_off + 3u * p + 1u]);
+        nan_seen |= partials[pc.p_off + 3u * p + 2u];
         if (better(vv, ii, bv, bi)) {
             bv = vv;
             bi = ii;
@@ -56,8 +58,8 @@ void main() {
         barrier();
     }
     if (tid == 0u) {
-        result[0] = s_idx[0];
-        result[1] = floatBitsToUint(s_val[0]);
-        result[2] = s_nan[0] != 0u ? 1u : 0u;
+        result[pc.r_off] = s_idx[0];
+        result[pc.r_off + 1u] = floatBitsToUint(s_val[0]);
+        result[pc.r_off + 2u] = s_nan[0] != 0u ? 1u : 0u;
     }
 }

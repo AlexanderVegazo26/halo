@@ -1,6 +1,8 @@
 #version 450
-// RMS_NORM: y[r,i] = x[r,i] / sqrt(mean(x[r,:]^2) + eps) * w[i]   (plain x̂·w, D-004).
-// One workgroup per row; fixed-order shared-memory tree reduction (deterministic).
+// RMS_NORM: y[r,i] = (x[r,i] * (1 / sqrt(mean(x[r,:]^2) + eps))) * w[i]   (plain x̂·w, D-004;
+// same operation order as cpu::rms_norm). One workgroup per row; fixed-order shared-memory
+// tree reduction (deterministic). Operands are views (element offset remainder + row
+// stride from the host, code review S-1).
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
@@ -14,6 +16,11 @@ layout(push_constant) uniform Push {
     uint rows;
     uint cols;
     float eps;
+    uint x_off;
+    uint x_stride;
+    uint w_off;
+    uint y_off;
+    uint y_stride;
 } pc;
 
 shared float red[WG];
@@ -22,11 +29,12 @@ void main() {
     const uint row = halo_group_id();
     if (row >= pc.rows) return;
     const uint tid = gl_LocalInvocationID.x;
-    const uint base = row * pc.cols;
+    const uint xb = pc.x_off + row * pc.x_stride;
+    const uint yb = pc.y_off + row * pc.y_stride;
 
     float acc = 0.0;
     for (uint i = tid; i < pc.cols; i += WG) {
-        const float v = x[base + i];
+        const float v = x[xb + i];
         acc += v * v;
     }
     red[tid] = acc;
@@ -37,6 +45,6 @@ void main() {
     }
     const float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
     for (uint i = tid; i < pc.cols; i += WG) {
-        y[base + i] = x[base + i] * inv * w[i];
+        y[yb + i] = (x[xb + i] * inv) * w[pc.w_off + i];
     }
 }
