@@ -1,14 +1,18 @@
-// Differential tests: every Vulkan kernel against a CPU scalar reference (TRD §29-§30).
+// Differential tests: every Vulkan kernel against the HALO CPU backend (halo::cpu) and
+// HALO's dequantization (halo::tensor::dequantize_row), run on the SAME input arrays and
+// weight bytes (TRD §29-§30; code review M-2). fp64 is used only for bound scales.
 //
-// Tolerances are a priori bounds, not fitted to observed output. With u = 2^-24 (fp32
-// unit roundoff), a GPU sum of n terms computed as WG strided partial sums of
-// ceil(n/WG) terms followed by a log2(WG)-level tree has forward error
-//     |ŷ - y| <= (ceil(n/WG) + log2(WG) + c) · u · Σ|termᵢ|        (Higham, §3.1)
-// where c covers the per-term rounding (dequant multiply-adds and the product). Every
-// matvec check uses that bound with c = 4 against the exact (double) sum over the
-// ggml-dequantized weights, with Σ|termᵢ| taken over |w|·|x| (for Q4_K over
-// (|d·sc·q| + |dmin·m|)·|x|, because d·sc·q - dmin·m can cancel). The reference is
-// evaluated in double, whose own error is ~1e-16 relative and ignored.
+// Tolerances are a priori bounds, not fitted to observed output. Each assertion is
+//     |vk - cpu| <= (bound_vk + bound_cpu) · scale
+// where each bound is that backend's forward-error bound against exact arithmetic. With
+// u = 2^-24 (fp32 unit roundoff), a sum of n terms computed as L strided partial sums of
+// ceil(n/L) terms followed by a log2(L)-level tree has forward error
+//     |ŷ - y| <= (ceil(n/L) + log2(L) + c) · u · Σ|termᵢ|        (Higham, §3.1)
+// where c covers the per-term rounding (dequant multiply-adds and the product). The GPU
+// kernels use L = WG (the reduction workgroup); the CPU dot product (backends/cpu
+// kernel_common.h detail::dot) uses L = 8 lanes. Matvec checks use c = 4 on both sides
+// with Σ|termᵢ| over |w|·|x| (for Q4_K over (|d·sc·q| + |dmin·m|)·|x|, because
+// d·sc·q - dmin·m can cancel), computed in fp64.
 
 #include <gtest/gtest.h>
 
@@ -24,11 +28,17 @@
 #include <string>
 #include <vector>
 
+#include "cpu_kernels/tolerance.h"
+#include "halo/backends/cpu/ops.h"
+#include "halo/backends/cpu/weight_matrix.h"
 #include "halo/backends/vulkan/ops.h"
+#include "halo/tensor/quant.h"
 #include "reference.h"
 #include "vk_test_util.h"
 
 namespace hv = halo::vulkan;
+namespace hc = halo::cpu;
+namespace ct = halo::cpu::test;
 namespace ref = halo::vulkan::ref;
 using hv::test::compare;
 using hv::test::download;
@@ -43,14 +53,32 @@ double sum_bound_factor(std::uint32_t n, std::uint32_t wg, double c = 4.0) {
     return (std::ceil(static_cast<double>(n) / wg) + log2u(wg) + c) * ref::k_u;
 }
 
-halo::DType dtype_of(ref::WType t) {
-    switch (t) {
-        case ref::WType::F32: return halo::DType::F32;
-        case ref::WType::Q8_0: return halo::DType::Q8_0;
-        case ref::WType::Q4_K: return halo::DType::Q4_K;
-        case ref::WType::Q6_K: return halo::DType::Q6_K;
-    }
-    return halo::DType::F32;
+// CPU dot product (detail::dot): 8 strided lanes + a 3-level tree.
+constexpr std::uint32_t k_cpu_lanes = 8;
+
+halo::DType dtype_of(ref::WType t) { return ref::dtype(t); }
+
+std::vector<double> to_dbl(std::span<const float> v) { return {v.begin(), v.end()}; }
+
+// halo::cpu::matmul of one x row with the SAME weights the GPU reads: F32 as a dense view
+// (w.deq holds exactly the uploaded bytes), quantized rows dequantized on demand from the
+// uploaded bytes by halo::tensor::dequantize_row.
+std::vector<float> cpu_matvec(const ref::Weights& w, ref::WType t, std::uint32_t rows, std::uint32_t cols,
+                              std::span<const float> x) {
+    const std::size_t rb = halo::tensor::row_bytes(ref::dtype(t), cols);
+    const hc::WeightMatrix m =
+        t == ref::WType::F32
+            ? hc::WeightMatrix::dense(hc::ConstRows(w.deq.data(), rows, cols, cols))
+            : hc::WeightMatrix::dequantized(rows, cols, [&w, t, rb, cols](std::size_t first, std::size_t n,
+                                                                          std::span<float> out) {
+                  for (std::size_t r = 0; r < n; ++r) {
+                      halo::tensor::dequantize_row(ref::dtype(t), std::as_bytes(std::span(w.bytes)).data() + (first + r) * rb,
+                                                   out.data() + r * cols, cols);
+                  }
+              });
+    std::vector<float> y(rows);
+    hc::matmul(hc::ConstRows(x.data(), 1, cols, cols), m, hc::Rows(y.data(), 1, rows, rows));
+    return y;
 }
 
 const char* name_of(ref::WType t) {
@@ -68,15 +96,16 @@ std::string timing_label(const hv::Context& ctx) {
                                        : "GPU timing (unvalidated, not a benchmark)";
 }
 
-// Runs one matvec differential case; returns the error stats.
+// Runs one matvec differential case (GPU vs halo::cpu::matmul on the same weight bytes);
+// returns the error stats.
 hv::test::ErrorStats run_matvec(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, ref::WType t,
                                 std::uint32_t rows, std::uint32_t cols, std::uint32_t seed,
                                 std::uint32_t max_exp = 30, bool print_timing = false) {
     std::mt19937 rng(seed);
     const ref::Weights w = ref::random_weights(t, rows, cols, rng, max_exp);
     const std::vector<float> x = ref::random_vec(cols, rng);
-    std::vector<double> y_ref, scale;
-    ref::matvec(w.deq, w.mag, x, rows, cols, y_ref, scale);
+    const std::vector<double> y_cpu = to_dbl(cpu_matvec(w, t, rows, cols, x));
+    const std::vector<double> scale = ref::matvec_scale(w.mag, x, rows, cols);
 
     hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
     hv::Buffer bx = upload(ctx, std::span<const float>(x));
@@ -91,15 +120,15 @@ hv::test::ErrorStats run_matvec(const std::shared_ptr<hv::Context>& ctx, hv::Ops
                   << *s.elapsed_ns(*t0, *t1) / 1e6 << " ms — " << timing_label(*ctx) << "\n";
     }
     const std::vector<float> y = download<float>(by, rows);
-    const double f = sum_bound_factor(cols, ops.options().reduce_workgroup);
-    return compare(y, y_ref, [&](std::size_t i) { return f * scale[i]; });
+    const double f = sum_bound_factor(cols, ops.options().reduce_workgroup) + sum_bound_factor(cols, k_cpu_lanes);
+    return compare(y, y_cpu, [&](std::size_t i) { return f * scale[i] + ct::kDenormFloor; });
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------- rms_norm
 
-TEST(VkOps, RmsNormMatchesReference) {
+TEST(VkOps, RmsNormMatchesCpu) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     struct Case {
         std::uint32_t rows, cols, wg;
@@ -113,7 +142,10 @@ TEST(VkOps, RmsNormMatchesReference) {
         const auto x = ref::random_vec(std::size_t{c.rows} * c.cols, rng, 3.0f);
         const auto w = ref::random_vec(c.cols, rng);
         const float eps = 1e-6f;
-        const auto y_ref = ref::rms_norm(x, w, c.rows, c.cols, eps);
+        std::vector<float> y_cpu(x.size());
+        hc::rms_norm(hc::ConstRows(x.data(), c.rows, c.cols, c.cols), w, eps,
+                     hc::Rows(y_cpu.data(), c.rows, c.cols, c.cols));
+        const auto mag = ref::rms_norm_scale(x, w, c.rows, c.cols, eps);
 
         hv::Buffer bx = upload(ctx, std::span<const float>(x));
         hv::Buffer bw = upload(ctx, std::span<const float>(w));
@@ -123,9 +155,11 @@ TEST(VkOps, RmsNormMatchesReference) {
         s.submit_and_wait();
         const auto y = download<float>(by, x.size());
         // Sum of squares: positive terms -> relative bound on the sum itself; then mean,
-        // +eps, sqrt (<= 3 ulp in Vulkan: 1/inversesqrt), 1/x (2.5 ulp), two products.
-        const double rtol = (std::ceil(double(c.cols) / c.wg) + log2u(c.wg) + 16.0) * ref::k_u;
-        const auto st = compare(y, y_ref, [&](std::size_t i) { return rtol * std::fabs(y_ref[i]) + 1e-30; });
+        // +eps, sqrt (<= 3 ulp in Vulkan: 1/inversesqrt), 1/x (2.5 ulp), two products. The
+        // CPU op has the same shape with an 8-lane sum and correctly rounded sqrt/divide.
+        const double rtol = (std::ceil(double(c.cols) / c.wg) + log2u(c.wg) + 16.0) * ref::k_u +
+                            (std::ceil(double(c.cols) / k_cpu_lanes) + log2u(k_cpu_lanes) + 16.0) * ref::k_u;
+        const auto st = compare(y, to_dbl(y_cpu), [&](std::size_t i) { return rtol * mag[i] + 1e-30; });
         report("rms_norm " + std::to_string(c.rows) + "x" + std::to_string(c.cols) + " wg" + std::to_string(c.wg),
                st);
         EXPECT_LE(st.max_ratio, 1.0) << "rows=" << c.rows << " cols=" << c.cols << " worst=" << st.worst;
@@ -136,7 +170,7 @@ TEST(VkOps, RmsNormMatchesReference) {
 
 class VkMatvec : public ::testing::TestWithParam<ref::WType> {};
 
-TEST_P(VkMatvec, MatchesReferenceAcrossShapes) {
+TEST_P(VkMatvec, MatchesCpuAcrossShapes) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const ref::WType t = GetParam();
     const std::uint32_t blk = static_cast<std::uint32_t>(ref::block_elems(t));
@@ -210,16 +244,15 @@ TEST(VkOps, MatvecValidatesShapesAndBuffers) {
 
 // ---------------------------------------------------------------- dequant cross-check dump
 
-TEST(VkRef, DequantReferenceDumpForGgufPyCrossCheck) {
-    // When HALO_VK_DUMP_DIR is set, write random blocks + this file's CPU dequantization so
-    // an external script can compare against gguf-py (python/…/gguf quants). Otherwise
-    // this only checks the reference on hand-built blocks.
+TEST(VkRef, TensorDequantMatchesHandBuiltGgmlBlocks) {
+    // The Vulkan tests take their dequantized reference from halo::tensor::dequantize_row;
+    // pin it on hand-built blocks. When HALO_VK_DUMP_DIR is set, also write random blocks +
+    // that dequantization so an external script can compare against gguf-py.
     // Hand-built Q8_0: d = 0.5, qs = -128..-97.
     std::uint8_t q8[34];
     ref::store_u16(q8, 0x3800);  // 0.5
     for (int i = 0; i < 32; ++i) q8[2 + i] = static_cast<std::uint8_t>(-128 + i);
-    float y[256];
-    ref::dequant_q8_0(q8, y);
+    std::vector<float> y = ref::dequantize(ref::WType::Q8_0, q8, 32);
     EXPECT_EQ(y[0], -64.0f);
     EXPECT_EQ(y[31], -48.5f);
     // Hand-built Q4_K: d = 1, dmin = 2, scales for sub-block 5 (j >= 4 branch):
@@ -231,8 +264,16 @@ TEST(VkRef, DequantReferenceDumpForGgufPyCrossCheck) {
     q4[4 + 5] = 0x40;                // s[5] top bits -> m high = 1
     q4[4 + 9] = 0x25;                // sc low = 5, m low = 2
     q4[16 + 64 + 3] = 0x70;          // chunk 2, l = 3, high nibble 7 -> element 128+32+3 (sub-block 5)
-    ref::dequant_q4_k(q4, y);
+    y = ref::dequantize(ref::WType::Q4_K, q4, 256);
     // sc = 5 | 3<<4 = 53, m = 2 | 1<<4 = 18 -> 1*53*7 - 2*18 = 335
+    EXPECT_EQ(y[128 + 32 + 3], 335.0f);
+    // Low-nibble path, sub-block 0 (j < 4 branch): sc = s[0] & 63 = 3, m = s[4] & 63 = 2,
+    // element 0 = low nibble of qs[0] = 5 -> 1*3*5 - 2*2 = 11.
+    q4[4 + 0] = 3;
+    q4[4 + 4] = 2;
+    q4[16 + 0] = 0x05;
+    y = ref::dequantize(ref::WType::Q4_K, q4, 256);
+    EXPECT_EQ(y[0], 11.0f);
     EXPECT_EQ(y[128 + 32 + 3], 335.0f);
     // Hand-built Q6_K: d = 1, scale[8+ (is=0) + 2*quarter=4] ... element n=1, quarter 2, l = 0.
     std::uint8_t q6[210] = {};
@@ -240,7 +281,7 @@ TEST(VkRef, DequantReferenceDumpForGgufPyCrossCheck) {
     q6[64 + 0] = 0xA0;                          // ql[64+0] high nibble = 10 (quarter >= 2)
     q6[128 + 32 + 0] = 0x30;                    // qh[32+0] bits 4..5 = 3
     q6[192 + 8 + 4] = static_cast<std::uint8_t>(-3);  // scales[8 + 0 + 4] = -3
-    ref::dequant_q6_k(q6, y);
+    y = ref::dequantize(ref::WType::Q6_K, q6, 256);
     // q = (10 | 3<<4) - 32 = 26 -> 1 * -3 * 26 = -78 at y[128 + 64 + 0]
     EXPECT_EQ(y[192], -78.0f);
 
@@ -333,6 +374,31 @@ double max_abs(std::span<const double> v) {
 // most linearly over T steps. Normalized by the tensor's largest magnitude.
 double gdn_factor(std::uint32_t d_k, std::uint32_t steps) { return steps * (2.0 * d_k + 24.0) * ref::k_u; }
 
+// |vk - cpu| bound after `steps` tokens: the GPU a-priori bound above plus the CPU
+// kernel's own bound vs exact arithmetic (Model G, tests/unit/cpu_kernels/tolerance.h).
+double gdn_bound(std::uint32_t d_k, std::uint32_t steps, double scale) {
+    return gdn_factor(d_k, steps) * scale + ct::tol_gdn(steps, d_k, scale) + ct::kDenormFloor;
+}
+
+// halo::cpu::gated_delta_rule_recurrent over one row, state in place, on the same host
+// arrays the GPU receives; q/k used as given (D-016 qk_l2norm = false, q_scale = 1).
+std::vector<float> cpu_gdn_row(const GdnDims& d, const GdnRow& r, std::vector<float>& state) {
+    const std::size_t qc = std::size_t{d.n_k} * d.d_k, vc = std::size_t{d.n_v} * d.d_v, nv = d.n_v;
+    std::vector<float> out(vc);
+    const hc::GdnInputs in{hc::ConstRows(r.q.data(), 1, qc, qc), hc::ConstRows(r.k.data(), 1, qc, qc),
+                           hc::ConstRows(r.v.data(), 1, vc, vc), hc::ConstRows(r.g.data(), 1, nv, nv),
+                           hc::ConstRows(r.beta.data(), 1, nv, nv)};
+    hc::gated_delta_rule_recurrent(hc::GdnDims{d.n_k, d.n_v, d.d_k, d.d_v, hc::GdnHeadMapping::Tiled}, in, state,
+                                   hc::Rows(out.data(), 1, vc, vc),
+                                   hc::GdnQkParams{.qk_l2norm = false, .q_scale = 1.0f});
+    return out;
+}
+
+// fp64 state after one row (bound scale max|S| only).
+void scale_step(const GdnDims& d, const GdnRow& r, std::vector<double>& s) {
+    ref::gdn_state_step(r.k, r.v, r.g, r.beta, s, d.n_v, d.n_k, d.d_k, d.d_v);
+}
+
 struct GdnBuffers {
     hv::Buffer q, k, v, g, beta, out;
 };
@@ -376,29 +442,29 @@ void gdn_continuity(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, s
     hv::Ops ops(ctx, hv::OpsOptions{.gdn_workgroup = wg});
     std::mt19937 rng(77 + d.n_v + d.d_k);
     const auto s0 = random_state(d, rng);
-    std::vector<double> s_ref(s0.begin(), s0.end());
+    std::vector<double> s_ref(s0.begin(), s0.end());  // fp64: bound scale only
+    std::vector<float> s_cpu = s0;
     hv::Buffer state = upload(ctx, std::span<const float>(s0), hv::MemoryUsage::HostVisible);
     double worst_out = 0.0, worst_state = 0.0;
     for (std::uint32_t t = 0; t < steps; ++t) {
         const GdnRow r = gdn_row(d, rng, gates);
-        std::vector<double> o_ref;
-        ref::gdn_step(r.q, r.k, r.v, r.g, r.beta, s_ref, o_ref, d.n_v, d.n_k, d.d_k, d.d_v);
+        const std::vector<float> o_cpu = cpu_gdn_row(d, r, s_cpu);
+        scale_step(d, r, s_ref);
         GdnBuffers b = gdn_upload(ctx, r, std::size_t{d.n_v} * d.d_v);
         hv::Stream s(ctx);
         ops.gated_delta_rule_decode(s, gdn_args(b, state, d, 1));
         s.submit_and_wait();
-        const auto o = download<float>(b.out, o_ref.size());
+        const auto o = download<float>(b.out, o_cpu.size());
         const double scale_o = max_abs(s_ref) * 1.0;  // |o_b| <= Σ_a |S_ab||q_a| <= max|S| * ||q||_1 <= max|S|
-        const double f = gdn_factor(d.d_k, t + 1);
-        const auto so = compare(o, o_ref, [&](std::size_t) { return f * scale_o; });
+        const double bound = gdn_bound(d.d_k, t + 1, scale_o);
+        const auto so = compare(o, to_dbl(o_cpu), [&](std::size_t) { return bound; });
         EXPECT_LE(so.max_ratio, 1.0) << label << " step " << t << " out worst=" << so.worst;
         worst_out = std::max(worst_out, so.max_ratio);
         if (t + 1 == steps) report(label + " out (step " + std::to_string(t + 1) + ")", so);
     }
     const auto st = download<float>(state, d.state_elems());
-    const double f = gdn_factor(d.d_k, steps);
-    const double scale_s = max_abs(s_ref);
-    const auto ss = compare(st, s_ref, [&](std::size_t) { return f * scale_s; });
+    const double bound = gdn_bound(d.d_k, steps, max_abs(s_ref));
+    const auto ss = compare(st, to_dbl(s_cpu), [&](std::size_t) { return bound; });
     worst_state = ss.max_ratio;
     report(label + " final state", ss);
     EXPECT_LE(ss.max_ratio, 1.0) << label << " final state worst=" << ss.worst;
@@ -449,15 +515,15 @@ void gdn_multi_row(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, st
     for (std::uint32_t t = 0; t < T; ++t) rows.push_back(gdn_row(d, rng));
     const GdnRow all = concat(rows);
 
-    // CPU: states after each row, outputs per row.
+    // halo::cpu: states after each row, outputs per row (fp64 run for the bound scale only).
     std::vector<double> s_ref(s0.begin(), s0.end());
+    std::vector<float> s_cpu = s0;
     std::vector<std::vector<double>> states_after;
     std::vector<double> out_ref;
     for (std::uint32_t t = 0; t < T; ++t) {
-        std::vector<double> o;
-        ref::gdn_step(rows[t].q, rows[t].k, rows[t].v, rows[t].g, rows[t].beta, s_ref, o, d.n_v, d.n_k, d.d_k,
-                      d.d_v);
-        states_after.push_back(s_ref);
+        const std::vector<float> o = cpu_gdn_row(d, rows[t], s_cpu);
+        scale_step(d, rows[t], s_ref);
+        states_after.push_back(to_dbl(s_cpu));
         out_ref.insert(out_ref.end(), o.begin(), o.end());
     }
 
@@ -484,16 +550,16 @@ void gdn_multi_row(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, st
     ops.gated_delta_rule_decode(s, a);
     s.submit_and_wait();
 
-    const double scale = max_abs(states_after.back());
-    const double f = gdn_factor(d.d_k, T);
+    const double scale = max_abs(s_ref);
+    const double bound = gdn_bound(d.d_k, T, scale);
     const auto o = download<float>(b.out, out_ref.size());
-    const auto so = compare(o, out_ref, [&](std::size_t) { return f * scale; });
+    const auto so = compare(o, out_ref, [&](std::size_t) { return bound; });
     report(label + " out", so);
     EXPECT_LE(so.max_ratio, 1.0) << label;
 
     std::vector<float> fin(S);
     state_out.download(std::span<float>(fin), 3 * 4);
-    const auto sf = compare(fin, states_after.back(), [&](std::size_t) { return f * scale; });
+    const auto sf = compare(fin, states_after.back(), [&](std::size_t) { return bound; });
     report(label + " final state", sf);
     EXPECT_LE(sf.max_ratio, 1.0) << label;
 
@@ -505,7 +571,8 @@ void gdn_multi_row(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, st
         const std::span<const float> got(slot_data.data() + 5 + std::size_t{sl} * S, S);
         if (sl < T) {
             const auto& expect = states_after[T - 1 - sl];
-            const auto st = compare(got, expect, [&](std::size_t) { return gdn_factor(d.d_k, T - sl) * scale; });
+            const double bs = gdn_bound(d.d_k, T - sl, scale);
+            const auto st = compare(got, expect, [&](std::size_t) { return bs; });
             report(label + " slot " + std::to_string(sl), st);
             EXPECT_LE(st.max_ratio, 1.0) << label << " slot " << sl;
         } else {
@@ -539,8 +606,10 @@ TEST(VkGdn, SameBufferDisjointRegionsAndInPlaceAgree) {
     std::mt19937 rng(5);
     const auto s0 = random_state(d, rng);
     const GdnRow r = gdn_row(d, rng);
-    std::vector<double> s_ref(s0.begin(), s0.end()), o_ref;
-    ref::gdn_step(r.q, r.k, r.v, r.g, r.beta, s_ref, o_ref, d.n_v, d.n_k, d.d_k, d.d_v);
+    std::vector<double> s_ref(s0.begin(), s0.end());
+    scale_step(d, r, s_ref);
+    std::vector<float> s_cpu = s0;
+    (void)cpu_gdn_row(d, r, s_cpu);
 
     std::vector<float> two(2 * S, 0.0f);
     std::copy(s0.begin(), s0.end(), two.begin());
@@ -560,8 +629,8 @@ TEST(VkGdn, SameBufferDisjointRegionsAndInPlaceAgree) {
     const auto ip = download<float>(inplace, S);
     EXPECT_TRUE(std::equal(ip.begin(), ip.end(), got.begin() + static_cast<std::ptrdiff_t>(S)))
         << "disjoint-region result differs bitwise from the in-place result";
-    const double f = gdn_factor(d.d_k, 1), scale = max_abs(s_ref);
-    const auto st = compare(ip, s_ref, [&](std::size_t) { return f * scale; });
+    const double bound = gdn_bound(d.d_k, 1, max_abs(s_ref));
+    const auto st = compare(ip, to_dbl(s_cpu), [&](std::size_t) { return bound; });
     EXPECT_LE(st.max_ratio, 1.0);
 }
 
@@ -586,11 +655,13 @@ TEST(VkGdn, StateRegionsBeyondMaxStorageBufferRange) {
     std::mt19937 rng(8);
     const auto s0 = random_state(d, rng);
     const std::vector<GdnRow> rows{gdn_row(d, rng), gdn_row(d, rng)};
-    std::vector<double> s_ref(s0.begin(), s0.end()), o;
+    std::vector<double> s_ref(s0.begin(), s0.end());
+    std::vector<float> s_cpu = s0;
     std::vector<std::vector<double>> after;
     for (const auto& r : rows) {
-        ref::gdn_step(r.q, r.k, r.v, r.g, r.beta, s_ref, o, d.n_v, d.n_k, d.d_k, d.d_v);
-        after.push_back(s_ref);
+        (void)cpu_gdn_row(d, r, s_cpu);
+        scale_step(d, r, s_ref);
+        after.push_back(to_dbl(s_cpu));
     }
     hv::Buffer arena = hv::Buffer::create(ctx, total * 4, hv::MemoryUsage::HostVisible);
     arena.upload(std::span<const float>(s0), base * 4);
@@ -604,11 +675,11 @@ TEST(VkGdn, StateRegionsBeyondMaxStorageBufferRange) {
     hv::Stream s(ctx);
     ops.gated_delta_rule_decode(s, a);
     s.submit_and_wait();
-    const double scale = max_abs(after.back());
+    const double bound = gdn_bound(d.d_k, T, max_abs(s_ref));
     auto check = [&](std::uint64_t off, const std::vector<double>& expect, const char* what) {
         std::vector<float> got(S);
         arena.download(std::span<float>(got), off * 4);
-        const auto st = compare(got, expect, [&](std::size_t) { return gdn_factor(d.d_k, T) * scale; });
+        const auto st = compare(got, expect, [&](std::size_t) { return bound; });
         report(std::string("gdn deep arena ") + what, st);
         EXPECT_LE(st.max_ratio, 1.0) << what;
     };
@@ -691,7 +762,12 @@ std::uint32_t gpu_argmax(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, 
 
 }  // namespace
 
-TEST(VkArgmax, VocabSizedRowMatchesReferenceExactly) {
+namespace {
+// cpu::argmax index as the GPU's uint32 index word.
+std::uint32_t cpu_argmax(std::span<const float> x) { return static_cast<std::uint32_t>(hc::argmax(x).index); }
+}  // namespace
+
+TEST(VkArgmax, VocabSizedRowMatchesCpuExactly) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t n = 248320;
     for (const std::uint32_t wg : {256u, 64u}) {
@@ -701,14 +777,14 @@ TEST(VkArgmax, VocabSizedRowMatchesReferenceExactly) {
         std::mt19937 rng(123 + wg);
         auto x = ref::random_vec(n, rng, 4.0f);
         float v = 0;
-        EXPECT_EQ(gpu_argmax(ctx, ops, x, &v, wg == 256), ref::argmax(x));
-        EXPECT_EQ(v, x[ref::argmax(x)]);
+        EXPECT_EQ(gpu_argmax(ctx, ops, x, &v, wg == 256), cpu_argmax(x));
+        EXPECT_EQ(v, hc::argmax(x).value);
 
         const float big = 1000.0f;
         auto check_at = [&](std::vector<std::uint32_t> at, std::uint32_t expect, const char* what) {
             auto y = x;
             for (auto i : at) y[i] = big;
-            EXPECT_EQ(ref::argmax(y), expect) << what << " (reference)";
+            EXPECT_EQ(cpu_argmax(y), expect) << what << " (halo::cpu)";
             EXPECT_EQ(gpu_argmax(ctx, ops, y), expect) << what << " wg=" << wg;
         };
         check_at({0}, 0, "max at index 0");
@@ -724,30 +800,38 @@ TEST(VkArgmax, EdgeValuesInfNanAndAllEqual) {
     hv::Ops ops(ctx);
     const float inf = std::numeric_limits<float>::infinity();
     const float nan = std::numeric_limits<float>::quiet_NaN();
-    std::vector<float> all_eq(100000, 2.5f);
-    EXPECT_EQ(gpu_argmax(ctx, ops, all_eq), 0u);
+    // Every non-NaN case: the GPU index equals halo::cpu::argmax on the same array.
+    auto same = [&](const std::vector<float>& x, std::uint32_t expect, const char* what) {
+        EXPECT_EQ(cpu_argmax(x), expect) << what << " (halo::cpu)";
+        EXPECT_EQ(gpu_argmax(ctx, ops, x), expect) << what;
+    };
+    same(std::vector<float>(100000, 2.5f), 0u, "all equal: first index");
     std::vector<float> neg_inf(10000, -inf);
-    EXPECT_EQ(gpu_argmax(ctx, ops, neg_inf), 0u) << "all -inf: first index";
+    same(neg_inf, 0u, "all -inf: first index");
     neg_inf[7777] = -1e30f;
-    EXPECT_EQ(gpu_argmax(ctx, ops, neg_inf), 7777u);
+    same(neg_inf, 7777u, "one finite among -inf");
+    std::vector<float> pos_inf(300, 1.0f);
+    pos_inf[299] = inf;
+    pos_inf[150] = inf;
+    same(pos_inf, 150u, "+inf tie -> lowest index");
+    same(std::vector<float>{-3.0f}, 0u, "single element");
+
+    // NaN: halo::cpu raises Error(Kernel) (D-016). The Vulkan kernel still ignores NaN and
+    // reports k_argmax_none when every element is NaN; making it raise too is review item
+    // S-3 (next milestone), which replaces these three GPU expectations.
     std::vector<float> with_nan(50000, 0.0f);
     with_nan[10] = nan;
     with_nan[20] = 1.0f;
     with_nan[30] = nan;
-    EXPECT_EQ(ref::argmax(with_nan), 20u);
-    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), 20u) << "NaN ignored";
+    EXPECT_THROW((void)hc::argmax(with_nan), halo::Error);
+    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), 20u) << "pre-S-3: NaN ignored";
     with_nan.assign(9000, nan);
     with_nan[8999] = -inf;
-    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), 8999u) << "only non-NaN element is -inf";
+    EXPECT_THROW((void)hc::argmax(with_nan), halo::Error);
+    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), 8999u) << "pre-S-3: only non-NaN element is -inf";
     with_nan.assign(9000, nan);
-    EXPECT_EQ(ref::argmax(with_nan), hv::k_argmax_none);
-    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), hv::k_argmax_none) << "all NaN -> none";
-    std::vector<float> pos_inf(300, 1.0f);
-    pos_inf[299] = inf;
-    pos_inf[150] = inf;
-    EXPECT_EQ(gpu_argmax(ctx, ops, pos_inf), 150u);
-    std::vector<float> one{-3.0f};
-    EXPECT_EQ(gpu_argmax(ctx, ops, one), 0u);
+    EXPECT_THROW((void)hc::argmax(with_nan), halo::Error);
+    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), hv::k_argmax_none) << "pre-S-3: all NaN -> none";
 }
 
 TEST(VkArgmax, ValidatesBuffers) {
@@ -780,10 +864,11 @@ TEST(VkOps, ChainedNormMatvecArgmaxInOneSubmission) {
     const auto x = ref::random_vec(cols, rng);
     const auto nw = ref::random_vec(cols, rng);
     const ref::Weights w = ref::random_weights(ref::WType::Q8_0, rows, cols, rng, 14);
-    const auto xn = ref::rms_norm(x, nw, 1, cols, 1e-6f);
-    std::vector<float> xn_f(xn.begin(), xn.end());
-    std::vector<double> logits_ref, scale;
-    ref::matvec(w.deq, w.mag, xn_f, rows, cols, logits_ref, scale);
+    // halo::cpu on the same arrays: rms_norm -> matmul (tensor-dequantized weights).
+    std::vector<float> xn_cpu(cols);
+    hc::rms_norm(hc::ConstRows(x.data(), 1, cols, cols), nw, 1e-6f, hc::Rows(xn_cpu.data(), 1, cols, cols));
+    const std::vector<double> logits_cpu = to_dbl(cpu_matvec(w, ref::WType::Q8_0, rows, cols, xn_cpu));
+    const std::vector<double> scale = ref::matvec_scale(w.mag, xn_cpu, rows, cols);
 
     hv::Buffer bx = upload(ctx, std::span<const float>(x));
     hv::Buffer bn = upload(ctx, std::span<const float>(nw));
@@ -799,11 +884,14 @@ TEST(VkOps, ChainedNormMatvecArgmaxInOneSubmission) {
     s.submit_and_wait();
     EXPECT_EQ(s.dispatch_count(), 4u);
     const auto logits = download<float>(blog, rows);
-    // Compare the GPU argmax with the argmax of the GPU logits (exact), and the logits
-    // with the reference within the matvec bound widened by the rms_norm input error.
-    EXPECT_EQ(download<std::uint32_t>(result, 1)[0], ref::argmax(logits));
-    const double f = sum_bound_factor(cols, 256) + 64 * ref::k_u;
-    const auto st = compare(logits, logits_ref, [&](std::size_t i) { return f * scale[i]; });
+    // Compare the GPU argmax with halo::cpu::argmax of the GPU logits (exact), and the
+    // logits with the CPU logits within both matvec bounds widened by both rms_norm
+    // relative input errors (see RmsNormMatchesCpu; the normalized input enters linearly).
+    EXPECT_EQ(download<std::uint32_t>(result, 1)[0], cpu_argmax(logits));
+    const double rms_rel = (std::ceil(double(cols) / 256) + log2u(256) + 16.0) * ref::k_u +
+                           (std::ceil(double(cols) / k_cpu_lanes) + log2u(k_cpu_lanes) + 16.0) * ref::k_u;
+    const double f = sum_bound_factor(cols, 256) + sum_bound_factor(cols, k_cpu_lanes) + rms_rel;
+    const auto st = compare(logits, logits_cpu, [&](std::size_t i) { return f * scale[i] + ct::kDenormFloor; });
     report("chained norm->q8_0 matvec", st);
     EXPECT_LE(st.max_ratio, 1.0);
 }

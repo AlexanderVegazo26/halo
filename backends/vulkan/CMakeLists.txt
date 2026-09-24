@@ -101,4 +101,9 @@ add_library(halo_backend_vulkan STATIC
 target_include_directories(halo_backend_vulkan
   PUBLIC ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(halo_backend_vulkan PUBLIC halo_core Vulkan::Vulkan PRIVATE halo_warnings)
+# halo_tensor is PUBLIC: the public ops.h uses halo::DType (halo/tensor/dtype.h), code
+# review N-2.
+if(NOT TARGET halo_tensor)
+  message(FATAL_ERROR "backends/vulkan needs halo_tensor: add 'tensor' to HALO_ONLY")
+endif()
+target_link_libraries(halo_backend_vulkan PUBLIC halo_core halo_tensor Vulkan::Vulkan PRIVATE halo_warnings)
