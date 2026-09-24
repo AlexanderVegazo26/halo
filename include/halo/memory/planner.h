@@ -13,7 +13,7 @@
 //   * Placement is greedy in Component declaration order: GDN recurrent/conv state and its
 //     MTP rollback copies first (read and written every token, so they get the fastest
 //     tier that fits), then KV, then small per-step buffers, then weights, and last the
-//     optional prefix-cache GDN checkpoints (GPU tiers only, never HOST; the derived
+//     prefix-cache GDN checkpoints (D-013, on by default; GPU pool only, never HOST; the derived
 //     per-slot count shrinks to fit unless configured explicitly).
 //   * GTT pages come from OS RAM, so GTT placements also count against the HOST budget
 //     (constraint "HOST": planned(HOST) + planned(GTT) <= budget(HOST)).
@@ -140,12 +140,15 @@ inline constexpr std::uint64_t kDefaultGpuRuntimeOverhead = 256ULL << 20;   ///<
 inline constexpr std::uint64_t kDefaultHostRuntimeOverhead = 1ULL << 30;    ///< unmeasured placeholder
 inline constexpr double kMaxSafetyFactor = 0.98;
 
-/// Prefix-cache GDN state checkpoints (TRD §12.2 R&D spike; architecture review M-3).
-/// Each checkpoint is one full recurrent + conv state copy. Checkpoints never go to the OS
-/// RAM pool: VRAM then GTT in the gtt-primary layout, VRAM only in the carveout-primary
-/// layout (there GTT pages are the OS pool). Disabled by default.
+/// Prefix-cache GDN state checkpoints — committed by DECISIONS D-013 (supersedes the TRD
+/// §12.2 "R&D spike" status); enabled by default with a planner-owned budget.
+/// Each checkpoint is one full recurrent + conv state copy. D-013 puts them in the GPU pool,
+/// never the OS RAM pool: VRAM then GTT in the gtt-primary layout, VRAM only in the
+/// carveout-primary layout (there GTT pages are the OS pool). With no eligible GPU tier a
+/// *derived* count degrades to 0 (D-013's always-recompute fallback, noted in the plan); an
+/// explicit `max_per_slot` > 0 is then a Config error.
 struct PrefixCheckpoints {
-    bool enabled = false;
+    bool enabled = true;
     std::uint32_t spacing_tokens = 8192;
     /// Explicit per-slot count. When unset the count is max_context / spacing + 1
     /// (17 at 131072 / 8192).

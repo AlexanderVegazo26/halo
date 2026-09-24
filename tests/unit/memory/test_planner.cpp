@@ -68,7 +68,10 @@ TEST(PlannerSizes, MatchDecisionsFacts) {
     EXPECT_EQ(s.gdn_state_per_copy, kGdnStatePerCopy);  // 149.625 MiB
     EXPECT_EQ(s.gdn_rollback_copies, 3u);             // draft depth 2 -> K = n + 1
     EXPECT_EQ(s.gdn_rollback, 3 * 8 * kGdnStatePerCopy);
-    EXPECT_EQ(s.prefix_checkpoints, 0u);  // opt-in
+    // D-013: on by default with the derived count, 131072 / 8192 + 1 = 17 per slot.
+    EXPECT_TRUE(PlanRequest{}.prefix_checkpoints.enabled);
+    EXPECT_EQ(s.prefix_checkpoints_per_slot, 17u);
+    EXPECT_EQ(s.prefix_checkpoints, 17ULL * 8 * kGdnStatePerCopy);
     EXPECT_EQ(s.weights.total(), kUdWeightsTotal);
 }
 
@@ -228,9 +231,17 @@ TEST(PlannerPolicy, SafetyFactorAndUserCap) {
 }
 
 TEST(PlannerCheckpoints, NeverInHost) {
-    PlanRequest r;
-    r.prefix_checkpoints.enabled = true;
-    EXPECT_THROW((void)plan_memory(qwen(), r, host_only_32g()), halo::Error);  // no GPU tier
+    PlanRequest r;  // default: enabled, derived count (D-013)
+    // No GPU tier: the derived budget degrades to always-recompute instead of going to HOST.
+    const auto plan = plan_memory(qwen(), r, host_only_32g());
+    ASSERT_TRUE(plan.ok) << plan.table();
+    EXPECT_EQ(plan.sizes.prefix_checkpoints, 0u);
+    EXPECT_FALSE(plan.tier_of(Component::PrefixCheckpoints));
+    EXPECT_TRUE(std::ranges::any_of(plan.notes, [](const std::string& n) { return n.find("always-recompute") != std::string::npos; }));
+    // An explicit count cannot be honoured without a GPU tier: typed error, not a silent 0.
+    auto explicit_cfg = r;
+    explicit_cfg.prefix_checkpoints.max_per_slot = 4;
+    EXPECT_THROW((void)plan_memory(qwen(), explicit_cfg, host_only_32g()), halo::Error);
     MemoryTiers t = host_only_32g();
     t.topology = MemoryTopology::CarveoutPrimary;
     t.vram_total = 96 * GiB;

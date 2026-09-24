@@ -14,7 +14,7 @@ tools/halo (CLI: run, serve, inspect, devices, bench, tune)
               ├─ speculative  MTP draft/verify, profit gate
               ├─ sampling     greedy fast path, top-k prefilter, CPU sampler chain
               ├─ kv_cache     paged KV for attention layers (+ MTP layer)
-              ├─ state        GDN recurrent + conv state per sequence, checkpoints (spike)
+              ├─ state        GDN recurrent + conv state per sequence, checkpoints (D-013)
               ├─ memory       tier-aware planner (WS-C)
               └─ models/qwen35  forward graph for the reference model
                   └─ Backend interface ── cpu (reference) | vulkan | hip

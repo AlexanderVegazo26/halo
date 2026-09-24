@@ -113,9 +113,9 @@ TEST(PlannerEvoX2, TightMemoryShrinksDerivedCheckpointsOrRefusesExplicitOnes) {
 // The budget search must not buy slots by silently shrinking requested checkpoints.
 TEST(PlannerEvoX2, MaxSequencesKeepsRequestedCheckpoints) {
     const auto tiers = tiers_of("evo_x2");
-    auto with = engine_report_config(KvLayout::PerSequence);
-    with.prefix_checkpoints.enabled = true;
+    auto with = engine_report_config(KvLayout::PerSequence);  // D-013 default: checkpoints on
     auto without = engine_report_config(KvLayout::PerSequence);
+    without.prefix_checkpoints.enabled = false;
     const auto n_with = max_sequences_for_budget(qwen(), with, tiers);
     const auto n_without = max_sequences_for_budget(qwen(), without, tiers);
     std::cout << "evo_x2 per-sequence 131k, MTP n=2: max sequences " << n_without << " without checkpoints, "
@@ -126,6 +126,30 @@ TEST(PlannerEvoX2, MaxSequencesKeepsRequestedCheckpoints) {
     const auto plan = plan_memory(qwen(), with, tiers);
     ASSERT_TRUE(plan.ok);
     EXPECT_EQ(plan.sizes.prefix_checkpoints_per_slot, 17u);  // not shrunk
+}
+
+// Same for context: with the default derived checkpoints (ctx/8192 + 1 per slot, growing
+// with ctx) the reachable context is lower, and the plan at N keeps the full derived count.
+TEST(PlannerEvoX2, MaxContextAccountsForDefaultCheckpoints) {
+    const auto tiers = tiers_of("evo_x2");
+    auto with = engine_report_config(KvLayout::PerSequence);
+    auto without = with;
+    without.prefix_checkpoints.enabled = false;
+    const auto c_with = max_context_for_budget(qwen(), with, tiers);
+    const auto c_without = max_context_for_budget(qwen(), without, tiers);
+    std::cout << "evo_x2 per-sequence x 8, MTP n=2: max context " << c_without << " without checkpoints, " << c_with
+              << " with default checkpoints\n";
+    ASSERT_GT(c_with, 0u);
+    EXPECT_LT(c_with, c_without);
+    with.max_context = c_with;
+    const auto plan = plan_memory(qwen(), with, tiers);
+    ASSERT_TRUE(plan.ok);
+    EXPECT_EQ(plan.sizes.prefix_checkpoints_per_slot, c_with / 8192 + 1);
+    EXPECT_EQ(plan.prefix_checkpoints_requested, plan.sizes.prefix_checkpoints_per_slot);  // not shrunk
+    // Boundary: one more token does not fit with the full checkpoint budget.
+    with.max_context = c_with + 1;
+    with.prefix_checkpoints.shrink_to_fit = false;
+    EXPECT_FALSE(plan_memory(qwen(), with, tiers).ok);
 }
 
 // PRD topology (1 GiB carveout, 120 GiB GTT): with 8 sequences the GDN state (1.2 GiB live

@@ -349,8 +349,16 @@ MemoryPlan plan_once(const ModelShape& shape, const PlanRequest& req, const hard
     }
     std::vector<MemoryTier> checkpoint_tiers = gpu_tiers;
     if (hw.topology == hardware::MemoryTopology::CarveoutPrimary) std::erase(checkpoint_tiers, MemoryTier::Gtt);
-    HALO_CHECK(plan.sizes.prefix_checkpoints == 0 || !checkpoint_tiers.empty(), ErrorCode::Config,
-               "prefix checkpoints require a GPU tier that is not the OS RAM pool; none was discovered");
+    if (plan.sizes.prefix_checkpoints > 0 && checkpoint_tiers.empty()) {
+        HALO_CHECK(!req.prefix_checkpoints.max_per_slot.has_value(), ErrorCode::Config,
+                   "prefix checkpoints require a GPU tier that is not the OS RAM pool; none was discovered");
+        // Derived (default) budget: fall back to always-recompute rather than failing (D-013).
+        plan.notes.push_back(std::format("prefix checkpoints disabled: no GPU tier outside the OS RAM pool "
+                                         "({} per slot requested); prefix reuse falls back to always-recompute",
+                                         plan.sizes.prefix_checkpoints_per_slot));
+        plan.sizes.prefix_checkpoints = 0;
+        plan.sizes.prefix_checkpoints_per_slot = 0;
+    }
 
     for (const auto c : kAllComponents) {
         const std::uint64_t bytes = plan.sizes.bytes(c);
