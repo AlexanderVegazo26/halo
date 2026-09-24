@@ -256,3 +256,14 @@ token ids, so they are unaffected.
 ## D-008 (amendment)
 unsloth UD-Q4_K_XL has **no** `tokenizer.ggml.add_bos_token` key; ggml-org files have it
 set to False. Absent is treated as "do not add BOS", which matches both HF configs.
+
+## D-016 — One GATED_DELTANET input contract for every backend (decision; code review M-1)
+Every backend's GDN op takes raw q and k (after conv+SiLU) plus two explicit parameters:
+`qk_l2norm` (bool: L2-normalize q and k per head, eps 1e-6) and `q_scale` (float, applied
+to q *after* the optional normalization; the model passes 1/sqrt(d_k)). A kernel applies
+exactly what the parameters say and nothing else; neither backend scales implicitly. The
+qwen35 forward calls with `qk_l2norm=true, q_scale=1/sqrt(128)`, i.e. normalization fused
+into the kernel. GPU kernels are accepted only by differential tests against `halo::cpu`
+and `halo::tensor` on the same input buffers (TRD §30; review M-2) — private test-tree
+oracles are allowed only for error-bound scaling.
+Also: ARGMAX on NaN raises `Error(Kernel)` on every backend (review S-3).
