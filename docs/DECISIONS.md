@@ -162,3 +162,71 @@ measured roofline (TRD §2.3).
   shipped template — verified by golden tests), GoogleTest. SQLite from the system.
 - Python (uv, 3.12) for reference generation, golden data, benchmarks — never in serving.
 - The build tree lives on the Linux filesystem (`~/halo-build`), sources on `/mnt/c`.
+
+---
+
+# Amendments after independent architecture review (2026-09-24)
+
+Source: `docs/reviews/2026-09-23-architecture-review.md` (solution-architect, evidence cited
+to llama.cpp `bd4f514` file:line). Earlier entries are kept as written; these amend them.
+
+## D-003 (annotation)
+`mamba_ssm_dtype` was not verifiable from the local reference set. fp32 is corroborated by
+the HF compute dtype and llama.cpp's hard-coded F32 recurrent cache.
+
+## D-005 (amendment) — MTP details
+- The MTP block is a **full decoder block**, including `post_attention_norm` and the FFN.
+- Fallbacks: `nextn.shared_head_norm` → `output_norm`; `nextn.embed_tokens` → `token_embd`;
+  `nextn.shared_head_head` → `output`.
+- Draft chain: draft step 1 feeds the carried-over trunk `h`. Steps ≥ 2 feed the MTP's **own**
+  post-`shared_head_norm` hidden at position `pos0+i+1` (`speculative.cpp:1672,1723-1724`).
+- After verification, `pending_h` is the trunk hidden row at index `n_accepted`
+  (`:1763-1765`).
+- Drafting uses argmax with `p_min` confidence gating. MTP KV rolls back past `pos_max`.
+- The golden covers only the teacher-forced catch-up mode. A draft-chain golden is owed.
+
+## D-006 (amendment)
+The duplicated tensors in the separate MTP file are **1.43 GB resident**, not per-token
+reads. Using the trunk's Q6_K head costs about +0.33 GB per draft token compared with the
+MTP file's Q4_0 head. The head choice is therefore a **measured plan decision**, not a fixed
+default. On the embedded (unsloth) pack HALO's default matches llama.cpp.
+
+## D-011 — Bytes per token and the decode ceiling (fact, computed from real headers)
+UD-Q4_K_XL trunk ≈ 16.48 GB per step; ggml-org Q4_K_M ≈ 18.25 GB (+10.7%); LM head (Q6_K)
+1.04 GB. Ceiling model:
+
+    tok/s ≤ S·τ·η·BW / B_step
+    B_step = W_trunk + (n+1)·W_mtp + n·W_head + S·[(1+K)·0.157 GB + ctx·64 KiB]
+
+At S=1, n=0, η=1 and 256 GB/s the ceiling is about **15.2 tok/s**. The measured no-MTP
+llama-cli result (12.0 tok/s) is η ≈ 0.79. The TRD §2.3 "empirical contradiction" is
+explained by MTP (18–21 tok/s ran with `--spec-type draft-mtp`), not by bandwidth above
+nameplate. Every decode target must state its context length (KV read = 64 KiB × ctx).
+
+## D-012 — Recurrent rollback uses per-row state slots (decision; supersedes ARCHITECTURE v1)
+The GDN and conv ops optionally write the state after each of the last K rows
+(K = n_draft+1; slot 0 = most recent), as llama.cpp does (`delta-net-base.cpp:497-603`).
+Rollback selects a slot: no restore copy and no replay forward. Cost: K × ~150 MiB per
+sequence. Snapshot + replay was rejected because it adds a full 16.5 GB trunk pass on most
+MTP steps. Deferred replay remains the fallback for memory-tight configurations.
+
+## D-013 — GDN prefix checkpoints are committed (decision; supersedes TRD §12.2 "R&D spike")
+KV-only reuse gives almost no time-to-first-token win on this hybrid model; llama-server
+re-processes fully without a checkpoint (`server-context.cpp:3379-3384`). HALO places full
+GDN-state checkpoints at the end of the system/tool preamble, at user-message starts, and
+near the prompt end (N−k), with a minimum spacing between them. A hit uses the newest
+checkpoint at a position ≤ the longest common prefix, and only the tail is recomputed.
+Checkpoints use a planner-owned budget in the **GPU pool**, not the 32 GiB OS pool
+(llama.cpp keeps them in host RAM). The template returns message-boundary offsets.
+Always-recompute is the fallback.
+
+## D-014 — PENDING HUMAN DECISION: performance targets and canonical pack
+1. PR-004's batch-1 ≥ 45 tok/s is physically unreachable (it would need ≥ 742 GB/s). The
+   ≥ 70 tok/s MTP-effective and ≥ 120 tok/s 4-agent targets are infeasible at realistic
+   acceptance. Proposed replacement NFRs: review §6.
+2. The canonical pack (ggml-org Q4_K_M, 3 quant types) differs from the file every baseline
+   ran on (UD-Q4_K_XL, 8 quant types, 10.7% fewer bytes per token).
+
+Until the owner decides, HALO **loads both** packs, keeps the PR-004 numbers as recorded
+aspirations, and reports against the review's §6 NFRs. GPU kernel work is prioritised for
+UD-Q4_K_XL's types (the file on the target machine), starting with Q4_K, Q5_K, Q6_K and Q8_0.

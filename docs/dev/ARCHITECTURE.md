@@ -37,15 +37,22 @@ class Backend {
   virtual BackendInfo info() const = 0;                 // name, device, driver, ISA target
   virtual std::unique_ptr<Buffer> allocate(std::size_t bytes, MemoryTier tier) = 0;
   virtual void upload_weights(const model::NormalizedModel&, const MemoryPlan&) = 0;
-  // Executes one forward step of the qwen35 graph for one sequence.
-  virtual void forward(const ForwardRequest&, SequenceState&, ForwardResult&) = 0;
+  // Kernel registry surface (TRD §9/§56): candidate implementations per operator key.
+  virtual std::vector<KernelVariant> variants(const OpKey&) const = 0;
+  // Single-operator execution, used by differential tests, the autotuner, and
+  // per-operator backend mixing.
+  virtual void run_op(const OpInvocation&) = 0;
+  // Batch-shaped model step: S sequences, each with its own token rows. The StepPlan
+  // carries the kernel choice per graph node (from the planner/autotuner).
+  virtual void forward(const StepPlan&, std::span<const SeqStep>, StepResult&) = 0;
 };
 ```
 
-v0.2 exposes a *model-level* `forward` rather than a per-kernel `execute`: the reference
-model is fixed (P3), and per-kernel dispatch through a generic graph is the Phase-5
-generalization. Kernels remain individually addressable inside each backend for the
-kernel registry / autotuner (TRD §9, §56).
+Contract: `forward` must equal composing `run_op` over the qwen35 graph, within operator
+tolerances; a test checks this on CPU. `SeqStep` carries tokens, positions, which logits
+and hidden rows are wanted, a greedy flag, and `n_state_slots` (D-012). The CPU reference
+may loop over sequences internally; the *signature* is batch-shaped from day one
+(review H-1/H-2).
 
 ### ForwardRequest / ForwardResult
 
@@ -59,11 +66,12 @@ kernel registry / autotuner (TRD §9, §56).
   logical length. FP16 baseline storage (TRD §15); CPU reference may store fp32 first.
 - GDN: per layer recurrent state `[n_v_heads, d_k, d_v]` fp32 + conv state
   `[conv_kernel-1, conv_channels]` fp32 (D-003).
-- **Commit/rollback** (MTP verification, cancellation): KV rollback = truncate logical
-  length; GDN rollback requires a snapshot (the recurrent state is not invertible) —
-  v0.2 keeps a per-step snapshot of the state before verification and restores it for
-  rejected suffixes (then replays accepted tokens). Consistency under cancellation at any
-  point is a tested invariant (RR-006).
+- **Commit/rollback** (MTP verification, cancellation), per D-012: during verification the
+  GDN and conv ops write the state after each of the last K = n_draft+1 rows into slots.
+  Accepting r tokens means selecting the matching slot. KV rollback truncates the logical
+  length, and MTP KV rolls back past `pos_max`. A commit is atomic: slot choice plus length.
+  No replay forward. Consistency under cancellation at any point is a tested invariant
+  (RR-006), checked by "verify + rollback to r" == "decode r tokens".
 
 ### Engine / Session (runtime)
 
@@ -86,11 +94,25 @@ class Session {            // one sequence; not thread-safe; owned by the schedu
 ### Scheduler (TRD §22)
 
 Request state machine `QUEUED → PREFILL → DECODING → STREAMING → COMPLETED | FAILED |
-CANCELLED`. v0.2: single worker thread executing sessions round-robin at token granularity
-(continuous batching of *independent* single-sequence forwards); true batched forwards are
-Phase 4. Prefix cache keyed by token-id prefix hashes at block granularity: KV blocks are
-shareable (refcounted); GDN state is reused only from exact-prefix snapshots (checkpoint
-spike, TRD §12.2) — otherwise always-recompute.
+CANCELLED`. v0.2: a single worker thread. Each tick issues **one batched `forward` over all
+DECODING sequences** (plus prefill chunks), so one weight pass serves every stream. Rounds of
+independent single-sequence forwards would only time-slice single-stream throughput (review
+H-1).
+
+Prefix cache (D-013): refcounted paged KV blocks plus GDN state checkpoints. Checkpoints
+sit at the end of the system/tool preamble, at user-message starts (offsets supplied by
+the template renderer), and at prompt end − k, with a minimum spacing. A hit takes the
+newest checkpoint at or before the longest common prefix, drops the KV blocks past it, and
+recomputes only the tail. Checkpoints use a planner-owned budget in the GPU pool;
+`preserve_thinking` defaults so history re-renders identically. Always-recompute is the
+fallback.
+
+### Cost model (review §3.3)
+
+The CPU reference counts bytes moved per operator per step, and reports the predicted
+`B_step` from D-011. CI asserts rollback and checkpoint paths stay within their byte
+budgets, so a performance-shaping regression is caught on the dev host before GPU hardware
+is involved.
 
 ### API (TRD §25)
 
@@ -103,7 +125,9 @@ request/queue caps (PRD §12).
 1. Kernel goldens from transformers' own functions (WS-D).
 2. Model goldens from transformers `Qwen3_5ForCausalLM` on the tiny model (hidden 256,
    8 layers, vocab 248,320): per-layer inputs, final hidden, logits rows, greedy decode.
-3. MTP golden from a NumPy port of llama.cpp's graph (D-005).
+3. MTP golden from a NumPy port of llama.cpp's graph (D-005): catch-up mode now; a
+   draft-chain case (h feedback, `pending_h` after accept) is owed.
+3b. Rollback equivalence (D-012) and forward == composed `run_op` differential tests.
 4. Dequant goldens from gguf-py on real blocks of the published files (WS-A).
 5. Tokenizer/template goldens from HF tokenizers + jinja2 (WS-B).
 6. Differential CPU vs Vulkan (lavapipe on the dev host; RADV on target) per operator and
