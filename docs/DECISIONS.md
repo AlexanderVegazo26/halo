@@ -100,9 +100,18 @@ One MTP block (`nextn_predict_layers=1`) stored as `blk.64.*`:
 hidden second** — then one full-attention block (same structure as D-004 attention layer,
 with its own KV cache), then `rmsnorm(·; nextn.shared_head_norm)` and the shared LM head
 (`output` unless `nextn.shared_head_head` exists). `h` is the trunk's **final
-output-normed** hidden state (`t_h_nextn` in llama.cpp) for the position of `tok`'s
-predecessor. llama.cpp is the only executable reference; HALO's MTP golden tests compare
-against a NumPy port of that graph.
+output-normed** hidden state (`t_h_nextn` in llama.cpp; set after `output_norm` in
+`qwen35.cpp`) for the position of `tok`'s predecessor.
+
+**Position/pairing convention** (llama.cpp `common/speculative.cpp`,
+`common_speculative_impl_draft_mtp`): MTP row pairs `(h_p, x_{p+1})` and runs at RoPE
+position **p+1** (the position of the embedded token). The MTP block keeps its **own KV
+cache** (one attention layer), which must be populated for every prompt position during
+prefill ("catch-up decode": target hidden rows shifted right by one, the last row carried
+over to the next call). Drafting starts from the last sampled token at `pos0` with the
+carried-over `h`; llama.cpp drafts with a top-k=10 sampler. llama.cpp is the only
+executable reference; HALO's MTP golden tests compare against a NumPy port of that graph
+(`python/tools/make_tiny_model.py`).
 
 ## D-006 — Two MTP packagings must both load (fact, [GGUF][HW])
 

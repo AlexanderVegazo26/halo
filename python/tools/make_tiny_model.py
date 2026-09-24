@@ -292,10 +292,11 @@ def main() -> None:
         G.add(f"{name}.decode_top16_ids", np.stack(steps_top))
         G.add(f"{name}.decode_top16_logits", np.stack(steps_hidden))
 
-        # ----- MTP reference: row i = (token ids[i+1], trunk hidden h[i]) at position i
+        # ----- MTP reference: row i = (token ids[i+1], trunk hidden h[i]) at RoPE position i+1
+        # (llama.cpp common/speculative.cpp: "pair (h_p, x_{p+1}) at MTP pos p+1")
         if T >= 2:
             hn, mlog = mtp_reference(cfg, mtp_np, embed, lm_head, np.array(ids[1:]), h_last[:-1].astype(np.float64),
-                                     np.arange(T - 1))
+                                     np.arange(1, T))
             G.add(f"{name}.mtp_hidden", hn)
             G.add(f"{name}.mtp_argmax", mlog.argmax(-1).astype(np.int32))
             G.add(f"{name}.mtp_logits_last", mlog[-1:])
@@ -308,7 +309,7 @@ def main() -> None:
             "conventions": {
                 "layer_in.i": "input hidden state to decoder layer i (i=0 is the token embedding)",
                 "final_hidden": "last hidden state after output norm",
-                "mtp": "row i = MTP(embed(tokens[i+1]), final_hidden[i]) at rope position i (DECISIONS D-005)",
+                "mtp": "row i = MTP(embed(tokens[i+1]), final_hidden[i]) at rope position i+1 (DECISIONS D-005)",
             }})
     print(f"golden written; p0 len={len(p0)} median top1 margin={margin:.4f} "
           f"min={float(margins.min()):.5f} frac>0.05={float((margins > 0.05).mean()):.3f}")
