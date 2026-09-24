@@ -16,7 +16,8 @@ halo_module(core
 # Modules are added below as they land (model, tensor, tokenizer, template, ...).
 foreach(mod IN ITEMS tensor model tokenizer template memory hardware kv_cache state
                      sampling speculative runtime scheduler profiling api autotune)
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${mod}/CMakeLists.txt)
+  halo_selected(${mod} _sel)
+  if(_sel AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${mod}/CMakeLists.txt)
     add_subdirectory(${mod})
   endif()
 endforeach()

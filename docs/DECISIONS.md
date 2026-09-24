@@ -157,7 +157,7 @@ measured roofline (TRD §2.3).
 
 ## D-010 — Build & dependency choices (decision)
 
-- C++20, clang, CMake + Ninja. Dependencies pinned by FetchContent tag:
+- C++23 (TRD's C++20 minimum; 23 used for `std::expected`/`std::format`), clang, CMake + Ninja. Dependencies pinned by FetchContent tag:
   nlohmann/json, cpp-httplib (HTTP/SSE server), minja (Jinja subset, if it renders the
   shipped template — verified by golden tests), GoogleTest. SQLite from the system.
 - Python (uv, 3.12) for reference generation, golden data, benchmarks — never in serving.

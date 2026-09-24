@@ -1,5 +1,16 @@
 # HALO — Implementation Agent Brief (read fully before writing code)
 
+## Shared working tree (read first)
+
+Several agents work **concurrently in the same working tree** (worktree isolation cannot
+run WSL). Therefore:
+- Edit **only** the paths your prompt says you own. Never edit, format, move or delete
+  anything else — other agents' files may be mid-edit and may not compile yet.
+- Build **only your modules** with the `HALO_ONLY` CMake list (module, backend and
+  test-directory names; see Environment below). `core` and `test_core` are always built.
+- **Do not run git write commands** (commit, add, stash, checkout, reset). The orchestrator
+  commits. Read-only git (status, diff, log) is fine.
+
 ## Environment
 
 - Host is Windows; **all building and testing happens in WSL** distro `Ubuntu-24.04` as root.
@@ -9,8 +20,10 @@
   script file and execute it** instead.
 - The repo is visible in WSL at `/mnt/c/...` (translate your worktree's Windows path:
   `C:\Users\...` → `/mnt/c/Users/...`).
-- Build: `bash scripts/build.sh` from the repo root inside WSL. Use a **private build dir**:
-  `HALO_BUILD_DIR=/root/halo-build-<your-workstream> bash scripts/build.sh`.
+- Build: `bash scripts/build.sh` from the repo root inside WSL. Use a **private build dir**
+  and your module filter, e.g.:
+  `HALO_BUILD_DIR=/root/halo-build-wsa bash scripts/build.sh "-DHALO_ONLY=tensor;model"`
+  (extra args are passed to CMake; the quotes keep the `;` list intact).
   Build dirs must be on the Linux FS (`/root/...`), never on `/mnt/c`.
 - Logs: `bash scripts/wsl-run.sh <logname> <cmd...>` prints the tail and the **real exit code**.
   Never judge success by piping to `tail`/`head` (that reports the pager's status).
@@ -69,9 +82,7 @@ or `/root/llama.cpp/src/models/qwen35.cpp`, `/root/llama.cpp/ggml/src/ggml-quant
    observe red, restore) — mention how in your report.
 3. Also build + run your tests once with `bash scripts/build.sh --asan`
    (`HALO_BUILD_DIR=/root/halo-build-<ws>`, the script appends `-asan`); report the result.
-4. Commit on your worktree branch with a descriptive message ending in
-   `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
-   Set identity if needed: `git config user.name AlexanderVegazo26`,
-   `git config user.email avegazorodriguez@gmail.com`. Never push.
+4. Do not commit. In your report, list every file you created or changed and propose a
+   commit message; the orchestrator commits.
 5. Final report: what you built (files), public API summary, test evidence, anything you
    could not verify and why, and open questions. Keep it factual; no unmeasured claims.

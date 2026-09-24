@@ -15,6 +15,18 @@ option(HALO_BUILD_HIP        "Build the HIP backend (needs ROCm)"    OFF)
 option(HALO_ENABLE_LTO       "Enable link-time optimization"         OFF)
 option(HALO_ENABLE_ASAN      "Enable AddressSanitizer + UBSan"       OFF)
 option(HALO_NATIVE           "Tune for the build machine CPU"        OFF)
+# Semicolon list of module / backend / test-dir names to build (empty = everything).
+# Lets parallel workstreams build only their own code in a shared tree, e.g.
+#   -DHALO_ONLY="tensor;model"
+set(HALO_ONLY "" CACHE STRING "Build only these modules (empty = all)")
+
+function(halo_selected name out)
+  if(HALO_ONLY STREQUAL "" OR name IN_LIST HALO_ONLY)
+    set(${out} TRUE PARENT_SCOPE)
+  else()
+    set(${out} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
