@@ -12,7 +12,7 @@ namespace {
 
 constexpr std::string_view kGdnDecisions = "D-003 D-004(5,6) D-012 D-016";
 
-constexpr std::array<KernelVariant, 18> kVariants{{
+constexpr std::array<KernelVariant, 21> kVariants{{
     {"GATED_DELTANET", "recurrent", "gdn_recurrent_b128", "k_gdn_recurrent", 128,
      "grid (n_v, ceil(d_v/128)); thread = one value column, S[:,c] in registers (d_k <= 128)",
      kGdnDecisions, true},
@@ -55,6 +55,14 @@ constexpr std::array<KernelVariant, 18> kVariants{{
      true},
     {"MUL_SIGMOID", "", "mul_sigmoid_b256", "k_eltwise", 256, "grid (rows, ceil(cols/256)); thread = one element",
      "D-004", true},
+    {"ATTENTION", "", "attn_online_b128", "k_attn_check, k_attn_online", 128,
+     "grid (T, n_head); key tiles of 128 with a running max; thread = one key score, then 2 output dims",
+     "D-004", true},
+    {"ATTENTION", "", "attn_online_b64", "k_attn_check, k_attn_online", 64, "as attn_online_b128 with 64-key tiles",
+     "D-004", false},
+    {"ATTENTION", "", "attn_exact_b128", "k_attn_check, k_attn_exact", 128,
+     "grid (T, n_head); the CPU's three passes and sequential sums (bit-identical, serial, slow)", "D-004",
+     false},
 }};
 
 }  // namespace

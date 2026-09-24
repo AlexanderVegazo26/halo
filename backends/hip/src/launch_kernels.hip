@@ -92,6 +92,24 @@ __global__ void __launch_bounds__(1024) k_eltwise(EwParams p) {
 }
 
 
+__global__ void __launch_bounds__(1024) k_attn_check(AttnParams p) {
+    __shared__ AttnNoRegs sh;
+    dev::DeviceExec<AttnNoRegs> ex;
+    attn_check_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(kAttnMaxBlock) k_attn_exact(AttnParams p) {
+    __shared__ AttnExactShared sh;
+    dev::DeviceExec<AttnNoRegs> ex;
+    attn_exact_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(kAttnMaxBlock) k_attn_online(AttnParams p) {
+    __shared__ AttnOnlineShared sh;
+    dev::DeviceExec<AttnOnlineRegs> ex;
+    attn_online_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
 template <class K, class P>
 int launch(K kernel, const P& p, const Launch& l, void* stream) {
     hipLaunchKernelGGL(kernel, dim3(l.grid_x, l.grid_y, 1), dim3(l.block, 1, 1), 0,
@@ -114,5 +132,8 @@ int launch_argmax_reduce(const ArgmaxParams& p, const Launch& l, void* s) { retu
 int launch_topk(const TopkParams& p, const Launch& l, void* s) { return launch(k_topk, p, l, s); }
 int launch_rope(const RopeParams& p, const Launch& l, void* s) { return launch(k_rope, p, l, s); }
 int launch_eltwise(const EwParams& p, const Launch& l, void* s) { return launch(k_eltwise, p, l, s); }
+int launch_attn_check(const AttnParams& p, const Launch& l, void* s) { return launch(k_attn_check, p, l, s); }
+int launch_attn_exact(const AttnParams& p, const Launch& l, void* s) { return launch(k_attn_exact, p, l, s); }
+int launch_attn_online(const AttnParams& p, const Launch& l, void* s) { return launch(k_attn_online, p, l, s); }
 
 }  // namespace halo::hip::detail

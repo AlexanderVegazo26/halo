@@ -15,7 +15,8 @@
 
 namespace halo::hip {
 
-static_assert(kStatusPositiveG == kern::kStatusPositiveG && kStatusNaN == kern::kStatusNaN);
+static_assert(kStatusPositiveG == kern::kStatusPositiveG && kStatusNaN == kern::kStatusNaN &&
+              kStatusBadBlock == kern::kStatusBadBlock);
 
 namespace {
 
@@ -269,6 +270,10 @@ Ops::Ops(OpsOptions options) : options_(std::move(options)) {
     rope_block_ = block_of("PARTIAL_ROPE", "", options_.rope);
     swiglu_block_ = block_of("SWIGLU", "", options_.swiglu);
     mulsig_block_ = block_of("MUL_SIGMOID", "", options_.mul_sigmoid);
+    attn_block_ = block_of("ATTENTION", "", options_.attention);
+    attn_exact_ = find_variant("ATTENTION", options_.attention).kernels.find("exact") != std::string_view::npos;
+    HALO_CHECK(attn_block_ >= 32 && attn_block_ <= kern::kAttnMaxBlock, ErrorCode::Config,
+               "HIP: attention variant block {} not in [32, {}]", attn_block_, kern::kAttnMaxBlock);
 }
 
 void Ops::gated_delta_rule_recurrent(const Target& target, const GdnArgs& args) const {
@@ -444,6 +449,7 @@ void Ops::check_status(const Target& target, const BufferView& status) {
     std::string what;
     if ((word & kStatusPositiveG) != 0) what += " g>0-or-NaN (chunked GATED_DELTANET requires g <= 0; nothing written)";
     if ((word & kStatusNaN) != 0) what += " NaN logit";
+    if ((word & kStatusBadBlock) != 0) what += " attention block table id outside the KV pool (out is undefined)";
     throw_error(ErrorCode::Kernel, "HIP kernel status 0x{:x}:{}", word, what);
 }
 
@@ -718,7 +724,10 @@ void Ops::partial_rope_neox(const Target& target, const RopeArgs& a) const {
                a.rot_dims, 2 * kern::kRopeMaxHalf);
     HALO_CHECK(a.n_heads >= 1, ErrorCode::Kernel, "{}: n_heads must be >= 1", kOp);
     if (a.n_tokens == 0) return;
-    const Rows x = resolve(target, a.x, a.n_tokens, mul_checked(a.n_heads, a.head_dim, kOp), kOp, "x");
+    const std::uint64_t hs = a.head_stride == 0 ? a.head_dim : a.head_stride;
+    HALO_CHECK(hs >= a.head_dim, ErrorCode::Kernel, "{}: head_stride {} < head_dim {}", kOp, hs, a.head_dim);
+    // Row extent: the last head ends at (n_heads - 1) * stride + head_dim.
+    const Rows x = resolve(target, a.x, a.n_tokens, mul_checked(a.n_heads - 1, hs, kOp) + a.head_dim, kOp, "x");
     const Rows pos = resolve(target, a.positions, 1, a.n_tokens, kOp, "positions");
     check_disjoint(x, "x", {{&pos, "positions"}}, kOp);
     kern::RopeParams p;
@@ -727,6 +736,7 @@ void Ops::partial_rope_neox(const Target& target, const RopeArgs& a) const {
     p.pos = reinterpret_cast<const std::int32_t*>(pos.ptr);
     p.n_heads = a.n_heads;
     p.head_dim = a.head_dim;
+    p.head_stride = hs;
     p.half = a.rot_dims / 2;
     for (unsigned i = 0; i < p.half; ++i) {
         // cpu::rope_inv_freq: 1 / theta^(float(2i) / rot_dims), fp32 pow and divide.
@@ -767,6 +777,87 @@ void Ops::swiglu(const Target& target, const EltwiseArgs& a) const {
 
 void Ops::mul_sigmoid(const Target& target, const EltwiseArgs& a) const {
     eltwise(target, a, kern::EwOp::MulSigmoid, mulsig_block_, "hip::mul_sigmoid");
+}
+
+}  // namespace halo::hip
+
+// ---- ATTENTION ------------------------------------------------------------------------------
+
+namespace halo::hip {
+
+std::uint64_t Ops::attention_workspace_bytes(std::uint32_t n_tokens, std::uint32_t n_head, std::uint32_t q_offset) const {
+    if (!attn_exact_) return 0;
+    constexpr const char* kOp = "attention_workspace_bytes";
+    return mul_checked(mul_checked(mul_checked(n_tokens, n_head, kOp), static_cast<std::uint64_t>(q_offset) + n_tokens,
+                                   kOp),
+                       4, kOp);
+}
+
+void Ops::attention(const Target& target, const AttentionArgs& a) const {
+    constexpr const char* kOp = "hip::attention";
+    HALO_CHECK(a.n_head > 0 && a.n_kv_head > 0 && a.head_dim > 0 && a.n_head % a.n_kv_head == 0, ErrorCode::Kernel,
+               "{}: bad dims n_head {} n_kv_head {} head_dim {}", kOp, a.n_head, a.n_kv_head, a.head_dim);
+    HALO_CHECK(a.head_dim <= kern::kAttnMaxHeadDim, ErrorCode::Kernel, "{}: head_dim {} exceeds this backend's {}", kOp,
+               a.head_dim, kern::kAttnMaxHeadDim);
+    HALO_CHECK(a.n_tokens >= 1, ErrorCode::Kernel, "{}: n_tokens must be >= 1", kOp);
+    HALO_CHECK(a.block_tokens >= 1 && a.n_layers >= 1 && a.layer < a.n_layers && a.n_pool_blocks >= 1,
+               ErrorCode::Kernel, "{}: bad pool layout (block_tokens {}, layer {} of {}, {} blocks)", kOp,
+               a.block_tokens, a.layer, a.n_layers, a.n_pool_blocks);
+    HALO_CHECK(std::isfinite(a.scale), ErrorCode::Kernel, "{}: scale {} is not finite", kOp, a.scale);
+    const std::uint64_t kv_dim = mul_checked(a.n_kv_head, a.head_dim, kOp);
+    HALO_CHECK(kv_dim <= std::numeric_limits<std::uint32_t>::max(), ErrorCode::Kernel, "{}: kv_dim too large", kOp);
+    const std::uint64_t history = static_cast<std::uint64_t>(a.q_offset) + a.n_tokens;
+    HALO_CHECK(history <= std::numeric_limits<std::uint32_t>::max(), ErrorCode::Kernel, "{}: history too long", kOp);
+    const std::uint64_t n_table = (history + a.block_tokens - 1) / a.block_tokens;
+    const std::uint64_t block_floats = mul_checked(mul_checked(2ull * a.n_layers, a.block_tokens, kOp), kv_dim, kOp);
+    const std::uint64_t hs = a.q_head_stride == 0 ? a.head_dim : a.q_head_stride;
+    HALO_CHECK(hs >= a.head_dim, ErrorCode::Kernel, "{}: q_head_stride {} < head_dim {}", kOp, hs, a.head_dim);
+    const Rows q = resolve(target, a.q, a.n_tokens, mul_checked(a.n_head - 1, hs, kOp) + a.head_dim, kOp, "q");
+    const Rows pool = resolve(target, a.kv_pool, 1, mul_checked(block_floats, a.n_pool_blocks, kOp), kOp, "kv_pool");
+    const Rows table = resolve(target, a.block_table, 1, n_table, kOp, "block_table");
+    const Rows out = resolve(target, a.out, a.n_tokens, mul_checked(a.n_head, a.head_dim, kOp), kOp, "out");
+    const Rows status = resolve_status(target, a.status, kOp);
+    Rows ws;
+    const std::uint64_t ws_bytes = attention_workspace_bytes(a.n_tokens, a.n_head, a.q_offset);
+    if (ws_bytes > 0) ws = resolve(target, a.workspace, 1, ws_bytes / 4, kOp, "workspace");
+    check_disjoint(out, "out",
+                   {{&q, "q"}, {&pool, "kv_pool"}, {&table, "block_table"}, {&status, "status"}, {&ws, "workspace"}},
+                   kOp);
+    check_disjoint(ws, "workspace", {{&q, "q"}, {&pool, "kv_pool"}, {&table, "block_table"}, {&status, "status"}}, kOp);
+    check_disjoint(status, "status", {{&q, "q"}, {&pool, "kv_pool"}, {&table, "block_table"}}, kOp);
+
+    kern::AttnParams p;
+    p.q = q.ptr;
+    p.q_stride = q.stride;
+    p.q_head_stride = hs;
+    p.pool = pool.ptr;
+    p.block_floats = block_floats;
+    p.k_off = static_cast<std::uint64_t>(a.layer) * 2 * a.block_tokens * kv_dim;
+    p.v_off = p.k_off + static_cast<std::uint64_t>(a.block_tokens) * kv_dim;
+    p.block_tokens = a.block_tokens;
+    p.kv_dim = static_cast<unsigned>(kv_dim);
+    p.n_pool_blocks = a.n_pool_blocks;
+    p.table = reinterpret_cast<const std::uint32_t*>(table.ptr);
+    p.n_table = static_cast<unsigned>(n_table);
+    p.n_head = a.n_head;
+    p.n_kv_head = a.n_kv_head;
+    p.head_dim = a.head_dim;
+    p.q_offset = a.q_offset;
+    p.scale = a.scale;
+    p.out = out.ptr;
+    p.out_stride = out.stride;
+    p.scores = ws.ptr;
+    p.scores_stride = history;
+    p.status = reinterpret_cast<std::uint32_t*>(status.ptr);
+    zero_status(target, status);
+    dispatch(target, &detail::launch_attn_check, &detail::emulate_attn_check, p,
+             kern::attn_check_launch(p.n_table, 256), kOp);
+    const kern::Launch l = kern::attn_launch(a.n_tokens, a.n_head, attn_block_);
+    if (attn_exact_) {
+        dispatch(target, &detail::launch_attn_exact, &detail::emulate_attn_exact, p, l, kOp);
+    } else {
+        dispatch(target, &detail::launch_attn_online, &detail::emulate_attn_online, p, l, kOp);
+    }
 }
 
 }  // namespace halo::hip

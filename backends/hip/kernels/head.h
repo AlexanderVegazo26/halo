@@ -256,6 +256,7 @@ struct RopeParams {
     const std::int32_t* pos = nullptr;
     unsigned n_heads = 0;
     unsigned head_dim = 0;
+    std::uint64_t head_stride = 0; // elements between consecutive heads (>= head_dim)
     unsigned half = 0;             // rot_dims / 2
     float inv[kRopeMaxHalf] = {};  // cpu::rope_inv_freq, computed on the host
 };
@@ -284,7 +285,7 @@ HALO_HD void rope_body(Exec& ex, RopeShared& sh, const RopeParams& p, unsigned b
         if (e >= p.n_heads * p.half) return;
         const unsigned h = e / p.half;
         const unsigned i = e % p.half;
-        float* xh = p.x + static_cast<std::uint64_t>(bx) * p.x_stride + static_cast<std::uint64_t>(h) * p.head_dim;
+        float* xh = p.x + static_cast<std::uint64_t>(bx) * p.x_stride + static_cast<std::uint64_t>(h) * p.head_stride;
         const float x1 = xh[i];
         const float x2 = xh[i + p.half];
         xh[i] = x1 * sh.cs[i] + (-x2) * sh.sn[i];

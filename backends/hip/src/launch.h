@@ -6,6 +6,7 @@
 #include "kernels/conv_norm.h"
 #include "kernels/gdn.h"
 #include "kernels/gemv.h"
+#include "kernels/attention.h"
 #include "kernels/head.h"
 
 namespace halo::hip::detail {
@@ -24,6 +25,9 @@ int launch_argmax_reduce(const kern::ArgmaxParams& p, const kern::Launch& l, voi
 int launch_topk(const kern::TopkParams& p, const kern::Launch& l, void* stream);
 int launch_rope(const kern::RopeParams& p, const kern::Launch& l, void* stream);
 int launch_eltwise(const kern::EwParams& p, const kern::Launch& l, void* stream);
+int launch_attn_check(const kern::AttnParams& p, const kern::Launch& l, void* stream);
+int launch_attn_exact(const kern::AttnParams& p, const kern::Launch& l, void* stream);
+int launch_attn_online(const kern::AttnParams& p, const kern::Launch& l, void* stream);
 
 // Host emulators (reverse = run threads and blocks in reverse order).
 void emulate_gdn_recurrent(const kern::GdnRecParams& p, const kern::Launch& l, bool reverse);
@@ -39,5 +43,8 @@ void emulate_argmax_reduce(const kern::ArgmaxParams& p, const kern::Launch& l, b
 void emulate_topk(const kern::TopkParams& p, const kern::Launch& l, bool reverse);
 void emulate_rope(const kern::RopeParams& p, const kern::Launch& l, bool reverse);
 void emulate_eltwise(const kern::EwParams& p, const kern::Launch& l, bool reverse);
+void emulate_attn_check(const kern::AttnParams& p, const kern::Launch& l, bool reverse);
+void emulate_attn_exact(const kern::AttnParams& p, const kern::Launch& l, bool reverse);
+void emulate_attn_online(const kern::AttnParams& p, const kern::Launch& l, bool reverse);
 
 }  // namespace halo::hip::detail

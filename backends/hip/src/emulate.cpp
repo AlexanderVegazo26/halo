@@ -93,3 +93,28 @@ void emulate_eltwise(const EwParams& p, const Launch& l, bool reverse) {
 }
 
 }  // namespace halo::hip::detail
+
+namespace halo::hip::detail {
+
+using namespace kern;
+
+void emulate_attn_check(const AttnParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<AttnNoRegs, AttnNoRegs>(l, reverse, [&](auto& ex, AttnNoRegs& sh, unsigned bx, unsigned by) {
+        attn_check_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_attn_exact(const AttnParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<AttnNoRegs, AttnExactShared>(l, reverse, [&](auto& ex, AttnExactShared& sh, unsigned bx, unsigned by) {
+        attn_exact_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_attn_online(const AttnParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<AttnOnlineRegs, AttnOnlineShared>(l, reverse,
+                                                    [&](auto& ex, AttnOnlineShared& sh, unsigned bx, unsigned by) {
+                                                        attn_online_body(ex, sh, p, bx, by);
+                                                    });
+}
+
+}  // namespace halo::hip::detail

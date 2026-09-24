@@ -10,3 +10,10 @@ halo_add_test(test_hip_gemv SOURCES test_hip_gemv.cpp LIBS halo_backend_hip halo
 target_include_directories(test_hip_gemv PRIVATE ${PROJECT_SOURCE_DIR}/backends/hip)
 halo_add_test(test_hip_head SOURCES test_hip_head.cpp LIBS halo_backend_hip halo_backend_cpu halo_tensor)
 target_include_directories(test_hip_head PRIVATE ${PROJECT_SOURCE_DIR}/backends/hip)
+# Attention tests build their paged inputs with the real halo::kv_cache pool (layout parity).
+if(TARGET halo_kv_cache)
+  halo_add_test(test_hip_attention SOURCES test_hip_attention.cpp LIBS halo_backend_hip halo_backend_cpu halo_kv_cache)
+else()
+  message(WARNING "HIP: halo_kv_cache is not selected (add kv_cache to HALO_ONLY); test_hip_attention "
+                  "(paged GQA attention vs cpu::attention_gqa) is NOT built")
+endif()

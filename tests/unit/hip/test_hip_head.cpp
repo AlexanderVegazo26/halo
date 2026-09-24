@@ -568,5 +568,73 @@ TEST(HipMiscEmu, RopeRejectsUnsupportedRotDims) {
     expect_kernel_error([&] { Ops().partial_rope_neox(Target::emulation(), a); }, "must be even");
 }
 
+// ---------------------------------------------------------------------------------------
+// PARTIAL_ROPE with a head stride (TD-9): in place on the interleaved [Q | gate] layout
+// ---------------------------------------------------------------------------------------
+
+void check_rope_interleaved(Runner& r) {
+    SCOPED_TRACE(r.name());
+    constexpr std::uint32_t kT = 5, kHeads = 24, kHd = 256, kRot = 64;
+    constexpr std::size_t kRow = static_cast<std::size_t>(kHeads) * 2 * kHd;  // [Q_h | gate_h] per head
+    std::mt19937 rng(901);
+    std::vector<float> x = uniform(rng, kT * kRow, -2.0f, 2.0f);
+    const std::vector<float> orig = x;
+    std::vector<std::int32_t> pos{0, 3, 17, 4095, 131071};
+    // CPU reference: de-interleave Q, rotate densely, re-interleave.
+    std::vector<float> qd(kT * static_cast<std::size_t>(kHeads) * kHd);
+    for (std::size_t t = 0; t < kT; ++t) {
+        for (std::size_t h = 0; h < kHeads; ++h) std::copy_n(&x[t * kRow + h * 2 * kHd], kHd, &qd[(t * kHeads + h) * kHd]);
+    }
+    cpu::partial_rope_neox(cpu::Rows(qd.data(), kT, static_cast<std::size_t>(kHeads) * kHd,
+                                     static_cast<std::size_t>(kHeads) * kHd),
+                           kHeads, kHd, pos, kRot, 1e7f);
+    std::vector<float> ref = orig;
+    for (std::size_t t = 0; t < kT; ++t) {
+        for (std::size_t h = 0; h < kHeads; ++h) std::copy_n(&qd[(t * kHeads + h) * kHd], kHd, &ref[t * kRow + h * 2 * kHd]);
+    }
+    std::vector<float> posf(kT);
+    std::memcpy(posf.data(), pos.data(), kT * 4);
+    const Buffer bx = r.make(x), bp = r.make(posf);
+    RopeArgs a;
+    a.x = BufferView(bx, 0, 0, kRow * 4);
+    a.positions = bp;
+    a.n_tokens = kT;
+    a.n_heads = kHeads;
+    a.head_dim = kHd;
+    a.head_stride = 2 * kHd;
+    a.rot_dims = kRot;
+    a.theta = 1e7f;
+    Ops().partial_rope_neox(r.target(), a);
+    r.finish();
+    r.fetch(bx, x);
+    EXPECT_TRUE(matches(ref, x, r.exact(), "interleaved [Q | gate] (Q rotated, gate untouched)"));
+}
+
+TEST(HipRopeEmu, HeadStrideInterleavedQGate) {
+    for (auto& r : emulation_runners()) check_rope_interleaved(*r);
+    std::vector<float> f(4096, 0.0f);
+    const Buffer b = Buffer::wrap_host(f.data(), f.size() * 4);
+    RopeArgs a;
+    a.x = BufferView(b, 0, 2048 * 4);
+    a.positions = BufferView(b, 2048 * 4, 4);
+    a.n_tokens = 1;
+    a.n_heads = 2;
+    a.head_dim = 256;
+    a.rot_dims = 64;
+    a.head_stride = 255;
+    try {
+        Ops().partial_rope_neox(Target::emulation(), a);
+        ADD_FAILURE() << "head_stride < head_dim accepted";
+    } catch (const Error& e) {
+        EXPECT_NE(std::string(e.what()).find("head_stride 255 < head_dim 256"), std::string::npos) << e.what();
+    }
+}
+
+TEST(HipRopeDevice, HeadStrideInterleavedQGate) {
+    HALO_REQUIRE_HIP_DEVICE();
+    DeviceRunner r;
+    check_rope_interleaved(r);
+}
+
 }  // namespace
 }  // namespace halo::hip::test

@@ -129,6 +129,7 @@ struct GdnChunkedArgs {
 /// Status bits written by ops that detect data errors on the device.
 inline constexpr std::uint32_t kStatusPositiveG = 1u;
 inline constexpr std::uint32_t kStatusNaN = 2u;
+inline constexpr std::uint32_t kStatusBadBlock = 4u;
 
 /// CONV1D_SHORT (cpu::causal_conv1d_silu): causal depthwise conv1d (no bias) + SiLU.
 ///  - x: T rows of [C]; weight: C rows of [K] (tap K-1 = current input); K in 1..8.
@@ -241,6 +242,12 @@ struct RmsNormArgs {
 /// [n_heads * head_dim]; positions: n_tokens int32. Only the first rot_dims of each head
 /// rotate (NeoX rotate-half). inv_freq is computed on the host exactly as the CPU op does;
 /// cos/sin of the fp32 angle are evaluated in double. rot_dims even, <= head_dim, <= 128.
+/// x's row_stride should be given explicitly when head_stride > head_dim (the dense default
+/// would be the extent of the last head, not the full interleaved row).
+/// head_stride (TD-9): elements between the starts of consecutive heads within a row; 0 means
+/// head_dim (dense, the CPU op's layout). qwen35's attn_q output interleaves [Q | gate] per
+/// head (D-004), so RoPE on Q in place is head_dim = 256, head_stride = 512; the gate halves are
+/// never touched. Must be >= head_dim.
 struct RopeArgs {
     BufferView x{};
     BufferView positions{};
@@ -249,6 +256,7 @@ struct RopeArgs {
     std::uint32_t head_dim = 0;
     std::uint32_t rot_dims = 0;
     float theta = 10000.0f;
+    std::uint32_t head_stride = 0;  ///< TD-9; 0 = head_dim
 };
 
 /// [SWIGLU] out = silu(a) * b (a = gate, b = up); [MUL_SIGMOID] out = a * sigmoid(b)
@@ -257,6 +265,42 @@ struct EltwiseArgs {
     BufferView a{}, b{}, out{};
     std::uint32_t rows = 0;
     std::uint32_t cols = 0;
+};
+
+/// [ATTENTION] causal GQA softmax attention over a paged K/V history (cpu::attention_gqa).
+///  - q: n_tokens rows of n_head heads of head_dim; q_head_stride = elements between heads
+///    (0 = head_dim; 512 reads Q in place from qwen35's interleaved [Q | gate] attn_q row).
+///  - kv_pool: a halo::kv_cache::KvPool's storage, byte for byte: n_pool_blocks blocks of
+///    n_layers * 2 * block_tokens * kv_dim floats, block[layer][K|V][token][kv_dim], with
+///    kv_dim = n_kv_head * head_dim. `layer` selects the attention layer.
+///  - block_table: uint32 block ids; history row s is in block table[s / block_tokens]. It
+///    must cover q_offset + n_tokens rows (the last block may be partially filled).
+///  - Query t attends history rows 0 ..= q_offset + t; query head h uses KV head
+///    h / (n_head / n_kv_head); scores = (q . k) * scale.
+///  - out: n_tokens rows of [n_head * head_dim]; must not overlap any operand.
+///  - status: one word, zeroed by the op; kStatusBadBlock when a table entry the call reads
+///    is >= n_pool_blocks (those rows are skipped, never read); check_status raises
+///    Error(Kernel). The contents of `out` are then undefined. The table lives on the device, so it is validated there.
+///  - workspace: attention_workspace_bytes() (the exact variant's score rows; 0 for online).
+/// Limits of this backend: head_dim <= 256.
+struct AttentionArgs {
+    BufferView q{};
+    std::uint32_t q_head_stride = 0;
+    BufferView kv_pool{};
+    std::uint32_t n_pool_blocks = 0;
+    std::uint32_t n_layers = 1;
+    std::uint32_t layer = 0;
+    std::uint32_t block_tokens = 16;
+    BufferView block_table{};
+    std::uint32_t n_head = 0;
+    std::uint32_t n_kv_head = 0;
+    std::uint32_t head_dim = 0;
+    std::uint32_t n_tokens = 1;
+    std::uint32_t q_offset = 0;
+    float scale = 1.0f;
+    BufferView out{};
+    BufferView workspace{};
+    BufferView status{};
 };
 
 /// Variant choice per operator (names from the kernel registry, registry.h).
@@ -272,6 +316,7 @@ struct OpsOptions {
     std::string rope = "rope_neox_b128";
     std::string swiglu = "swiglu_b256";
     std::string mul_sigmoid = "mul_sigmoid_b256";
+    std::string attention = "attn_online_b128";
 };
 
 class Ops {
@@ -311,6 +356,10 @@ public:
     void swiglu(const Target& target, const EltwiseArgs& args) const;
     /// [MUL_SIGMOID]
     void mul_sigmoid(const Target& target, const EltwiseArgs& args) const;
+    /// [ATTENTION] paged GQA decode / verify; then check_status(status).
+    void attention(const Target& target, const AttentionArgs& args) const;
+    [[nodiscard]] std::uint64_t attention_workspace_bytes(std::uint32_t n_tokens, std::uint32_t n_head,
+                                                          std::uint32_t q_offset) const;
 
     /// Reads a status word (device: synchronizes the target stream, then copies it) and
     /// throws Error(Kernel) naming the set bits; returns normally when it is zero.
@@ -330,6 +379,8 @@ private:
     unsigned rope_block_ = 0;
     unsigned swiglu_block_ = 0;
     unsigned mulsig_block_ = 0;
+    unsigned attn_block_ = 0;
+    bool attn_exact_ = false;
 };
 
 }  // namespace halo::hip

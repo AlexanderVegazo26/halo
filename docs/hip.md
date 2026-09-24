@@ -1,9 +1,10 @@
 # HALO HIP backend (WS-K)
 
-Status: **milestones M1–M3 complete** (the WS-K plan).
+Status: **milestones M1–M4 complete**.
 - M1: the host runtime and the GATED_DELTANET family.
 - M2: quantized GEMV.
 - M3: the LM head with fused argmax, TOP_K, RMS_NORM, PARTIAL_ROPE, SWIGLU and MUL_SIGMOID.
+- M4: the PARTIAL_ROPE head stride (TD-9) and GQA ATTENTION over the paged KV cache.
 
 What remains is listed under "Not done".
 
@@ -71,7 +72,9 @@ thread/workgroup order. Registers and LDS start poisoned with NaN. Both runs mus
 
 Build (inside WSL, as the brief describes):
 
-    HALO_BUILD_DIR=/root/halo-build-wsk bash scripts/build.sh "-DHALO_BUILD_HIP=ON" "-DHALO_ONLY=tensor;cpu;hip"
+    HALO_BUILD_DIR=/root/halo-build-wsk bash scripts/build.sh "-DHALO_BUILD_HIP=ON" "-DHALO_ONLY=tensor;cpu;hip;kv_cache"
+
+(`kv_cache` is needed only for `test_hip_attention`, which is skipped at configure time without it.)
 
 The default build (`HALO_BUILD_HIP=OFF`) contains no HIP target and no HIP test.
 
@@ -87,6 +90,7 @@ The default build (`HALO_BUILD_HIP=OFF`) contains no HIP target and no HIP test.
 | `backends/hip/kernels/conv_norm.h` | CONV1D_SHORT, RMS/GATED_NORM bodies |
 | `backends/hip/kernels/gemv.h` | QUANT_GEMV bodies (generic + wave), per-element dequant matching `tensor::dequantize_row`, and the LM head's argmax epilogue |
 | `backends/hip/kernels/head.h` | ARGMAX (partial + reduce), TOP_K (bitonic), PARTIAL_ROPE, SWIGLU / MUL_SIGMOID bodies |
+| `backends/hip/kernels/attention.h` | ATTENTION bodies: block-table check, exact and online (running-max) variants |
 | `backends/hip/src/launch_kernels.hip` | `__global__` wrappers + launchers (the only device TU) |
 | `backends/hip/src/emulate.cpp`, `host_exec.h` | host emulation |
 | `backends/hip/src/ops.cpp` | validation (before anything runs), parameter building, dispatch |
@@ -152,8 +156,9 @@ The contracts are the CPU reference's (`include/halo/backends/cpu/ops.h`). The o
 | ARGMAX_FUSED (over logits) | `k_argmax_partial` → `k_argmax_reduce` | `argmax_b256` | D-016 | `cpu::argmax` per vector. 16 logits per thread, then a fixed LDS tree. |
 | TOP_K | `k_topk` (repeated rounds) | `topk_bitonic_b256` | TRD §19, D-016 | `cpu::top_k` per vector: the k largest, sorted descending, ties by lower index; 1 ≤ k ≤ min(n, 1024). Each round bitonic-sorts 2048-candidate chunks in LDS (16 KiB) and keeps k of each, until one chunk remains. For 248,320 logits that is 3 rounds at k = 40 and 8 rounds at k = 1024. NaN sets `kStatusNaN`, and `check_status` raises `Error(Kernel)`. Only k ids and values leave the device. |
 | RMS_NORM | `k_norm` (no gate) | `rms_norm_b128`, `rms_norm_b32` | D-004 | `cpu::rms_norm`: `(x·inv)·w`, the CPU's 8-lane sum order. Per-head norms are rows = T·heads. out may alias x. |
-| PARTIAL_ROPE | `k_rope` | `rope_neox_b128` | D-004 | `cpu::partial_rope_neox` in place. inv_freq is computed on the host with the CPU's expression and passed in the kernel arguments. The angle is one fp32 multiply; cos/sin are evaluated in double of the fp32 angle. rot_dims ≤ 128 (backend limit; qwen35 uses 64). |
+| PARTIAL_ROPE | `k_rope` | `rope_neox_b128` | D-004 | `cpu::partial_rope_neox` in place. `head_stride` (TD-9, default head_dim) addresses head h at h·head_stride, so RoPE runs in place on qwen35's interleaved [Q | gate] attn_q row (head_stride = 512), leaving the gate halves untouched; pass the full row as the view's row_stride. inv_freq is computed on the host with the CPU's expression and passed in the kernel arguments. The angle is one fp32 multiply; cos/sin are evaluated in double of the fp32 angle. rot_dims ≤ 128 (backend limit; qwen35 uses 64). |
 | SWIGLU / MUL_SIGMOID | `k_eltwise` | `swiglu_b256`, `mul_sigmoid_b256` | D-004 | `silu(gate)·up` and `x·sigmoid(gate)`, with the CPU's expressions. out may alias either input. |
+| ATTENTION (paged GQA) | `k_attn_check` → `k_attn_online` or `k_attn_exact` | `attn_online_b128`, `attn_online_b64`, `attn_exact_b128` | D-004 | `cpu::attention_gqa`: causal (query t sees rows 0 ..= q_offset + t); q head h uses KV head h / (n_head / n_kv_head); scores are `(q·k)·scale`. Reads the halo::kv_cache pool byte for byte: block[layer][K\|V][token][kv_dim] plus the sequence's uint32 block table (fragmented tables and a partial last block are fine). `q_head_stride` reads Q in place from the interleaved attn_q row. Block ids ≥ n_pool_blocks are flagged by `k_attn_check` (`kStatusBadBlock` → `check_status` raises `Error(Kernel)`) and never dereferenced; `out` is then undefined. See "Attention accumulation order" below. head_dim ≤ 256. |
 
 ### GEMV reduction orders and the tolerance
 
@@ -182,6 +187,47 @@ cannot see a single wrong weight there. Dequantization errors are caught by the 
 variant's bitwise test, which shares `wq_elem` with the wave variants. The bound catches
 reduction bugs in the wave kernels (a dropped tree level, a wrong group stride; see the
 demonstrate-fail record in the M2 report).
+
+### Attention accumulation order and the tolerance
+
+Both variants use one workgroup per (query row, query head). Both are numerically stable:
+every exponent is `x − m ≤ 0`, with m either the exact maximum or the running maximum.
+
+**`attn_exact_b128`** runs the CPU's order.
+1. Scores: 8-lane dot × scale, in the order of `cpu::detail::dot`.
+2. m = max over all scores.
+3. `p_s = exp(x_s − m)`.
+4. One thread forms the sequential sum `Σ_s p_s` in ascending s.
+5. `p_s /= sum`.
+6. `o[d] = Σ_s p_s·v_s[d]`, sequential in ascending s.
+
+It is bit-identical to `cpu::attention_gqa` in emulation. The serial sum makes it slow on
+purpose: it is the exactness reference.
+
+**`attn_online_b*`** (default) makes one pass over key tiles of `block` keys.
+1. Each thread scores one key of the tile.
+2. `m' = max(m, max_tile)` and `α = exp(m − m')`.
+3. `p_j = exp(x_j − m')`.
+4. `l = l·α + Σ_j p_j`, ascending j, on one thread.
+5. `acc[d] = acc[d]·α + Σ_j p_j·v_j[d]`, ascending j.
+6. At the end, `o = acc / l`.
+
+This is deterministic but rounds differently from the CPU. It is accepted by a first-order
+bound per output element, with u = 2⁻²⁴:
+
+    |o_hip − o_cpu| ≤ u·(4N + 3·n_tiles + 4R + 16)·Σ_s w_s·|v_s[d]|
+
+- N is the number of keys and R = max_s (m − x_s) is the score range.
+- The terms cover:
+  - each side's `exp`;
+  - the rounding of the exponent argument;
+  - the α rescale chain;
+  - the normalizing sums;
+  - the weighted accumulation.
+- Weights and R come from the CPU-side inputs, in double.
+- Observed on the test data: at most **0.085** of the bound.
+- Tile-rescale bugs (a dropped α on l or on acc) show up only with more than one tile. The
+  1001-key case covers that, and both mutations went red there.
 
 ### D-016 (the GDN q/k contract)
 
@@ -212,6 +258,10 @@ Each of these is rejected with `Error(Kernel)` and tested:
 | Conv kernel size | ≤ 8 | any |
 | TOP_K k | ≤ 1024 (TRD §19's pre-filter size) | ≤ n |
 | RoPE rot_dims | ≤ 128 | ≤ head_dim |
+| Attention head_dim | ≤ 256 | any |
+
+Two additions go beyond the CPU contract: RoPE `head_stride` and attention `q_head_stride`
+(TD-9). The CPU views cannot express the interleaved layout (review S-2).
 
 In place is also different:
 - The CPU GDN op is always in place.
@@ -301,6 +351,30 @@ In place is also different:
       ±90 inputs.
 
     RoPE rejects rot 130 and odd rot.
+- **`test_hip_attention`** builds its K/V history in a real `halo::kv_cache::KvPool`. Two
+  sequences grow in alternation, so each block table is fragmented. It uses layer 1 of 2,
+  and every case ends in a partially filled block. The CPU reads `SequenceKv::keys()` /
+  `values()`; the HIP op reads a byte copy of the pool and the block ids.
+  - **Cases,** each through the 3 variants: exact must be bitwise, online must be within
+    the bound.
+    - qwen35 decode: 24/4 heads, hd 256, 41 rows = 3 blocks;
+    - MTP verify at T = 4, causal, with Q read in place from interleaved [Q | gate];
+    - hd 20 with 6/2 heads, block 5, history = T;
+    - 1001 keys: 8 tiles of 128 or 16 of 64.
+  - **Errors and rejections:**
+    - a bad block id raises `Error(Kernel)`;
+    - rejections: head_dim 288, n_head not a multiple of n_kv_head, a table too short,
+      a layer outside the pool, out overlapping the pool.
+  - Device runs use the same derived bound rather than the fixed 2e-5 tolerance. In
+    emulation the worst |d| is 6e-8 and the worst |d|/bound is 0.085, so the bound is
+    generally stricter than 2e-5 here. Its exp term assumes ≤ 2 ulp per side, to be
+    calibrated on the EVO-X2.
+  - This test needs `kv_cache` in `HALO_ONLY`. Without it, CMake prints a warning and the
+    test is not built.
+- **RoPE head stride (TD-9, in `test_hip_head`):** 24 heads × [Q 256 | gate 256] at T = 5
+  with rot 64 and θ = 10⁷. Q must be bitwise equal to `cpu::partial_rope_neox` on a
+  de-interleaved copy, and the gate halves must be untouched. `head_stride < head_dim` is
+  rejected.
 - **Device tests.** Each scenario above also exists as a `…Device…` test. They skip on
   the dev host.
   - GDN, conv and norm compare against `halo::cpu` within `|err| ≤ 2e-5 + 1e-5·|ref|`.
@@ -315,7 +389,7 @@ In place is also different:
 ### Running the device tests on the EVO-X2
 
     cmake -S . -B build-hip -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-          -DHALO_BUILD_HIP=ON -DHALO_ONLY="tensor;cpu;hip"
+          -DHALO_BUILD_HIP=ON -DHALO_ONLY="tensor;cpu;hip;kv_cache"
     cmake --build build-hip && ctest --test-dir build-hip -R Hip --output-on-failure
 
 `ROCM_PATH` must be `/opt/rocm`, or set `CMAKE_HIP_COMPILER`. Every `…Device…` test must
@@ -341,6 +415,13 @@ at `-O2` (RelWithDebInfo).
 | `k_topk` | 11 | 0 | 16384 | 16 |
 | `k_rope` | 43 | 0 | 512 | 16 |
 | `k_eltwise` | 11 | 0 | 0 | 16 |
+| `k_attn_check` | 3 | 0 | 0 | 16 |
+| `k_attn_exact` | 27 | 0 | 2056 | 16 |
+| `k_attn_online` | 28 | 0 | 10252 | 16 |
+
+The online kernel's per-thread accumulator array (8 floats × 256 threads = 8 KiB) was
+placed in LDS by the compiler (promote-alloca) rather than in registers. That is why it
+uses 10 KiB of LDS and not 2 KiB.
 
 Two findings from getting these numbers (measured at build time):
 
@@ -385,6 +466,12 @@ until the EVO-X2 runs.
    ⌈rows / rows-per-workgroup⌉, about 62K for the 248,320-row head with `gemv_wave32_r4`.
    - One workgroup reads all 62K × 16 B. That is fine for correctness but serial.
    - A second partial stage would parallelize it.
+6. **Attention decode is one workgroup per (token, head) with no split-K.**
+   - For decode that is 24 workgroups over the whole history.
+   - V rows are re-addressed for every output dimension.
+   - A flash-decoding split over key ranges, with a combine step, and LDS-staged K/V tiles
+     are the tuning path.
+   - The exact variant is serial by design and is not for production.
 
 ## TRD §63 acceptance status
 
@@ -393,8 +480,8 @@ until the EVO-X2 runs.
 | gfx1151 (or logged gfx11-generic) build succeeds | **Met on the dev host (compile).** gfx1151 by default. A generic ISA needs explicit opt-in and is logged. |
 | Device discovery succeeds; tier probing succeeds | **Discovery implemented, unverified on a device.** On the dev host it fails cleanly with `hipErrorNoDevice`. Tier probing belongs to the hardware module and is not part of this backend. |
 | GPU allocations succeed on GTT and carveout | **Implemented** (`HostPinned` = GTT, `Device` = carveout). The test exists but is unverified (skipped). |
-| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K), LM head with fused argmax, argmax, top-k, RoPE, SwiGLU and sigmoid gate. Attention over paged KV is not built. |
-| Reference-vs-HIP correctness passes | **Emulation passes.** It is bit for bit everywhere except the wave-GEMV logits, which are within the derived summation bound (their argmax index still equals the CPU's). **Device: unverified.** |
+| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K), LM head with fused argmax, argmax, top-k, RoPE (with head stride), SwiGLU, sigmoid gate, and GQA attention over the paged KV cache. |
+| Reference-vs-HIP correctness passes | **Emulation passes.** It is bit for bit everywhere except two variants that sum in a different order, each within its own derived bound: the wave-GEMV logits (whose argmax index still equals the CPU's) and online attention. **Device: unverified.** |
 | Benchmark suite executes reproducibly | **Not started.** |
 
 ## Not done (end of the WS-K plan)
@@ -405,8 +492,10 @@ until the EVO-X2 runs.
   - IQ4_XS, IQ4_NL, Q3_K, IQ3_S (the D-014 second tier);
   - a prefill GEMM;
   - a wave64 comparison.
-- **Attention and kernels:** GQA attention over paged KV (TRD §18 item 5), softmax, and
-  the KV-cache kernels. These were optional ("if room remains") and were not started.
+- **Attention and kernels:**
+  - a prefill (T ≫ 1) attention variant;
+  - a split-K decode variant (debt 6);
+  - the KV-cache write and append kernels, and fp16 KV storage (TRD §15; the CPU pool is fp32).
 - **Runtime pieces:**
   - `hip_graph`;
   - the profiler;
