@@ -1,0 +1,7 @@
+{
+  "id": "chatcmpl-abc",
+  "object": "=chat.completion.chunk",
+  "created": 1694268190,
+  "model": "m",
+  "choices": [{"index": 0, "delta": {}, "logprobs": null, "finish_reason": null}]
+}

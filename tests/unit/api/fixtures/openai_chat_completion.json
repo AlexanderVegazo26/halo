@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-abc",
+  "object": "=chat.completion",
+  "created": 1741570283,
+  "model": "m",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "=assistant", "content": null},
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 19,
+    "completion_tokens": 10,
+    "total_tokens": 29,
+    "prompt_tokens_details": {"cached_tokens": 0},
+    "completion_tokens_details": {"reasoning_tokens": 0}
+  }
+}

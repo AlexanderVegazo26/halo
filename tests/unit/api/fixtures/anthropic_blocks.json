@@ -1,0 +1,5 @@
+{
+  "thinking": {"type": "=thinking", "thinking": "t", "signature": "s"},
+  "text": {"type": "=text", "text": "t"},
+  "tool_use": {"type": "=tool_use", "id": "toolu_abc", "name": "get_weather", "input": {}}
+}

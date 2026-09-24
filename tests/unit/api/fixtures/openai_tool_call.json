@@ -1,0 +1,1 @@
+{"id": "call_abc", "type": "=function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}

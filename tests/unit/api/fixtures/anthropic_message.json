@@ -1,0 +1,10 @@
+{
+  "id": "msg_abc",
+  "type": "=message",
+  "role": "=assistant",
+  "model": "m",
+  "content": [{"type": "text"}],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 10, "output_tokens": 5}
+}

@@ -1,0 +1,8 @@
+{
+  "id": "cmpl-abc",
+  "object": "=text_completion",
+  "created": 1589478378,
+  "model": "m",
+  "choices": [{"text": "x", "index": 0, "logprobs": null, "finish_reason": "length"}],
+  "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+}
