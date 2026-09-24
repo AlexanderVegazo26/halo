@@ -1,0 +1,63 @@
+#version 450
+// ARGMAX pass 1: workgroup g reduces logits[g*chunk, min(n, (g+1)*chunk)) to one
+// (index, value) pair in partials[2g], partials[2g+1] (value as float bits).
+// Order: larger value wins; equal values -> lower index; NaN is ignored; an empty /
+// all-NaN range yields index 0xFFFFFFFF.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Logits { float logits[]; };
+layout(std430, binding = 1) writeonly buffer Partials { uint partials[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint chunk;
+    uint groups;
+} pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+shared float s_val[WG];
+shared uint s_idx[WG];
+
+// true if (va, ia) should replace (vb, ib)
+bool better(float va, uint ia, float vb, uint ib) {
+    if (ia == NONE) return false;
+    if (ib == NONE) return true;
+    return va > vb || (va == vb && ia < ib);
+}
+
+void main() {
+    const uint grp = halo_group_id();
+    if (grp >= pc.groups) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint begin = grp * pc.chunk;
+    const uint end = min(pc.n, begin + pc.chunk);
+
+    float bv = 0.0;
+    uint bi = NONE;
+    for (uint i = begin + tid; i < end; i += WG) {
+        const float v = logits[i];
+        if (isnan(v)) continue;
+        if (better(v, i, bv, bi)) {
+            bv = v;
+            bi = i;
+        }
+    }
+    s_val[tid] = bv;
+    s_idx[tid] = bi;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s && better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        partials[2u * grp] = s_idx[0];
+        partials[2u * grp + 1u] = floatBitsToUint(s_val[0]);
+    }
+}

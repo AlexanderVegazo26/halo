@@ -1,0 +1,36 @@
+#version 450
+// MATMUL (decode GEMV), fp32 weights: y[r] = sum_c W[r*cols + c] * x[c].
+// One workgroup per output row; strided per-thread partial sums, then a fixed-order
+// shared-memory tree reduction.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wt { float wt[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * pc.cols;
+
+    float acc = 0.0;
+    for (uint c = tid; c < pc.cols; c += WG) acc += wt[base + c] * x[c];
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) y[row] = red[0];
+}

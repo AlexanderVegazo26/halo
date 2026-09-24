@@ -1,0 +1,95 @@
+#version 450
+// GATED_DELTANET recurrent decode over T rows (DECISIONS D-004 item 6; C-1 state slots).
+//
+// Per value head j (one workgroup), key head kh = j % n_k (GGUF tiled order, D-004 item 5),
+// for t = 0..T-1:
+//   S *= exp(g[t,j]);  kv = S^T k_t;  delta = (v_t - kv) * beta[t,j];  S += k_t delta^T;
+//   o_t = S^T q_t
+// A state is [n_v, d_k, d_v] fp32, element (j, a, b) at (j*d_k + a)*d_v + b. Column b of
+// S depends only on column b, so thread t owns columns b = t, t+WG, ... for all rows — no
+// cross-thread reduction, and each thread only re-reads state it wrote itself.
+// Row 0 reads the input state region; later rows read the output region (already holding
+// the previous row's state). Slot s (s < min(T, n_slots)) receives the state after row
+// T-1-s. Inputs q, k are already L2-normalized, q already scaled by 1/sqrt(d_k); g is the
+// log-decay (exp applied here); beta is already sigmoid-activated.
+//
+// state_in and state_out may be the same buffer (host guarantees identical or disjoint
+// regions). With identical regions each element is read through state_in strictly before
+// the same invocation writes it through state_out, and never read through state_in again.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint MAX_DK = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer K { float k[]; };
+layout(std430, binding = 2) readonly buffer V { float v[]; };
+layout(std430, binding = 3) readonly buffer G { float g[]; };
+layout(std430, binding = 4) readonly buffer Beta { float beta[]; };
+layout(std430, binding = 5) readonly buffer StateIn { float state_in[]; };
+layout(std430, binding = 6) buffer StateOut { float state_out[]; };
+layout(std430, binding = 7) writeonly buffer Out { float o[]; };
+layout(std430, binding = 8) writeonly buffer Slots { float slots[]; };
+
+layout(push_constant) uniform Push {
+    uint n_v;
+    uint n_k;
+    uint d_k;
+    uint d_v;
+    uint n_tokens;
+    uint n_slots;
+    uint in_off;     // element offset of the input state
+    uint out_off;    // element offset of the output state
+    uint slots_off;  // element offset of slot 0
+} pc;
+
+shared float sq[MAX_DK];
+shared float sk[MAX_DK];
+
+void main() {
+    const uint j = halo_group_id();
+    if (j >= pc.n_v) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kh = j % pc.n_k;
+    const uint head = j * pc.d_k * pc.d_v;              // head offset inside one state
+    const uint state_elems = pc.n_v * pc.d_k * pc.d_v;
+
+    for (uint t = 0u; t < pc.n_tokens; ++t) {
+        barrier();  // previous row finished with sq/sk
+        const uint qk_row = (t * pc.n_k + kh) * pc.d_k;
+        for (uint a = tid; a < pc.d_k; a += WG) {
+            sq[a] = q[qk_row + a];
+            sk[a] = k[qk_row + a];
+        }
+        barrier();
+
+        const float decay = exp(g[t * pc.n_v + j]);
+        const float bt = beta[t * pc.n_v + j];
+        const uint vrow = (t * pc.n_v + j) * pc.d_v;
+        const bool first = t == 0u;
+        const uint slot = pc.n_tokens - 1u - t;  // slot this row's state belongs to
+        const bool to_slot = slot < pc.n_slots;
+        const uint slot_base = pc.slots_off + slot * state_elems + head;
+
+        for (uint b = tid; b < pc.d_v; b += WG) {
+            float kv = 0.0;
+            for (uint a = 0u; a < pc.d_k; ++a) {
+                const uint e = head + a * pc.d_v + b;
+                const float s0 = first ? state_in[pc.in_off + e] : state_out[pc.out_off + e];
+                kv += (s0 * decay) * sk[a];
+            }
+            const float delta = (v[vrow + b] - kv) * bt;
+            float acc = 0.0;
+            for (uint a = 0u; a < pc.d_k; ++a) {
+                const uint e = head + a * pc.d_v + b;
+                const float s0 = first ? state_in[pc.in_off + e] : state_out[pc.out_off + e];
+                const float s = s0 * decay + sk[a] * delta;
+                state_out[pc.out_off + e] = s;
+                if (to_slot) slots[slot_base + a * pc.d_v + b] = s;
+                acc += s * sq[a];
+            }
+            o[vrow + b] = acc;
+        }
+    }
+}

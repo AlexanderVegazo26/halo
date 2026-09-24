@@ -1,0 +1,61 @@
+#version 450
+// QUANT_GEMV, ggml Q6_K weights: y[r] = sum_c W[r,c] * x[c]. (LM head format, D-007.)
+// block_q6_K (ggml-common.h, MIT), 210 bytes / 256 values:
+//   uint8 ql[128] (low 4 bits); uint8 qh[64] (high 2 bits); int8 scales[16]; fp16 d
+// Dequantization ported from ggml-quants.c dequantize_row_q6_K (MIT). For half n (128
+// values) and l in 0..31, with ql/qh/sc advanced by 64n/32n/8n and is = l/16:
+//   y[l+ 0] = d*sc[is+0]*((ql[l]    & 0xF) | ((qh[l]>>0 & 3)<<4)) - 32)
+//   y[l+32] = d*sc[is+2]*((ql[l+32] & 0xF) | ((qh[l]>>2 & 3)<<4)) - 32)
+//   y[l+64] = d*sc[is+4]*((ql[l]    >> 4)  | ((qh[l]>>4 & 3)<<4)) - 32)
+//   y[l+96] = d*sc[is+6]*((ql[l+32] >> 4)  | ((qh[l]>>6 & 3)<<4)) - 32)
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+HALO_DEFINE_BYTE_READERS(wq)
+
+const uint QK_K = 256u;
+const uint BLOCK_BYTES = 210u;
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_off = row * (pc.cols / QK_K) * BLOCK_BYTES;
+
+    float acc = 0.0;
+    for (uint c = tid; c < pc.cols; c += WG) {
+        const uint bo = row_off + (c / QK_K) * BLOCK_BYTES;
+        const uint i = c % QK_K;
+        const uint n = i / 128u;          // half
+        const uint quarter = (i / 32u) & 3u;
+        const uint l = i % 32u;
+        const uint is = l / 16u;
+        const uint ql = read_u8(bo + 64u * n + l + ((quarter & 1u) != 0u ? 32u : 0u));
+        const uint qh = read_u8(bo + 128u + 32u * n + l);
+        const uint lo4 = quarter >= 2u ? (ql >> 4) : (ql & 0xFu);
+        const int q = int(lo4 | (((qh >> (2u * quarter)) & 3u) << 4)) - 32;
+        const int sc = read_i8(bo + 192u + 8u * n + is + 2u * quarter);
+        const float d = read_f16(bo + 208u);
+        acc += (d * float(sc) * float(q)) * x[c];
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) y[row] = red[0];
+}

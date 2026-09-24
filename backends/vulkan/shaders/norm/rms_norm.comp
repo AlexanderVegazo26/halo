@@ -1,0 +1,42 @@
+#version 450
+// RMS_NORM: y[r,i] = x[r,i] / sqrt(mean(x[r,:]^2) + eps) * w[i]   (plain x̂·w, D-004).
+// One workgroup per row; fixed-order shared-memory tree reduction (deterministic).
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Wt { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    float eps;
+} pc;
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * pc.cols;
+
+    float acc = 0.0;
+    for (uint i = tid; i < pc.cols; i += WG) {
+        const float v = x[base + i];
+        acc += v * v;
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
+    for (uint i = tid; i < pc.cols; i += WG) {
+        y[base + i] = x[base + i] * inv * w[i];
+    }
+}

@@ -1,0 +1,53 @@
+#version 450
+// ARGMAX pass 2: one workgroup reduces `count` (index, value-bits) partials from pass 1
+// into result[0] = index, result[1] = value bits. Same ordering rules as pass 1.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Partials { uint partials[]; };
+layout(std430, binding = 1) writeonly buffer Result { uint result[]; };
+
+layout(push_constant) uniform Push {
+    uint count;
+} pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+shared float s_val[WG];
+shared uint s_idx[WG];
+
+bool better(float va, uint ia, float vb, uint ib) {
+    if (ia == NONE) return false;
+    if (ib == NONE) return true;
+    return va > vb || (va == vb && ia < ib);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float bv = 0.0;
+    uint bi = NONE;
+    for (uint p = tid; p < pc.count; p += WG) {
+        const uint ii = partials[2u * p];
+        const float vv = uintBitsToFloat(partials[2u * p + 1u]);
+        if (better(vv, ii, bv, bi)) {
+            bv = vv;
+            bi = ii;
+        }
+    }
+    s_val[tid] = bv;
+    s_idx[tid] = bi;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s && better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        result[0] = s_idx[0];
+        result[1] = floatBitsToUint(s_val[0]);
+    }
+}

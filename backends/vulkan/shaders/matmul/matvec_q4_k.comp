@@ -1,0 +1,71 @@
+#version 450
+// QUANT_GEMV, ggml Q4_K weights: y[r] = sum_c W[r,c] * x[c].
+// block_q4_K (ggml-common.h, MIT), 144 bytes / 256 values:
+//   fp16 d; fp16 dmin; uint8 scales[12] (6-bit scales + mins); uint8 qs[128] (4-bit)
+// Dequantization ported from ggml-quants.c dequantize_row_q4_K / get_scale_min_k4 (MIT):
+//   for chunk c in 0..3 (64 values): sub-blocks 2c (low nibbles) and 2c+1 (high nibbles)
+//   of qs[32c .. 32c+31];  value = d*sc[sub] * q - dmin*m[sub].
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+HALO_DEFINE_BYTE_READERS(wq)
+
+const uint QK_K = 256u;
+const uint BLOCK_BYTES = 144u;
+
+// get_scale_min_k4(j, q, &d, &m) with q = block scales at byte offset `so`.
+void scale_min_k4(uint j, uint so, out uint sc, out uint m) {
+    if (j < 4u) {
+        sc = read_u8(so + j) & 63u;
+        m = read_u8(so + j + 4u) & 63u;
+    } else {
+        sc = (read_u8(so + j + 4u) & 0xFu) | ((read_u8(so + j - 4u) >> 6) << 4);
+        m = (read_u8(so + j + 4u) >> 4) | ((read_u8(so + j) >> 6) << 4);
+    }
+}
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_off = row * (pc.cols / QK_K) * BLOCK_BYTES;
+
+    float acc = 0.0;
+    for (uint c = tid; c < pc.cols; c += WG) {
+        const uint bo = row_off + (c / QK_K) * BLOCK_BYTES;
+        const uint i = c % QK_K;
+        const uint chunk = i / 64u;
+        const uint hi = (i / 32u) & 1u;
+        const uint l = i % 32u;
+        const float d = read_f16(bo);
+        const float dmin = read_f16(bo + 2u);
+        uint sc;
+        uint m;
+        scale_min_k4(2u * chunk + hi, bo + 4u, sc, m);
+        const uint qb = read_u8(bo + 16u + 32u * chunk + l);
+        const uint q = hi == 1u ? (qb >> 4) : (qb & 0xFu);
+        const float d1 = d * float(sc);
+        const float m1 = dmin * float(m);
+        acc += (d1 * float(q) - m1) * x[c];
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) y[row] = red[0];
+}
