@@ -1,0 +1,29 @@
+{
+  "schema": "halo.bench.workload/1",
+  "id": "long_context_v1",
+  "kind": "long_context",
+  "description": "Long-context retrieval shape: a real-text instruction, a large synthetic document body and a short question. Agent i targets the i-th PRD section 18 depth (4K/32K/128K/256K); the synthetic body is sized so body + instruction + question stays below the depth with room for 128 generated tokens. Token ids are deterministic from the seed (SplitMix64, see include/halo/profiling/workload.h) and are NOT natural text: use for throughput and memory, never for quality.",
+  "provenance": "Authored for HALO by WS-J (2026-09). Instruction and question text are original; document bodies are synthetic_tokens segments generated from the listed seeds. Frozen.",
+  "agents": [
+    {"id": "ctx4k", "max_tokens": 128,
+     "preamble": [
+       {"role": "system", "text": "You answer questions about the document the user provides. Quote the relevant passage before answering."},
+       {"role": "user", "synthetic_tokens": 3712, "seed": 4096}],
+     "turns": [{"role": "user", "text": "Summarize the section that discusses error handling, in three sentences."}]},
+    {"id": "ctx32k", "max_tokens": 128,
+     "preamble": [
+       {"role": "system", "text": "You answer questions about the document the user provides. Quote the relevant passage before answering."},
+       {"role": "user", "synthetic_tokens": 32384, "seed": 32768}],
+     "turns": [{"role": "user", "text": "Summarize the section that discusses error handling, in three sentences."}]},
+    {"id": "ctx128k", "max_tokens": 128,
+     "preamble": [
+       {"role": "system", "text": "You answer questions about the document the user provides. Quote the relevant passage before answering."},
+       {"role": "user", "synthetic_tokens": 130688, "seed": 131072}],
+     "turns": [{"role": "user", "text": "Summarize the section that discusses error handling, in three sentences."}]},
+    {"id": "ctx256k", "max_tokens": 128,
+     "preamble": [
+       {"role": "system", "text": "You answer questions about the document the user provides. Quote the relevant passage before answering."},
+       {"role": "user", "synthetic_tokens": 261760, "seed": 262144}],
+     "turns": [{"role": "user", "text": "Summarize the section that discusses error handling, in three sentences."}]}
+  ]
+}

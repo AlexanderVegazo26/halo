@@ -1,0 +1,32 @@
+{
+  "schema": "halo.bench.workload/1",
+  "id": "agent_replay_v1",
+  "kind": "agent_replay",
+  "description": "Coding-agent style session: a fixed system prompt and tool list followed by a six-turn replay in which each turn extends the previous conversation, so turns 1..5 are prefix-cache reuse turns (PR-004 cached TTFT).",
+  "provenance": "Authored for HALO by WS-J (2026-09). Original text written for this benchmark; no third-party or user data. Frozen: changing any text changes every token count, so add a new file with a new id instead of editing this one.",
+  "tools": [
+    {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file from the workspace.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "search", "description": "Search the workspace for a regular expression and return matching lines with file and line number.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}}, "required": ["pattern"]}}},
+    {"type": "function", "function": {"name": "apply_patch", "description": "Apply a unified diff to the workspace. Fails without side effects if any hunk does not apply.", "parameters": {"type": "object", "properties": {"diff": {"type": "string"}}, "required": ["diff"]}}},
+    {"type": "function", "function": {"name": "run_tests", "description": "Run the project test suite, optionally filtered, and return the exit status and the last 200 lines of output.", "parameters": {"type": "object", "properties": {"filter": {"type": "string"}}}}}
+  ],
+  "agents": [
+    {
+      "id": "coder",
+      "max_tokens": 256,
+      "think_time_ms": 0,
+      "preamble": [
+        {"role": "system", "text": "You are a careful software engineering agent working inside a C++ repository. You have four tools: read_file, search, apply_patch and run_tests. Before changing code, read the relevant files and state what you intend to change and why. Keep diffs minimal and scoped to the request. After every change, run the affected tests and report the real exit status; never claim a test passed without running it. When a requirement is ambiguous, state the assumption you are making. Prefer the existing conventions of the codebase over your own preferences. If a tool call fails, report the failure and try a different approach instead of repeating the same call. Respond concisely: a short plan, the tool calls, then a summary of what changed and what was verified."},
+        {"role": "system", "text": "Repository facts: the build uses CMake and Ninja with clang 18 in C++23 mode and -Werror. Tests use GoogleTest and are registered with ctest. Public headers live under include/<project>/<module>/ and sources under src/<module>/. Errors are reported by throwing a typed error with an error code; logging uses a component tag. External input such as files and network data is untrusted: every length, count and offset must be bounds-checked."}
+      ],
+      "turns": [
+        {"role": "user", "text": "The function that parses the configuration file crashes when the file is empty. Find it and explain the cause before changing anything."},
+        {"role": "user", "text": "Good. Write a failing test that reproduces the crash first, run it, and show me that it fails."},
+        {"role": "user", "text": "Now fix the parser so an empty file produces a typed configuration error instead of a crash. Keep the change minimal."},
+        {"role": "user", "text": "Run the full test suite for that module and tell me the exact pass, fail and skip counts."},
+        {"role": "user", "text": "While you were in there, did you notice anything else that looks wrong? List it, but do not change it."},
+        {"role": "user", "text": "Write a commit message for this change in the style of the repository: a short imperative subject line and a body explaining the cause and the fix."}
+      ]
+    }
+  ]
+}
