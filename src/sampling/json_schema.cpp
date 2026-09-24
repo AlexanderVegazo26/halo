@@ -358,6 +358,9 @@ private:
             for (const auto& n : r) {
                 HALO_CHECK(n.is_string(), ErrorCode::Api, "structured output: required entries must be strings");
                 const auto name = n.get<std::string>();
+                // Searching `props` *including* entries appended below for earlier required
+                // names is what deduplicates repeated names (covered by
+                // JsonSchema.DuplicateRequiredNamesAreDeduplicated).
                 auto it = std::find_if(props.begin(), props.end(), [&](const Prop& p) { return p.name == name; });
                 if (it != props.end()) {
                     it->required = true;

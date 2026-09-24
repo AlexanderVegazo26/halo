@@ -19,6 +19,7 @@
 #include "halo/core/error.h"
 #include "halo/sampling/structured.h"
 #include "json_check.h"
+#include "walk.h"
 #include "sampling/grammar_impl.h"
 
 namespace {
@@ -29,6 +30,7 @@ using halo::sampling::ByteMatcher;
 using halo::sampling::Grammar;
 using halo::sampling::SchemaOptions;
 using halo::sampling::test::OJson;
+using halo::sampling::test::shortest_completion;
 using halo::sampling::test::validate_text;
 
 bool accepts(const Grammar& g, std::string_view doc) {
@@ -80,6 +82,19 @@ TEST(JsonSchema, ObjectRequiredOptionalNoAdditional) {
                      R"({"name":"x",})", R"({"name":"x","name":"y"})"});
     // Generation policy, not schema semantics: declared properties come in schema order.
     EXPECT_FALSE(accepts(g, R"({"age":3,"name":"x"})"));
+}
+
+TEST(JsonSchema, DuplicateRequiredNamesAreDeduplicated) {
+    // A name listed twice in `required` is one requirement: the key must appear exactly
+    // once, whether it is declared in `properties` or only allowed by additionalProperties.
+    const auto undeclared = Grammar::from_json_schema(R"({"type":"object","required":["x","x"]})");
+    expect_language(undeclared, {R"({"x":1})", R"({"x":1,"y":2})"}, {"{}", R"({"x":1,"x":2})", R"({"y":2})"});
+    const auto typed = Grammar::from_json_schema(
+        R"({"type":"object","required":["x","y","x"],"additionalProperties":{"type":"integer"}})");
+    expect_language(typed, {R"({"x":1,"y":2})"}, {R"({"x":1,"y":2,"x":3})", R"({"x":1})", R"({"x":"s","y":2})"});
+    const auto declared = Grammar::from_json_schema(
+        R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a","a"],"additionalProperties":false})");
+    expect_language(declared, {R"({"a":1})"}, {"{}", R"({"a":1,"a":2})"});
 }
 
 TEST(JsonSchema, AdditionalPropertiesDefaultTrueNeverShadowsDeclared) {
@@ -268,39 +283,6 @@ TEST(JsonSchemaPattern, UnicodeAndEscapesInsideStrings) {
 }
 
 // ---- byte-level random walks validated independently ----------------------------------
-
-/// Shortest byte string leading from `from` to an accepting state (breadth-first over the
-/// interned matcher states, bytes tried in ascending order). nullopt if none is found
-/// within `max_states` visited states — for these grammars that means a live state that
-/// can never complete, which is itself a defect.
-std::optional<std::string> shortest_completion(halo::sampling::detail::Runtime& rt, std::int32_t from,
-                                               std::size_t max_states = 200000) {
-    using halo::sampling::detail::byteset_has;
-    struct Prev {
-        std::int32_t state;
-        std::uint8_t byte;
-    };
-    std::unordered_map<std::int32_t, Prev> prev{{from, {from, 0}}};
-    std::deque<std::int32_t> queue{from};
-    while (!queue.empty() && prev.size() <= max_states) {
-        const std::int32_t s = queue.front();
-        queue.pop_front();
-        if (rt.accepting(s)) {
-            std::string path;
-            for (std::int32_t t = s; t != from; t = prev.at(t).state) path.push_back(static_cast<char>(prev.at(t).byte));
-            return std::string(path.rbegin(), path.rend());
-        }
-        const auto next = rt.next_bytes(s);
-        for (unsigned b = 0; b < 256; ++b) {
-            if (!byteset_has(next, static_cast<std::uint8_t>(b))) continue;
-            const std::int32_t t = rt.step(s, static_cast<std::uint8_t>(b));
-            if (t == halo::sampling::detail::kDead || prev.contains(t)) continue;
-            prev.emplace(t, Prev{s, static_cast<std::uint8_t>(b)});
-            queue.push_back(t);
-        }
-    }
-    return std::nullopt;
-}
 
 /// Random walk over the byte automaton: random allowed bytes for `budget` steps, then the
 /// shortest completion (so unanchored patterns and deep nesting close too). Returns the
