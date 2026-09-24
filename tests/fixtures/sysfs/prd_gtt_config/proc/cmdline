@@ -1,0 +1,1 @@
+BOOT_IMAGE=/boot/vmlinuz-6.8.0-45-generic root=UUID=00000000-0000-0000-0000-000000000000 ro quiet amdgpu.gttsize=122880 ttm.pages_limit=31457280

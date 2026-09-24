@@ -1,0 +1,8 @@
+cpu_cores_count 32
+simd_count 0
+mem_banks_count 1
+gfx_target_version 0
+vendor_id 0
+device_id 0
+location_id 0
+domain 0

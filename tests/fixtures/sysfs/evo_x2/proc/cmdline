@@ -1,0 +1,1 @@
+BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=00000000-0000-0000-0000-000000000000 ro quiet splash amd_iommu=off
