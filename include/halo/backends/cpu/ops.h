@@ -1,5 +1,5 @@
 #pragma once
-// HALO CPU reference operator set (WS-D; TRD §9 operator ids, DECISIONS.md D-003/D-004).
+// HALO CPU reference operator set (WS-D; TRD §9 operator ids, DECISIONS.md D-003/D-004/D-016).
 //
 // This is the semantic definition of every HALO operator: GPU kernels are accepted only
 // after differential tests against these functions (TRD §30). Correctness and clarity
@@ -23,8 +23,10 @@
 //     order as a naive loop or as torch — that is covered by the tested tolerances.
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -160,8 +162,25 @@ struct GdnInputs {
     ConstRows beta;
 };
 
+/// q/k preprocessing of GATED_DELTANET — the one input contract shared by every backend
+/// (DECISIONS.md D-016; the Vulkan op's GdnDecodeArgs has the same two fields with the
+/// same defaults). q and k are the raw per-head rows (after conv + SiLU). The kernel
+/// applies exactly this and nothing else:
+///   if qk_l2norm:  q <- q * rsqrt(sum(q^2) + 1e-6),  k <- k * rsqrt(sum(k^2) + 1e-6)
+///   q <- q * q_scale   (after the optional normalization; k is never scaled)
+/// q_scale = nullopt means 1/sqrt(d_k), the qwen35 value (D-004 item 3). Pass 1.0f for
+/// "no scaling". The model forward should pass both fields explicitly:
+/// GdnQkParams{.qk_l2norm = true, .q_scale = 1.0f / std::sqrt(128.0f)}.
+struct GdnQkParams {
+    bool qk_l2norm = true;
+    std::optional<float> q_scale;  // nullopt = 1/sqrt(d_k)
+};
+
+/// The q_scale a GdnQkParams resolves to for head dim d_k.
+[[nodiscard]] float gdn_q_scale(const GdnQkParams& qk, std::size_t d_k);
+
 /// GATED_DELTANET, recurrent form (D-004 item 6), per value head j and token t:
-///   q, k <- l2norm(q), l2norm(k) (eps 1e-6) when qk_l2norm; q <- q * (1/sqrt(d_k))
+///   q, k preprocessed per `qk` (GdnQkParams, D-016)
 ///   S <- S * exp(g);  kv = S^T k;  delta = (v - kv) * beta;  S <- S + k delta^T;
 ///   o = S^T q.
 /// state: [n_v_heads, d_k, d_v] fp32, d_v fastest (HF layout; NOTE ggml stores the
@@ -177,8 +196,20 @@ struct GdnInputs {
 /// bit-identical to the final state of the same call run on rows [0, T-1-s] only.
 /// Must not overlap any other operand.
 void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in,
-                                std::span<float> state, Rows out, bool qk_l2norm,
+                                std::span<float> state, Rows out, const GdnQkParams& qk = {},
                                 ThreadPool* pool = nullptr, std::span<float> state_slots = {});
+
+/// Source-compatible shorthand (pre-D-016 signature): GdnQkParams{qk_l2norm, 1/sqrt(d_k)}.
+/// This is exactly what the old bool form computed, so existing callers keep their results.
+/// A template on exactly `bool` so that a braced `{}` argument can only mean GdnQkParams{}
+/// (a plain `bool` overload would win overload resolution for `{}` and mean false).
+template <std::same_as<bool> Bool>
+void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in, std::span<float> state,
+                                Rows out, Bool qk_l2norm, ThreadPool* pool = nullptr,
+                                std::span<float> state_slots = {}) {
+    gated_delta_rule_recurrent(dims, in, state, out, GdnQkParams{.qk_l2norm = qk_l2norm, .q_scale = std::nullopt}, pool,
+                               state_slots);
+}
 
 /// GATED_DELTANET, chunked form: the same function as the recurrent form, evaluated
 /// chunk_size tokens at a time exactly as transformers torch_chunk_gated_delta_rule
@@ -192,8 +223,17 @@ void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in,
 /// slots never changes `out` or `state`, and slot s is bit-identical to the final state of
 /// a chunked call on rows [0, T-1-s] only (same chunk boundaries).
 void gated_delta_rule_chunked(const GdnDims& dims, const GdnInputs& in, std::span<float> state,
-                              Rows out, bool qk_l2norm, std::size_t chunk_size = 64,
+                              Rows out, const GdnQkParams& qk = {}, std::size_t chunk_size = 64,
                               ThreadPool* pool = nullptr, std::span<float> state_slots = {});
+
+/// Source-compatible shorthand (pre-D-016 signature): GdnQkParams{qk_l2norm, 1/sqrt(d_k)}.
+template <std::same_as<bool> Bool>
+void gated_delta_rule_chunked(const GdnDims& dims, const GdnInputs& in, std::span<float> state,
+                              Rows out, Bool qk_l2norm, std::size_t chunk_size = 64,
+                              ThreadPool* pool = nullptr, std::span<float> state_slots = {}) {
+    gated_delta_rule_chunked(dims, in, state, out, GdnQkParams{.qk_l2norm = qk_l2norm, .q_scale = std::nullopt}, chunk_size,
+                             pool, state_slots);
+}
 
 // ---------------------------------------------------------------------------------------
 // Attention
@@ -252,7 +292,8 @@ struct TopKEntry {
 };
 
 /// Index of the maximum; ties resolve to the lowest index. Throws Kernel on an empty
-/// row or on any NaN (a NaN logit is a bug upstream and must not be sampled silently).
+/// row or on any NaN (a NaN logit is a bug upstream and must not be sampled silently; every
+/// backend raises Error(Kernel) on NaN, D-016).
 [[nodiscard]] TopKEntry argmax(std::span<const float> logits);
 
 /// The k largest entries, sorted by value descending, ties by lower index first.

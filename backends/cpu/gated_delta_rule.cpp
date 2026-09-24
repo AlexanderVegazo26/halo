@@ -77,6 +77,13 @@ void prep_qk(const float* src, std::size_t n, bool l2, float scale, float* dst) 
 
 }  // namespace
 
+float gdn_q_scale(const GdnQkParams& qk, std::size_t d_k) {
+    HALO_CHECK(d_k > 0, ErrorCode::Kernel, "gdn_q_scale: d_k == 0");
+    const float s = qk.q_scale.value_or(1.0f / std::sqrt(static_cast<float>(d_k)));
+    HALO_CHECK(std::isfinite(s), ErrorCode::Kernel, "gdn: q_scale {} is not finite", s);
+    return s;
+}
+
 std::size_t gdn_k_head(const GdnDims& dims, std::size_t v_head) {
     HALO_CHECK(dims.n_k_heads > 0 && dims.n_v_heads % dims.n_k_heads == 0 && v_head < dims.n_v_heads,
                ErrorCode::Kernel, "gdn_k_head: bad head {} for n_v {} / n_k {}", v_head, dims.n_v_heads,
@@ -86,7 +93,7 @@ std::size_t gdn_k_head(const GdnDims& dims, std::size_t v_head) {
 }
 
 void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in, std::span<float> state,
-                                Rows out, bool qk_l2norm, ThreadPool* pool, std::span<float> state_slots) {
+                                Rows out, const GdnQkParams& qk, ThreadPool* pool, std::span<float> state_slots) {
     constexpr const char* kOp = "gated_delta_rule_recurrent";
     validate(dims, in, state, out, kOp);
     const std::size_t n_slots = validate_slots(in, state, out, state_slots, kOp);
@@ -94,7 +101,8 @@ void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in, std::s
     const std::size_t dv = dims.d_v;
     const std::size_t n_tok = in.q.rows();
     const std::size_t state_n = state.size();
-    const float scale = 1.0f / std::sqrt(static_cast<float>(dk));
+    const float scale = gdn_q_scale(qk, dk);
+    const bool qk_l2norm = qk.qk_l2norm;
 
     parallel_for(pool, dims.n_v_heads, [&](std::size_t h0, std::size_t h1) {
         std::vector<float> qn(dk), kn(dk), kv(dv), delta(dv);
@@ -140,7 +148,7 @@ void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in, std::s
 }
 
 void gated_delta_rule_chunked(const GdnDims& dims, const GdnInputs& in, std::span<float> state, Rows out,
-                              bool qk_l2norm, std::size_t chunk_size, ThreadPool* pool,
+                              const GdnQkParams& qk, std::size_t chunk_size, ThreadPool* pool,
                               std::span<float> state_slots) {
     constexpr const char* kOp = "gated_delta_rule_chunked";
     validate(dims, in, state, out, kOp);
@@ -158,7 +166,8 @@ void gated_delta_rule_chunked(const GdnDims& dims, const GdnInputs& in, std::spa
     const std::size_t dk = dims.d_k;
     const std::size_t dv = dims.d_v;
     const std::size_t cs = chunk_size;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(dk));
+    const float scale = gdn_q_scale(qk, dk);
+    const bool qk_l2norm = qk.qk_l2norm;
 
     parallel_for(pool, dims.n_v_heads, [&](std::size_t h0, std::size_t h1) {
         // Per-chunk scratch, row-major. Names follow torch_chunk_gated_delta_rule.

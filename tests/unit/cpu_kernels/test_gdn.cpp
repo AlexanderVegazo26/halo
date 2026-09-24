@@ -124,7 +124,8 @@ Ref ref(const Data& d, std::size_t n) {
     r.state.assign(d.s0.begin(), d.s0.end());
     const GdnRefDims rd{d.dims.n_k_heads, d.dims.n_v_heads, d.dims.d_k, d.dims.d_v,
                         d.dims.mapping == GdnHeadMapping::Tiled};
-    r.out = gdn_ref(rd, n, d.q, d.k, d.v, d.g, d.beta, r.state, true, &r.out_terms);
+    r.out = gdn_ref(rd, n, d.q, d.k, d.v, d.g, d.beta, r.state, true,
+                    1.0 / std::sqrt(static_cast<double>(d.dims.d_k)), &r.out_terms);
     return r;
 }
 

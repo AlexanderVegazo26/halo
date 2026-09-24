@@ -197,7 +197,8 @@ TEST_F(CpuGolden, GatedDeltaRuleGroupedAndTiledBothForms) {
             const GdnInputs in{cv(q, T, nk * dk), cv(k, T, nk * dk), cv(v, T, nv * dv), cv(g, T, nv), cv(beta, T, nv)};
             // Model G output scale (sum of |terms| of each output dot product) from fp64.
             std::vector<double> ref_state(s0.begin(), s0.end()), out_terms;
-            (void)gdn_ref({nk, nv, dk, dv, layout == "tiled"}, T, q, k, v, g, beta, ref_state, true, &out_terms);
+            (void)gdn_ref({nk, nv, dk, dv, layout == "tiled"}, T, q, k, v, g, beta, ref_state, true,
+                          1.0 / std::sqrt(static_cast<double>(dk)), &out_terms);
             for (const bool chunked : {false, true}) {
                 std::vector<float> st = s0, out(T * nv * dv);
                 if (chunked)

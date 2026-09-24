@@ -26,7 +26,9 @@ struct GdnRefDims {
     return d.tiled ? j % d.n_k : j / (d.n_v / d.n_k);
 }
 
-/// fp64 gated delta rule, recurrent form, D-004 item 6. Inputs dense token-major:
+/// fp64 gated delta rule, recurrent form, D-004 item 6, with the D-016 q/k contract: when
+/// `l2`, q and k are L2-normalized per head (eps 1e-6); then q *= q_scale (always explicit
+/// here -- no implicit 1/sqrt(d_k)). Inputs dense token-major:
 /// q,k [T, n_k*d_k], v [T, n_v*d_v], g/beta [T, n_v]; state [n_v, d_k, d_v] in/out.
 /// Returns out [T, n_v*d_v]. If out_terms is given it receives, per output element,
 /// sum_i |S[i][c] q[i]| -- the magnitude of the terms of the final dot product (the scale of
@@ -34,12 +36,11 @@ struct GdnRefDims {
 inline std::vector<double> gdn_ref(const GdnRefDims& d, std::size_t T, std::span<const float> q,
                                    std::span<const float> k, std::span<const float> v,
                                    std::span<const float> g, std::span<const float> beta,
-                                   std::vector<double>& state, bool l2,
+                                   std::vector<double>& state, bool l2, double q_scale,
                                    std::vector<double>* out_terms = nullptr) {
     std::vector<double> out(T * d.n_v * d.d_v, 0.0);
     if (out_terms) out_terms->assign(out.size(), 0.0);
     std::vector<double> qn(d.d_k), kn(d.d_k), kv(d.d_v), delta(d.d_v);
-    const double scale = 1.0 / std::sqrt(static_cast<double>(d.d_k));
     for (std::size_t t = 0; t < T; ++t) {
         for (std::size_t j = 0; j < d.n_v; ++j) {
             const std::size_t kh = ref_k_head(d, j);
@@ -53,7 +54,7 @@ inline std::vector<double> gdn_ref(const GdnRefDims& d, std::size_t T, std::span
             const double iq = l2 ? 1.0 / std::sqrt(sq + 1e-6) : 1.0;
             const double ik = l2 ? 1.0 / std::sqrt(sk + 1e-6) : 1.0;
             for (std::size_t i = 0; i < d.d_k; ++i) {
-                qn[i] *= iq * scale;
+                qn[i] *= iq * q_scale;
                 kn[i] *= ik;
             }
             double* S = state.data() + j * d.d_k * d.d_v;
