@@ -1,0 +1,47 @@
+// Host emulation of the HIP kernels: the same kernel bodies as the device, run by HostExec.
+// Compiled with -ffp-contract=off like the CPU reference and the device code.
+
+#include "host_exec.h"
+#include "launch.h"
+
+namespace halo::hip::detail {
+
+using namespace kern;
+
+void emulate_gdn_recurrent(const GdnRecParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GdnRecRegs, GdnRecShared>(l, reverse, [&](auto& ex, GdnRecShared& sh, unsigned bx, unsigned by) {
+        gdn_recurrent_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_gdn_check_g(const GdnCheckParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GdnNoRegs, GdnNoShared>(l, reverse, [&](auto& ex, GdnNoShared& sh, unsigned bx, unsigned by) {
+        gdn_check_g_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_gdn_chunk_intra(const GdnChunkParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GdnNoRegs, GdnIntraShared>(l, reverse, [&](auto& ex, GdnIntraShared& sh, unsigned bx, unsigned by) {
+        gdn_chunk_intra_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_gdn_chunk_state(const GdnChunkParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GdnNoRegs, GdnStateShared>(l, reverse, [&](auto& ex, GdnStateShared& sh, unsigned bx, unsigned by) {
+        gdn_chunk_state_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_conv1d_silu(const ConvParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<ConvRegs, ConvShared>(l, reverse, [&](auto& ex, ConvShared& sh, unsigned bx, unsigned by) {
+        conv1d_silu_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_norm(const NormParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<NormRegs, NormShared>(l, reverse, [&](auto& ex, NormShared& sh, unsigned bx, unsigned by) {
+        norm_body(ex, sh, p, bx, by);
+    });
+}
+
+}  // namespace halo::hip::detail
