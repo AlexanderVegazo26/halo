@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 #include "halo/backends/vulkan/buffer.h"
@@ -101,10 +102,26 @@ struct GdnDecodeArgs {
     std::optional<float> q_scale;  ///< D-016: q multiplier after normalization; nullopt = 1/sqrt(d_k)
 };
 
-/// Result layout written by argmax(): two 32-bit words {index (uint32), value (float bits)}.
-/// index == k_argmax_none when every element is NaN.
+/// Result layout written by argmax(): three 32-bit words
+///   {index (uint32), value (float bits), nan (1 if any logit was NaN, else 0)}.
+/// Read it with read_argmax() / decode_argmax(), which raise Error(Kernel) when the NaN
+/// word is set, like cpu::argmax (DECISIONS D-016, code review S-3).
+inline constexpr std::uint32_t k_argmax_result_bytes = 12;
+/// Index word when no element was eligible (every logit NaN); decode_argmax never returns it.
 inline constexpr std::uint32_t k_argmax_none = 0xFFFFFFFFu;
-inline constexpr std::uint32_t k_argmax_result_bytes = 8;
+
+struct ArgmaxResult {
+    std::uint32_t index = 0;
+    float value = 0.0f;
+};
+
+/// Decodes the three result words. Throws Error(Kernel) when the NaN word is set (a NaN
+/// logit is a bug upstream and must not be sampled silently; D-016), or when there is no
+/// index.
+[[nodiscard]] ArgmaxResult decode_argmax(std::span<const std::uint32_t, 3> words);
+/// Downloads k_argmax_result_bytes at byte `offset` of `result` (after the stream that
+/// wrote it has been waited on) and decodes them (same errors as decode_argmax).
+[[nodiscard]] ArgmaxResult read_argmax(const Buffer& result, std::uint64_t offset = 0);
 
 class Ops {
 public:
@@ -131,8 +148,10 @@ public:
 
     /// [ARGMAX_FUSED building block] index of the maximum of `logits[0..n)`. Two passes:
     /// per-workgroup partials into `scratch` (argmax_scratch_bytes(n) bytes), then one
-    /// workgroup reduces them into `result` (k_argmax_result_bytes). Ties resolve to the
-    /// lowest index; NaN elements are ignored; -inf is an ordinary value.
+    /// workgroup reduces them into `result` (k_argmax_result_bytes; read it with
+    /// read_argmax). Ties resolve to the lowest index; -inf is an ordinary value; any NaN
+    /// sets the result's NaN word, so read_argmax raises Error(Kernel) (D-016). Every
+    /// dispatch rewrites all three words, so a result buffer can be reused.
     void argmax(Stream& stream, const Buffer& logits, std::uint32_t n, Buffer& scratch,
                 Buffer& result);
     [[nodiscard]] std::uint64_t argmax_scratch_bytes(std::uint32_t n) const;

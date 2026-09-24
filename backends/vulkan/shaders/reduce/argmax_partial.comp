@@ -1,11 +1,13 @@
 #version 450
 // ARGMAX pass 1: workgroup g reduces logits[g*chunk, min(n, (g+1)*chunk)) to one
-// (index, value) pair in partials[2g], partials[2g+1] (value as float bits).
-// Order: larger value wins; equal values -> lower index; NaN is ignored; an empty /
+// (index, value, nan) triple in partials[3g .. 3g+2] (value as float bits).
+// Order: larger value wins; equal values -> lower index; -inf is ordinary. A NaN never
+// wins but sets the nan word (1 if any element of the range is NaN), so the host can
+// raise Error(Kernel) like cpu::argmax (DECISIONS D-016, code review S-3). An empty or
 // all-NaN range yields index 0xFFFFFFFF.
 #include "halo_common.glsl"
 
-layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Logits { float logits[]; };
@@ -21,6 +23,7 @@ const uint NONE = 0xFFFFFFFFu;
 
 shared float s_val[WG];
 shared uint s_idx[WG];
+shared uint s_nan[WG];
 
 // true if (va, ia) should replace (vb, ib)
 bool better(float va, uint ia, float vb, uint ib) {
@@ -38,9 +41,13 @@ void main() {
 
     float bv = 0.0;
     uint bi = NONE;
+    uint nan_seen = 0u;
     for (uint i = begin + tid; i < end; i += WG) {
         const float v = logits[i];
-        if (isnan(v)) continue;
+        if (isnan(v)) {
+            nan_seen = 1u;
+            continue;
+        }
         if (better(v, i, bv, bi)) {
             bv = v;
             bi = i;
@@ -48,16 +55,21 @@ void main() {
     }
     s_val[tid] = bv;
     s_idx[tid] = bi;
+    s_nan[tid] = nan_seen;
     barrier();
     for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s && better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
-            s_val[tid] = s_val[tid + s];
-            s_idx[tid] = s_idx[tid + s];
+        if (tid < s) {
+            if (better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+            s_nan[tid] |= s_nan[tid + s];
         }
         barrier();
     }
     if (tid == 0u) {
-        partials[2u * grp] = s_idx[0];
-        partials[2u * grp + 1u] = floatBitsToUint(s_val[0]);
+        partials[3u * grp] = s_idx[0];
+        partials[3u * grp + 1u] = floatBitsToUint(s_val[0]);
+        partials[3u * grp + 2u] = s_nan[0];
     }
 }

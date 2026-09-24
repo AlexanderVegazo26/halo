@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -740,8 +741,9 @@ TEST(VkGdn, ValidatesRegionsAndSizes) {
 
 namespace {
 
-std::uint32_t gpu_argmax(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, std::span<const float> x,
-                         float* value = nullptr, bool print_timing = false) {
+// One argmax dispatch; returns the three raw result words {index, value bits, nan}.
+std::array<std::uint32_t, 3> gpu_argmax_words(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops,
+                                              std::span<const float> x, bool print_timing = false) {
     hv::Buffer bx = upload(ctx, x);
     hv::Buffer scratch = hv::Buffer::create(ctx, ops.argmax_scratch_bytes(static_cast<std::uint32_t>(x.size())),
                                             hv::MemoryUsage::DeviceLocal);
@@ -755,9 +757,17 @@ std::uint32_t gpu_argmax(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, 
         std::cout << "[vk-timing] argmax n=" << x.size() << ": " << *s.elapsed_ns(*t0, *t1) / 1e6 << " ms — "
                   << timing_label(*ctx) << "\n";
     }
-    const auto r = download<std::uint32_t>(result, 2);
-    if (value) *value = std::bit_cast<float>(r[1]);
-    return r[0];
+    std::array<std::uint32_t, 3> w{};
+    result.download(std::span<std::uint32_t>(w));
+    return w;
+}
+
+// The host API path: decode_argmax raises Error(Kernel) on the NaN word (D-016).
+std::uint32_t gpu_argmax(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, std::span<const float> x,
+                         float* value = nullptr, bool print_timing = false) {
+    const hv::ArgmaxResult r = hv::decode_argmax(gpu_argmax_words(ctx, ops, x, print_timing));
+    if (value) *value = r.value;
+    return r.index;
 }
 
 }  // namespace
@@ -816,22 +826,79 @@ TEST(VkArgmax, EdgeValuesInfNanAndAllEqual) {
     same(pos_inf, 150u, "+inf tie -> lowest index");
     same(std::vector<float>{-3.0f}, 0u, "single element");
 
-    // NaN: halo::cpu raises Error(Kernel) (D-016). The Vulkan kernel still ignores NaN and
-    // reports k_argmax_none when every element is NaN; making it raise too is review item
-    // S-3 (next milestone), which replaces these three GPU expectations.
+    // NaN: both backends raise Error(Kernel) (D-016, code review S-3). Differential: for
+    // every array, the GPU path throws exactly when halo::cpu::argmax does.
+    auto nan_case = [&](const std::vector<float>& x, const std::string& what) {
+        EXPECT_THROW((void)hc::argmax(x), halo::Error) << what << " (halo::cpu)";
+        EXPECT_THROW((void)gpu_argmax(ctx, ops, x), halo::Error) << what;
+        EXPECT_EQ(gpu_argmax_words(ctx, ops, x)[2], 1u) << what << ": NaN word";
+    };
     std::vector<float> with_nan(50000, 0.0f);
     with_nan[10] = nan;
     with_nan[20] = 1.0f;
     with_nan[30] = nan;
-    EXPECT_THROW((void)hc::argmax(with_nan), halo::Error);
-    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), 20u) << "pre-S-3: NaN ignored";
+    nan_case(with_nan, "NaN next to the max, same partial");
     with_nan.assign(9000, nan);
     with_nan[8999] = -inf;
-    EXPECT_THROW((void)hc::argmax(with_nan), halo::Error);
-    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), 8999u) << "pre-S-3: only non-NaN element is -inf";
-    with_nan.assign(9000, nan);
-    EXPECT_THROW((void)hc::argmax(with_nan), halo::Error);
-    EXPECT_EQ(gpu_argmax(ctx, ops, with_nan), hv::k_argmax_none) << "pre-S-3: all NaN -> none";
+    nan_case(with_nan, "only non-NaN element is -inf");
+    nan_case(std::vector<float>(9000, nan), "all NaN");
+    nan_case(std::vector<float>{nan}, "single NaN");
+    for (const std::size_t at : {std::size_t{0}, std::size_t{4095}, std::size_t{4096}, std::size_t{49999}}) {
+        std::vector<float> y(50000, 0.5f);
+        y[123] = 9.0f;  // the max sits in partial 0; the NaN in partial 0, 0, 1 and the last one
+        y[at] = nan;
+        nan_case(y, "one NaN at " + std::to_string(at));
+    }
+    std::vector<float> neg_nan(5000, 1.0f);
+    neg_nan[777] = -nan;  // sign bit set
+    nan_case(neg_nan, "negative NaN");
+}
+
+TEST(VkArgmax, NanFlagAcrossWorkgroupSizesAndResultReuse) {
+    // The NaN word is OR-reduced through both passes at every workgroup size, and every
+    // dispatch rewrites it: a result buffer that held a NaN result reads clean afterwards.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const std::uint32_t n = 248320;
+    for (const std::uint32_t wg : {32u, 64u, 256u}) {
+        hv::Ops ops(ctx, hv::OpsOptions{.reduce_workgroup = wg});
+        std::mt19937 rng(700 + wg);
+        const auto x = ref::random_vec(n, rng, 4.0f);
+        auto bad = x;
+        bad[n - 1 - wg] = nan;  // late partial, not the max's
+        hv::Buffer bx = upload(ctx, std::span<const float>(x));
+        hv::Buffer bbad = upload(ctx, std::span<const float>(bad));
+        hv::Buffer scratch = hv::Buffer::create(ctx, ops.argmax_scratch_bytes(n), hv::MemoryUsage::DeviceLocal);
+        hv::Buffer result = hv::Buffer::create(ctx, hv::k_argmax_result_bytes, hv::MemoryUsage::HostCached);
+        for (int round = 0; round < 2; ++round) {
+            hv::Stream s1(ctx);
+            ops.argmax(s1, bbad, n, scratch, result);
+            s1.submit_and_wait();
+            EXPECT_THROW((void)hc::argmax(bad), halo::Error);
+            EXPECT_THROW((void)hv::read_argmax(result), halo::Error) << "wg=" << wg << " round " << round;
+            hv::Stream s2(ctx);
+            ops.argmax(s2, bx, n, scratch, result);
+            s2.submit_and_wait();
+            const hv::ArgmaxResult r = hv::read_argmax(result);
+            EXPECT_EQ(r.index, cpu_argmax(x)) << "wg=" << wg << " round " << round;
+            EXPECT_EQ(r.value, hc::argmax(x).value);
+        }
+    }
+}
+
+TEST(VkArgmax, DecodeArgmaxRaisesOnNanWordAndMissingIndex) {
+    // Host decoding alone (no device needed).
+    const std::array<std::uint32_t, 3> ok{7u, std::bit_cast<std::uint32_t>(2.5f), 0u};
+    const hv::ArgmaxResult r = hv::decode_argmax(ok);
+    EXPECT_EQ(r.index, 7u);
+    EXPECT_EQ(r.value, 2.5f);
+    EXPECT_THROW((void)hv::decode_argmax(std::array<std::uint32_t, 3>{7u, 0u, 1u}), halo::Error);
+    EXPECT_THROW((void)hv::decode_argmax(std::array<std::uint32_t, 3>{hv::k_argmax_none, 0u, 0u}), halo::Error);
+    try {
+        (void)hv::decode_argmax(std::array<std::uint32_t, 3>{7u, 0u, 1u});
+    } catch (const halo::Error& e) {
+        EXPECT_EQ(e.code(), halo::ErrorCode::Kernel);
+    }
 }
 
 TEST(VkArgmax, ValidatesBuffers) {
@@ -841,8 +908,9 @@ TEST(VkArgmax, ValidatesBuffers) {
     hv::Buffer x = hv::Buffer::create(ctx, 4000 * 4, hv::MemoryUsage::DeviceLocal);
     hv::Buffer small = hv::Buffer::create(ctx, 8, hv::MemoryUsage::DeviceLocal);
     hv::Buffer scratch = hv::Buffer::create(ctx, ops64.argmax_scratch_bytes(4000), hv::MemoryUsage::DeviceLocal);
-    hv::Buffer result = hv::Buffer::create(ctx, 8, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer result = hv::Buffer::create(ctx, hv::k_argmax_result_bytes, hv::MemoryUsage::DeviceLocal);
     hv::Stream s(ctx);
+    EXPECT_THROW(ops64.argmax(s, x, 4000, scratch, small), halo::Error);      // result < 12 bytes (no NaN word)
     EXPECT_THROW(ops64.argmax(s, x, 0, scratch, result), halo::Error);        // empty
     EXPECT_THROW(ops64.argmax(s, x, 4001, scratch, result), halo::Error);     // logits too small
     EXPECT_THROW(ops64.argmax(s, x, 4000, small, result), halo::Error);       // scratch too small
@@ -876,7 +944,7 @@ TEST(VkOps, ChainedNormMatvecArgmaxInOneSubmission) {
     hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
     hv::Buffer blog = hv::Buffer::create(ctx, rows * 4, hv::MemoryUsage::HostCached);
     hv::Buffer scratch = hv::Buffer::create(ctx, ops.argmax_scratch_bytes(rows), hv::MemoryUsage::DeviceLocal);
-    hv::Buffer result = hv::Buffer::create(ctx, 8, hv::MemoryUsage::HostCached);
+    hv::Buffer result = hv::Buffer::create(ctx, hv::k_argmax_result_bytes, hv::MemoryUsage::HostCached);
     hv::Stream s(ctx);
     ops.rms_norm(s, bx, bn, bxn, 1, cols, 1e-6f);
     ops.matvec(s, halo::DType::Q8_0, bw, bxn, blog, rows, cols);
@@ -887,7 +955,7 @@ TEST(VkOps, ChainedNormMatvecArgmaxInOneSubmission) {
     // Compare the GPU argmax with halo::cpu::argmax of the GPU logits (exact), and the
     // logits with the CPU logits within both matvec bounds widened by both rms_norm
     // relative input errors (see RmsNormMatchesCpu; the normalized input enters linearly).
-    EXPECT_EQ(download<std::uint32_t>(result, 1)[0], cpu_argmax(logits));
+    EXPECT_EQ(hv::read_argmax(result).index, cpu_argmax(logits));
     const double rms_rel = (std::ceil(double(cols) / 256) + log2u(256) + 16.0) * ref::k_u +
                            (std::ceil(double(cols) / k_cpu_lanes) + log2u(k_cpu_lanes) + 16.0) * ref::k_u;
     const double f = sum_bound_factor(cols, 256) + sum_bound_factor(cols, k_cpu_lanes) + rms_rel;

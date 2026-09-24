@@ -1,9 +1,11 @@
 #version 450
-// ARGMAX pass 2: one workgroup reduces `count` (index, value-bits) partials from pass 1
-// into result[0] = index, result[1] = value bits. Same ordering rules as pass 1.
+// ARGMAX pass 2: one workgroup reduces `count` (index, value-bits, nan) partials from pass
+// 1 into result[0] = index, result[1] = value bits, result[2] = nan (1 if any partial saw
+// a NaN). Same ordering rules as pass 1. Every dispatch writes all three words, so a
+// result buffer can be reused.
 #include "halo_common.glsl"
 
-layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Partials { uint partials[]; };
@@ -17,6 +19,7 @@ const uint NONE = 0xFFFFFFFFu;
 
 shared float s_val[WG];
 shared uint s_idx[WG];
+shared uint s_nan[WG];
 
 bool better(float va, uint ia, float vb, uint ib) {
     if (ia == NONE) return false;
@@ -28,9 +31,11 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     float bv = 0.0;
     uint bi = NONE;
+    uint nan_seen = 0u;
     for (uint p = tid; p < pc.count; p += WG) {
-        const uint ii = partials[2u * p];
-        const float vv = uintBitsToFloat(partials[2u * p + 1u]);
+        const uint ii = partials[3u * p];
+        const float vv = uintBitsToFloat(partials[3u * p + 1u]);
+        nan_seen |= partials[3u * p + 2u];
         if (better(vv, ii, bv, bi)) {
             bv = vv;
             bi = ii;
@@ -38,16 +43,21 @@ void main() {
     }
     s_val[tid] = bv;
     s_idx[tid] = bi;
+    s_nan[tid] = nan_seen;
     barrier();
     for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s && better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
-            s_val[tid] = s_val[tid + s];
-            s_idx[tid] = s_idx[tid + s];
+        if (tid < s) {
+            if (better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+            s_nan[tid] |= s_nan[tid + s];
         }
         barrier();
     }
     if (tid == 0u) {
         result[0] = s_idx[0];
         result[1] = floatBitsToUint(s_val[0]);
+        result[2] = s_nan[0] != 0u ? 1u : 0u;
     }
 }

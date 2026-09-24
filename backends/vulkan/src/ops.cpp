@@ -21,6 +21,9 @@ namespace {
 constexpr std::uint64_t k_f32 = 4;
 // Elements handled per argmax pass-1 thread (chunk = workgroup * this).
 constexpr std::uint32_t k_argmax_per_thread = 16;
+// Words per argmax partial / result: {index, value bits, nan flag}.
+constexpr std::uint32_t k_argmax_words = 3;
+static_assert(k_argmax_words * 4 == k_argmax_result_bytes);
 
 std::uint64_t round_up4(std::uint64_t v) { return (v + 3) / 4 * 4; }
 
@@ -80,7 +83,8 @@ Ops::Ops(std::shared_ptr<Context> ctx, OpsOptions options) : ctx_(std::move(ctx)
                    (std::uint64_t{options_.gdn_max_dk} + gw) * 2 * k_f32 <= info.max_shared_memory,
                ErrorCode::Kernel, "Ops: gdn_max_dk={} with gdn_workgroup={} exceeds shared memory ({} bytes)",
                options_.gdn_max_dk, gw, info.max_shared_memory);
-    HALO_CHECK(std::uint64_t{rw} * 8 <= info.max_shared_memory, ErrorCode::Kernel,
+    // argmax: three WG-wide shared arrays (value, index, NaN flag); rms_norm/matvec use one.
+    HALO_CHECK(std::uint64_t{rw} * 12 <= info.max_shared_memory, ErrorCode::Kernel,
                "Ops: reduce_workgroup={} exceeds shared memory", rw);
 }
 
@@ -275,6 +279,18 @@ void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) {
     stream.dispatch(k, bindings, push, grid_1d(a.n_v, info.max_workgroup_count[0], info.max_workgroup_count[1]));
 }
 
+ArgmaxResult decode_argmax(std::span<const std::uint32_t, 3> words) {
+    HALO_CHECK(words[2] == 0, ErrorCode::Kernel, "argmax: NaN in the logits (Vulkan kernel flag, D-016)");
+    HALO_CHECK(words[0] != k_argmax_none, ErrorCode::Kernel, "argmax: no index in the result");
+    return ArgmaxResult{words[0], std::bit_cast<float>(words[1])};
+}
+
+ArgmaxResult read_argmax(const Buffer& result, std::uint64_t offset) {
+    std::array<std::uint32_t, 3> w{};
+    result.download(std::span<std::uint32_t>(w), offset);
+    return decode_argmax(w);
+}
+
 std::uint32_t Ops::argmax_partials(std::uint32_t n) const {
     HALO_CHECK(n > 0, ErrorCode::Kernel, "argmax: empty input");
     const std::uint64_t chunk = std::uint64_t{options_.reduce_workgroup} * k_argmax_per_thread;
@@ -282,7 +298,7 @@ std::uint32_t Ops::argmax_partials(std::uint32_t n) const {
 }
 
 std::uint64_t Ops::argmax_scratch_bytes(std::uint32_t n) const {
-    return std::uint64_t{argmax_partials(n)} * 8;
+    return std::uint64_t{argmax_partials(n)} * k_argmax_words * 4;
 }
 
 void Ops::argmax(Stream& stream, const Buffer& logits, std::uint32_t n, Buffer& scratch, Buffer& result) {
