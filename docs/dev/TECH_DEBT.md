@@ -12,4 +12,4 @@ Each item has a cost (what it hurts), how it was found, and the fix. Owner decis
 | TD-6 | API server renders and tokenizes on the HTTP worker before admission, with no stack/time budget (review A-5 partial). | A hostile template or huge prompt ties up an HTTP worker. | WS-I M1 | Bounded render pool; depends on the WS-L template limits. |
 | TD-7 | HIP TOP_K does full bitonic sorts of every 2048-chunk (8 rounds at k=1024 over 248,320 logits). | LM-head top-k latency, unmeasured. | WS-K M3 | Radix-select or threshold pre-pass. |
 | TD-8 | HIP LM-head argmax reduce is one workgroup per vector over ~62K partials. | Decode-step latency tail, unmeasured. | WS-K M3 | Second partial stage. |
-| TD-9 | HIP `partial_rope_neox` assumes head h starts at h*head_dim; qwen35 `attn_q` interleaves [Q | gate] per head (D-004). | Wiring qwen35 onto HIP needs a de-interleave copy. | WS-K M3 | Head-stride parameter on RoPE. |
+| TD-9 | HIP `partial_rope_neox` assumes head h starts at h*head_dim; qwen35 `attn_q` interleaves [Q, gate] per head (D-004). | Wiring qwen35 onto HIP needs a de-interleave copy. | WS-K M3 | Head-stride parameter on RoPE. |
