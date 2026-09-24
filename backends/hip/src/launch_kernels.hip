@@ -49,6 +49,18 @@ __global__ void __launch_bounds__(1024) k_norm(NormParams p) {
     norm_body(ex, sh, p, blockIdx.x, blockIdx.y);
 }
 
+__global__ void __launch_bounds__(kGemvMaxBlock) k_gemv_generic(GemvParams p) {
+    __shared__ GemvGenericShared sh;
+    dev::DeviceExec<GemvNoRegs> ex;
+    gemv_generic_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(kGemvMaxBlock) k_gemv_wave(GemvParams p) {
+    __shared__ GemvWaveShared sh;
+    dev::DeviceExec<GemvNoRegs> ex;
+    gemv_wave_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
 template <class K, class P>
 int launch(K kernel, const P& p, const Launch& l, void* stream) {
     hipLaunchKernelGGL(kernel, dim3(l.grid_x, l.grid_y, 1), dim3(l.block, 1, 1), 0,
@@ -64,5 +76,7 @@ int launch_gdn_chunk_intra(const GdnChunkParams& p, const Launch& l, void* s) { 
 int launch_gdn_chunk_state(const GdnChunkParams& p, const Launch& l, void* s) { return launch(k_gdn_chunk_state, p, l, s); }
 int launch_conv1d_silu(const ConvParams& p, const Launch& l, void* s) { return launch(k_conv1d_silu, p, l, s); }
 int launch_norm(const NormParams& p, const Launch& l, void* s) { return launch(k_norm, p, l, s); }
+int launch_gemv_generic(const GemvParams& p, const Launch& l, void* s) { return launch(k_gemv_generic, p, l, s); }
+int launch_gemv_wave(const GemvParams& p, const Launch& l, void* s) { return launch(k_gemv_wave, p, l, s); }
 
 }  // namespace halo::hip::detail

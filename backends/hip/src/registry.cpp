@@ -12,7 +12,7 @@ namespace {
 
 constexpr std::string_view kGdnDecisions = "D-003 D-004(5,6) D-012 D-016";
 
-constexpr std::array<KernelVariant, 8> kVariants{{
+constexpr std::array<KernelVariant, 11> kVariants{{
     {"GATED_DELTANET", "recurrent", "gdn_recurrent_b128", "k_gdn_recurrent", 128,
      "grid (n_v, ceil(d_v/128)); thread = one value column, S[:,c] in registers (d_k <= 128)",
      kGdnDecisions, true},
@@ -31,6 +31,15 @@ constexpr std::array<KernelVariant, 8> kVariants{{
      "grid rows; lanes 0..7 = the CPU's 8 partial sums, thread 0 combines, then element-wise", "D-004(7)", true},
     {"GATED_NORM", "", "gated_norm_b32", "k_norm", 32, "as gated_norm_b128 with 32 threads (one wave32)",
      "D-004(7)", false},
+    {"QUANT_GEMV", "", "gemv_wave32_r4", "k_gemv_wave", 128,
+     "grid (ceil(N/4), T); one wave32 per row; lane owns 8-element groups l, l+32, ...; fixed LDS tree",
+     "D-007 D-014", true},
+    {"QUANT_GEMV", "", "gemv_wave32_r8", "k_gemv_wave", 256, "as gemv_wave32_r4 with 8 rows per workgroup",
+     "D-007 D-014", false},
+    {"QUANT_GEMV", "", "gemv_generic_b64", "k_gemv_generic", 64,
+     "grid (ceil(N/8), T); 8 lanes per row in the CPU dot order (bit-identical to cpu::matmul); per-element "
+     "dequant, slow",
+     "D-007 D-014", false},
 }};
 
 }  // namespace

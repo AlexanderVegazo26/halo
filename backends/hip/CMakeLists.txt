@@ -54,4 +54,5 @@ string(REPLACE ";" "," _halo_hip_archs "${CMAKE_HIP_ARCHITECTURES}")
 target_compile_definitions(halo_backend_hip PRIVATE HALO_HIP_OFFLOAD_ARCHS="${_halo_hip_archs}"
                                                     HALO_HIP_GENERIC_ISA=${_halo_hip_generic})
 target_compile_options(halo_backend_hip PRIVATE -ffp-contract=off)
-target_link_libraries(halo_backend_hip PUBLIC halo_core PRIVATE hip::host halo_hip_device halo_warnings)
+# PUBLIC halo_tensor: ops.h uses halo::DType (review N-2 pattern: include => link).
+target_link_libraries(halo_backend_hip PUBLIC halo_core halo_tensor PRIVATE hip::host halo_hip_device halo_warnings)

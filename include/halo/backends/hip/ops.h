@@ -28,6 +28,7 @@
 #include <string>
 
 #include "halo/backends/hip/runtime.h"
+#include "halo/tensor/dtype.h"
 
 namespace halo::hip {
 
@@ -152,12 +153,32 @@ struct GatedNormArgs {
     float eps = 1e-6f;
 };
 
+/// QUANT_GEMV / MATMUL for decode (cpu::matmul with a dequantized WeightMatrix):
+///   y[t][n] = sum_i x[t][i] * W[n][i],  t < n_vec, n < rows, i < cols.
+///  - wtype: F32, F16, Q8_0, Q4_K, Q5_K, Q6_K (ggml block layouts; DECISIONS D-007, D-014).
+///    Other types raise Error(Unsupported). cols must be a multiple of the block size.
+///  - w: `rows` rows of row_bytes(wtype, cols) bytes; the view's row_stride (0 = dense) is
+///    the byte distance between rows. Quantized/F16 rows may start at any byte; F32 rows
+///    need 4-byte alignment.
+///  - x: n_vec rows of [cols] fp32; y: n_vec rows of [rows] fp32; y must not overlap x or w.
+/// Dequantized weights are bit-identical to halo::tensor::dequantize_row. The generic
+/// variant also reproduces cpu::detail::dot's summation order (bit-identical to the CPU
+/// matmul); the wave variants use a different, fixed order (see docs/hip.md for the bound).
+struct GemvArgs {
+    DType wtype = DType::F32;
+    BufferView w{}, x{}, y{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+    std::uint32_t n_vec = 1;
+};
+
 /// Variant choice per operator (names from the kernel registry, registry.h).
 struct OpsOptions {
     std::string gdn_recurrent = "gdn_recurrent_b128";
     std::string gdn_chunked = "gdn_chunked_b64";
     std::string conv1d = "conv1d_silu_b256";
     std::string gated_norm = "gated_norm_b128";
+    std::string gemv = "gemv_wave32_r4";
 };
 
 class Ops {
@@ -175,6 +196,8 @@ public:
     void causal_conv1d_silu(const Target& target, const Conv1dArgs& args) const;
     /// [GATED_NORM]
     void gated_rms_norm(const Target& target, const GatedNormArgs& args) const;
+    /// [QUANT_GEMV / MATMUL]
+    void gemv(const Target& target, const GemvArgs& args) const;
 
     /// Reads a status word (device: synchronizes the target stream, then copies it) and
     /// throws Error(Kernel) naming the set bits; returns normally when it is zero.
@@ -186,6 +209,8 @@ private:
     unsigned gdn_chunk_block_ = 0;
     unsigned conv_block_ = 0;
     unsigned norm_block_ = 0;
+    unsigned gemv_block_ = 0;
+    bool gemv_generic_ = false;
 };
 
 }  // namespace halo::hip

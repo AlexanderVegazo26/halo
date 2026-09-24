@@ -44,4 +44,16 @@ void emulate_norm(const NormParams& p, const Launch& l, bool reverse) {
     });
 }
 
+void emulate_gemv_generic(const GemvParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GemvNoRegs, GemvGenericShared>(l, reverse, [&](auto& ex, GemvGenericShared& sh, unsigned bx, unsigned by) {
+        gemv_generic_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_gemv_wave(const GemvParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GemvNoRegs, GemvWaveShared>(l, reverse, [&](auto& ex, GemvWaveShared& sh, unsigned bx, unsigned by) {
+        gemv_wave_body(ex, sh, p, bx, by);
+    });
+}
+
 }  // namespace halo::hip::detail

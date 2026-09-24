@@ -94,6 +94,46 @@ Rows resolve(const Target& t, const BufferView& v, std::uint64_t rows, std::uint
     return r;
 }
 
+/// A validated byte-addressed 2-D operand (quantized weight rows).
+struct ByteRows {
+    const std::uint8_t* ptr = nullptr;
+    std::uint64_t stride = 0;  // bytes
+    Range range;
+};
+
+ByteRows resolve_bytes(const Target& t, const BufferView& v, std::uint64_t rows, std::uint64_t row_bytes,
+                       std::uint64_t align, const char* op, const char* what) {
+    HALO_CHECK(v.buffer != nullptr && !v.buffer->empty(), ErrorCode::Kernel, "{}: {} is missing", op, what);
+    const Buffer& b = *v.buffer;
+    check_target(t, b, op, what);
+    const std::uint64_t stride = v.row_stride == 0 ? row_bytes : v.row_stride;
+    HALO_CHECK(rows <= 1 || stride >= row_bytes, ErrorCode::Kernel, "{}: {} row stride {} < row bytes {}", op, what,
+               stride, row_bytes);
+    HALO_CHECK(v.offset <= b.bytes(), ErrorCode::Kernel, "{}: {} offset {} beyond buffer of {} bytes", op, what,
+               v.offset, b.bytes());
+    const std::uint64_t avail = b.bytes() - v.offset;
+    HALO_CHECK(v.bytes <= avail, ErrorCode::Kernel, "{}: {} view of {} bytes exceeds the {} bytes after offset",
+               op, what, v.bytes, avail);
+    const std::uint64_t limit = v.bytes == 0 ? avail : v.bytes;
+    std::uint64_t extent = 0;
+    if (rows > 0 && row_bytes > 0) {
+        extent = mul_checked(rows - 1, stride, op);
+        HALO_CHECK(extent <= std::numeric_limits<std::uint64_t>::max() - row_bytes, ErrorCode::Kernel,
+                   "{}: size overflow", op);
+        extent += row_bytes;
+    }
+    HALO_CHECK(extent <= limit, ErrorCode::Kernel, "{}: {} needs {} bytes ({} rows of {} bytes, stride {}), view has {}",
+               op, what, extent, rows, row_bytes, stride, limit);
+    ByteRows r;
+    r.ptr = static_cast<const std::uint8_t*>(b.data()) + v.offset;
+    HALO_CHECK(reinterpret_cast<std::uintptr_t>(r.ptr) % align == 0 && stride % align == 0, ErrorCode::Kernel,
+               "{}: {} is not {}-byte aligned", op, what, align);
+    r.stride = stride;
+    r.range.begin = reinterpret_cast<std::uintptr_t>(r.ptr);
+    r.range.end = r.range.begin + extent;
+    return r;
+}
+
 struct Named {
     const Rows* r;
     const char* what;
@@ -217,6 +257,8 @@ Ops::Ops(OpsOptions options) : options_(std::move(options)) {
                kern::kGdnStateMaxBlock);
     conv_block_ = block_of("CONV1D_SHORT", "", options_.conv1d);
     norm_block_ = block_of("GATED_NORM", "", options_.gated_norm);
+    gemv_block_ = block_of("QUANT_GEMV", "", options_.gemv);
+    gemv_generic_ = find_variant("QUANT_GEMV", options_.gemv).kernels == "k_gemv_generic";
 }
 
 void Ops::gated_delta_rule_recurrent(const Target& target, const GdnArgs& args) const {
@@ -393,6 +435,62 @@ void Ops::check_status(const Target& target, const BufferView& status) {
     if ((word & kStatusPositiveG) != 0) what += " g>0-or-NaN (chunked GATED_DELTANET requires g <= 0; nothing written)";
     if ((word & kStatusNaN) != 0) what += " NaN logit";
     throw_error(ErrorCode::Kernel, "HIP kernel status 0x{:x}:{}", word, what);
+}
+
+}  // namespace halo::hip
+
+namespace halo::hip {
+
+namespace {
+
+kern::WType gemv_wtype(DType t, const char* op) {
+    switch (t) {
+        case DType::F32: return kern::WType::F32;
+        case DType::F16: return kern::WType::F16;
+        case DType::Q8_0: return kern::WType::Q8_0;
+        case DType::Q4_K: return kern::WType::Q4_K;
+        case DType::Q5_K: return kern::WType::Q5_K;
+        case DType::Q6_K: return kern::WType::Q6_K;
+        default: break;
+    }
+    throw_error(ErrorCode::Unsupported, "{}: weight type id {} has no HIP GEMV kernel (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K)",
+                op, static_cast<std::uint32_t>(t));
+}
+
+}  // namespace
+
+void Ops::gemv(const Target& target, const GemvArgs& a) const {
+    constexpr const char* kOp = "hip::gemv";
+    const kern::WType wt = gemv_wtype(a.wtype, kOp);
+    HALO_CHECK(a.rows >= 1 && a.cols >= 1 && a.n_vec >= 1, ErrorCode::Kernel,
+               "{}: rows {}, cols {}, n_vec {} must all be >= 1", kOp, a.rows, a.cols, a.n_vec);
+    const unsigned be = kern::wq_block_elems(wt);
+    HALO_CHECK(a.cols % be == 0, ErrorCode::Kernel, "{}: cols {} is not a multiple of the block size {}", kOp, a.cols,
+               be);
+    const std::uint64_t row_bytes = mul_checked(a.cols / be, kern::wq_block_bytes(wt), kOp);
+    const ByteRows w = resolve_bytes(target, a.w, a.rows, row_bytes, wt == kern::WType::F32 ? 4 : 1, kOp, "w");
+    const Rows x = resolve(target, a.x, a.n_vec, a.cols, kOp, "x");
+    const Rows y = resolve(target, a.y, a.n_vec, a.rows, kOp, "y");
+    const Rows wr{nullptr, 0, w.range};
+    check_disjoint(y, "y", {{&x, "x"}, {&wr, "w"}}, kOp);
+    kern::GemvParams p;
+    p.type = wt;
+    p.w = w.ptr;
+    p.w_stride = w.stride;
+    p.x = x.ptr;
+    p.x_stride = x.stride;
+    p.y = y.ptr;
+    p.y_stride = y.stride;
+    p.rows = a.rows;
+    p.cols = a.cols;
+    p.n_vec = a.n_vec;
+    if (gemv_generic_) {
+        dispatch(target, &detail::launch_gemv_generic, &detail::emulate_gemv_generic, p,
+                 kern::gemv_generic_launch(a.rows, a.n_vec, gemv_block_), kOp);
+    } else {
+        dispatch(target, &detail::launch_gemv_wave, &detail::emulate_gemv_wave, p,
+                 kern::gemv_wave_launch(a.rows, a.n_vec, gemv_block_), kOp);
+    }
 }
 
 }  // namespace halo::hip

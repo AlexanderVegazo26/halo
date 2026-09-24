@@ -5,6 +5,7 @@
 
 #include "kernels/conv_norm.h"
 #include "kernels/gdn.h"
+#include "kernels/gemv.h"
 
 namespace halo::hip::detail {
 
@@ -15,6 +16,8 @@ int launch_gdn_chunk_intra(const kern::GdnChunkParams& p, const kern::Launch& l,
 int launch_gdn_chunk_state(const kern::GdnChunkParams& p, const kern::Launch& l, void* stream);
 int launch_conv1d_silu(const kern::ConvParams& p, const kern::Launch& l, void* stream);
 int launch_norm(const kern::NormParams& p, const kern::Launch& l, void* stream);
+int launch_gemv_generic(const kern::GemvParams& p, const kern::Launch& l, void* stream);
+int launch_gemv_wave(const kern::GemvParams& p, const kern::Launch& l, void* stream);
 
 // Host emulators (reverse = run threads and blocks in reverse order).
 void emulate_gdn_recurrent(const kern::GdnRecParams& p, const kern::Launch& l, bool reverse);
@@ -23,5 +26,7 @@ void emulate_gdn_chunk_intra(const kern::GdnChunkParams& p, const kern::Launch& 
 void emulate_gdn_chunk_state(const kern::GdnChunkParams& p, const kern::Launch& l, bool reverse);
 void emulate_conv1d_silu(const kern::ConvParams& p, const kern::Launch& l, bool reverse);
 void emulate_norm(const kern::NormParams& p, const kern::Launch& l, bool reverse);
+void emulate_gemv_generic(const kern::GemvParams& p, const kern::Launch& l, bool reverse);
+void emulate_gemv_wave(const kern::GemvParams& p, const kern::Launch& l, bool reverse);
 
 }  // namespace halo::hip::detail

@@ -1,8 +1,8 @@
 # HALO HIP backend (WS-K)
 
-Status: **milestone M1 of 3** (host runtime + GATED_DELTANET family). M2 (quantized GEMV)
-and M3 (LM head, RMSNorm / RoPE / SwiGLU / sigmoid gate) are not built yet; see
-"Not done" below.
+Status: **milestones M1 and M2 of 3**. M1 is the host runtime and the GATED_DELTANET family;
+M2 is quantized GEMV. M3 (LM head, RMSNorm / RoPE / SwiGLU / sigmoid gate) is not built
+yet; see "Not done" below.
 
 HALO's own kernels only. No rocBLAS, hipBLASLt or MIOpen (TRD §3.3); nothing here links a
 vendor math library.
@@ -82,6 +82,7 @@ The default build (`HALO_BUILD_HIP=OFF`) contains no HIP target and no HIP test.
 | `backends/hip/kernels/hd.h` | execution model, host/device math shims, the CPU's fixed-order 8-lane dot |
 | `backends/hip/kernels/gdn.h` | GATED_DELTANET recurrent + chunked (K0/K1/K2) bodies |
 | `backends/hip/kernels/conv_norm.h` | CONV1D_SHORT, RMS/GATED_NORM bodies |
+| `backends/hip/kernels/gemv.h` | QUANT_GEMV bodies (generic + wave), per-element dequant matching `tensor::dequantize_row` |
 | `backends/hip/src/launch_kernels.hip` | `__global__` wrappers + launchers (the only device TU) |
 | `backends/hip/src/emulate.cpp`, `host_exec.h` | host emulation |
 | `backends/hip/src/ops.cpp` | validation (before anything runs), parameter building, dispatch |
@@ -127,7 +128,7 @@ The default build (`HALO_BUILD_HIP=OFF`) contains no HIP target and no HIP test.
 - **Not in M1:** `hip_graph` (graph capture for decode replay), `hip_profiler`, and tier
   probing microbenchmarks. The hardware module owns tier discovery (D-002).
 
-## Operators (M1)
+## Operators
 
 The contracts are the CPU reference's (`include/halo/backends/cpu/ops.h`). The operands are
 `BufferView{buffer, offset, bytes, row_stride}`, the Vulkan backend's concept (review S-1):
@@ -142,6 +143,36 @@ The contracts are the CPU reference's (`include/halo/backends/cpu/ops.h`). The o
 | GATED_DELTANET, chunked | `k_gdn_check_g` → per group (`k_gdn_chunk_intra`, `k_gdn_chunk_state`) | `gdn_chunked_b64`, `gdn_chunked_b32` | same | Same math as `cpu::gated_delta_rule_chunked`: UT forward substitution, intra-chunk attention, one state update per chunk, and slots from the chunk's closed form. Workspace records hold q, k, k_cumdecay, new_values/v_new, attn, decay and gc. The op runs as many chunks per group as fit. Group 0 reads `state`, later groups read `state_out`. |
 | CONV1D_SHORT | `k_conv1d_silu` | `conv1d_silu_b256`, `conv1d_silu_b64` | D-004 (2), D-012 | One thread per channel. The K−1 history lives in registers (K ≤ 8). Fused SiLU. out may alias x. Slots. |
 | GATED_NORM | `k_norm` (gate operand set) | `gated_norm_b128`, `gated_norm_b32` | D-004 (7) | One workgroup per row. Lanes 0..7 compute the CPU's 8 interleaved partial sums, thread 0 combines them, then the element-wise `(w·(x·inv))·silu(z)`. out may alias x or z. |
+| QUANT_GEMV / MATMUL (decode) | `k_gemv_wave`, `k_gemv_generic` | `gemv_wave32_r4`, `gemv_wave32_r8`, `gemv_generic_b64` | D-007, D-014 | `y[t][n] = Σ_i x[t][i]·W[n][i]` for F32, F16, Q8_0, Q4_K, Q5_K, Q6_K in ggml block layouts, T = n_vec vectors (decode T = 1, MTP verify T > 1). Weight rows may start at any byte and have any byte stride (F32 needs 4-byte alignment). Other types raise `Error(Unsupported)`. See "GEMV reduction orders" below. |
+| QUANT_GEMV / MATMUL (decode) | `k_gemv_wave`, `k_gemv_generic` | `gemv_wave32_r4`, `gemv_wave32_r8`, `gemv_generic_b64` | D-007, D-014 | `y[t][n] = Σ_i x[t][i]·W[n][i]` for F32, F16, Q8_0, Q4_K, Q5_K, Q6_K in ggml block layouts, T = n_vec vectors (decode T = 1, MTP verify T > 1). Weight rows may start at any byte and have any byte stride (F32 needs 4-byte alignment). Other types raise `Error(Unsupported)`. See "GEMV reduction orders" below. |
+
+### GEMV reduction orders and the tolerance
+
+Dequantization (`kernels/gemv.h` `wq_elem`) reproduces `src/tensor/quant.cpp` operation by
+operation, including the fp16 → fp32 conversion. Every dequantized weight is therefore
+bit-identical to `halo::tensor::dequantize_row`. The variants differ only in how they sum:
+
+| Variant | Summation | Accepted by |
+|---|---|---|
+| `gemv_generic_b64` | 8 lanes per row in `cpu::detail::dot`'s order: lane l sums i ≡ l (mod 8) in increasing i, then `((p0+p4)+(p1+p5))+((p2+p6)+(p3+p7))` + tail | **bitwise** equality with `dequantize_row` + `cpu::matmul` |
+| `gemv_wave32_r4` (default), `gemv_wave32_r8` | one wave32 per row; lane l owns the 8-element groups l, l+32, … in increasing i (one scale lookup per group, contiguous loads), then a fixed LDS tree 16, 8, 4, 2, 1 | the summation bound below |
+
+**The bound (derived, not tuned).**
+- Both sides form every product `x_i·w_i` from bit-identical operands, so the products are
+  identical and the results differ only by summation rounding.
+- A sum whose longest addition chain has depth d satisfies `|ŝ − s| ≤ d·u·Σ|t_i|` to first
+  order, with u = 2⁻²⁴.
+- Hence `|y_hip − y_cpu| ≤ (d_cpu + d_wave)·u·Σ_i|x_i·w_i|·(1 + 10⁻³)`, where:
+  - `d_cpu = K/8 + 3 + K mod 8 + 1`;
+  - `d_wave = ⌈K/32⌉ + 5`;
+  - `Σ|x_i·w_i|` is computed in double from the dequantized weights.
+- Observed on the test data: at most **0.022** of the bound (emulation).
+
+The bound is loose for large K (about a quarter of an average term at K = 5120), so it
+cannot see a single wrong weight there. Dequantization errors are caught by the generic
+variant's bitwise test, which shares `wq_elem` with the wave variants. The bound catches
+reduction bugs in the wave kernels (a dropped tree level, a wrong group stride; see the
+demonstrate-fail record in the M2 report).
 
 ### D-016 (the GDN q/k contract)
 
@@ -211,9 +242,27 @@ In place is also different:
     with a strided x, K = 1, and K = 8.
   - **Gated norm:** 48 heads × 128. Also cols 37 with out = x at block 32, out = z with a
     strided view, and cols 5.
-- **Device tests.** Each scenario above also exists as a `…Device…` test. It compares
-  against `halo::cpu` within `|err| ≤ 2e-5 + 1e-5·|ref|`, which is an unmeasured choice
-  to be confirmed on the EVO-X2. They skip on the dev host.
+- **`test_hip_gemv`** runs the emulation in both orders against `tensor::dequantize_row`
+  followed by `cpu::matmul` on the same bytes. There are 12 shapes: 2 per type for all six
+  types, each through all three variants.
+  - **Weights:** random quants with finite f16 scales. Every row includes one subnormal
+    f16 scale (or subnormal element for F16 and F32), which exercises the fp16 subnormal
+    path.
+  - **Shape 1:** 37 rows, K = 512 (K = 100 for F16/F32, which exercises the dot tail).
+  - **Shape 2:** 13 rows, K = 5120 (the qwen35 hidden size), T = 3 vectors, row stride
+    padded by 3 bytes and the first row at byte offset 1. For F32 the padding and offset
+    are 4 bytes, keeping 4-byte alignment. x and y are strided views (x padded by 5
+    floats, y by 3), and the y padding must keep its sentinel.
+  - **Rejections:** an unsupported type (Q4_0) raises `Error(Unsupported)`; cols not a
+    multiple of the block size, y overlapping w, a view one block short, and misaligned
+    F32 weights each raise `Error(Kernel)`.
+- **Device tests.** Each scenario above also exists as a `…Device…` test. They skip on
+  the dev host.
+  - GDN, conv and norm compare against `halo::cpu` within `|err| ≤ 2e-5 + 1e-5·|ref|`.
+    That tolerance is an unmeasured choice, to be confirmed on the EVO-X2.
+  - GEMV uses the same criteria as the emulation. The generic variant must be bitwise
+    equal, because it uses only IEEE fp32 multiply and add. A device mismatch there (for
+    example from denormal flushing) is a finding to investigate, not a tolerance to widen.
 
 ### Running the device tests on the EVO-X2
 
@@ -237,6 +286,8 @@ at `-O2` (RelWithDebInfo).
 | `k_gdn_chunk_state` | 20 | 0 | 32768 | 2 |
 | `k_conv1d_silu` | 40 | 0 | 0 | 16 |
 | `k_norm` | 15 | 0 | 36 | 16 |
+| `k_gemv_wave` | 29 | 0 | 1024 | 16 |
+| `k_gemv_generic` | 25 | 0 | 1024 | 16 |
 
 Two findings from getting these numbers (measured at build time):
 
@@ -251,10 +302,27 @@ Two findings from getting these numbers (measured at build time):
   - put a compiler-only memory fence (`sched_fence`) every 16 steps.
 
 **2. The register-resident chunk-state kernel still spilled** (ScratchSize 2744 B/lane).
-- It now keeps each thread's state column in a thread-private LDS tile instead: 32 KiB,
-  with the block ≤ 64.
-- That costs occupancy (an estimated 2 waves/SIMD) and reloads S from LDS in every loop.
-- It is the first thing to tune on hardware, and is recorded as performance debt.
+It now keeps each thread's state column in LDS; see "Known performance debt".
+
+## Known performance debt
+
+Each item is a deliberate correctness-first choice. None is measured; the cost is unknown
+until the EVO-X2 runs.
+
+1. **Chunked GDN state kernel keeps S in LDS, not registers.** (Recorded by the
+   orchestrator.)
+   - Each thread's state column sits in a thread-private 32 KiB LDS tile, with the block
+     ≤ 64. The register-resident version spilled 2744 B/lane.
+   - Cost: an estimated 2 waves/SIMD, and S is reloaded from LDS in every loop.
+   - Affects prefill throughput. It is the first thing to tune on hardware, with
+     cooperative LDS tiling of the chunk update.
+2. **GEMV decodes each element's block header and scale again.** `wq_elem` decodes the
+   f16 d/dmin and the 6-bit scale per element.
+   - The wave variant's 8-element groups let the compiler share some of that work.
+   - A tuned path would decode once per 32-element sub-block and use packed loads.
+   - The generic variant exists for exactness and is not meant to be fast.
+3. **No wave64 variant.** RDNA3.5 wave32 vs wave64 was not compared. Only wave32 variants
+   are registered.
 
 ## TRD §63 acceptance status
 
@@ -263,13 +331,16 @@ Two findings from getting these numbers (measured at build time):
 | gfx1151 (or logged gfx11-generic) build succeeds | **Met on the dev host (compile).** gfx1151 by default. A generic ISA needs explicit opt-in and is logged. |
 | Device discovery succeeds; tier probing succeeds | **Discovery implemented, unverified on a device.** On the dev host it fails cleanly with `hipErrorNoDevice`. Tier probing belongs to the hardware module and is not part of this backend. |
 | GPU allocations succeed on GTT and carveout | **Implemented** (`HostPinned` = GTT, `Device` = carveout). The test exists but is unverified (skipped). |
-| Core operators execute; custom GDN and GEMV kernels exist | **GDN kernels exist**: compiled, emulation-verified, not executed. **GEMV: not yet (M2).** |
+| Core operators execute; custom GDN and GEMV kernels exist | **GDN and GEMV kernels exist** (GEMV: F32, F16, Q8_0, Q4_K, Q5_K, Q6_K): compiled and emulation-verified, not executed. |
 | Reference-vs-HIP correctness passes | **Emulation: passes bit for bit. Device: unverified.** |
 | Benchmark suite executes reproducibly | **Not started.** |
 
-## Not done (M1 scope boundary)
+## Not done (M2 scope boundary)
 
-- **M2:** quantized GEMV (Q4_K, Q5_K, Q6_K, Q8_0, F16, F32) plus a tuned variant.
+- **GEMV:**
+  - IQ4_XS, IQ4_NL, Q3_K, IQ3_S (the D-014 second tier);
+  - a prefill GEMM;
+  - a wave64 comparison.
 - **M3:**
   - LM head: logits GEMV, fused argmax with NaN → `Error(Kernel)`, and top-k ≤ 1024;
   - plain RMS_NORM exposed as an op (the kernel body already supports it);

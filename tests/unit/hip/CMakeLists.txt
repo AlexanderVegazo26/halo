@@ -5,3 +5,6 @@ if(NOT TARGET halo_backend_hip)
 endif()
 halo_add_test(test_hip_runtime SOURCES test_hip_runtime.cpp LIBS halo_backend_hip hip::host)
 halo_add_test(test_hip_gdn SOURCES test_hip_gdn.cpp LIBS halo_backend_hip halo_backend_cpu)
+halo_add_test(test_hip_gemv SOURCES test_hip_gemv.cpp LIBS halo_backend_hip halo_backend_cpu halo_tensor)
+# The error bound uses the kernels' own summation-depth formulas (kernels/gemv.h).
+target_include_directories(test_hip_gemv PRIVATE ${PROJECT_SOURCE_DIR}/backends/hip)
