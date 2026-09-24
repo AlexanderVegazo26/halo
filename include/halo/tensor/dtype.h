@@ -2,6 +2,11 @@
 // Tensor element types. Numeric values are identical to ggml's `enum ggml_type` so GGUF
 // tensor-info type ids map 1:1 (DECISIONS.md D-007). Block geometry and dequantization
 // live in the tensor module (src/tensor).
+//
+// The enumerator list is deliberately limited to the ggml types HALO knows the geometry of.
+// Newer ggml types (TQ1_0=34, TQ2_0=35, MXFP4=39, NVFP4=40, Q1_0=41, Q2_0=42 at llama.cpp
+// bd4f514db) are not enumerators: `dtype_from_id` returns nullopt for them and
+// `ggml_type_name` still names them so loaders can report UNSUPPORTED_ERROR precisely.
 
 #include <cstddef>
 #include <cstdint>
@@ -52,5 +57,13 @@ struct DTypeTraits {
 // Returns nullopt for ids HALO does not know (a GGUF may carry any uint32).
 [[nodiscard]] std::optional<DType> dtype_from_id(std::uint32_t id) noexcept;
 [[nodiscard]] const DTypeTraits& traits(DType t);  // throws Error(Unsupported) if unknown
+
+// Name of a ggml type id as ggml spells it ("Q4_K", "MXFP4", ...), including ggml types
+// that HALO has no DType for. Returns an empty view for ids that were never valid ggml
+// types (4, 5, 31-33, 36-38, >= 43 at llama.cpp bd4f514db).
+[[nodiscard]] std::string_view ggml_type_name(std::uint32_t id) noexcept;
+
+// True if `tensor::dequantize_row` / `tensor::vec_dot_row` implement this type.
+[[nodiscard]] bool dequant_supported(DType t) noexcept;
 
 }  // namespace halo
