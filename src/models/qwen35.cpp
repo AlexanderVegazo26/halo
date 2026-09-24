@@ -436,6 +436,7 @@ std::size_t Qwen35::n_embd() const noexcept { return impl_->E; }
 std::uint64_t Qwen35::trunk_weight_bytes() const noexcept { return impl_->trunk_bytes; }
 std::uint64_t Qwen35::lm_head_bytes() const noexcept { return impl_->head_bytes; }
 std::uint64_t Qwen35::mtp_block_bytes() const noexcept { return impl_->mtp ? impl_->mtp->bytes : 0; }
+std::uint64_t Qwen35::mtp_head_bytes() const noexcept { return impl_->mtp ? impl_->mtp->head_ref.n_bytes() : 0; }
 std::uint64_t Qwen35::embedding_row_bytes() const noexcept {
     return tensor::row_bytes(impl_->embd.type(), static_cast<std::int64_t>(impl_->E));
 }

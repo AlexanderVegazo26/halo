@@ -176,6 +176,7 @@ public:
     [[nodiscard]] std::uint64_t trunk_weight_bytes() const noexcept;  ///< all trunk layers + output_norm, no head/embedding
     [[nodiscard]] std::uint64_t lm_head_bytes() const noexcept;
     [[nodiscard]] std::uint64_t mtp_block_bytes() const noexcept;     ///< 0 without MTP
+    [[nodiscard]] std::uint64_t mtp_head_bytes() const noexcept;      ///< LM head the MTP uses (0 without MTP)
     [[nodiscard]] std::uint64_t embedding_row_bytes() const noexcept;
 
     struct Impl;

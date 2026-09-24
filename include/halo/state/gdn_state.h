@@ -12,7 +12,7 @@
 // state (slot 0 is the live state already, so accepting everything copies nothing).
 //
 // Checkpoints (D-013): snapshot() copies the full live state of every layer; restore()
-// copies one back. CheckpointStore keeps snapshots under a byte budget.
+// copies one back. CheckpointStore (checkpoint.h) keeps snapshots under a byte budget.
 //
 // Thread-safety: a GdnState is not thread-safe (one sequence, one owner).
 
