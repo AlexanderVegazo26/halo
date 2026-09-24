@@ -61,6 +61,37 @@ __global__ void __launch_bounds__(kGemvMaxBlock) k_gemv_wave(GemvParams p) {
     gemv_wave_body(ex, sh, p, blockIdx.x, blockIdx.y);
 }
 
+__global__ void __launch_bounds__(kArgMaxBlock) k_argmax_partial(ArgmaxParams p) {
+    __shared__ ArgShared sh;
+    dev::DeviceExec<ArgNoRegs> ex;
+    argmax_partial_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(kArgMaxBlock) k_argmax_reduce(ArgmaxParams p) {
+    __shared__ ArgShared sh;
+    dev::DeviceExec<ArgNoRegs> ex;
+    argmax_reduce_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(256) k_topk(TopkParams p) {
+    __shared__ TopkShared sh;
+    dev::DeviceExec<ArgNoRegs> ex;
+    topk_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(256) k_rope(RopeParams p) {
+    __shared__ RopeShared sh;
+    dev::DeviceExec<ArgNoRegs> ex;
+    rope_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(1024) k_eltwise(EwParams p) {
+    __shared__ EwShared sh;
+    dev::DeviceExec<ArgNoRegs> ex;
+    ew_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+
 template <class K, class P>
 int launch(K kernel, const P& p, const Launch& l, void* stream) {
     hipLaunchKernelGGL(kernel, dim3(l.grid_x, l.grid_y, 1), dim3(l.block, 1, 1), 0,
@@ -78,5 +109,10 @@ int launch_conv1d_silu(const ConvParams& p, const Launch& l, void* s) { return l
 int launch_norm(const NormParams& p, const Launch& l, void* s) { return launch(k_norm, p, l, s); }
 int launch_gemv_generic(const GemvParams& p, const Launch& l, void* s) { return launch(k_gemv_generic, p, l, s); }
 int launch_gemv_wave(const GemvParams& p, const Launch& l, void* s) { return launch(k_gemv_wave, p, l, s); }
+int launch_argmax_partial(const ArgmaxParams& p, const Launch& l, void* s) { return launch(k_argmax_partial, p, l, s); }
+int launch_argmax_reduce(const ArgmaxParams& p, const Launch& l, void* s) { return launch(k_argmax_reduce, p, l, s); }
+int launch_topk(const TopkParams& p, const Launch& l, void* s) { return launch(k_topk, p, l, s); }
+int launch_rope(const RopeParams& p, const Launch& l, void* s) { return launch(k_rope, p, l, s); }
+int launch_eltwise(const EwParams& p, const Launch& l, void* s) { return launch(k_eltwise, p, l, s); }
 
 }  // namespace halo::hip::detail

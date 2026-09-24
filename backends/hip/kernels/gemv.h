@@ -16,6 +16,7 @@
 //     the CPU's order: accepted within a derived summation-error bound (tests).
 
 #include "hd.h"
+#include "head.h"
 
 namespace halo::hip::kern {
 
@@ -163,11 +164,44 @@ struct GemvParams {
     unsigned rows = 0;           // N
     unsigned cols = 0;           // K
     unsigned n_vec = 1;          // T
+    ArgPart* part = nullptr;     // LM head: per-workgroup argmax partials, [n_vec][n_parts]
+    unsigned n_parts = 0;        // = grid.x
 };
 
 struct GemvNoRegs {
     float unused;
 };
+
+/// ARGMAX_FUSED epilogue: thread 0 ranks this workgroup's rows (rows n >= p.rows excluded)
+/// into one partial; NaN rows only set the flag. Stage 2 is argmax_reduce_body.
+template <class Exec>
+HALO_HD void gemv_argmax_epilogue(Exec& ex, const float* rowv, const GemvParams& p, unsigned rpb, unsigned bx,
+                                  unsigned by) {
+    ex.phase([&](unsigned tid, GemvNoRegs&) {
+        if (tid != 0) return;
+        float bv = 0.0f;
+        std::uint32_t bi = kNoIndex;
+        std::uint32_t nan = 0;
+        for (unsigned r = 0; r < rpb; ++r) {
+            const unsigned n = bx * rpb + r;
+            if (n >= p.rows) break;
+            const float v = rowv[r];
+            if (hisnan(v)) {
+                nan = 1;
+                continue;
+            }
+            if (ranks_before(v, n, bv, bi)) {
+                bv = v;
+                bi = n;
+            }
+        }
+        ArgPart& o = p.part[static_cast<std::uint64_t>(by) * p.n_parts + bx];
+        o.value = bv;
+        o.index = bi;
+        o.nan = nan;
+        o.pad = 0;
+    });
+}
 
 // ---- generic: 8 lanes per row (the CPU dot order) -------------------------------------
 
@@ -176,6 +210,7 @@ inline constexpr unsigned kGemvMaxBlock = 256;
 
 struct GemvGenericShared {
     float part[kGemvMaxBlock];
+    float rowv[kGemvMaxBlock / 8];
 };
 
 inline Launch gemv_generic_launch(unsigned rows, unsigned n_vec, unsigned block) {
@@ -207,8 +242,11 @@ HALO_HD void gemv_generic_body(Exec& ex, GemvGenericShared& sh, const GemvParams
         float tail = 0.0f;
         for (unsigned i = full; i < p.cols; ++i) tail = tail + x[i] * wq_elem(p.type, row, i);
         const float s = ((q[0] + q[4]) + (q[1] + q[5])) + ((q[2] + q[6]) + (q[3] + q[7]));
-        p.y[static_cast<std::uint64_t>(by) * p.y_stride + n] = s + tail;
+        const float v = s + tail;
+        sh.rowv[tid / kGemvGenericLanes] = v;
+        if (p.y != nullptr) p.y[static_cast<std::uint64_t>(by) * p.y_stride + n] = v;
     });
+    if (p.part != nullptr) gemv_argmax_epilogue(ex, sh.rowv, p, rpb, bx, by);
 }
 
 // ---- wave: 32 lanes per row, 8-element groups, fixed LDS tree --------------------------
@@ -218,6 +256,7 @@ inline constexpr unsigned kGemvGroup = 8;
 
 struct GemvWaveShared {
     float red[kGemvMaxBlock];
+    float rowv[kGemvMaxBlock / 8];
 };
 
 inline Launch gemv_wave_launch(unsigned rows, unsigned n_vec, unsigned block) {
@@ -252,8 +291,11 @@ HALO_HD void gemv_wave_body(Exec& ex, GemvWaveShared& sh, const GemvParams& p, u
     ex.phase([&](unsigned tid, GemvNoRegs&) {
         if (tid % kGemvWaveLanes != 0u) return;
         const unsigned n = bx * rpb + tid / kGemvWaveLanes;
-        if (n < p.rows) p.y[static_cast<std::uint64_t>(by) * p.y_stride + n] = sh.red[tid];
+        if (n >= p.rows) return;
+        sh.rowv[tid / kGemvWaveLanes] = sh.red[tid];
+        if (p.y != nullptr) p.y[static_cast<std::uint64_t>(by) * p.y_stride + n] = sh.red[tid];
     });
+    if (p.part != nullptr) gemv_argmax_epilogue(ex, sh.rowv, p, rpb, bx, by);
 }
 
 /// Depth of the wave variant's summation tree for K columns (for the error bound): the

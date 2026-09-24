@@ -1,8 +1,11 @@
 # HALO HIP backend (WS-K)
 
-Status: **milestones M1 and M2 of 3**. M1 is the host runtime and the GATED_DELTANET family;
-M2 is quantized GEMV. M3 (LM head, RMSNorm / RoPE / SwiGLU / sigmoid gate) is not built
-yet; see "Not done" below.
+Status: **milestones M1–M3 complete** (the WS-K plan).
+- M1: the host runtime and the GATED_DELTANET family.
+- M2: quantized GEMV.
+- M3: the LM head with fused argmax, TOP_K, RMS_NORM, PARTIAL_ROPE, SWIGLU and MUL_SIGMOID.
+
+What remains is listed under "Not done".
 
 HALO's own kernels only. No rocBLAS, hipBLASLt or MIOpen (TRD §3.3); nothing here links a
 vendor math library.
@@ -82,7 +85,8 @@ The default build (`HALO_BUILD_HIP=OFF`) contains no HIP target and no HIP test.
 | `backends/hip/kernels/hd.h` | execution model, host/device math shims, the CPU's fixed-order 8-lane dot |
 | `backends/hip/kernels/gdn.h` | GATED_DELTANET recurrent + chunked (K0/K1/K2) bodies |
 | `backends/hip/kernels/conv_norm.h` | CONV1D_SHORT, RMS/GATED_NORM bodies |
-| `backends/hip/kernels/gemv.h` | QUANT_GEMV bodies (generic + wave), per-element dequant matching `tensor::dequantize_row` |
+| `backends/hip/kernels/gemv.h` | QUANT_GEMV bodies (generic + wave), per-element dequant matching `tensor::dequantize_row`, and the LM head's argmax epilogue |
+| `backends/hip/kernels/head.h` | ARGMAX (partial + reduce), TOP_K (bitonic), PARTIAL_ROPE, SWIGLU / MUL_SIGMOID bodies |
 | `backends/hip/src/launch_kernels.hip` | `__global__` wrappers + launchers (the only device TU) |
 | `backends/hip/src/emulate.cpp`, `host_exec.h` | host emulation |
 | `backends/hip/src/ops.cpp` | validation (before anything runs), parameter building, dispatch |
@@ -144,7 +148,12 @@ The contracts are the CPU reference's (`include/halo/backends/cpu/ops.h`). The o
 | CONV1D_SHORT | `k_conv1d_silu` | `conv1d_silu_b256`, `conv1d_silu_b64` | D-004 (2), D-012 | One thread per channel. The K−1 history lives in registers (K ≤ 8). Fused SiLU. out may alias x. Slots. |
 | GATED_NORM | `k_norm` (gate operand set) | `gated_norm_b128`, `gated_norm_b32` | D-004 (7) | One workgroup per row. Lanes 0..7 compute the CPU's 8 interleaved partial sums, thread 0 combines them, then the element-wise `(w·(x·inv))·silu(z)`. out may alias x or z. |
 | QUANT_GEMV / MATMUL (decode) | `k_gemv_wave`, `k_gemv_generic` | `gemv_wave32_r4`, `gemv_wave32_r8`, `gemv_generic_b64` | D-007, D-014 | `y[t][n] = Σ_i x[t][i]·W[n][i]` for F32, F16, Q8_0, Q4_K, Q5_K, Q6_K in ggml block layouts, T = n_vec vectors (decode T = 1, MTP verify T > 1). Weight rows may start at any byte and have any byte stride (F32 needs 4-byte alignment). Other types raise `Error(Unsupported)`. See "GEMV reduction orders" below. |
-| QUANT_GEMV / MATMUL (decode) | `k_gemv_wave`, `k_gemv_generic` | `gemv_wave32_r4`, `gemv_wave32_r8`, `gemv_generic_b64` | D-007, D-014 | `y[t][n] = Σ_i x[t][i]·W[n][i]` for F32, F16, Q8_0, Q4_K, Q5_K, Q6_K in ggml block layouts, T = n_vec vectors (decode T = 1, MTP verify T > 1). Weight rows may start at any byte and have any byte stride (F32 needs 4-byte alignment). Other types raise `Error(Unsupported)`. See "GEMV reduction orders" below. |
+| LOGITS_MATMUL + ARGMAX_FUSED (LM head) | the QUANT_GEMV kernel with its argmax epilogue → `k_argmax_reduce` | GEMV variant (`OpsOptions::gemv`) + `argmax_b256` | D-007, D-016, TRD §19 | `cpu::matmul_argmax` per vector (T = n_vec). Each GEMV workgroup ranks its own rows as soon as their logits exist, so the logits never have to be written (they are written only if `gemv.y` is set). Stage 2 is one workgroup per vector. Ties go to the lowest index; −inf is an ordinary value. A NaN sets the result's NaN word, and `Ops::read_argmax` raises `Error(Kernel)`. Result layout `{index, value bits, nan}` is the Vulkan backend's. |
+| ARGMAX_FUSED (over logits) | `k_argmax_partial` → `k_argmax_reduce` | `argmax_b256` | D-016 | `cpu::argmax` per vector. 16 logits per thread, then a fixed LDS tree. |
+| TOP_K | `k_topk` (repeated rounds) | `topk_bitonic_b256` | TRD §19, D-016 | `cpu::top_k` per vector: the k largest, sorted descending, ties by lower index; 1 ≤ k ≤ min(n, 1024). Each round bitonic-sorts 2048-candidate chunks in LDS (16 KiB) and keeps k of each, until one chunk remains. For 248,320 logits that is 3 rounds at k = 40 and 8 rounds at k = 1024. NaN sets `kStatusNaN`, and `check_status` raises `Error(Kernel)`. Only k ids and values leave the device. |
+| RMS_NORM | `k_norm` (no gate) | `rms_norm_b128`, `rms_norm_b32` | D-004 | `cpu::rms_norm`: `(x·inv)·w`, the CPU's 8-lane sum order. Per-head norms are rows = T·heads. out may alias x. |
+| PARTIAL_ROPE | `k_rope` | `rope_neox_b128` | D-004 | `cpu::partial_rope_neox` in place. inv_freq is computed on the host with the CPU's expression and passed in the kernel arguments. The angle is one fp32 multiply; cos/sin are evaluated in double of the fp32 angle. rot_dims ≤ 128 (backend limit; qwen35 uses 64). |
+| SWIGLU / MUL_SIGMOID | `k_eltwise` | `swiglu_b256`, `mul_sigmoid_b256` | D-004 | `silu(gate)·up` and `x·sigmoid(gate)`, with the CPU's expressions. out may alias either input. |
 
 ### GEMV reduction orders and the tolerance
 
@@ -201,6 +210,8 @@ Each of these is rejected with `Error(Kernel)` and tested:
 | `d_k` | ≤ 128 (register-resident state column) | any |
 | `chunk_size` | ≤ 64 (LDS tiles) | up to 1024 |
 | Conv kernel size | ≤ 8 | any |
+| TOP_K k | ≤ 1024 (TRD §19's pre-filter size) | ≤ n |
+| RoPE rot_dims | ≤ 128 | ≤ head_dim |
 
 In place is also different:
 - The CPU GDN op is always in place.
@@ -256,10 +267,47 @@ In place is also different:
   - **Rejections:** an unsupported type (Q4_0) raises `Error(Unsupported)`; cols not a
     multiple of the block size, y overlapping w, a view one block short, and misaligned
     F32 weights each raise `Error(Kernel)`.
+- **`test_hip_head`** runs the emulation in both orders against `halo::cpu` / `halo::tensor`.
+  - **LM head:** 6 cases × the 3 GEMV variants:
+    - Q6_K (the real LM-head type, D-007): 1003 rows × 512, T = 2;
+    - Q4_K without writing logits;
+    - F16 at T = 3;
+    - an exact tie (the winning row duplicated at a higher index);
+    - a NaN weight, which gives `Error(Kernel)` on both sides.
+    - the production shape: F32, 248,320 rows (D-008) × 16, T = 2, so stage 2 reduces
+      about 62K partials per vector.
+  - **LM-head acceptance by GEMV variant:**
+    - Generic GEMV: index and value must be bitwise equal to `cpu::matmul_argmax`, and the
+      written logits must equal `cpu::matmul`.
+    - Wave GEMV: the index must be equal, and the value within the M2 summation bound.
+      The test first asserts that the CPU's top-2 gap exceeds twice the worst bound, so
+      the index is decided by the data, not by rounding.
+  - **Argmax** (bitwise): the 248,320 vocabulary at T = 3 with strided rows, a tied
+    maximum, all −inf (index 0), NaN → `Error(Kernel)`, and n = 1.
+  - **Top-k** (ids and values bitwise vs `cpu::top_k`):
+    - vocabulary with k = 40 at T = 2, k = 1024 with heavy exact ties (3 rounds), and
+      k = 1;
+    - n = 2049 with k = 1024 (just over one chunk);
+    - k = n = 100;
+    - all −inf;
+    - NaN → `Error(Kernel)`.
+
+    Rejections: k > n, k = 0, ids overlapping values.
+  - **RMS norm, RoPE, SwiGLU, MUL_SIGMOID** (bitwise):
+    - RMS norm: per-head norm 48 × 256 in place, 3 × 5120 strided, cols 37 at block 32;
+    - RoPE: 24 and 4 heads × 256 with rot 64 and θ = 10⁷, rot 128 = head_dim;
+      positions up to 262,143;
+    - SwiGLU at the FFN width 17408, and MUL_SIGMOID at 6144; both also with aliasing and
+      ±90 inputs.
+
+    RoPE rejects rot 130 and odd rot.
 - **Device tests.** Each scenario above also exists as a `…Device…` test. They skip on
   the dev host.
   - GDN, conv and norm compare against `halo::cpu` within `|err| ≤ 2e-5 + 1e-5·|ref|`.
     That tolerance is an unmeasured choice, to be confirmed on the EVO-X2.
+  - ARGMAX and TOP_K must match exactly on the device too (pure comparisons), and so must
+    the LM head with the generic GEMV. RMS norm, RoPE (device double `cos`/`sin`) and the
+    element-wise ops use the tolerance above.
   - GEMV uses the same criteria as the emulation. The generic variant must be bitwise
     equal, because it uses only IEEE fp32 multiply and add. A device mismatch there (for
     example from denormal flushing) is a finding to investigate, not a tolerance to widen.
@@ -286,8 +334,13 @@ at `-O2` (RelWithDebInfo).
 | `k_gdn_chunk_state` | 20 | 0 | 32768 | 2 |
 | `k_conv1d_silu` | 40 | 0 | 0 | 16 |
 | `k_norm` | 15 | 0 | 36 | 16 |
-| `k_gemv_wave` | 29 | 0 | 1024 | 16 |
-| `k_gemv_generic` | 25 | 0 | 1024 | 16 |
+| `k_gemv_wave` | 30 | 0 | 1152 | 16 |
+| `k_gemv_generic` | 26 | 0 | 1152 | 16 |
+| `k_argmax_partial` | 10 | 0 | 3072 | 16 |
+| `k_argmax_reduce` | 10 | 0 | 3072 | 16 |
+| `k_topk` | 11 | 0 | 16384 | 16 |
+| `k_rope` | 43 | 0 | 512 | 16 |
+| `k_eltwise` | 11 | 0 | 0 | 16 |
 
 Two findings from getting these numbers (measured at build time):
 
@@ -323,6 +376,15 @@ until the EVO-X2 runs.
    - The generic variant exists for exactness and is not meant to be fast.
 3. **No wave64 variant.** RDNA3.5 wave32 vs wave64 was not compared. Only wave32 variants
    are registered.
+4. **TOP_K does a full bitonic sort per chunk.** At k = 1024 a 248,320-logit vector takes 8
+   rounds (3 at k = 40). Each chunk uses O(C log² C) compare-exchanges per
+   2048-element chunk, and all k survivors are kept every round.
+   - A radix-select or threshold pre-pass would do less work.
+   - Its cost against the ~1 GB LM-head read is expected to be small, but is unmeasured.
+5. **The argmax reduce is one workgroup per vector.** The partials number
+   ⌈rows / rows-per-workgroup⌉, about 62K for the 248,320-row head with `gemv_wave32_r4`.
+   - One workgroup reads all 62K × 16 B. That is fine for correctness but serial.
+   - A second partial stage would parallelize it.
 
 ## TRD §63 acceptance status
 
@@ -331,19 +393,24 @@ until the EVO-X2 runs.
 | gfx1151 (or logged gfx11-generic) build succeeds | **Met on the dev host (compile).** gfx1151 by default. A generic ISA needs explicit opt-in and is logged. |
 | Device discovery succeeds; tier probing succeeds | **Discovery implemented, unverified on a device.** On the dev host it fails cleanly with `hipErrorNoDevice`. Tier probing belongs to the hardware module and is not part of this backend. |
 | GPU allocations succeed on GTT and carveout | **Implemented** (`HostPinned` = GTT, `Device` = carveout). The test exists but is unverified (skipped). |
-| Core operators execute; custom GDN and GEMV kernels exist | **GDN and GEMV kernels exist** (GEMV: F32, F16, Q8_0, Q4_K, Q5_K, Q6_K): compiled and emulation-verified, not executed. |
-| Reference-vs-HIP correctness passes | **Emulation: passes bit for bit. Device: unverified.** |
+| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K), LM head with fused argmax, argmax, top-k, RoPE, SwiGLU and sigmoid gate. Attention over paged KV is not built. |
+| Reference-vs-HIP correctness passes | **Emulation passes.** It is bit for bit everywhere except the wave-GEMV logits, which are within the derived summation bound (their argmax index still equals the CPU's). **Device: unverified.** |
 | Benchmark suite executes reproducibly | **Not started.** |
 
-## Not done (M2 scope boundary)
+## Not done (end of the WS-K plan)
 
+- **Device execution of anything.** D-001. The first EVO-X2 run is also the first
+  ROCm 7.1 → HIP 7.15 compatibility check.
 - **GEMV:**
   - IQ4_XS, IQ4_NL, Q3_K, IQ3_S (the D-014 second tier);
   - a prefill GEMM;
   - a wave64 comparison.
-- **M3:**
-  - LM head: logits GEMV, fused argmax with NaN → `Error(Kernel)`, and top-k ≤ 1024;
-  - plain RMS_NORM exposed as an op (the kernel body already supports it);
-  - partial NeoX RoPE, SwiGLU, sigmoid gate.
-- **Later:** attention over paged KV, `hip_graph`, the profiler, a tuned chunked GDN
-  (cooperative LDS tiling) and a register-resident chunk state.
+- **Attention and kernels:** GQA attention over paged KV (TRD §18 item 5), softmax, and
+  the KV-cache kernels. These were optional ("if room remains") and were not started.
+- **Runtime pieces:**
+  - `hip_graph`;
+  - the profiler;
+  - the benchmark suite (TRD §63);
+  - a `Backend`-interface adapter wiring these ops into `runtime` (other workstreams'
+    modules).
+- **Performance work:** see "Known performance debt".

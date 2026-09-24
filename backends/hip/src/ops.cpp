@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <bit>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -259,6 +260,15 @@ Ops::Ops(OpsOptions options) : options_(std::move(options)) {
     norm_block_ = block_of("GATED_NORM", "", options_.gated_norm);
     gemv_block_ = block_of("QUANT_GEMV", "", options_.gemv);
     gemv_generic_ = find_variant("QUANT_GEMV", options_.gemv).kernels == "k_gemv_generic";
+    argmax_block_ = block_of("ARGMAX_FUSED", "", options_.argmax);
+    HALO_CHECK(argmax_block_ >= 1 && argmax_block_ <= kern::kArgMaxBlock && (argmax_block_ & (argmax_block_ - 1)) == 0,
+               ErrorCode::Config, "HIP: argmax variant block {} must be a power of two <= {}", argmax_block_,
+               kern::kArgMaxBlock);
+    topk_block_ = block_of("TOP_K", "", options_.topk);
+    rms_block_ = block_of("RMS_NORM", "", options_.rms_norm);
+    rope_block_ = block_of("PARTIAL_ROPE", "", options_.rope);
+    swiglu_block_ = block_of("SWIGLU", "", options_.swiglu);
+    mulsig_block_ = block_of("MUL_SIGMOID", "", options_.mul_sigmoid);
 }
 
 void Ops::gated_delta_rule_recurrent(const Target& target, const GdnArgs& args) const {
@@ -459,8 +469,18 @@ kern::WType gemv_wtype(DType t, const char* op) {
 
 }  // namespace
 
-void Ops::gemv(const Target& target, const GemvArgs& a) const {
-    constexpr const char* kOp = "hip::gemv";
+namespace {
+
+struct GemvPlan {
+    kern::GemvParams p;
+    kern::Launch launch;
+    Rows x, y;
+    Range w_range;
+};
+
+/// Validates a GemvArgs (y may be empty when y_optional) and builds the launch.
+GemvPlan plan_gemv(const Target& target, const GemvArgs& a, unsigned block, bool generic, bool y_optional,
+                   const char* kOp) {
     const kern::WType wt = gemv_wtype(a.wtype, kOp);
     HALO_CHECK(a.rows >= 1 && a.cols >= 1 && a.n_vec >= 1, ErrorCode::Kernel,
                "{}: rows {}, cols {}, n_vec {} must all be >= 1", kOp, a.rows, a.cols, a.n_vec);
@@ -469,28 +489,284 @@ void Ops::gemv(const Target& target, const GemvArgs& a) const {
                be);
     const std::uint64_t row_bytes = mul_checked(a.cols / be, kern::wq_block_bytes(wt), kOp);
     const ByteRows w = resolve_bytes(target, a.w, a.rows, row_bytes, wt == kern::WType::F32 ? 4 : 1, kOp, "w");
-    const Rows x = resolve(target, a.x, a.n_vec, a.cols, kOp, "x");
-    const Rows y = resolve(target, a.y, a.n_vec, a.rows, kOp, "y");
+    GemvPlan g;
+    g.x = resolve(target, a.x, a.n_vec, a.cols, kOp, "x");
+    if (!(y_optional && a.y.empty())) g.y = resolve(target, a.y, a.n_vec, a.rows, kOp, "y");
+    g.w_range = w.range;
     const Rows wr{nullptr, 0, w.range};
-    check_disjoint(y, "y", {{&x, "x"}, {&wr, "w"}}, kOp);
-    kern::GemvParams p;
+    check_disjoint(g.y, "y", {{&g.x, "x"}, {&wr, "w"}}, kOp);
+    kern::GemvParams& p = g.p;
     p.type = wt;
     p.w = w.ptr;
     p.w_stride = w.stride;
-    p.x = x.ptr;
-    p.x_stride = x.stride;
-    p.y = y.ptr;
-    p.y_stride = y.stride;
+    p.x = g.x.ptr;
+    p.x_stride = g.x.stride;
+    p.y = g.y.ptr;
+    p.y_stride = g.y.stride;
     p.rows = a.rows;
     p.cols = a.cols;
     p.n_vec = a.n_vec;
-    if (gemv_generic_) {
-        dispatch(target, &detail::launch_gemv_generic, &detail::emulate_gemv_generic, p,
-                 kern::gemv_generic_launch(a.rows, a.n_vec, gemv_block_), kOp);
+    g.launch = generic ? kern::gemv_generic_launch(a.rows, a.n_vec, block)
+                       : kern::gemv_wave_launch(a.rows, a.n_vec, block);
+    return g;
+}
+
+void run_gemv(const Target& target, const GemvPlan& g, bool generic, const char* kOp) {
+    if (generic) {
+        dispatch(target, &detail::launch_gemv_generic, &detail::emulate_gemv_generic, g.p, g.launch, kOp);
     } else {
-        dispatch(target, &detail::launch_gemv_wave, &detail::emulate_gemv_wave, p,
-                 kern::gemv_wave_launch(a.rows, a.n_vec, gemv_block_), kOp);
+        dispatch(target, &detail::launch_gemv_wave, &detail::emulate_gemv_wave, g.p, g.launch, kOp);
     }
+}
+
+}  // namespace
+
+void Ops::gemv(const Target& target, const GemvArgs& a) const {
+    constexpr const char* kOp = "hip::gemv";
+    const GemvPlan g = plan_gemv(target, a, gemv_block_, gemv_generic_, false, kOp);
+    run_gemv(target, g, gemv_generic_, kOp);
+}
+
+// ---- LM head / ARGMAX -------------------------------------------------------------------
+
+std::vector<ArgmaxResult> decode_argmax(std::span<const std::uint32_t> words) {
+    HALO_CHECK(words.size() % 3 == 0, ErrorCode::Kernel, "decode_argmax: {} words is not 3 per vector", words.size());
+    std::vector<ArgmaxResult> out(words.size() / 3);
+    for (std::size_t v = 0; v < out.size(); ++v) {
+        const std::uint32_t idx = words[3 * v];
+        const std::uint32_t nan = words[3 * v + 2];
+        HALO_CHECK(nan == 0, ErrorCode::Kernel, "argmax: NaN logit in vector {} (D-016)", v);
+        HALO_CHECK(idx != kern::kNoIndex, ErrorCode::Kernel, "argmax: vector {} has no candidate", v);
+        out[v].index = idx;
+        out[v].value = std::bit_cast<float>(words[3 * v + 1]);
+    }
+    return out;
+}
+
+std::uint64_t Ops::lm_head_workspace_bytes(std::uint32_t rows, std::uint32_t n_vec) const {
+    const kern::Launch l = gemv_generic_ ? kern::gemv_generic_launch(rows, n_vec, gemv_block_)
+                                         : kern::gemv_wave_launch(rows, n_vec, gemv_block_);
+    return mul_checked(mul_checked(l.grid_x, n_vec, "lm_head_workspace_bytes"), sizeof(kern::ArgPart),
+                       "lm_head_workspace_bytes");
+}
+
+std::uint64_t Ops::argmax_workspace_bytes(std::uint32_t n, std::uint32_t n_vec) const {
+    const kern::Launch l = kern::argmax_partial_launch(n, n_vec, argmax_block_);
+    return mul_checked(mul_checked(l.grid_x, n_vec, "argmax_workspace_bytes"), sizeof(kern::ArgPart),
+                       "argmax_workspace_bytes");
+}
+
+void Ops::lm_head_argmax(const Target& target, const LmHeadArgs& a) const {
+    constexpr const char* kOp = "hip::lm_head_argmax";
+    GemvPlan g = plan_gemv(target, a.gemv, gemv_block_, gemv_generic_, true, kOp);
+    const unsigned n_parts = g.launch.grid_x;
+    const Rows ws = resolve(target, a.workspace, 1, static_cast<std::uint64_t>(n_parts) * a.gemv.n_vec * 4, kOp,
+                            "workspace");
+    const Rows res = resolve(target, a.result, 1, static_cast<std::uint64_t>(a.gemv.n_vec) * 3, kOp, "result");
+    const Rows wr{nullptr, 0, g.w_range};
+    check_disjoint(ws, "workspace", {{&g.x, "x"}, {&g.y, "y"}, {&wr, "w"}, {&res, "result"}}, kOp);
+    check_disjoint(res, "result", {{&g.x, "x"}, {&g.y, "y"}, {&wr, "w"}}, kOp);
+    g.p.part = reinterpret_cast<kern::ArgPart*>(ws.ptr);
+    g.p.n_parts = n_parts;
+    run_gemv(target, g, gemv_generic_, kOp);
+    kern::ArgmaxParams r;
+    r.part = g.p.part;
+    r.n_parts = n_parts;
+    r.result = reinterpret_cast<kern::ArgResult*>(res.ptr);
+    dispatch(target, &detail::launch_argmax_reduce, &detail::emulate_argmax_reduce, r,
+             kern::argmax_reduce_launch(a.gemv.n_vec, argmax_block_), kOp);
+}
+
+void Ops::argmax(const Target& target, const ArgmaxArgs& a) const {
+    constexpr const char* kOp = "hip::argmax";
+    HALO_CHECK(a.n >= 1 && a.n_vec >= 1, ErrorCode::Kernel, "{}: n and n_vec must be >= 1", kOp);
+    HALO_CHECK(a.n < kern::kNoIndex, ErrorCode::Kernel, "{}: n {} too large", kOp, a.n);
+    const Rows x = resolve(target, a.logits, a.n_vec, a.n, kOp, "logits");
+    const kern::Launch l1 = kern::argmax_partial_launch(a.n, a.n_vec, argmax_block_);
+    const Rows ws = resolve(target, a.workspace, 1, static_cast<std::uint64_t>(l1.grid_x) * a.n_vec * 4, kOp,
+                            "workspace");
+    const Rows res = resolve(target, a.result, 1, static_cast<std::uint64_t>(a.n_vec) * 3, kOp, "result");
+    check_disjoint(ws, "workspace", {{&x, "logits"}, {&res, "result"}}, kOp);
+    check_disjoint(res, "result", {{&x, "logits"}}, kOp);
+    kern::ArgmaxParams p;
+    p.x = x.ptr;
+    p.x_stride = x.stride;
+    p.n = a.n;
+    p.part = reinterpret_cast<kern::ArgPart*>(ws.ptr);
+    p.n_parts = l1.grid_x;
+    p.result = reinterpret_cast<kern::ArgResult*>(res.ptr);
+    dispatch(target, &detail::launch_argmax_partial, &detail::emulate_argmax_partial, p, l1, kOp);
+    dispatch(target, &detail::launch_argmax_reduce, &detail::emulate_argmax_reduce, p,
+             kern::argmax_reduce_launch(a.n_vec, argmax_block_), kOp);
+}
+
+std::vector<ArgmaxResult> Ops::read_argmax(const Target& target, const BufferView& result, std::uint32_t n_vec) {
+    constexpr const char* kOp = "hip::read_argmax";
+    HALO_CHECK(n_vec >= 1, ErrorCode::Kernel, "{}: n_vec must be >= 1", kOp);
+    static_cast<void>(resolve(target, result, 1, static_cast<std::uint64_t>(n_vec) * 3, kOp, "result"));
+    if (target.is_device()) target.stream()->synchronize();
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(n_vec) * 3);
+    result.buffer->download(words.data(), words.size() * 4, result.offset);
+    return decode_argmax(words);
+}
+
+// ---- TOP_K --------------------------------------------------------------------------------
+
+namespace {
+
+/// Candidates per vector entering each round: n, then blocks * k until one chunk remains.
+std::vector<std::uint32_t> topk_rounds(std::uint32_t n, std::uint32_t k) {
+    std::vector<std::uint32_t> m{n};
+    while (m.back() > kern::kTopkChunk) {
+        const std::uint32_t blocks = (m.back() + kern::kTopkChunk - 1) / kern::kTopkChunk;
+        m.push_back(blocks * k);
+    }
+    return m;
+}
+
+}  // namespace
+
+std::uint64_t topk_workspace_bytes(std::uint32_t n, std::uint32_t k, std::uint32_t n_vec) {
+    HALO_CHECK(k >= 1 && k <= kern::kTopkMaxK && k <= n, ErrorCode::Kernel,
+               "topk_workspace_bytes: k {} not in [1, min(n {}, {})]", k, n, kern::kTopkMaxK);
+    const std::vector<std::uint32_t> m = topk_rounds(n, k);
+    if (m.size() == 1) return 0;
+    // Two ping-pong buffers, each sized for the largest intermediate round (m[1]).
+    return mul_checked(mul_checked(2ull * m[1], n_vec, "topk_workspace_bytes"), sizeof(kern::TopkPair),
+                       "topk_workspace_bytes");
+}
+
+void Ops::top_k(const Target& target, const TopKArgs& a) const {
+    constexpr const char* kOp = "hip::top_k";
+    HALO_CHECK(a.n_vec >= 1 && a.n >= 1, ErrorCode::Kernel, "{}: n and n_vec must be >= 1", kOp);
+    HALO_CHECK(a.k >= 1 && a.k <= a.n && a.k <= kern::kTopkMaxK, ErrorCode::Kernel,
+               "{}: k = {} for {} entries (this backend: k <= {})", kOp, a.k, a.n, kern::kTopkMaxK);
+    HALO_CHECK(a.n < kern::kNoIndex, ErrorCode::Kernel, "{}: n {} too large", kOp, a.n);
+    const std::vector<std::uint32_t> m = topk_rounds(a.n, a.k);
+    const Rows x = resolve(target, a.logits, a.n_vec, a.n, kOp, "logits");
+    const Rows ids = resolve(target, a.ids, a.n_vec, a.k, kOp, "ids");
+    const Rows vals = resolve(target, a.values, a.n_vec, a.k, kOp, "values");
+    HALO_CHECK(ids.stride == vals.stride, ErrorCode::Kernel, "{}: ids and values need the same row stride", kOp);
+    const Rows status = resolve_status(target, a.status, kOp);
+    const std::uint64_t pairs_per_vec = m.size() > 1 ? m[1] : 0;
+    Rows ws;
+    if (m.size() > 1) {
+        ws = resolve(target, a.workspace, 1, 2 * pairs_per_vec * a.n_vec * 2, kOp, "workspace");
+    }
+    check_disjoint(ids, "ids", {{&x, "logits"}, {&vals, "values"}, {&status, "status"}, {&ws, "workspace"}}, kOp);
+    check_disjoint(vals, "values", {{&x, "logits"}, {&status, "status"}, {&ws, "workspace"}}, kOp);
+    check_disjoint(ws, "workspace", {{&x, "logits"}, {&status, "status"}}, kOp);
+    check_disjoint(status, "status", {{&x, "logits"}}, kOp);
+    zero_status(target, status);
+    auto* pairs = reinterpret_cast<kern::TopkPair*>(ws.ptr);
+    kern::TopkPair* buf[2] = {pairs, pairs == nullptr ? nullptr : pairs + pairs_per_vec * a.n_vec};
+    for (std::size_t r = 0; r < m.size(); ++r) {
+        kern::TopkParams p;
+        p.m = m[r];
+        p.k = a.k;
+        p.status = reinterpret_cast<std::uint32_t*>(status.ptr);
+        if (r == 0) {
+            p.src_logits = x.ptr;
+            p.src_stride = x.stride;
+        } else {
+            p.src_pairs = buf[(r - 1) % 2];
+            p.src_stride = pairs_per_vec;
+        }
+        if (r + 1 == m.size()) {
+            p.out_ids = reinterpret_cast<std::int32_t*>(ids.ptr);
+            p.out_vals = vals.ptr;
+            p.out_stride = ids.stride;
+        } else {
+            p.dst = buf[r % 2];
+            p.dst_stride = pairs_per_vec;
+        }
+        dispatch(target, &detail::launch_topk, &detail::emulate_topk, p, kern::topk_launch(m[r], a.n_vec, topk_block_),
+                 kOp);
+    }
+}
+
+// ---- RMS_NORM / PARTIAL_ROPE / SWIGLU / MUL_SIGMOID -----------------------------------------
+
+void Ops::rms_norm(const Target& target, const RmsNormArgs& a) const {
+    constexpr const char* kOp = "hip::rms_norm";
+    HALO_CHECK(a.cols >= 1, ErrorCode::Kernel, "{}: cols must be >= 1", kOp);
+    if (a.rows == 0) return;
+    const Rows x = resolve(target, a.x, a.rows, a.cols, kOp, "x");
+    const Rows w = resolve(target, a.w, 1, a.cols, kOp, "w");
+    const Rows out = resolve(target, a.out, a.rows, a.cols, kOp, "out");
+    check_alias_exact_or_disjoint(x, out, kOp, "x");
+    check_disjoint(out, "out", {{&w, "w"}}, kOp);
+    kern::NormParams p;
+    p.x = x.ptr;
+    p.x_stride = x.stride;
+    p.w = w.ptr;
+    p.out = out.ptr;
+    p.out_stride = out.stride;
+    p.rows = a.rows;
+    p.cols = a.cols;
+    p.eps = a.eps;
+    dispatch(target, &detail::launch_norm, &detail::emulate_norm, p, kern::norm_launch(a.rows, rms_block_), kOp);
+}
+
+void Ops::partial_rope_neox(const Target& target, const RopeArgs& a) const {
+    constexpr const char* kOp = "hip::partial_rope_neox";
+    HALO_CHECK(a.rot_dims > 0 && a.rot_dims % 2 == 0, ErrorCode::Kernel, "{}: rot_dims {} must be even and > 0", kOp,
+               a.rot_dims);
+    HALO_CHECK(a.rot_dims <= a.head_dim, ErrorCode::Kernel, "{}: rot_dims {} > head_dim {}", kOp, a.rot_dims,
+               a.head_dim);
+    HALO_CHECK(a.rot_dims / 2 <= kern::kRopeMaxHalf, ErrorCode::Kernel, "{}: rot_dims {} exceeds this backend's {}", kOp,
+               a.rot_dims, 2 * kern::kRopeMaxHalf);
+    HALO_CHECK(a.n_heads >= 1, ErrorCode::Kernel, "{}: n_heads must be >= 1", kOp);
+    if (a.n_tokens == 0) return;
+    const Rows x = resolve(target, a.x, a.n_tokens, mul_checked(a.n_heads, a.head_dim, kOp), kOp, "x");
+    const Rows pos = resolve(target, a.positions, 1, a.n_tokens, kOp, "positions");
+    check_disjoint(x, "x", {{&pos, "positions"}}, kOp);
+    kern::RopeParams p;
+    p.x = x.ptr;
+    p.x_stride = x.stride;
+    p.pos = reinterpret_cast<const std::int32_t*>(pos.ptr);
+    p.n_heads = a.n_heads;
+    p.head_dim = a.head_dim;
+    p.half = a.rot_dims / 2;
+    for (unsigned i = 0; i < p.half; ++i) {
+        // cpu::rope_inv_freq: 1 / theta^(float(2i) / rot_dims), fp32 pow and divide.
+        const float e = static_cast<float>(2 * i) / static_cast<float>(a.rot_dims);
+        p.inv[i] = 1.0f / std::pow(a.theta, e);
+    }
+    dispatch(target, &detail::launch_rope, &detail::emulate_rope, p,
+             kern::rope_launch(a.n_tokens, a.n_heads, p.half, rope_block_), kOp);
+}
+
+namespace {
+
+void eltwise(const Target& target, const EltwiseArgs& a, kern::EwOp op, unsigned block, const char* kOp) {
+    if (a.rows == 0 || a.cols == 0) return;
+    const Rows ra = resolve(target, a.a, a.rows, a.cols, kOp, "a");
+    const Rows rb = resolve(target, a.b, a.rows, a.cols, kOp, "b");
+    const Rows out = resolve(target, a.out, a.rows, a.cols, kOp, "out");
+    check_alias_exact_or_disjoint(ra, out, kOp, "a");
+    check_alias_exact_or_disjoint(rb, out, kOp, "b");
+    kern::EwParams p;
+    p.op = op;
+    p.a = ra.ptr;
+    p.a_stride = ra.stride;
+    p.b = rb.ptr;
+    p.b_stride = rb.stride;
+    p.out = out.ptr;
+    p.out_stride = out.stride;
+    p.rows = a.rows;
+    p.cols = a.cols;
+    dispatch(target, &detail::launch_eltwise, &detail::emulate_eltwise, p, kern::ew_launch(a.rows, a.cols, block), kOp);
+}
+
+}  // namespace
+
+void Ops::swiglu(const Target& target, const EltwiseArgs& a) const {
+    eltwise(target, a, kern::EwOp::SwiGlu, swiglu_block_, "hip::swiglu");
+}
+
+void Ops::mul_sigmoid(const Target& target, const EltwiseArgs& a) const {
+    eltwise(target, a, kern::EwOp::MulSigmoid, mulsig_block_, "hip::mul_sigmoid");
 }
 
 }  // namespace halo::hip

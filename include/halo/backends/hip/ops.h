@@ -25,7 +25,9 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "halo/backends/hip/runtime.h"
 #include "halo/tensor/dtype.h"
@@ -172,6 +174,91 @@ struct GemvArgs {
     std::uint32_t n_vec = 1;
 };
 
+/// ARGMAX result words of one vector: {index (uint32), value (float bits), nan (0/1)} — the
+/// Vulkan backend's layout. Read them with Ops::read_argmax, which raises Error(Kernel) when
+/// the NaN word is set (D-016; cpu::argmax raises the same error).
+inline constexpr std::uint32_t k_argmax_result_bytes = 12;
+
+struct ArgmaxResult {
+    std::uint32_t index = 0;
+    float value = 0.0f;
+};
+
+/// Decodes 3 words per vector; throws Error(Kernel) naming the vector if its NaN word is set.
+[[nodiscard]] std::vector<ArgmaxResult> decode_argmax(std::span<const std::uint32_t> words);
+
+/// [LOGITS_MATMUL + ARGMAX_FUSED] (cpu::matmul_argmax, per vector): argmax_n of
+/// y[t][n] = Σ_i x[t][i]·W[n][i], ties to the lowest n, NaN -> error. The GEMV variant
+/// (OpsOptions::gemv) computes the logits and each workgroup ranks its own rows (epilogue);
+/// a second kernel reduces the partials. The logits are also written when gemv.y is set,
+/// and stay on the device either way (TRD §19).
+///  - workspace: >= Ops::lm_head_workspace_bytes(rows, n_vec).
+///  - result: n_vec * k_argmax_result_bytes.
+struct LmHeadArgs {
+    GemvArgs gemv{};  ///< gemv.y may be empty (argmax only)
+    BufferView workspace{};
+    BufferView result{};
+};
+
+/// [ARGMAX_FUSED building block] argmax of each of n_vec logits vectors of length n (cpu::argmax).
+struct ArgmaxArgs {
+    BufferView logits{};  ///< n_vec rows of [n]; row_stride = distance between vectors
+    std::uint32_t n = 0;
+    std::uint32_t n_vec = 1;
+    BufferView workspace{};  ///< >= Ops::argmax_workspace_bytes(n, n_vec)
+    BufferView result{};     ///< n_vec * k_argmax_result_bytes
+};
+
+/// [TOP_K] (cpu::top_k, per vector; TRD §19 GPU pre-filter): the k largest logits, sorted by
+/// value descending, ties by lower index first; 1 <= k <= min(n, 1024).
+///  - ids: n_vec rows of [k] int32; values: n_vec rows of [k] fp32 (dense).
+///  - workspace: >= topk_workspace_bytes(n, k, n_vec) (0 when n <= 2048).
+///  - status: one word, zeroed by the op, kStatusNaN set when some logit is NaN; call
+///    Ops::check_status afterwards (raises Error(Kernel), as cpu::top_k).
+struct TopKArgs {
+    BufferView logits{};
+    std::uint32_t n = 0;
+    std::uint32_t k = 0;
+    std::uint32_t n_vec = 1;
+    BufferView workspace{};
+    BufferView ids{};
+    BufferView values{};
+    BufferView status{};
+};
+
+[[nodiscard]] std::uint64_t topk_workspace_bytes(std::uint32_t n, std::uint32_t k, std::uint32_t n_vec);
+
+/// [RMS_NORM] (cpu::rms_norm): out[r] = (x[r] * rsqrt(mean(x[r]^2) + eps)) * w, per row.
+/// Per-head norms are rows = T * heads with cols = head_dim. out may alias x exactly.
+struct RmsNormArgs {
+    BufferView x{}, w{}, out{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+    float eps = 1e-6f;
+};
+
+/// [PARTIAL_ROPE] (cpu::partial_rope_neox), in place on x: n_tokens rows of
+/// [n_heads * head_dim]; positions: n_tokens int32. Only the first rot_dims of each head
+/// rotate (NeoX rotate-half). inv_freq is computed on the host exactly as the CPU op does;
+/// cos/sin of the fp32 angle are evaluated in double. rot_dims even, <= head_dim, <= 128.
+struct RopeArgs {
+    BufferView x{};
+    BufferView positions{};
+    std::uint32_t n_tokens = 0;
+    std::uint32_t n_heads = 0;
+    std::uint32_t head_dim = 0;
+    std::uint32_t rot_dims = 0;
+    float theta = 10000.0f;
+};
+
+/// [SWIGLU] out = silu(a) * b (a = gate, b = up); [MUL_SIGMOID] out = a * sigmoid(b)
+/// (a = attention output, b = gate). rows x cols; out may alias a or b exactly.
+struct EltwiseArgs {
+    BufferView a{}, b{}, out{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+};
+
 /// Variant choice per operator (names from the kernel registry, registry.h).
 struct OpsOptions {
     std::string gdn_recurrent = "gdn_recurrent_b128";
@@ -179,6 +266,12 @@ struct OpsOptions {
     std::string conv1d = "conv1d_silu_b256";
     std::string gated_norm = "gated_norm_b128";
     std::string gemv = "gemv_wave32_r4";
+    std::string argmax = "argmax_b256";
+    std::string topk = "topk_bitonic_b256";
+    std::string rms_norm = "rms_norm_b128";
+    std::string rope = "rope_neox_b128";
+    std::string swiglu = "swiglu_b256";
+    std::string mul_sigmoid = "mul_sigmoid_b256";
 };
 
 class Ops {
@@ -198,6 +291,26 @@ public:
     void gated_rms_norm(const Target& target, const GatedNormArgs& args) const;
     /// [QUANT_GEMV / MATMUL]
     void gemv(const Target& target, const GemvArgs& args) const;
+    /// [LOGITS_MATMUL + ARGMAX_FUSED]; read the result with read_argmax.
+    void lm_head_argmax(const Target& target, const LmHeadArgs& args) const;
+    [[nodiscard]] std::uint64_t lm_head_workspace_bytes(std::uint32_t rows, std::uint32_t n_vec) const;
+    /// [ARGMAX_FUSED building block] over existing logits; read with read_argmax.
+    void argmax(const Target& target, const ArgmaxArgs& args) const;
+    [[nodiscard]] std::uint64_t argmax_workspace_bytes(std::uint32_t n, std::uint32_t n_vec) const;
+    /// Reads n_vec argmax results (device: synchronizes the target stream first); throws
+    /// Error(Kernel) when a vector contained NaN.
+    [[nodiscard]] static std::vector<ArgmaxResult> read_argmax(const Target& target, const BufferView& result,
+                                                               std::uint32_t n_vec);
+    /// [TOP_K]; then check_status(status).
+    void top_k(const Target& target, const TopKArgs& args) const;
+    /// [RMS_NORM]
+    void rms_norm(const Target& target, const RmsNormArgs& args) const;
+    /// [PARTIAL_ROPE]
+    void partial_rope_neox(const Target& target, const RopeArgs& args) const;
+    /// [SWIGLU]
+    void swiglu(const Target& target, const EltwiseArgs& args) const;
+    /// [MUL_SIGMOID]
+    void mul_sigmoid(const Target& target, const EltwiseArgs& args) const;
 
     /// Reads a status word (device: synchronizes the target stream, then copies it) and
     /// throws Error(Kernel) naming the set bits; returns normally when it is zero.
@@ -211,6 +324,12 @@ private:
     unsigned norm_block_ = 0;
     unsigned gemv_block_ = 0;
     bool gemv_generic_ = false;
+    unsigned argmax_block_ = 0;
+    unsigned topk_block_ = 0;
+    unsigned rms_block_ = 0;
+    unsigned rope_block_ = 0;
+    unsigned swiglu_block_ = 0;
+    unsigned mulsig_block_ = 0;
 };
 
 }  // namespace halo::hip

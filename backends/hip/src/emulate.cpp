@@ -57,3 +57,39 @@ void emulate_gemv_wave(const GemvParams& p, const Launch& l, bool reverse) {
 }
 
 }  // namespace halo::hip::detail
+
+namespace halo::hip::detail {
+
+using namespace kern;
+
+void emulate_argmax_partial(const ArgmaxParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<ArgNoRegs, ArgShared>(l, reverse, [&](auto& ex, ArgShared& sh, unsigned bx, unsigned by) {
+        argmax_partial_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_argmax_reduce(const ArgmaxParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<ArgNoRegs, ArgShared>(l, reverse, [&](auto& ex, ArgShared& sh, unsigned bx, unsigned by) {
+        argmax_reduce_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_topk(const TopkParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<ArgNoRegs, TopkShared>(l, reverse, [&](auto& ex, TopkShared& sh, unsigned bx, unsigned by) {
+        topk_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_rope(const RopeParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<ArgNoRegs, RopeShared>(l, reverse, [&](auto& ex, RopeShared& sh, unsigned bx, unsigned by) {
+        rope_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_eltwise(const EwParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<ArgNoRegs, EwShared>(l, reverse, [&](auto& ex, EwShared& sh, unsigned bx, unsigned by) {
+        ew_body(ex, sh, p, bx, by);
+    });
+}
+
+}  // namespace halo::hip::detail

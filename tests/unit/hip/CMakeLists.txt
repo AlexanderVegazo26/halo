@@ -8,3 +8,5 @@ halo_add_test(test_hip_gdn SOURCES test_hip_gdn.cpp LIBS halo_backend_hip halo_b
 halo_add_test(test_hip_gemv SOURCES test_hip_gemv.cpp LIBS halo_backend_hip halo_backend_cpu halo_tensor)
 # The error bound uses the kernels' own summation-depth formulas (kernels/gemv.h).
 target_include_directories(test_hip_gemv PRIVATE ${PROJECT_SOURCE_DIR}/backends/hip)
+halo_add_test(test_hip_head SOURCES test_hip_head.cpp LIBS halo_backend_hip halo_backend_cpu halo_tensor)
+target_include_directories(test_hip_head PRIVATE ${PROJECT_SOURCE_DIR}/backends/hip)

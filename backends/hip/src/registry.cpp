@@ -12,7 +12,7 @@ namespace {
 
 constexpr std::string_view kGdnDecisions = "D-003 D-004(5,6) D-012 D-016";
 
-constexpr std::array<KernelVariant, 11> kVariants{{
+constexpr std::array<KernelVariant, 18> kVariants{{
     {"GATED_DELTANET", "recurrent", "gdn_recurrent_b128", "k_gdn_recurrent", 128,
      "grid (n_v, ceil(d_v/128)); thread = one value column, S[:,c] in registers (d_k <= 128)",
      kGdnDecisions, true},
@@ -40,6 +40,21 @@ constexpr std::array<KernelVariant, 11> kVariants{{
      "grid (ceil(N/8), T); 8 lanes per row in the CPU dot order (bit-identical to cpu::matmul); per-element "
      "dequant, slow",
      "D-007 D-014", false},
+    {"ARGMAX_FUSED", "", "argmax_b256", "k_argmax_partial, k_argmax_reduce", 256,
+     "partial: 16 logits per thread + LDS tree per workgroup; reduce: one workgroup per vector. Also the "
+     "LM head's stage 2 (stage 1 = the QUANT_GEMV variant's argmax epilogue)",
+     "D-016", true},
+    {"TOP_K", "", "topk_bitonic_b256", "k_topk", 256,
+     "rounds of 2048-candidate bitonic sorts in LDS keeping k per chunk until one chunk remains (k <= 1024)",
+     "TRD 19, D-016", true},
+    {"RMS_NORM", "", "rms_norm_b128", "k_norm", 128, "as gated_norm_b128 without the gate", "D-004", true},
+    {"RMS_NORM", "", "rms_norm_b32", "k_norm", 32, "one wave32 per row", "D-004", false},
+    {"PARTIAL_ROPE", "", "rope_neox_b128", "k_rope", 128,
+     "grid (T, ceil(heads*half/128)); cos/sin per (t, i) in LDS; thread = one rotated pair", "D-004", true},
+    {"SWIGLU", "", "swiglu_b256", "k_eltwise", 256, "grid (rows, ceil(cols/256)); thread = one element", "D-004",
+     true},
+    {"MUL_SIGMOID", "", "mul_sigmoid_b256", "k_eltwise", 256, "grid (rows, ceil(cols/256)); thread = one element",
+     "D-004", true},
 }};
 
 }  // namespace
