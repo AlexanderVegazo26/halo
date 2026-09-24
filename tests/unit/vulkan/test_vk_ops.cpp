@@ -280,8 +280,9 @@ struct GdnGates {
 constexpr GdnGates k_fast_decay{};
 constexpr GdnGates k_slow_decay{-0.05f, -0.001f, 0.9f, 0.999f};
 
-// One row of inputs: q, k L2-normalized per head, q scaled by 1/sqrt(d_k) (kernel
-// contract); g (log-decay) and beta drawn from `gates`.
+// One row of inputs: q, k L2-normalized per head, q scaled by 1/sqrt(d_k) on the host
+// (run with qk_l2norm = false, q_scale = 1, see gdn_args); g (log-decay) and beta drawn
+// from `gates`.
 GdnRow gdn_row(const GdnDims& d, std::mt19937& rng, const GdnGates& gates = k_fast_decay) {
     GdnRow r;
     r.q = ref::random_vec(std::size_t{d.n_k} * d.d_k, rng);
@@ -357,6 +358,11 @@ hv::GdnDecodeArgs gdn_args(GdnBuffers& b, hv::Buffer& state, const GdnDims& d, s
     a.d_k = d.d_k;
     a.d_v = d.d_v;
     a.n_tokens = T;
+    // These tests feed pre-normalized, pre-scaled q/k (gdn_row), so they select the D-016
+    // "apply nothing" contract explicitly; the raw-q/k in-kernel-L2 path is covered
+    // differentially in test_vk_differential.cpp.
+    a.qk_l2norm = false;
+    a.q_scale = 1.0f;
     return a;
 }
 

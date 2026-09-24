@@ -10,8 +10,11 @@
 // cross-thread reduction, and each thread only re-reads state it wrote itself.
 // Row 0 reads the input state region; later rows read the output region (already holding
 // the previous row's state). Slot s (s < min(T, n_slots)) receives the state after row
-// T-1-s. Inputs q, k are already L2-normalized, q already scaled by 1/sqrt(d_k); g is the
-// log-decay (exp applied here); beta is already sigmoid-activated.
+// T-1-s. q and k are the RAW per-head rows (DECISIONS D-016): when qk_l2norm is set
+// both are L2-normalized here, x * 1/sqrt(sum(x^2) + 1e-6) (sum of squares: strided
+// partials + a fixed-order tree, so deterministic), then q *= q_scale. Nothing else is
+// applied; k is never scaled. g is the log-decay (exp applied here); beta is already
+// sigmoid-activated.
 //
 // state_in and state_out may be the same buffer (host guarantees identical or disjoint
 // regions). With identical regions each element is read through state_in strictly before
@@ -42,10 +45,14 @@ layout(push_constant) uniform Push {
     uint in_off;     // element offset of the input state
     uint out_off;    // element offset of the output state
     uint slots_off;  // element offset of slot 0
+    uint qk_l2norm;  // 1: L2-normalize q and k per head (eps 1e-6) before use (D-016)
+    float q_scale;   // q *= q_scale after the optional normalization (D-016)
 } pc;
 
 shared float sq[MAX_DK];
 shared float sk[MAX_DK];
+shared float red_q[WG];
+shared float red_k[WG];
 
 void main() {
     const uint j = halo_group_id();
@@ -54,13 +61,39 @@ void main() {
     const uint kh = j % pc.n_k;
     const uint head = j * pc.d_k * pc.d_v;              // head offset inside one state
     const uint state_elems = pc.n_v * pc.d_k * pc.d_v;
+    uint p2 = 1u;  // smallest power of two >= WG
+    while (p2 < WG) p2 <<= 1;
 
     for (uint t = 0u; t < pc.n_tokens; ++t) {
-        barrier();  // previous row finished with sq/sk
+        barrier();  // previous row finished with sq/sk/red_*
         const uint qk_row = (t * pc.n_k + kh) * pc.d_k;
+        float pq = 0.0;
+        float pk = 0.0;
         for (uint a = tid; a < pc.d_k; a += WG) {
-            sq[a] = q[qk_row + a];
-            sk[a] = k[qk_row + a];
+            const float qa = q[qk_row + a];
+            const float ka = k[qk_row + a];
+            sq[a] = qa;
+            sk[a] = ka;
+            pq += qa * qa;
+            pk += ka * ka;
+        }
+        red_q[tid] = pq;
+        red_k[tid] = pk;
+        barrier();
+        // Fixed-order tree over WG partials (WG need not be a power of two).
+        for (uint s = p2 / 2u; s > 0u; s >>= 1) {
+            if (tid < s && tid + s < WG) {
+                red_q[tid] += red_q[tid + s];
+                red_k[tid] += red_k[tid + s];
+            }
+            barrier();
+        }
+        const bool l2 = pc.qk_l2norm != 0u;
+        const float inv_q = l2 ? 1.0 / sqrt(red_q[0] + 1e-6) : 1.0;
+        const float inv_k = l2 ? 1.0 / sqrt(red_k[0] + 1e-6) : 1.0;
+        for (uint a = tid; a < pc.d_k; a += WG) {
+            sq[a] = (sq[a] * inv_q) * pc.q_scale;
+            sk[a] = sk[a] * inv_k;
         }
         barrier();
 

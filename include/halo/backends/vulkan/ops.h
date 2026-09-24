@@ -32,7 +32,8 @@ struct OpsOptions {
     /// Workgroup size (power of two, 32..1024) of the reduction kernels (rms_norm,
     /// matvec_*, argmax). Passed as specialization constant 0.
     std::uint32_t reduce_workgroup = 256;
-    /// Workgroup size of gated_delta_rule_decode (threads map to d_v columns).
+    /// Workgroup size of gated_delta_rule_decode (threads map to d_v columns; need not be a
+    /// power of two).
     std::uint32_t gdn_workgroup = 128;
     /// Largest d_k gated_delta_rule_decode accepts (shared-memory q/k tile size).
     std::uint32_t gdn_max_dk = 256;
@@ -47,9 +48,17 @@ struct OpsOptions {
 /// item 6). T = 1 is the single-token decode step; T > 1 is the MTP-verify form, which
 /// can also record per-row state slots for rollback (architecture decision C-1).
 ///
-/// Conventions (shared with backends/cpu `gated_delta_rule_recurrent`):
-///  - q, k: [T, n_k, d_k]. **Already L2-normalized per head, and q already multiplied by
-///    1/sqrt(d_k)** — the kernel does neither.
+/// q/k contract — DECISIONS **D-016**, identical to `halo::cpu::GdnQkParams` (same two
+/// fields, same defaults, same order of operations, same validation):
+///  - q, k: [T, n_k, d_k], the RAW per-head rows (after conv + SiLU).
+///  - if `qk_l2norm`: q <- q * (1 / sqrt(sum(q^2) + 1e-6)), likewise k, per head (in-kernel
+///    reduction, fixed order).
+///  - then q <- q * q_scale (k is never scaled). `q_scale` = nullopt means 1/sqrt(d_k); it
+///    must be finite (Error(Kernel) otherwise). The kernel applies exactly this and
+///    nothing else. The qwen35 forward passes qk_l2norm = true, q_scale = 1/sqrt(128).
+///    Callers holding pre-normalized, pre-scaled q/k pass qk_l2norm = false, q_scale = 1.
+///
+/// Other conventions (shared with backends/cpu `gated_delta_rule_recurrent`):
 ///  - v: [T, n_v, d_v].  g: [T, n_v] log-decay (the kernel applies exp(g); g <= 0 in the
 ///    model).  beta: [T, n_v], already sigmoid-activated.
 ///  - Head mapping is GGUF *tiled*: value head j uses key head `j % n_k` (D-004 item 5).
@@ -87,6 +96,9 @@ struct GdnDecodeArgs {
     Buffer* state_slots = nullptr;
     std::uint64_t slots_offset = 0;
     std::uint32_t n_slots = 0;
+
+    bool qk_l2norm = true;         ///< D-016: L2-normalize q and k per head in the kernel
+    std::optional<float> q_scale;  ///< D-016: q multiplier after normalization; nullopt = 1/sqrt(d_k)
 };
 
 /// Result layout written by argmax(): two 32-bit words {index (uint32), value (float bits)}.

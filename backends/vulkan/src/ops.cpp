@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <format>
 #include <utility>
 
@@ -73,10 +74,12 @@ Ops::Ops(std::shared_ptr<Context> ctx, OpsOptions options) : ctx_(std::move(ctx)
     const std::uint32_t gw = options_.gdn_workgroup;
     HALO_CHECK(gw >= 1 && gw <= info.max_workgroup_size[0] && gw <= info.max_workgroup_invocations,
                ErrorCode::Kernel, "Ops: gdn_workgroup={} outside device limits", gw);
+    // gated_delta_rule_decode shared memory: q/k tiles (2 * MAX_DK floats) plus the two
+    // WG-wide L2-norm reduction arrays (2 * WG floats, D-016).
     HALO_CHECK(options_.gdn_max_dk >= 1 &&
-                   std::uint64_t{options_.gdn_max_dk} * 2 * k_f32 <= info.max_shared_memory,
-               ErrorCode::Kernel, "Ops: gdn_max_dk={} exceeds shared memory ({} bytes)", options_.gdn_max_dk,
-               info.max_shared_memory);
+                   (std::uint64_t{options_.gdn_max_dk} + gw) * 2 * k_f32 <= info.max_shared_memory,
+               ErrorCode::Kernel, "Ops: gdn_max_dk={} with gdn_workgroup={} exceeds shared memory ({} bytes)",
+               options_.gdn_max_dk, gw, info.max_shared_memory);
     HALO_CHECK(std::uint64_t{rw} * 8 <= info.max_shared_memory, ErrorCode::Kernel,
                "Ops: reduce_workgroup={} exceeds shared memory", rw);
 }
@@ -174,6 +177,9 @@ void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) {
                options_.gdn_max_dk);
     HALO_CHECK(a.n_slots == 0 || a.state_slots != nullptr, ErrorCode::Kernel,
                "{}: n_slots={} without a state_slots buffer", op, a.n_slots);
+    // D-016: same default and validation as cpu::gdn_q_scale.
+    const float q_scale = a.q_scale.value_or(1.0f / std::sqrt(static_cast<float>(a.d_k)));
+    HALO_CHECK(std::isfinite(q_scale), ErrorCode::Kernel, "{}: q_scale {} is not finite", op, q_scale);
     const std::uint64_t T = a.n_tokens;
     const std::uint64_t qk_bytes = checked_mul(checked_mul(checked_mul(T, a.n_k, op), a.d_k, op), k_f32, op);
     const std::uint64_t v_elems = checked_mul(checked_mul(T, a.n_v, op), a.d_v, op);
@@ -247,9 +253,13 @@ void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) {
 
     const std::uint32_t wg = options_.gdn_workgroup;
     struct Push {
-        std::uint32_t n_v, n_k, d_k, d_v, n_tokens, n_slots, in_off, out_off, slots_off;
-    } push{a.n_v,      a.n_k,           a.d_k,           a.d_v, a.n_tokens, static_cast<std::uint32_t>(used_slots),
-           r_in.elem_rem, r_out.elem_rem, r_slots.elem_rem};
+        std::uint32_t n_v, n_k, d_k, d_v, n_tokens, n_slots, in_off, out_off, slots_off, qk_l2norm;
+        float q_scale;
+    } push{a.n_v,          a.n_k,          a.d_k,
+           a.d_v,          a.n_tokens,     static_cast<std::uint32_t>(used_slots),
+           r_in.elem_rem,  r_out.elem_rem, r_slots.elem_rem,
+           a.qk_l2norm ? 1u : 0u, q_scale};
+    static_assert(sizeof(Push) == 44, "must match the gated_delta_rule_decode.comp push block");
     const Kernel& k = kernel("gated_delta_rule_decode", 9, sizeof(Push), {{0, wg}, {1, options_.gdn_max_dk}},
                              {wg, 1, 1});
     const std::array bindings{bind(*a.q, qk_bytes),

@@ -367,6 +367,51 @@ TEST(CpuGdn, PrenormalizedInputsEqualInKernelL2Bitwise) {
     }
 }
 
+TEST(CpuGdn, ExplicitQScaleIsAppliedExactlyAsGiven) {
+    // D-016: q_scale is applied after the optional normalization and nothing is scaled
+    // implicitly. qk_l2norm=false needs unit-norm inputs for a non-expansive recursion.
+    Data d = make(kR3, 70, Regime::Model, true, 1500);
+    l2_norm_heads(ConstRows(std::span<const float>(d.q), d.T, d.qk_cols()), kR3.n_k_heads, kR3.d_k,
+                  Rows(std::span<float>(d.q), d.T, d.qk_cols()));
+    l2_norm_heads(ConstRows(std::span<const float>(d.k), d.T, d.qk_cols()), kR3.n_k_heads, kR3.d_k,
+                  Rows(std::span<float>(d.k), d.T, d.qk_cols()));
+    Data prescaled = d;
+    for (float& x : prescaled.q) x *= 0.5f;  // exact (power of two)
+    const GdnRefDims rd{kR3.n_k_heads, kR3.n_v_heads, kR3.d_k, kR3.d_v, true};
+    auto run_qk = [](const Data& dd, Form f, const GdnQkParams& qk) {
+        Result r;
+        r.out.assign(dd.T * dd.v_cols(), 0.0f);
+        r.state = dd.s0;
+        Rows out(r.out.data(), dd.T, dd.v_cols(), dd.v_cols());
+        if (f == Form::Recurrent)
+            gated_delta_rule_recurrent(dd.dims, dd.rows(0, dd.T), r.state, out, qk);
+        else
+            gated_delta_rule_chunked(dd.dims, dd.rows(0, dd.T), r.state, out, qk);
+        return r;
+    };
+    for (const auto& [l2, qs] : {std::pair{false, 0.5f}, std::pair{true, 0.25f}}) {
+        Ref r;
+        r.state.assign(d.s0.begin(), d.s0.end());
+        r.out = gdn_ref(rd, d.T, d.q, d.k, d.v, d.g, d.beta, r.state, l2, qs, &r.out_terms);
+        for (Form f : {Form::Recurrent, Form::Chunked}) {
+            const std::string what = std::string(f == Form::Recurrent ? "rec" : "chunk") + (l2 ? " l2" : " no-l2") +
+                                     " q_scale " + std::to_string(qs);
+            const Result got = run_qk(d, f, GdnQkParams{.qk_l2norm = l2, .q_scale = qs});
+            check_vs(d, d.T, got.out, got.state, r.out, r.state, r.out_terms, 1.0, what);
+        }
+    }
+    for (Form f : {Form::Recurrent, Form::Chunked}) {
+        const Result a = run_qk(d, f, GdnQkParams{.qk_l2norm = false, .q_scale = 0.5f});
+        const Result b = run_qk(prescaled, f, GdnQkParams{.qk_l2norm = false, .q_scale = 1.0f});
+        EXPECT_TRUE(bitwise_equal(a.out, b.out)) << "q_scale must be exactly one multiply of q";
+        EXPECT_TRUE(bitwise_equal(a.state, b.state));
+    }
+    EXPECT_EQ(gdn_q_scale(GdnQkParams{}, 16), 0.25f);
+    EXPECT_EQ(gdn_q_scale(GdnQkParams{.qk_l2norm = false, .q_scale = 3.0f}, 16), 3.0f);
+    EXPECT_THROW((void)gdn_q_scale(GdnQkParams{.qk_l2norm = true, .q_scale = std::numeric_limits<float>::infinity()}, 16),
+                 halo::Error);
+}
+
 // --------------------------------------------------------------------- rollback slots
 
 TEST(CpuGdn, SlotsEqualFinalStateOfTruncatedRunBitwise) {
