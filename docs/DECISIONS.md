@@ -230,3 +230,29 @@ Always-recompute is the fallback.
 Until the owner decides, HALO **loads both** packs, keeps the PR-004 numbers as recorded
 aspirations, and reports against the review's §6 NFRs. GPU kernel work is prioritised for
 UD-Q4_K_XL's types (the file on the target machine), starting with Q4_K, Q5_K, Q6_K and Q8_0.
+
+## D-014 — RESOLVED by the owner (2026-09-24)
+1. **Success is defined by efficiency NFRs** (review §6), not PR-004's absolute numbers:
+   - decode bandwidth efficiency η ≥ 0.80 of measured bandwidth (S=1, n=0, 4K context);
+   - MTP net speedup ≥ 1.5× at measured acceptance, auto-disabled below 1.05×;
+   - rollback costs ≤ (K−1)·0.157 GB extra and no extra weight passes;
+   - aggregate decode above llama.cpp's same-file 22.7 tok/s at S=4 (stretch ≥ 40);
+   - cached TTFT ≤ 300 ms for a 24K re-submit and for 32K multi-turn replay at ≥ 80% hits;
+   - checkpoints use the GPU pool only.
+   PR-004's numbers are recorded as aspirations.
+2. **The canonical performance pack is unsloth UD-Q4_K_XL** (embedded MTP), the file every
+   baseline used. ggml-org Q4_K_M plus a separate MTP file remains supported and tested.
+   GPU kernel priority is UD's types: Q4_K, Q5_K, Q6_K, Q8_0, then IQ4_XS, IQ4_NL, Q3_K, IQ3_S.
+
+## D-015 — Tokenizer reference is tokenizer.json, not AutoTokenizer (fact, WS-B)
+In transformers 5.17 this checkpoint's `tokenizer_config.json` names `Qwen2Tokenizer`, which
+rebuilds the Qwen2 regex (no `\p{M}`) and ignores tokenizer.json. That class tokenized 56
+golden cases differently, including Devanagari and Thai. The shipped `tokenizer.json`,
+`Qwen3_5Tokenizer` and llama.cpp `llama-tokenize` all agree with each other. HALO matches
+`tokenizers.Tokenizer.from_file(tokenizer.json)` and applies the **NFC** normalizer, which
+llama.cpp does not; on non-NFC input HALO and llama.cpp can differ. Model goldens store
+token ids, so they are unaffected.
+
+## D-008 (amendment)
+unsloth UD-Q4_K_XL has **no** `tokenizer.ggml.add_bos_token` key; ggml-org files have it
+set to False. Absent is treated as "do not add BOS", which matches both HF configs.
