@@ -267,3 +267,9 @@ into the kernel. GPU kernels are accepted only by differential tests against `ha
 and `halo::tensor` on the same input buffers (TRD §30; review M-2) — private test-tree
 oracles are allowed only for error-bound scaling.
 Also: ARGMAX on NaN raises `Error(Kernel)` on every backend (review S-3).
+
+**D-016 amendment (2026-09-25, code review N-6).** "Neither backend scales implicitly" means no
+backend scales beyond what its parameters say. The API has one named default, identical on CPU,
+Vulkan and HIP: `q_scale` omitted (`std::nullopt`) means `1/sqrt(d_k)`, and `qk_l2norm` defaults
+to `true`. A caller that wants no scaling passes `q_scale = 1.0f`. The qwen35 forward always
+passes both fields explicitly.
