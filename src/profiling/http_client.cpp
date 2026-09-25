@@ -171,6 +171,9 @@ HttpResponse http_request(const HttpRequest& req) {
     HALO_CHECK(req.method == "GET" || req.method == "POST", ErrorCode::Config, "http: method {}", req.method);
     HALO_CHECK(!req.path.empty() && req.path.front() == '/' && req.path.find_first_of("\r\n ") == std::string::npos,
                ErrorCode::Config, "http: invalid path");
+    // Header values are written verbatim: CR, LF or NUL would inject header lines (S-35).
+    HALO_CHECK(req.content_type.find_first_of(std::string_view("\r\n\0", 3)) == std::string::npos,
+               ErrorCode::Config, "http: invalid content_type (CR/LF/NUL)");
     const auto deadline = Clock::now() + req.timeout;
     Socket s = connect_loopback(req, deadline);
     std::string head = std::format("{} {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nAccept: application/json\r\n",

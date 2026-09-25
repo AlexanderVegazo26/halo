@@ -1,6 +1,6 @@
 halo_add_test(test_profiling
   SOURCES test_stats.cpp test_timer_counters.cpp test_hw_state.cpp test_record.cpp test_workload.cpp
-          test_suites.cpp test_sha256.cpp test_subprocess.cpp test_http.cpp test_baseline.cpp
+          test_suites.cpp test_sha256.cpp test_subprocess.cpp test_http.cpp test_baseline.cpp test_security_m4.cpp
           test_baseline_integration.cpp
   LIBS halo_profiling)
 

@@ -58,7 +58,9 @@ TEST(Subprocess, ExplicitEnvironmentOnly) {
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r.out, "HALO_A=1\nRADV_PERFTEST=nogttspill\n");
     // Recorded environment: only what was passed (+ prefixed inherited vars when inheriting).
-    EXPECT_EQ(recorded_environment(o), o.env);
+    // Values only for allowlisted non-secret names (S-31): HALO_A is recorded redacted.
+    EXPECT_EQ(recorded_environment(o),
+              (std::map<std::string, std::string>{{"HALO_A", std::string(kRedacted)}, {"RADV_PERFTEST", "nogttspill"}}));
     ::setenv("HALO_WSJ_SECRET_TOKEN", "hunter2", 1);
     ::setenv("GGML_VK_VISIBLE_DEVICES", "0", 1);
     o.inherit_env = true;

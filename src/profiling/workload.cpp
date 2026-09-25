@@ -1,9 +1,13 @@
 #include "halo/profiling/workload.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <cstring>
 #include <format>
-#include <fstream>
 #include <optional>
-#include <sstream>
 
 #include "halo/core/error.h"
 
@@ -139,11 +143,25 @@ Workload load_workload(const std::filesystem::path& path) {
     HALO_CHECK(!ec, ErrorCode::Io, "workload {}: {}", path.string(), ec.message());
     HALO_CHECK(size <= kMaxWorkloadBytes, ErrorCode::Config, "workload {}: {} bytes exceed {}", path.string(), size,
                kMaxWorkloadBytes);
-    std::ifstream in(path, std::ios::binary);
-    HALO_CHECK(in.good(), ErrorCode::Io, "workload {}: cannot open", path.string());
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    const auto j = nlohmann::json::parse(ss.str(), nullptr, /*allow_exceptions=*/false);
+    // open(O_CLOEXEC) + bounded read (S-33: no descriptor without close-on-exec).
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    HALO_CHECK(fd >= 0, ErrorCode::Io, "workload {}: cannot open: {}", path.string(), std::strerror(errno));
+    struct Closer {
+        int fd;
+        ~Closer() { ::close(fd); }
+    } closer{fd};
+    std::string text;
+    std::array<char, 65536> buf{};
+    while (true) {
+        const ssize_t n = ::read(fd, buf.data(), buf.size());
+        if (n < 0 && errno == EINTR) continue;
+        HALO_CHECK(n >= 0, ErrorCode::Io, "workload {}: read error: {}", path.string(), std::strerror(errno));
+        if (n == 0) break;
+        text.append(buf.data(), static_cast<std::size_t>(n));
+        HALO_CHECK(text.size() <= kMaxWorkloadBytes, ErrorCode::Config, "workload {}: exceeds {} bytes", path.string(),
+                   kMaxWorkloadBytes);
+    }
+    const auto j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
     HALO_CHECK(!j.is_discarded(), ErrorCode::Config, "workload {}: invalid JSON", path.string());
     return parse_workload(j);
 }

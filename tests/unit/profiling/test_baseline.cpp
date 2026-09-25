@@ -174,7 +174,7 @@ TEST(LlamaBench, RejectsMalformedOutput) {
 TEST(LlamaBench, RunsFakeBinaryEndToEnd) {
     LlamaBenchConfig c;
     c.binary = HALO_CHILD_HELPER;
-    c.model = "/dev/null";
+    c.model = fixture("llama_bench_version.txt");  // any regular file (S-36)
     c.backend = "cpu";
     c.common = common();
     c.common.process.env = {{"HALO_FAKE_MODE", "llama_bench"},
@@ -186,7 +186,7 @@ TEST(LlamaBench, RunsFakeBinaryEndToEnd) {
     EXPECT_EQ(r.invocation->version, "0.5.0-dev (build 1, commit bd4f514)");
     EXPECT_EQ(r.invocation->commit, "bd4f514");
     EXPECT_EQ(r.invocation->argv, llama_bench_argv(c));
-    EXPECT_EQ(r.invocation->environment.at("HALO_FAKE_MODE"), "llama_bench");
+    EXPECT_EQ(r.invocation->environment.at("HALO_FAKE_MODE"), kRedacted);  // name kept, value not (S-31)
     EXPECT_EQ(r.model_hash, "precomputed");
     EXPECT_TRUE(r.pack_hash.empty());  // a placeholder hash yields no PACK_ID
     EXPECT_EQ(r.power_mode, "unknown|unknown/unknown");  // capture disabled: says so
@@ -206,7 +206,7 @@ TEST(LlamaBench, RunsFakeBinaryEndToEnd) {
 TEST(LlamaBench, ToolFailuresBecomeInvalidArtifacts) {
     LlamaBenchConfig c;
     c.binary = HALO_CHILD_HELPER;
-    c.model = "/dev/null";
+    c.model = fixture("llama_bench_version.txt");  // any regular file (S-36)
     c.backend = "cpu";
     c.common = common();
     const auto run = [&](std::map<std::string, std::string> env) {

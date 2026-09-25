@@ -1,8 +1,11 @@
 #include "halo/profiling/sha256.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <bit>
+#include <cerrno>
 #include <cstring>
-#include <fstream>
 #include <vector>
 
 #include "halo/core/error.h"
@@ -138,22 +141,26 @@ std::string sha256_file(const std::filesystem::path& path, std::size_t chunk_byt
                         const std::function<void(std::uint64_t)>& progress) {
     HALO_CHECK(chunk_bytes >= 1 && chunk_bytes <= (256U << 20), ErrorCode::Config, "sha256_file: chunk {} invalid",
                chunk_bytes);
-    std::ifstream in(path, std::ios::binary);
-    HALO_CHECK(in.is_open(), ErrorCode::Io, "sha256_file: cannot open {}", path.string());
+    // open(O_CLOEXEC): the descriptor never leaks into a concurrently spawned child (S-33).
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    HALO_CHECK(fd >= 0, ErrorCode::Io, "sha256_file: cannot open {}: {}", path.string(), std::strerror(errno));
+    struct Closer {
+        int fd;
+        ~Closer() { ::close(fd); }
+    } closer{fd};
     std::vector<char> buf(chunk_bytes);
     Sha256 h;
     std::uint64_t done = 0;
-    while (in) {
-        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-        const std::streamsize n = in.gcount();
-        if (n > 0) {
-            h.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(buf.data()),
-                                                   static_cast<std::size_t>(n)));
-            done += static_cast<std::uint64_t>(n);
-            if (progress) progress(done);
-        }
+    while (true) {
+        const ssize_t n = ::read(fd, buf.data(), buf.size());
+        if (n < 0 && errno == EINTR) continue;
+        HALO_CHECK(n >= 0, ErrorCode::Io, "sha256_file: read error on {}: {}", path.string(), std::strerror(errno));
+        if (n == 0) break;
+        h.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(buf.data()),
+                                               static_cast<std::size_t>(n)));
+        done += static_cast<std::uint64_t>(n);
+        if (progress) progress(done);
     }
-    HALO_CHECK(in.eof() && !in.bad(), ErrorCode::Io, "sha256_file: read error on {}", path.string());
     return h.finish_hex();
 }
 

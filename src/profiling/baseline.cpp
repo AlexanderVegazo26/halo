@@ -86,6 +86,23 @@ void check_common(const BaselineCommon& c, const std::filesystem::path& binary, 
                binary.string());
     if (model != nullptr) {
         HALO_CHECK(!model->empty(), ErrorCode::Config, "baseline: model path is empty");
+        // A FIFO / device would block the hash forever, and a directory is not a model (S-36).
+        std::error_code ec;
+        HALO_CHECK(std::filesystem::is_regular_file(*model, ec), ErrorCode::Config,
+                   "baseline: model '{}' is not a regular file", model->string());
+    }
+}
+
+/// extra_args must not redirect the run away from what HALO hashes and binds (S-36):
+/// another model, or (llama-server) another host/port.
+void check_extra_args(const std::vector<std::string>& extra, std::initializer_list<std::string_view> forbidden,
+                      const char* tool) {
+    for (const auto& a : extra) {
+        for (const std::string_view f : forbidden) {
+            const bool eq_form = a.size() > f.size() && a.starts_with(f) && a[f.size()] == '=';
+            HALO_CHECK(a != f && !eq_form, ErrorCode::Config,
+                       "{}: extra_args may not contain '{}' (HALO sets the model/host/port itself)", tool, f);
+        }
     }
 }
 
@@ -154,6 +171,8 @@ void finish_driver(SuiteArtifact& a, std::string_view backend) {
     for (auto& r : a.records) {
         if (r.driver.empty()) r.driver = driver_label(backend, a.hardware_before);
         if (r.pack_hash.empty() && is_sha256_hex(r.model_hash)) r.pack_hash = make_pack_id(r.model_hash, std::nullopt);
+        // The file is hashed, then re-opened by the tool: say so (S-36, TOCTOU).
+        if (!r.model_hash.empty()) r.extra["model_hash_taken"] = "before the run (file re-opened by the tool)";
     }
 }
 
@@ -199,6 +218,10 @@ std::vector<std::string> llama_bench_argv(const LlamaBenchConfig& c) {
                c.repetitions);
     HALO_CHECK(!c.n_prompt.empty() && !c.n_gen.empty() && !c.n_depth.empty(), ErrorCode::Config,
                "llama-bench: n_prompt / n_gen / n_depth lists must be non-empty");
+    // llama-bench splits -m on ',': one hashed path must be one benchmarked model (S-36).
+    HALO_CHECK(c.model.string().find(',') == std::string::npos, ErrorCode::Config,
+               "llama-bench: model path '{}' contains ','", c.model.string());
+    check_extra_args(c.extra_args, {"-m", "--model", "-hf", "--hf-repo", "-mu", "--model-url"}, "llama-bench");
     std::vector<std::string> a{c.binary.string(), "-m", c.model.string(), "-p", join_u(c.n_prompt), "-n",
                                join_u(c.n_gen),   "-d", join_u(c.n_depth), "-r", std::to_string(c.repetitions),
                                "-ngl", std::to_string(c.n_gpu_layers), "-fa", c.flash_attn, "-o", "json"};
@@ -344,6 +367,9 @@ std::vector<std::string> llama_server_argv(const LlamaServerConfig& c) {
     (void)ggml_backend_name(c.backend);
     HALO_CHECK(c.port != 0, ErrorCode::Config, "llama-server: port 0 (choose a free port)");
     HALO_CHECK(c.parallel >= 1 && c.spec_draft_n_max >= 1, ErrorCode::Config, "llama-server: invalid parallel/draft");
+    check_extra_args(c.extra_args,
+                     {"-m", "--model", "-hf", "-hfr", "--hf-repo", "-mu", "--model-url", "--host", "--port"},
+                     "llama-server");
     std::vector<std::string> a{c.binary.string(), "-m", c.model.string(), "-ngl", std::to_string(c.n_gpu_layers),
                                "--ctx-size", std::to_string(c.ctx_size), "--parallel", std::to_string(c.parallel),
                                "--flash-attn", c.flash_attn};
@@ -412,7 +438,12 @@ SuiteArtifact run_llama_server(const LlamaServerConfig& c) {
     ArtifactBuilder b("baseline", c.common.environment, id, c.common.stability);
     const std::string hash = model_hash_of(c.common, c.model);
     const auto bi = read_version(c.binary, c.common.process, b);
-    if (bi) {
+    // S-29: whatever already listens on the port would otherwise be taken for our server.
+    if (bi && !loopback_port_free(c.port)) {
+        b.failure(std::format("llama-server: port {} is already in use on 127.0.0.1; refusing to start "
+                              "(a stale or foreign server would answer instead of the spawned one)",
+                              c.port));
+    } else if (bi) {
         ChildProcess server(argv, c.common.process, c.log_path);  // torn down on every path
         const auto deadline = std::chrono::steady_clock::now() + c.startup_timeout;
         bool ready = false;
@@ -438,8 +469,14 @@ SuiteArtifact run_llama_server(const LlamaServerConfig& c) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        std::optional<bool> owned;
+        if (ready) owned = port_listener_is(server.pid(), c.port);
         if (!ready) {
             b.failure(std::format("llama-server did not become ready within {} ms: {}", c.startup_timeout.count(), last));
+        } else if (owned != true) {
+            b.failure(std::format("llama-server: the listener on port {} is {} the spawned server (pid {}); "
+                                  "results would not be its own",
+                                  c.port, owned ? "not" : "not verifiably", server.pid()));
         } else {
             const Invocation inv = make_invocation(c.binary, *bi, argv, c.common.process);
             BaselineParseContext ctx{"llama-server", c.backend, c.common.model_name, c.common.pack, hash,
@@ -457,6 +494,10 @@ SuiteArtifact run_llama_server(const LlamaServerConfig& c) {
                                           {"seed", c.seed},
                                           {"stream", false}}
                                .dump();
+                if (!server.running()) {
+                    b.failure(std::format("llama-server exited during the run (before request {})", i));
+                    break;
+                }
                 try {
                     const HttpResponse resp = http_request(req);
                     HALO_CHECK(resp.status == 200, ErrorCode::Api, "/completion returned {}: {}", resp.status,

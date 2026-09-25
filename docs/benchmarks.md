@@ -448,9 +448,10 @@ The `llama-server` MTP flags follow the engine report (docs/strix-halo-qwen38-en
 - full command line: `invocation.argv`, which is the exact argv that was exec'd.
 - model hash: `model_hash`, the streamed SHA-256 of the GGUF (`sha256_file`, 4 MiB chunks).
   Ollama records `ollama-digest:<digest>`, which is Ollama's model digest, not a GGUF hash.
-- environment: `invocation.environment`. This holds only the variables passed explicitly,
-  plus inherited `RADV_`/`AMD_`/`HSA_`/`ROCR_`/`HIP_`/`GGML_`/`VK_`/`LLAMA_`/`OLLAMA_`/`MESA_`
-  variables. The full parent environment is never recorded.
+- environment: `invocation.environment` holds the **names** of the variables passed
+  explicitly plus inherited `RADV_`/`AMD_`/`HSA_`/`ROCR_`/`HIP_`/`GGML_`/`VK_`/`LLAMA_`/`OLLAMA_`/`MESA_`
+  variables. Values are kept only for allowlisted, non-secret names; everything else is
+  `<redacted>` (S-31, see below). The full parent environment is never recorded.
 - power mode: `power_mode`, plus the artifact's `power_mode_pinned`.
 - results: see the mode/context contract below.
 
@@ -506,6 +507,20 @@ or thermal drift therefore never becomes the latest baseline by default.
   - Numeric loopback only (`127.0.0.1` / `::1`).
   - The header block, `Content-Length` and chunked body are all bounded.
   - Every call has a timeout.
+
+### Security review fixes (docs/reviews/2026-09-25-security-review-bench.md)
+
+| ID | Fix |
+|---|---|
+| S-29 | `run_llama_server` refuses to start if 127.0.0.1:port is already bound (bind probe before spawn). Once `/health` answers, it verifies through `/proc/net/tcp{,6}` and `/proc/<pid>/fd` that the listening socket belongs to the spawned child. A server that exits mid-run is a FAILED note. |
+| S-30 | A `waitpid`/`waitid` failure (for example, SIGCHLD set to SIG_IGN) gives `status_unknown`, and `ok()` is false. It never reports exit 0. |
+| S-31 | Recorded environment: names are recorded, but a value only for `RADV_`/`AMD_`/`HSA_`/`ROCR_`/`HIP_`/`GGML_`/`VK_`/`MESA_` names. Any name containing KEY, TOKEN, SECRET, PASSWORD, AUTH or CREDENTIAL, and every `LLAMA_*`/`OLLAMA_*` or other value, is stored as `<redacted>`. |
+| S-32 | Exit is detected with `waitid(WNOWAIT)`. The group is signalled while the unreaped leader still pins its pid/pgid, and only then reaped. Nothing is ever signalled after a reap, and there is no single-pid fallback. |
+| S-33 | The child closes every fd >= 3 before exec (`posix_spawn_file_actions_addclosefrom_np`). HALO's own file reads (`sha256_file`, `load_workload`), pipes, sockets and log file are opened with `O_CLOEXEC`. |
+| S-34 | **Known limitation, documented rather than fixed.** A descendant that calls `setsid()` leaves the process group and survives the group kill. llama.cpp tools do not do this. A hard guarantee would need `PR_SET_CHILD_SUBREAPER` plus a sweep, or a transient cgroup. |
+| S-35 | CR, LF or NUL in `content_type` is refused with `Error(Config)`. The path and host were already validated. |
+| S-36 | llama-bench refuses a `,` in the model path, because it splits `-m` on commas. `extra_args` may not contain `-m`, `--model`, `-hf`, `--hf-repo` or `-mu`/`--model-url`; for llama-server, `--host` and `--port` are also refused, as is any `--flag=value` form of these. The model must be a regular file. Records note `extra.model_hash_taken = "before the run"`. The TOCTOU between hashing and the tool opening the file is not closed. |
+| S-37 | The llama-server log is opened by HALO with `O_NOFOLLOW` and mode 0600 (`fchmod`, so an existing file is tightened too), then passed to the child. A symlink at that path is an `Error(Io)`. |
 
 ### Intended `halo bench baseline` flags (for WS-I)
 

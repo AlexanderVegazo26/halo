@@ -6,14 +6,21 @@
 //   grandchild     fork a child that sleeps 60 s, then sleep 60 s (tests group kill);
 //                  writes the grandchild pid to HALO_FAKE_PIDFILE
 //   close_sleep    close stdout/stderr, then sleep 60 s (tests the deadline after EOF)
+//   fds            print every open fd number (S-33 fd-leak test)
+//   fake_server    a grandchild serves HALO_FAKE_JSON on HALO_FAKE_PORT (S-29 ownership test)
 //   argv           print each argv[i] (i >= 1) followed by '\n'
 //   llama_bench    "--version" -> version text on stderr; otherwise cat HALO_FAKE_JSON to
 //                  stdout (and exit HALO_FAKE_CODE, default 0)
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +78,56 @@ int main(int argc, char** argv) {
         ::close(1);
         ::close(2);
         ::sleep(60);
+        return 0;
+    }
+    if (mode == "fake_server") {
+        // "--version" answers like llama.cpp; otherwise a GRANDCHILD listens on
+        // 127.0.0.1:HALO_FAKE_PORT and answers every request with HALO_FAKE_JSON, while this
+        // (direct) child holds no socket: an in-group impostor for the S-29 ownership check.
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--version") {
+                std::cerr << "version: 0.5.0-dev (build 1, commit bd4f514)\n";
+                return 0;
+            }
+        }
+        std::ifstream in(env("HALO_FAKE_JSON"), std::ios::binary);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const std::string body = ss.str();
+        const int port = std::atoi(env("HALO_FAKE_PORT", "0").c_str());
+        const pid_t g = ::fork();
+        if (g == 0) {
+            ::alarm(30);  // never outlive a test, even if a mutation breaks the group kill
+            const int s = ::socket(AF_INET, SOCK_STREAM, 0);
+            int one = 1;
+            ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(static_cast<std::uint16_t>(port));
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ::listen(s, 8) != 0) return 3;
+            for (int n = 0; n < 200; ++n) {
+                const int c = ::accept(s, nullptr, nullptr);
+                if (c < 0) continue;
+                char buf[8192];
+                (void)::recv(c, buf, sizeof(buf), 0);
+                const std::string resp = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+                                         "\r\nConnection: close\r\n\r\n" + body;
+                write_all(c, resp.data(), resp.size());
+                ::close(c);
+            }
+            return 0;
+        }
+        ::sleep(60);
+        return 0;
+    }
+    if (mode == "fds") {  // list open fds (one per line), excluding the listing's own dir fd
+        for (int fd = 0; fd < 1024; ++fd) {
+            if (::fcntl(fd, F_GETFD) != -1) {
+                const std::string s = std::to_string(fd) + "\n";
+                write_all(1, s.data(), s.size());
+            }
+        }
         return 0;
     }
     if (mode == "argv") {
