@@ -17,17 +17,32 @@
 
 #include "hd.h"
 #include "head.h"
+// The IQ lookup tables are halo::tensor's own (src/tensor/ggml_tables.h, verbatim from ggml):
+// one source for the CPU reference and the kernels, no private copy (review M-2).
+#include "tensor/ggml_tables.h"
 
 namespace halo::hip::kern {
 
-enum class WType : unsigned { F32 = 0, F16 = 1, Q8_0 = 2, Q4_K = 3, Q5_K = 4, Q6_K = 5 };
+enum class WType : unsigned {
+    F32 = 0,
+    F16 = 1,
+    Q8_0 = 2,
+    Q4_K = 3,
+    Q5_K = 4,
+    Q6_K = 5,
+    IQ4_NL = 6,  // D-014 second tier (UD-Q4_K_XL)
+    IQ4_XS = 7,
+    Q3_K = 8,
+    IQ3_S = 9,
+};
 
 /// Elements and bytes per block of each weight type (ggml geometry).
 HALO_HD inline unsigned wq_block_elems(WType t) {
     switch (t) {
         case WType::F32:
         case WType::F16: return 1;
-        case WType::Q8_0: return 32;
+        case WType::Q8_0:
+        case WType::IQ4_NL: return 32;
         default: return 256;
     }
 }
@@ -39,6 +54,10 @@ HALO_HD inline unsigned wq_block_bytes(WType t) {
         case WType::Q4_K: return 144;
         case WType::Q5_K: return 176;
         case WType::Q6_K: return 210;
+        case WType::IQ4_NL: return 18;
+        case WType::IQ4_XS: return 136;
+        case WType::Q3_K: return 110;
+        case WType::IQ3_S: return 110;
     }
     return 0;
 }
@@ -67,6 +86,12 @@ HALO_HD inline std::uint16_t ld16(const std::uint8_t* p) {
 }
 
 HALO_HD inline float fli(int v) { return static_cast<float>(v); }
+
+/// Little-endian u32 at any byte address (quant.cpp memcpy on a little-endian host).
+HALO_HD inline std::uint32_t ld32(const std::uint8_t* p) {
+    return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+}
 
 /// ggml get_scale_min_k4 (src/tensor/quant.cpp scale_min_k4).
 HALO_HD inline void scale_min_k4(unsigned j, const std::uint8_t* q, unsigned& d, unsigned& m) {
@@ -148,6 +173,81 @@ HALO_HD inline float wq_elem(WType t, const std::uint8_t* row, unsigned i) {
             const int q = static_cast<int>(nib | (((qh[l] >> (2u * qd)) & 3u) << 4)) - 32;
             const float s = fli(static_cast<std::int8_t>(sc[is + 2u * qd]));
             return d * s * fli(q);
+        }
+        case WType::IQ4_NL: {  // block_iq4_nl { f16 d; u8 qs[16]; } — quant.cpp deq_iq4_nl
+            const std::uint8_t* blk = row + 18u * (i / 32u);
+            const unsigned r = i % 32u;
+            const float d = h2f(ld16(blk));
+            const std::uint8_t qb = blk[2u + r % 16u];
+            const unsigned nib = r < 16u ? (qb & 0xFu) : (qb >> 4);
+            return d * fli(tensor::detail::kvalues_iq4nl[nib]);
+        }
+        case WType::IQ4_XS: {  // block_iq4_xs { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]; }
+            const std::uint8_t* blk = row + 136u * (i / 256u);
+            const unsigned r = i % 256u;
+            const unsigned ib = r / 32u;
+            const unsigned w = r % 32u;
+            const float d = h2f(ld16(blk));
+            const unsigned scales_h = ld16(blk + 2);
+            const int ls = static_cast<int>(((blk[4u + ib / 2u] >> (4u * (ib % 2u))) & 0xFu) |
+                                            (((scales_h >> (2u * ib)) & 3u) << 4));
+            const float dl = d * fli(ls - 32);
+            const std::uint8_t qb = blk[8u + 16u * ib + w % 16u];
+            const unsigned nib = w < 16u ? (qb & 0xFu) : (qb >> 4);
+            return dl * fli(tensor::detail::kvalues_iq4nl[nib]);
+        }
+        case WType::Q3_K: {  // block_q3_K { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d; }
+            const std::uint8_t* blk = row + 110u * (i / 256u);
+            const unsigned r = i % 256u;
+            const unsigned nh = r / 128u;  // 128-element half
+            const unsigned rr = r % 128u;
+            const unsigned j = rr / 32u;   // shift group
+            const unsigned w = rr % 32u;
+            const unsigned l = w % 16u;
+            const unsigned hi = w / 16u;
+            const float d_all = h2f(ld16(blk + 108));
+            // The 16 6-bit scales, unpacked exactly as quant.cpp (kmask1/kmask2 over 3 words).
+            constexpr std::uint32_t kmask1 = 0x03030303u;
+            constexpr std::uint32_t kmask2 = 0x0f0f0f0fu;
+            const std::uint32_t a0 = ld32(blk + 96);
+            const std::uint32_t a1 = ld32(blk + 100);
+            const std::uint32_t a2 = ld32(blk + 104);  // quant.cpp tmp
+            const unsigned is = r / 16u;
+            std::uint32_t word = 0;
+            switch (is / 4u) {
+                case 0: word = (a0 & kmask2) | (((a2 >> 0) & kmask1) << 4); break;
+                case 1: word = (a1 & kmask2) | (((a2 >> 2) & kmask1) << 4); break;
+                case 2: word = ((a0 >> 4) & kmask2) | (((a2 >> 4) & kmask1) << 4); break;
+                default: word = ((a1 >> 4) & kmask2) | (((a2 >> 6) & kmask1) << 4); break;
+            }
+            const int sc = static_cast<std::int8_t>(static_cast<std::uint8_t>((word >> (8u * (is % 4u))) & 0xFFu));
+            const float dl = d_all * fli(sc - 32);
+            const unsigned qi = 32u * nh + l + 16u * hi;
+            const unsigned m = 1u << (j + 4u * nh);
+            const int q = static_cast<int>((blk[32u + qi] >> (2u * j)) & 3u) - ((blk[l + 16u * hi] & m) != 0u ? 0 : 4);
+            return dl * fli(q);
+        }
+        case WType::IQ3_S: {  // block_iq3_s { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4]; }
+            const std::uint8_t* blk = row + 110u * (i / 256u);
+            const unsigned r = i % 256u;
+            const unsigned sb = r / 32u;    // 32-element sub-block (ib32 + half)
+            const unsigned half = sb % 2u;
+            const unsigned within = r % 32u;
+            const unsigned l = within / 8u;
+            const unsigned k = within % 8u;
+            const unsigned j = k % 4u;
+            const unsigned second = k / 4u;
+            const float d = h2f(ld16(blk));
+            const std::uint8_t* qs = blk + 2u + 8u * sb;
+            const unsigned h = blk[66u + sb];
+            const std::uint8_t* signs = blk + 74u + 4u * sb;
+            const std::uint8_t scb = blk[106u + sb / 2u];
+            const float db = d * fli(static_cast<int>(1u + 2u * (half == 0u ? (scb & 0xFu) : (scb >> 4))));
+            const unsigned g = second == 0u ? (qs[2u * l] | ((h << (8u - 2u * l)) & 256u))
+                                            : (qs[2u * l + 1u] | ((h << (7u - 2u * l)) & 256u));
+            const float grid = fli(static_cast<int>((tensor::detail::iq3s_grid[g] >> (8u * j)) & 0xFFu));
+            const float sign = (signs[l] & tensor::detail::kmask_iq2xs[j + 4u * second]) != 0u ? -1.f : 1.f;
+            return db * grid * sign;
         }
     }
     return 0.0f;

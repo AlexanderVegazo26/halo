@@ -1,4 +1,5 @@
-// QUANT_GEMV of the HIP backend (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K), differentially tested
+// QUANT_GEMV of the HIP backend (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q3_K, IQ3_S),
+// differentially tested
 // against halo::tensor::dequantize_row + halo::cpu::matmul on the same input bytes
 // (TRD §30, review M-2).
 //
@@ -79,6 +80,18 @@ std::vector<std::byte> make_weights(const GemvCase& c, std::uint64_t row_bytes, 
             }
             case DType::Q6_K:
                 for (std::uint32_t b = 0; b < c.cols / 256; ++b) put16(row + 210 * b + 208, b == 0 ? 1e-6f : scale(rng));
+                break;
+            case DType::IQ4_NL:  // f16 d at the start of each 18-byte block of 32
+                for (std::uint32_t b = 0; b < c.cols / 32; ++b) put16(row + 18 * b, b == 0 ? 2e-6f : scale(rng));
+                break;
+            case DType::IQ4_XS:  // f16 d at the start of each 136-byte block of 256
+                for (std::uint32_t b = 0; b < c.cols / 256; ++b) put16(row + 136 * b, b == 0 ? 3e-6f : scale(rng));
+                break;
+            case DType::Q3_K:  // f16 d at byte 108 of each 110-byte block
+                for (std::uint32_t b = 0; b < c.cols / 256; ++b) put16(row + 110 * b + 108, b == 0 ? 1e-6f : scale(rng));
+                break;
+            case DType::IQ3_S:  // f16 d at the start of each 110-byte block
+                for (std::uint32_t b = 0; b < c.cols / 256; ++b) put16(row + 110 * b, b == 0 ? 2e-6f : scale(rng));
                 break;
             default:
                 break;
@@ -192,7 +205,9 @@ void check_gemv(const GemvCase& c, const std::string& variant, Runner& r) {
 std::vector<GemvCase> gemv_cases() {
     std::vector<GemvCase> v;
     std::uint32_t seed = 100;
-    for (DType t : {DType::Q4_K, DType::Q5_K, DType::Q6_K, DType::Q8_0, DType::F16, DType::F32}) {
+    // D-014 order, then the second tier the UD-Q4_K_XL pack needs (IQ4_XS, IQ4_NL, Q3_K, IQ3_S).
+    for (DType t : {DType::Q4_K, DType::Q5_K, DType::Q6_K, DType::Q8_0, DType::F16, DType::F32, DType::IQ4_XS,
+                    DType::IQ4_NL, DType::Q3_K, DType::IQ3_S}) {
         const bool plain = t == DType::F32 || t == DType::F16;
         GemvCase a{.type = t, .rows = 37, .cols = plain ? 100u : 512u, .seed = ++seed};  // plain: dot tail (100 % 8)
         v.push_back(a);

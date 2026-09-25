@@ -467,9 +467,13 @@ kern::WType gemv_wtype(DType t, const char* op) {
         case DType::Q4_K: return kern::WType::Q4_K;
         case DType::Q5_K: return kern::WType::Q5_K;
         case DType::Q6_K: return kern::WType::Q6_K;
+        case DType::IQ4_NL: return kern::WType::IQ4_NL;
+        case DType::IQ4_XS: return kern::WType::IQ4_XS;
+        case DType::Q3_K: return kern::WType::Q3_K;
+        case DType::IQ3_S: return kern::WType::IQ3_S;
         default: break;
     }
-    throw_error(ErrorCode::Unsupported, "{}: weight type id {} has no HIP GEMV kernel (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K)",
+    throw_error(ErrorCode::Unsupported, "{}: weight type id {} has no HIP GEMV kernel (F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS)",
                 op, static_cast<std::uint32_t>(t));
 }
 

@@ -1,10 +1,12 @@
 # HALO HIP backend (WS-K)
 
-Status: **milestones M1–M4 complete**.
+Status: **milestones M1–M5 complete**.
 - M1: the host runtime and the GATED_DELTANET family.
 - M2: quantized GEMV.
 - M3: the LM head with fused argmax, TOP_K, RMS_NORM, PARTIAL_ROPE, SWIGLU and MUL_SIGMOID.
 - M4: the PARTIAL_ROPE head stride (TD-9) and GQA ATTENTION over the paged KV cache.
+- M5: GEMV for the D-014 second-tier types (IQ4_XS, IQ4_NL, Q3_K, IQ3_S). With them, every
+  weight type of the canonical UD-Q4_K_XL pack has a HIP GEMV.
 
 What remains is listed under "Not done".
 
@@ -151,7 +153,7 @@ The contracts are the CPU reference's (`include/halo/backends/cpu/ops.h`). The o
 | GATED_DELTANET, chunked | `k_gdn_check_g` → per group (`k_gdn_chunk_intra`, `k_gdn_chunk_state`) | `gdn_chunked_b64`, `gdn_chunked_b32` | same | Same math as `cpu::gated_delta_rule_chunked`: UT forward substitution, intra-chunk attention, one state update per chunk, and slots from the chunk's closed form. Workspace records hold q, k, k_cumdecay, new_values/v_new, attn, decay and gc. The op runs as many chunks per group as fit. Group 0 reads `state`, later groups read `state_out`. |
 | CONV1D_SHORT | `k_conv1d_silu` | `conv1d_silu_b256`, `conv1d_silu_b64` | D-004 (2), D-012 | One thread per channel. The K−1 history lives in registers (K ≤ 8). Fused SiLU. out may alias x. Slots. |
 | GATED_NORM | `k_norm` (gate operand set) | `gated_norm_b128`, `gated_norm_b32` | D-004 (7) | One workgroup per row. Lanes 0..7 compute the CPU's 8 interleaved partial sums, thread 0 combines them, then the element-wise `(w·(x·inv))·silu(z)`. out may alias x or z. |
-| QUANT_GEMV / MATMUL (decode) | `k_gemv_wave`, `k_gemv_generic` | `gemv_wave32_r4`, `gemv_wave32_r8`, `gemv_generic_b64` | D-007, D-014 | `y[t][n] = Σ_i x[t][i]·W[n][i]` for F32, F16, Q8_0, Q4_K, Q5_K, Q6_K in ggml block layouts, T = n_vec vectors (decode T = 1, MTP verify T > 1). Weight rows may start at any byte and have any byte stride (F32 needs 4-byte alignment). Other types raise `Error(Unsupported)`. See "GEMV reduction orders" below. |
+| QUANT_GEMV / MATMUL (decode) | `k_gemv_wave`, `k_gemv_generic` | `gemv_wave32_r4`, `gemv_wave32_r8`, `gemv_generic_b64` | D-007, D-014 | `y[t][n] = Σ_i x[t][i]·W[n][i]` for F32, F16, Q8_0, Q4_K, Q5_K, Q6_K and the second tier IQ4_XS, IQ4_NL, Q3_K, IQ3_S, in ggml block layouts, T = n_vec vectors (decode T = 1, MTP verify T > 1). Weight rows may start at any byte and have any byte stride (F32 needs 4-byte alignment). Other types raise `Error(Unsupported)`. See "GEMV reduction orders" below. |
 | LOGITS_MATMUL + ARGMAX_FUSED (LM head) | the QUANT_GEMV kernel with its argmax epilogue → `k_argmax_reduce` | GEMV variant (`OpsOptions::gemv`) + `argmax_b256` | D-007, D-016, TRD §19 | `cpu::matmul_argmax` per vector (T = n_vec). Each GEMV workgroup ranks its own rows as soon as their logits exist, so the logits never have to be written (they are written only if `gemv.y` is set). Stage 2 is one workgroup per vector. Ties go to the lowest index; −inf is an ordinary value. A NaN sets the result's NaN word, and `Ops::read_argmax` raises `Error(Kernel)`. Result layout `{index, value bits, nan}` is the Vulkan backend's. |
 | ARGMAX_FUSED (over logits) | `k_argmax_partial` → `k_argmax_reduce` | `argmax_b256` | D-016 | `cpu::argmax` per vector. 16 logits per thread, then a fixed LDS tree. |
 | TOP_K | `k_topk` (repeated rounds) | `topk_bitonic_b256` | TRD §19, D-016 | `cpu::top_k` per vector: the k largest, sorted descending, ties by lower index; 1 ≤ k ≤ min(n, 1024). Each round bitonic-sorts 2048-candidate chunks in LDS (16 KiB) and keeps k of each, until one chunk remains. For 248,320 logits that is 3 rounds at k = 40 and 8 rounds at k = 1024. NaN sets `kStatusNaN`, and `check_status` raises `Error(Kernel)`. Only k ids and values leave the device. |
@@ -187,6 +189,40 @@ cannot see a single wrong weight there. Dequantization errors are caught by the 
 variant's bitwise test, which shares `wq_elem` with the wave variants. The bound catches
 reduction bugs in the wave kernels (a dropped tree level, a wrong group stride; see the
 demonstrate-fail record in the M2 report).
+
+### Weight types of the canonical pack (M5)
+
+These are the types in the canonical pack, unsloth UD-Q4_K_XL (D-014).
+- **Source:** `/root/halo-ref/unsloth-ud-q4kxl.summary.json`, produced by
+  `python/tools/fetch_reference.py` from the real GGUF header (866 tensors). It is
+  consistent with D-007, and the byte total matches its 17.56 GB.
+- **How the table was made:** the byte counts are the ggml block geometry × element counts.
+  I did not re-read the header with halo's own `model::GgufFile`.
+
+| Type | Tensors | GB | Share | HIP GEMV |
+|---|---|---|---|---|
+| Q5_K | 191 | 7.926 | 45.2 % | M2 |
+| IQ4_XS | 70 | 3.125 | 17.8 % | **M5** |
+| Q4_K | 69 | 3.060 | 17.4 % | M2 |
+| Q6_K | 56 | 2.862 | 16.3 % (incl. the LM head) | M2 |
+| IQ4_NL | 6 | 0.280 | 1.6 % | **M5** |
+| Q8_0 | 110 | 0.131 | 0.7 % | M2 |
+| Q3_K | 3 | 0.115 | 0.7 % | **M5** |
+| IQ3_S | 1 | 0.038 | 0.2 % | **M5** |
+| F32 | 360 | 0.011 | 0.1 % (norms, ssm_a, …) | M2 |
+
+- **Dequantization:** the M5 types dequantize element by element in `wq_elem`, reproducing
+  `src/tensor/quant.cpp` (`deq_iq4_xs`, `deq_iq4_nl`, `deq_q3_k`, `deq_iq3_s`) operation
+  by operation.
+- **Lookup tables:** `kvalues_iq4nl`, `iq3s_grid` and `kmask_iq2xs` are halo::tensor's own
+  `src/tensor/ggml_tables.h`, included by the kernels. There is one table source for the
+  CPU reference and the device, and no private copy (review M-2). The tables are
+  `constexpr std::array`. They appear as data objects in the gfx1151 code object:
+  `llvm-readelf -s` on the unbundled `.hip_fatbin` shows `iq3s_grid` (2048 B),
+  `kvalues_iq4nl` (16 B) and `kmask_iq2xs` (8 B). That the device reads them correctly is
+  unverified until the kernels run on hardware.
+- **Acceptance:** as for M2. The generic variant is bitwise equal to `dequantize_row` +
+  `cpu::matmul`; the wave variants are within the summation bound.
 
 ### Attention accumulation order and the tolerance
 
@@ -304,7 +340,7 @@ In place is also different:
   - **Gated norm:** 48 heads × 128. Also cols 37 with out = x at block 32, out = z with a
     strided view, and cols 5.
 - **`test_hip_gemv`** runs the emulation in both orders against `tensor::dequantize_row`
-  followed by `cpu::matmul` on the same bytes. There are 12 shapes: 2 per type for all six
+  followed by `cpu::matmul` on the same bytes. There are 20 shapes: 2 per type for all ten
   types, each through all three variants.
   - **Weights:** random quants with finite f16 scales. Every row includes one subnormal
     f16 scale (or subnormal element for F16 and F32), which exercises the fp16 subnormal
@@ -408,8 +444,8 @@ at `-O2` (RelWithDebInfo).
 | `k_gdn_chunk_state` | 20 | 0 | 32768 | 2 |
 | `k_conv1d_silu` | 40 | 0 | 0 | 16 |
 | `k_norm` | 15 | 0 | 36 | 16 |
-| `k_gemv_wave` | 30 | 0 | 1152 | 16 |
-| `k_gemv_generic` | 26 | 0 | 1152 | 16 |
+| `k_gemv_wave` | 35 | 0 | 1152 | 16 |
+| `k_gemv_generic` | 33 | 0 | 1152 | 16 |
 | `k_argmax_partial` | 10 | 0 | 3072 | 16 |
 | `k_argmax_reduce` | 10 | 0 | 3072 | 16 |
 | `k_topk` | 11 | 0 | 16384 | 16 |
@@ -480,7 +516,7 @@ until the EVO-X2 runs.
 | gfx1151 (or logged gfx11-generic) build succeeds | **Met on the dev host (compile).** gfx1151 by default. A generic ISA needs explicit opt-in and is logged. |
 | Device discovery succeeds; tier probing succeeds | **Discovery implemented, unverified on a device.** On the dev host it fails cleanly with `hipErrorNoDevice`. Tier probing belongs to the hardware module and is not part of this backend. |
 | GPU allocations succeed on GTT and carveout | **Implemented** (`HostPinned` = GTT, `Device` = carveout). The test exists but is unverified (skipped). |
-| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K), LM head with fused argmax, argmax, top-k, RoPE (with head stride), SwiGLU, sigmoid gate, and GQA attention over the paged KV cache. |
+| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS), LM head with fused argmax, argmax, top-k, RoPE (with head stride), SwiGLU, sigmoid gate, and GQA attention over the paged KV cache. |
 | Reference-vs-HIP correctness passes | **Emulation passes.** It is bit for bit everywhere except two variants that sum in a different order, each within its own derived bound: the wave-GEMV logits (whose argmax index still equals the CPU's) and online attention. **Device: unverified.** |
 | Benchmark suite executes reproducibly | **Not started.** |
 
@@ -489,9 +525,10 @@ until the EVO-X2 runs.
 - **Device execution of anything.** D-001. The first EVO-X2 run is also the first
   ROCm 7.1 → HIP 7.15 compatibility check.
 - **GEMV:**
-  - IQ4_XS, IQ4_NL, Q3_K, IQ3_S (the D-014 second tier);
   - a prefill GEMM;
-  - a wave64 comparison.
+  - a wave64 comparison;
+  - the remaining D-007 dequant types (Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, BF16). None is in
+    UD-Q4_K_XL, but ggml-org's MTP pack is Q4_0.
 - **Attention and kernels:**
   - a prefill (T ≫ 1) attention variant;
   - a split-K decode variant (debt 6);

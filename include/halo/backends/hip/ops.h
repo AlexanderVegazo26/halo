@@ -158,7 +158,8 @@ struct GatedNormArgs {
 
 /// QUANT_GEMV / MATMUL for decode (cpu::matmul with a dequantized WeightMatrix):
 ///   y[t][n] = sum_i x[t][i] * W[n][i],  t < n_vec, n < rows, i < cols.
-///  - wtype: F32, F16, Q8_0, Q4_K, Q5_K, Q6_K (ggml block layouts; DECISIONS D-007, D-014).
+///  - wtype: F32, F16, Q8_0, Q4_K, Q5_K, Q6_K and the D-014 second tier IQ4_XS, IQ4_NL, Q3_K,
+///    IQ3_S (ggml block layouts; DECISIONS D-007, D-014; every type of the UD-Q4_K_XL pack).
 ///    Other types raise Error(Unsupported). cols must be a multiple of the block size.
 ///  - w: `rows` rows of row_bytes(wtype, cols) bytes; the view's row_stride (0 = dense) is
 ///    the byte distance between rows. Quantized/F16 rows may start at any byte; F32 rows

@@ -34,7 +34,9 @@ message(STATUS "HIP: device code for '${CMAKE_HIP_ARCHITECTURES}' (HIP ${hip_VER
 # contraction, like the CPU reference, so the emulation reproduces the device's roundings.
 add_library(halo_hip_device STATIC src/launch_kernels.hip)
 set_target_properties(halo_hip_device PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_EXTENSIONS OFF)
-target_include_directories(halo_hip_device PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ${PROJECT_SOURCE_DIR}/src: kernels/gemv.h uses halo::tensor's own IQ tables (src/tensor/ggml_tables.h).
+target_include_directories(halo_hip_device PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                   ${PROJECT_SOURCE_DIR}/src)
 target_compile_options(halo_hip_device PRIVATE -ffp-contract=off -Rpass-analysis=kernel-resource-usage)
 # ASan builds (HALO_ENABLE_ASAN): the host side of the .hip TU is sanitized; device-side
 # sanitizers need an xnack+ target, which gfx1151 is not, so they are disabled explicitly.
@@ -49,7 +51,8 @@ add_library(halo_backend_hip STATIC
   src/ops.cpp
   src/emulate.cpp)
 target_include_directories(halo_backend_hip PUBLIC ${PROJECT_SOURCE_DIR}/include
-                                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+                                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                    ${PROJECT_SOURCE_DIR}/src)
 string(REPLACE ";" "," _halo_hip_archs "${CMAKE_HIP_ARCHITECTURES}")
 target_compile_definitions(halo_backend_hip PRIVATE HALO_HIP_OFFLOAD_ARCHS="${_halo_hip_archs}"
                                                     HALO_HIP_GENERIC_ISA=${_halo_hip_generic})
