@@ -12,6 +12,7 @@
 #include <limits>
 
 #include "halo/core/error.h"
+#include "halo/template/output_parser.h"
 
 // Fail closed: without the in-tree patch minja has no limits at all (security review S-3).
 // A FETCHCONTENT_SOURCE_DIR_MINJA override or a stale _deps directory would otherwise build
@@ -296,7 +297,8 @@ OrderedJson with_parsed_arguments(const OrderedJson& messages) {
             if (!tc.is_object()) continue;
             OrderedJson& fn = tc.contains("function") && tc["function"].is_object() ? tc["function"] : tc;
             if (!fn.contains("arguments") || !fn["arguments"].is_string()) continue;
-            OrderedJson parsed = OrderedJson::parse(fn["arguments"].get<std::string>(), nullptr, false);
+            // S-2/S-9: the same parse-time depth cap as the API and the output parser.
+            OrderedJson parsed = parse_json_bounded(fn["arguments"].get<std::string>());
             if (!parsed.is_discarded() && parsed.is_object()) fn["arguments"] = std::move(parsed);
         }
     }
@@ -470,6 +472,16 @@ const std::string& ChatTemplate::source() const noexcept { return impl_->source;
 RenderResult ChatTemplate::render(const OrderedJson& messages, const OrderedJson& tools,
                                   const RenderOptions& options) const {
     HALO_CHECK(messages.is_array(), ErrorCode::Api, "messages must be an array");
+    // S-2 (defence in depth): copying and converting the inputs below recurse once per
+    // nesting level, so over-deep inputs are rejected by an iterative walk first. The API
+    // already caps request bodies at the same depth while parsing.
+    const auto check_depth = [](const OrderedJson& v, std::string_view what) {
+        HALO_CHECK(json_nesting_depth(v) <= kMaxJsonDepth, ErrorCode::Api, "{} nests deeper than {} levels", what,
+                   kMaxJsonDepth);
+    };
+    check_depth(messages, "messages");
+    check_depth(tools, "tools");
+    check_depth(options.extra_context, "extra template context");
     for (const auto& m : messages) {
         HALO_CHECK(m.is_object(), ErrorCode::Api, "each message must be an object");
         // HF's Jinja raises on `'<function=' + tool_call.name` when the name is missing;

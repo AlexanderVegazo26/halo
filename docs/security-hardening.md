@@ -12,8 +12,9 @@ the tests that cover it, and anything not done. Model files (GGUF metadata, chat
 | S-10 `range()` off-by-one, macro leak | M1 | mitigated |
 | S-6 quadratic tokenizer | M2 | mitigated |
 | S-7 tokenizer.json allocation | M2 | mitigated |
-| S-4 GGUF metadata amplification | M3 | pending |
-| S-9 output-parser nesting | M3 | pending |
+| S-4 GGUF metadata amplification | M3 | mitigated |
+| S-9 output-parser nesting | M3 | mitigated |
+| S-2 render-side depth check (review remediation 2, defence in depth) | M3 | done |
 | S-5 SIGBUS on truncated mapping | — | out of scope (see below) |
 
 ## Chat template (M1)
@@ -228,8 +229,7 @@ Test files are `tests/unit/template/test_template_limits.cpp` and the existing
   `select*` and similar builtins are bounded only through the size of their inputs (every
   container built is size-checked on return) and the steps of the expressions that call
   them.
-- **Untrusted request data is not depth-checked here.** The S-2 render-side depth check on
-  `messages`/`tools` (an iterative walk, depth 64) is planned with S-9 in M3.
+- **Untrusted request data.** The S-2 render-side depth check was added in M3; see below.
 
 ## Tokenizer (M2)
 
@@ -313,7 +313,118 @@ After the mutants, the restored copy is green and byte-identical to the repo sou
 - **Matcher cost.** Matching is not Aho–Corasick-linear. Its cost per input byte is bounded
   by the longest added token (256 by default), as above.
 - **GGUF path unchanged.** GGUF-sourced vocabularies arrive as vectors already bounded by
-  the GGUF parser; M3 adds the metadata budget.
+  the GGUF parser, which the M3 metadata budget now caps.
+
+## GGUF metadata and JSON depth (M3)
+
+### S-4: GGUF metadata memory amplification
+
+**Mitigation.**
+- `GgufOptions::max_metadata_bytes` sets a total allocation budget for the parsed header.
+  The default is `GgufLimits::kMaxMetadataBytes`, 1 GiB.
+- Every allocation is charged before it happens, as elements × stored size:
+  - 8 bytes per integer or float element;
+  - 1 byte per bool;
+  - `sizeof(std::string)` per string slot, plus the bytes of any string long enough to
+    leave SSO;
+  - `sizeof(GgufArray)` (152 B) per nested array;
+  - per-KV and per-tensor-info bookkeeping.
+- When the budget is exceeded, parsing throws
+  `Error(Model): … metadata allocation budget of N bytes exceeded at offset …`.
+- The existing per-array caps and "fits in the remaining bytes" checks stay in place.
+
+**API (additive).**
+- `GgufFile::open(path, mode, options)`
+- `GgufFile::parse(bytes, mode, name, options)`
+- `GgufFile::metadata_bytes()`
+
+The existing overloads use the default budget, so `src/models/adapters.cpp` and the other
+callers are unchanged.
+
+**Measured.** The real Qwen3.8 headers (about 11 MB each) are charged 18.5–18.8 MB, about
+1/57 of the default.
+
+**Tests** (in `tests/unit/model/test_gguf_budget.cpp`):
+- **`EmptyNestedArraysAreChargedAtTheirStoredSize`:** a small-scale version of the review's
+  20M empty nested arrays.
+  - 100K empty arrays take 1.2 MB on disk and are charged about 15 MB.
+  - Rejected under a 4 MiB budget; accepted at the default.
+- **`NarrowElementsAreChargedAtEightBytes`:**
+  - A u8 array of 1M elements is charged 8 MB.
+  - 1M empty strings are charged 32 MB.
+  - 100K strings of 100 B are charged their heap bytes as well.
+- **`DefaultAndDisabledBudget`:**
+  - The default is 1 GiB, and 0 disables the budget.
+  - Tensor infos are charged too.
+- **`BudgetBoundsPeakMemory`:**
+  - A forked child parses 2M empty nested arrays (a 24 MB image, about 300 MB if stored)
+    under a 64 MiB budget.
+  - It passes only if the file is rejected with `Error(Model)` while peak RSS
+    (`/proc/self/clear_refs` + VmHWM) grows by less than 96 MiB.
+- **`RealHeadersUseAFractionOfTheDefault`:** at least 8x headroom on all three real headers.
+
+### S-9, and S-2 render-side: JSON nesting depth
+
+**Shared limit.** `halo::chat::kMaxJsonDepth = 64` matches the API's
+`ServerConfig::max_json_depth` in value and semantics.
+- Depth is the number of arrays/objects enclosing an element, the depth nlohmann's parser
+  callback reports. `[]` is 0, `[1]` is 1, and 65 nested empty arrays are the deepest
+  accepted.
+- The semantics match because the check is the same callback condition as the API's
+  `parse_strict` (`depth > max_depth`), which I compared by reading the code.
+- The api module's own depth tests were built and run against these changes (see the M3
+  handback for the counts).
+
+**Mitigations:**
+- **`parse_json_bounded(text, max_depth)`:** nlohmann's iterative parser with that
+  callback. It returns a discarded value for invalid or over-deep input, and gives up
+  before any deep value exists.
+  - `OutputParser`'s argument typing (`convert_value`) uses it, so a parameter over the
+    cap stays the raw string (S-9).
+  - `ChatTemplate`'s `parse_string_tool_arguments` (`with_parsed_arguments`) uses it too,
+    so over-deep argument strings stay strings.
+- **`json_nesting_depth(v, limit)`:** an iterative walk with the same measure.
+  - `render()` rejects `messages`, `tools` or `extra_context` deeper than 64 with
+    `Error(Api)` ("… nests deeper than 64 levels") before copying them.
+  - The copy and the minja conversion recurse once per level, so this check must come
+    first.
+  - This is defence in depth: the API already caps request bodies at parse time.
+
+**Tests** (in `tests/unit/template/test_template_limits.cpp`):
+- **`JsonDepthCapMatchesTheApi`:**
+  - the boundary at 65/66 empty arrays and at 64/65 levels with a scalar;
+  - the parser and the walk agree for n = 60–70, with and without inner values;
+  - the output parser keeps a 66-deep argument as its raw text.
+- **`DeeplyNestedToolArgumentsInModelOutputAreKeptAsText`:** the review's 100,000-level
+  `<parameter>`, on an 8 MiB thread in a death-test child.
+- **`DeeplyNestedMessagesAreRejectedBeforeCopying`:**
+  - a message field and tools at 30,000 levels (the review's crash depth) return
+    `Error(Api)`;
+  - a 100,000-level argument string with `parse_string_tool_arguments` stays a string;
+  - at the cap, render still works.
+
+### Demonstrated red (M3)
+
+Each mutant was built into a private copy of the tree (scratch tools `l_m3mut.py` and
+`l_m3mut.sh`):
+
+| Mutant | Red outcome |
+|---|---|
+| no element charge | nested-array, narrow-element and peak-memory tests; peak RSS +296,708 KiB, accepted |
+| no string-heap charge | narrow-element test (long strings) |
+| no tensor-info charge | default/disabled test |
+| unbounded parse (plain `json::parse`) | depth-cap test; the 100K-level output-parser child exits wrong |
+| no render walk | deep-messages child SIGSEGV |
+| walk off by one (`>=`) | depth-cap test; the at-the-cap render assertion |
+
+The restored copy is green.
+
+### Not done (M3)
+
+- **Storage width.** u8/i8 arrays are still stored widened to 64 bits. The review listed
+  narrow storage as optional, and the budget already charges the real stored size.
+- **Model-level API.** `NormalizedModel::open` uses the default budget. There is no
+  model-level option to change it yet; `GgufFile::open` takes one.
 
 ## S-5 (out of scope)
 

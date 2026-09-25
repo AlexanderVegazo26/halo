@@ -106,6 +106,20 @@ struct GgufLimits {
     static constexpr int kMaxArrayDepth = 8;
     static constexpr std::uint64_t kMaxTensorNameBytes = 63;  // ggml GGML_MAX_NAME - 1
     static constexpr std::uint64_t kMaxAlignment = 1u << 20;
+    /// Default total allocation budget for the parsed header (S-4), see GgufOptions.
+    static constexpr std::uint64_t kMaxMetadataBytes = std::uint64_t{1} << 30;
+};
+
+/// Parse options (additive to GgufMode).
+struct GgufOptions {
+    /// Total bytes the parsed header may allocate: every metadata value and tensor info is
+    /// charged elements x stored size (8 per integer/float element, sizeof(std::string) +
+    /// its bytes per string, sizeof(GgufArray) per nested array, plus per-KV and per-tensor
+    /// bookkeeping) before it is allocated. The on-disk encoding is up to ~13x smaller than
+    /// the stored form, so the per-array caps alone let a large "model" request hundreds of
+    /// GB (security review S-4). Exceeding it throws Error(Model). Real Qwen3.8 headers use
+    /// ~30 MB (GgufFile::metadata_bytes()). 0 disables the budget.
+    std::uint64_t max_metadata_bytes = GgufLimits::kMaxMetadataBytes;
 };
 
 class GgufFile {
@@ -113,9 +127,12 @@ public:
     /// Opens and parses `path`. Throws Error(Io) if the file cannot be mapped, Error(Model)
     /// or Error(Unsupported) if it is not a valid/supported GGUF for `mode`.
     static GgufFile open(const std::filesystem::path& path, GgufMode mode = GgufMode::Full);
+    static GgufFile open(const std::filesystem::path& path, GgufMode mode, const GgufOptions& options);
 
     /// Parses an in-memory image (takes ownership). Same validation as open().
     static GgufFile parse(std::vector<std::byte> bytes, GgufMode mode, std::string source_name = "<memory>");
+    static GgufFile parse(std::vector<std::byte> bytes, GgufMode mode, std::string source_name,
+                          const GgufOptions& options);
 
     GgufFile(GgufFile&&) noexcept = default;
     GgufFile& operator=(GgufFile&&) noexcept = default;
@@ -131,6 +148,8 @@ public:
     [[nodiscard]] std::uint64_t header_size() const noexcept { return header_size_; }  // end of tensor infos
     [[nodiscard]] std::uint64_t data_offset() const noexcept { return data_offset_; }  // aligned data start
     [[nodiscard]] std::uint64_t file_size() const noexcept { return bytes_.size(); }
+    /// Bytes charged against GgufOptions::max_metadata_bytes while parsing.
+    [[nodiscard]] std::uint64_t metadata_bytes() const noexcept { return metadata_bytes_; }
 
     // ---- metadata -------------------------------------------------------------------
     [[nodiscard]] const std::vector<std::pair<std::string, GgufValue>>& kvs() const noexcept { return kvs_; }
@@ -156,7 +175,7 @@ public:
 
 private:
     GgufFile() = default;
-    void parse_all();
+    void parse_all(const GgufOptions& options);
 
     std::string source_;
     GgufMode mode_ = GgufMode::Full;
@@ -167,6 +186,7 @@ private:
     std::uint64_t alignment_ = 32;
     std::uint64_t header_size_ = 0;
     std::uint64_t data_offset_ = 0;
+    std::uint64_t metadata_bytes_ = 0;
     std::vector<std::pair<std::string, GgufValue>> kvs_;
     std::map<std::string, std::size_t, std::less<>> kv_index_;
     std::vector<GgufTensorInfo> tensors_;

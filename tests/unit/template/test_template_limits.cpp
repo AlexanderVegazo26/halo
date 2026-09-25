@@ -32,6 +32,7 @@
 
 #include "halo/core/error.h"
 #include "halo/template/chat_template.h"
+#include "halo/template/output_parser.h"
 
 namespace fs = std::filesystem;
 using halo::ErrorCode;
@@ -634,4 +635,99 @@ TEST(TemplateLimitsUnit, RenderAtDepthCapFitsTheDocumentedStack) {
     std::printf("render to depth %zu used %zu KiB of stack\n", t.limits().max_render_depth, used >> 10);
     EXPECT_EQ(code, ErrorCode::Api);
     EXPECT_LE(used, halo::chat::kMaxRenderStackBytes);
+}
+
+// ---- S-9 / S-2: JSON nesting depth -------------------------------------------------------
+
+namespace {
+
+std::string nested(std::size_t n) { return std::string(n, '[') + std::string(n, ']'); }
+
+std::string tool_call_output(const std::string& value) {
+    return "</think>\n\n<tool_call>\n<function=f>\n<parameter=p>\n" + value + "\n</parameter>\n</function>\n</tool_call>";
+}
+
+}  // namespace
+
+TEST(TemplateLimitsUnit, JsonDepthCapMatchesTheApi) {
+    using halo::chat::kMaxJsonDepth;
+    using halo::chat::parse_json_bounded;
+    EXPECT_EQ(kMaxJsonDepth, 64u);  // include/halo/api/server.h ServerConfig::max_json_depth
+    // Depth = arrays/objects enclosing an element: 65 nested empty arrays are depth 64.
+    EXPECT_FALSE(parse_json_bounded(nested(65)).is_discarded());
+    EXPECT_TRUE(parse_json_bounded(nested(66)).is_discarded());
+    EXPECT_TRUE(parse_json_bounded(std::string(65, '[') + "1" + std::string(65, ']')).is_discarded());
+    EXPECT_FALSE(parse_json_bounded(std::string(64, '[') + "1" + std::string(64, ']')).is_discarded());
+    EXPECT_FALSE(parse_json_bounded("{\"a\": [1, {\"b\": null}]}").is_discarded());
+    EXPECT_TRUE(parse_json_bounded("{\"a\": ").is_discarded());
+    // The iterative walk agrees with the parser's measure.
+    for (std::size_t n = 60; n <= 70; ++n) {
+        const bool parser_ok = !parse_json_bounded(nested(n)).is_discarded();
+        const bool walk_ok = halo::chat::json_nesting_depth(OrderedJson::parse(nested(n))) <= kMaxJsonDepth;
+        EXPECT_EQ(parser_ok, walk_ok) << n;
+        const std::string with_value = std::string(n, '[') + "{\"k\": 1}" + std::string(n, ']');
+        EXPECT_EQ(!parse_json_bounded(with_value).is_discarded(),
+                  halo::chat::json_nesting_depth(OrderedJson::parse(with_value)) <= kMaxJsonDepth)
+            << n;
+    }
+    EXPECT_EQ(halo::chat::json_nesting_depth(OrderedJson::parse(nested(65))), 64u);
+    EXPECT_EQ(halo::chat::json_nesting_depth(OrderedJson::parse(nested(66))), 65u);
+    EXPECT_EQ(halo::chat::json_nesting_depth(OrderedJson::parse("[1]")), 1u);
+    EXPECT_EQ(halo::chat::json_nesting_depth(OrderedJson(3)), 0u);
+    // Output parser: at the cap the argument is JSON, past it the raw text is kept.
+    const auto arg = [](std::size_t n) {
+        return halo::chat::OutputParser::parse(tool_call_output(nested(n)), {}).tool_calls.at(0).arguments.at("p");
+    };
+    EXPECT_TRUE(arg(65).is_array());
+    ASSERT_TRUE(arg(66).is_string());
+    EXPECT_EQ(arg(66).get<std::string>(), nested(66));
+}
+
+TEST_F(TemplateRows, DeeplyNestedToolArgumentsInModelOutputAreKeptAsText) {
+    // S-9: the review crashed OutputParser::parse with 100,000 levels (EXIT=139).
+    const auto body = [] {
+        const auto m = halo::chat::OutputParser::parse(tool_call_output(nested(100000)), {});
+        if (!m.tool_calls.at(0).arguments.at("p").is_string()) throw std::runtime_error("parsed a 100K-deep value");
+    };
+    EXPECT_EXIT(run_ok(body), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(TemplateRows, DeeplyNestedMessagesAreRejectedBeforeCopying) {
+    // S-2 defence in depth: 30,000 levels crashed render() on an 8 MiB thread (EXIT=139).
+    const auto body = [] {
+        const ChatTemplate t("{% for m in messages %}{{ m.content }}{% endfor %}");
+        OrderedJson msgs = OrderedJson::array({{{"role", "user"}, {"content", "hi"}}});
+        msgs[0]["extra"] = OrderedJson::parse(nested(30000));  // nlohmann's parser is iterative
+        (void)t.render(msgs, nullptr, {});
+    };
+    EXPECT_EXIT(run_row(body, ErrorCode::Api, "messages nests deeper than 64 levels"), ::testing::ExitedWithCode(0), "");
+    const auto tools_body = [] {
+        const ChatTemplate t("{{ tools|length }}");
+        (void)t.render(OrderedJson::array(), OrderedJson::array({OrderedJson::parse(nested(30000))}), {});
+    };
+    EXPECT_EXIT(run_row(tools_body, ErrorCode::Api, "tools nests deeper than 64 levels"), ::testing::ExitedWithCode(0),
+                "");
+    const auto string_args = [] {
+        // parse_string_tool_arguments: a 100K-deep argument string stays a string.
+        const ChatTemplate t("{{ messages[0].tool_calls[0].function.arguments is string }}");
+        OrderedJson msgs = OrderedJson::array({{{"role", "assistant"},
+                                                {"content", ""},
+                                                {"tool_calls", OrderedJson::array({{{"type", "function"},
+                                                                                    {"function",
+                                                                                     {{"name", "f"},
+                                                                                      {"arguments", nested(100000)}}}}})}}});
+        RenderOptions o;
+        o.add_generation_prompt = false;
+        o.parse_string_tool_arguments = true;
+        if (t.apply(msgs, nullptr, o) != "True") throw std::runtime_error("deep arguments were parsed");
+    };
+    EXPECT_EXIT(run_ok(string_args), ::testing::ExitedWithCode(0), "");
+    // At the cap render() still works: a field of a message is enclosed by `messages` and the
+    // message object, so 63 nested arrays there reach depth 64.
+    const ChatTemplate t("{% for m in messages %}{{ m.content }}{% endfor %}");
+    OrderedJson ok = OrderedJson::array({{{"role", "user"}, {"content", "hi"}}});
+    ok[0]["extra"] = OrderedJson::parse(nested(63));
+    EXPECT_EQ(t.apply(ok, nullptr, {}), "hi");
+    ok[0]["extra"] = OrderedJson::parse(nested(64));
+    EXPECT_EQ(error_code_of([&] { (void)t.apply(ok, nullptr, {}); }), ErrorCode::Api);
 }

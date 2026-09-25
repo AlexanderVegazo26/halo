@@ -156,7 +156,8 @@ public:
     /// calls raise_exception (message = the template's text), rendering fails on the given
     /// input, a TemplateLimits bound is exceeded ("chat template limit exceeded: ..."), and
     /// for malformed arguments (messages not an array, extra_context overriding a reserved
-    /// variable — messages, tools, bos_token, eos_token, add_generation_prompt — etc.).
+    /// variable — messages, tools, bos_token, eos_token, add_generation_prompt —, messages,
+    /// tools or extra_context deeper than kMaxJsonDepth (64, as the API's cap), etc.).
     [[nodiscard]] RenderResult render(const OrderedJson& messages, const OrderedJson& tools,
                                       const RenderOptions& options) const;
 

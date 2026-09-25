@@ -56,7 +56,26 @@ bool is_signed(GgufType t) noexcept {
 
 class Reader {
 public:
-    Reader(std::span<const std::byte> b, const std::string& src) : b_(b), src_(src) {}
+    Reader(std::span<const std::byte> b, const std::string& src, std::uint64_t budget)
+        : b_(b), src_(src), budget_(budget) {}
+
+    // S-4: charges `n` bytes of parsed-header storage (elements x stored size) before it
+    // is allocated; throws once the total would exceed the budget.
+    void charge(std::uint64_t n, std::string_view what) {
+        if (budget_ != 0 && (n > budget_ || charged_ > budget_ - n)) {
+            throw_error(ErrorCode::Model,
+                        "{}: metadata allocation budget of {} bytes exceeded at offset {} ({}: {} more bytes after {})",
+                        src_, budget_, pos_, what, n, charged_);
+        }
+        charged_ += n;
+    }
+    // charge(count * each), overflow-safe.
+    void charge(std::uint64_t count, std::uint64_t each, std::string_view what) {
+        std::uint64_t n = 0;
+        if (!checked_mul(count, each, n)) n = std::numeric_limits<std::uint64_t>::max();
+        charge(n, what);
+    }
+    [[nodiscard]] std::uint64_t charged() const noexcept { return charged_; }
 
     [[nodiscard]] std::uint64_t pos() const noexcept { return pos_; }
     [[nodiscard]] std::uint64_t remaining() const noexcept { return b_.size() - pos_; }
@@ -106,7 +125,22 @@ private:
     std::span<const std::byte> b_;
     const std::string& src_;
     std::uint64_t pos_ = 0;
+    std::uint64_t budget_ = 0;
+    std::uint64_t charged_ = 0;
 };
+
+// Stored size of one array element of type t (its slot in the GgufArray vectors).
+std::uint64_t stored_size(GgufType t) noexcept {
+    switch (t) {
+        case GgufType::Bool: return 1;
+        case GgufType::String: return sizeof(std::string);
+        case GgufType::Array: return sizeof(GgufArray);
+        default: return 8;  // uint64_t / int64_t / double
+    }
+}
+
+// Bytes a string of `len` bytes allocates beyond its std::string object (SSO: none).
+std::uint64_t string_heap_bytes(std::uint64_t len) noexcept { return len < sizeof(std::string) ? 0 : len + 1; }
 
 GgufType read_type(Reader& r, std::string_view what) {
     const auto t = r.scalar<std::uint32_t>(what);
@@ -137,7 +171,10 @@ void read_scalar_into(Reader& r, GgufType t, GgufValue& v) {
         case GgufType::I32: v.i = r.scalar<std::int32_t>("i32"); break;
         case GgufType::F32: v.f = static_cast<double>(r.scalar<float>("f32")); break;
         case GgufType::Bool: v.b = read_bool(r); break;
-        case GgufType::String: v.s = r.string("string value", GgufLimits::kMaxStringBytes); break;
+        case GgufType::String:
+            v.s = r.string("string value", GgufLimits::kMaxStringBytes);
+            r.charge(string_heap_bytes(v.s.size()), "string value");
+            break;
         case GgufType::U64: v.u = r.scalar<std::uint64_t>("u64"); break;
         case GgufType::I64: v.i = r.scalar<std::int64_t>("i64"); break;
         case GgufType::F64: v.f = r.scalar<double>("f64"); break;
@@ -153,6 +190,7 @@ void read_array(Reader& r, GgufArray& a, int depth) {
     a.elem_type = read_type(r, "array element type");
     const auto n = r.scalar<std::uint64_t>("array length");
     r.check_count(n, min_encoded_size(a.elem_type), GgufLimits::kMaxArrayElems, "array element");
+    r.charge(n, stored_size(a.elem_type), "array elements");
     const auto count = static_cast<std::size_t>(n);
     switch (a.elem_type) {
         case GgufType::U8:
@@ -203,6 +241,7 @@ void read_array(Reader& r, GgufArray& a, int depth) {
             a.strings.reserve(count);
             for (std::size_t k = 0; k < count; ++k) {
                 a.strings.push_back(r.string("array string", GgufLimits::kMaxStringBytes));
+                r.charge(string_heap_bytes(a.strings.back().size()), "array string");
             }
             break;
         case GgufType::Array:
@@ -261,28 +300,37 @@ std::size_t GgufArray::size() const noexcept {
     return 0;
 }
 
-GgufFile GgufFile::open(const std::filesystem::path& path, GgufMode mode) {
+GgufFile GgufFile::open(const std::filesystem::path& path, GgufMode mode) { return open(path, mode, GgufOptions{}); }
+
+GgufFile GgufFile::open(const std::filesystem::path& path, GgufMode mode, const GgufOptions& options) {
     GgufFile f;
     f.source_ = path.string();
     f.mode_ = mode;
     f.map_ = MappedFile::open(path);
     f.bytes_ = f.map_.bytes();
-    f.parse_all();
+    f.parse_all(options);
     return f;
 }
 
 GgufFile GgufFile::parse(std::vector<std::byte> bytes, GgufMode mode, std::string source_name) {
+    return parse(std::move(bytes), mode, std::move(source_name), GgufOptions{});
+}
+
+GgufFile GgufFile::parse(std::vector<std::byte> bytes, GgufMode mode, std::string source_name,
+                         const GgufOptions& options) {
     GgufFile f;
     f.source_ = std::move(source_name);
     f.mode_ = mode;
     f.owned_ = std::move(bytes);
     f.bytes_ = f.owned_;
-    f.parse_all();
+    f.parse_all(options);
     return f;
 }
 
-void GgufFile::parse_all() {
-    Reader r(bytes_, source_);
+void GgufFile::parse_all(const GgufOptions& options) {
+    Reader r(bytes_, source_, options.max_metadata_bytes);
+    // Per-entry bookkeeping charged for every KV and tensor info (vector slot + index node).
+    constexpr std::uint64_t kIndexNodeBytes = 64;
     const auto& src = source_;
 
     // ---- header -------------------------------------------------------------------------
@@ -302,11 +350,13 @@ void GgufFile::parse_all() {
     const auto n_tensors = r.scalar<std::uint64_t>("tensor count");
     const auto n_kv = r.scalar<std::uint64_t>("kv count");
     r.check_count(n_kv, 8 + 4 + 1, GgufLimits::kMaxKv, "kv");
+    r.charge(n_kv, sizeof(std::pair<std::string, GgufValue>) + kIndexNodeBytes + sizeof(std::string), "kv entries");
 
     // ---- metadata -----------------------------------------------------------------------
     kvs_.reserve(static_cast<std::size_t>(n_kv));
     for (std::uint64_t k = 0; k < n_kv; ++k) {
         std::string key = r.string("kv key", GgufLimits::kMaxStringBytes);
+        r.charge(2 * string_heap_bytes(key.size()), "kv key");  // the key and its index copy
         GgufValue v;
         v.type = read_type(r, "kv value type");
         read_scalar_into(r, v.type, v);
@@ -330,6 +380,7 @@ void GgufFile::parse_all() {
 
     // ---- tensor infos -------------------------------------------------------------------
     r.check_count(n_tensors, 8 + 4 + 8 + 4 + 8, GgufLimits::kMaxTensors, "tensor info");
+    r.charge(n_tensors, sizeof(GgufTensorInfo) + kIndexNodeBytes + sizeof(std::string) + 2 * 64, "tensor infos");
     tensors_.reserve(static_cast<std::size_t>(n_tensors));
     for (std::uint64_t k = 0; k < n_tensors; ++k) {
         GgufTensorInfo t;
@@ -383,6 +434,7 @@ void GgufFile::parse_all() {
         tensors_.push_back(std::move(t));
     }
     header_size_ = r.pos();
+    metadata_bytes_ = r.charged();
     data_offset_ = align_up(header_size_, alignment_, src);
 
     // ---- data ranges: no overlap; inside the file (Full mode) ---------------------------

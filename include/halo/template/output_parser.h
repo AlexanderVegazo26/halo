@@ -16,7 +16,9 @@
 // Argument typing: a parameter whose schema type (from `tools`) is "string" stays the raw
 // text; any other parameter is parsed as JSON, falling back to the raw string when it is not
 // valid JSON. For a type list containing "string" (e.g. ["string","null"]) the JSON parse is
-// kept only if it has one of the other listed types.
+// kept only if it has one of the other listed types. A value nested deeper than
+// kMaxJsonDepth also stays the raw string (security review S-9): the depth is checked while
+// parsing, before any recursive copy or destruction of the value.
 //
 // Content segments separated by a tool-call block are joined with a blank line ("\n\n").
 //
@@ -30,6 +32,23 @@
 #include <vector>
 
 namespace halo::chat {
+
+/// JSON nesting limit for untrusted JSON handled by this module (tool-call arguments in model
+/// output and in messages, render() inputs). Same value and semantics as the API's
+/// request-body cap (ServerConfig::max_json_depth, security review S-2/S-9), which rejects
+/// when nlohmann's parser callback reports a depth above it: an element's depth is the
+/// number of arrays/objects enclosing it, so `[]` is 0, `[1]` and `[[]]` are 1, and 65
+/// nested empty arrays (depth 64) are the deepest accepted.
+inline constexpr std::size_t kMaxJsonDepth = 64;
+
+/// Parses `text` as JSON, or returns a discarded value (is_discarded()) if it is not valid
+/// JSON or nests deeper than `max_depth`. Never throws; iterative, so input of any depth is
+/// safe.
+[[nodiscard]] nlohmann::ordered_json parse_json_bounded(std::string_view text, std::size_t max_depth = kMaxJsonDepth);
+
+/// Depth of `v` in the kMaxJsonDepth sense (the most arrays/objects enclosing any element),
+/// computed iteratively; stops once `limit` is exceeded and returns limit + 1.
+[[nodiscard]] std::size_t json_nesting_depth(const nlohmann::ordered_json& v, std::size_t limit = kMaxJsonDepth);
 
 struct ToolCall {
     std::string name;

@@ -1,6 +1,7 @@
 #include "halo/template/output_parser.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace halo::chat {
 namespace {
@@ -129,7 +130,7 @@ OrderedJson convert_value(const OrderedJson* schema, std::string_view value) {
     }
     const bool allows_string = std::find(types.begin(), types.end(), "string") != types.end();
     if (allows_string && types.size() == 1) return std::string(value);
-    OrderedJson parsed = OrderedJson::parse(value, nullptr, false);
+    OrderedJson parsed = parse_json_bounded(value);  // S-9: depth capped while parsing
     if (parsed.is_discarded()) return std::string(value);
     if (allows_string) {
         const bool typed = std::any_of(types.begin(), types.end(),
@@ -139,7 +140,37 @@ OrderedJson convert_value(const OrderedJson* schema, std::string_view value) {
     return parsed;
 }
 
+struct TooDeep {};
+
 }  // namespace
+
+OrderedJson parse_json_bounded(std::string_view text, std::size_t max_depth) {
+    // nlohmann's parser is iterative; the callback runs for every element before it is
+    // attached, so an over-deep document is abandoned before any deep value exists.
+    const auto cb = [max_depth](int depth, OrderedJson::parse_event_t, OrderedJson&) -> bool {
+        if (depth < 0 || static_cast<std::size_t>(depth) > max_depth) throw TooDeep{};
+        return true;
+    };
+    try {
+        return OrderedJson::parse(text, cb, /*allow_exceptions=*/false);
+    } catch (const TooDeep&) {
+        return OrderedJson(OrderedJson::value_t::discarded);
+    }
+}
+
+std::size_t json_nesting_depth(const OrderedJson& v, std::size_t limit) {
+    std::size_t deepest = 0;
+    std::vector<std::pair<const OrderedJson*, std::size_t>> todo{{&v, 0}};
+    while (!todo.empty()) {
+        const auto [node, enclosing] = todo.back();  // enclosing = containers around node
+        todo.pop_back();
+        if (enclosing > limit) return limit + 1;
+        deepest = std::max(deepest, enclosing);
+        if (!node->is_structured()) continue;
+        for (const auto& child : *node) todo.emplace_back(&child, enclosing + 1);
+    }
+    return deepest;
+}
 
 OrderedJson ParsedMessage::to_openai_json(std::string_view id_prefix) const {
     OrderedJson j = OrderedJson::object();
