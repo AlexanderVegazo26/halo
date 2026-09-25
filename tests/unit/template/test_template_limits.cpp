@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -93,12 +94,22 @@ void limit_address_space() {
 
 // Child side of a row. Exit codes: 0 expected typed error, 1 no error, 2 wrong ErrorCode,
 // 3 non-halo exception, 4 message does not name the bound, 5 too slow.
+// CPU seconds of the whole (death-test child) process: the parse runs on its own thread, so
+// the process clock, not the worker's, is the one that covers a row. CPU time rather than
+// wall time keeps the "completes quickly" budget independent of machine load (F-4).
+double process_cpu_seconds() {
+    timespec ts{};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+}
+
 [[noreturn]] void run_row(const std::function<void()>& body, ErrorCode expect, std::string_view needle) {
     alarm(kRowAlarmSeconds);
     limit_address_space();
     int rc = 1;
     std::thread worker([&] {
         const auto t0 = std::chrono::steady_clock::now();
+        const double c0 = process_cpu_seconds();
         try {
             body();
         } catch (const halo::Error& e) {
@@ -109,9 +120,10 @@ void limit_address_space() {
             rc = 3;
             std::fprintf(stderr, "row threw non-halo: %.300s\n", e.what());
         }
-        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "row took %.3f s\n", s);
-        if (rc == 0 && s > kRowSecondsBudget) rc = 5;
+        const double cpu = process_cpu_seconds() - c0;
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "row took %.3f s CPU (%.3f s wall)\n", cpu, wall);
+        if (rc == 0 && cpu > kRowSecondsBudget) rc = 5;
     });
     worker.join();
     std::exit(rc);

@@ -1,9 +1,13 @@
 // Hostile-vocabulary tests (security review S-6, S-7; docs/security-hardening.md).
 //
 // Timing thresholds are dev-host smoke checks (D-001), not performance claims; under ASan
-// only the measured times are printed.
+// only the measured times are printed. They measure this thread's CPU time
+// (CLOCK_THREAD_CPUTIME_ID), not wall time, so a loaded machine (ctest -j) does not make
+// them fail: the unhardened code costs 13-60x the bound in CPU time, a margin load cannot
+// create (F-4: a wall-clock bound failed once at 1.93 s under ctest -j).
 
 #include <gtest/gtest.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -79,8 +83,11 @@ void add(VocabSpec& s, std::string content, TokenType t) {
     s.types.push_back(t);
 }
 
-double seconds_since(std::chrono::steady_clock::time_point t0) {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+// CPU seconds consumed by the calling thread.
+double thread_cpu_seconds() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
 ErrorCode code_of(const std::function<void()>& f) {
@@ -105,14 +112,15 @@ VocabSpec s6_vocabulary() {
 // ---- S-6 ---------------------------------------------------------------------------------
 
 TEST(TokenizerLimits, EightyThousandAddedTokensBuildAndEncodeQuickly) {
-    auto t0 = std::chrono::steady_clock::now();
-    const Tokenizer tok = Tokenizer::from_spec(s6_vocabulary());
-    const double build = seconds_since(t0);
+    VocabSpec spec = s6_vocabulary();  // built outside the measured region
+    double t0 = thread_cpu_seconds();
+    const Tokenizer tok = Tokenizer::from_spec(std::move(spec));
+    const double build = thread_cpu_seconds() - t0;
     const std::string text(20000, '<');
-    t0 = std::chrono::steady_clock::now();
+    t0 = thread_cpu_seconds();
     const auto ids = tok.encode(text, true);
-    const double enc = seconds_since(t0);
-    std::printf("80000 added tokens: build %.3f s, encode 20 KB of '<' %.4f s\n", build, enc);
+    const double enc = thread_cpu_seconds() - t0;
+    std::printf("80000 added tokens: build %.3f s CPU, encode 20 KB of '<' %.4f s CPU\n", build, enc);
     EXPECT_EQ(ids.size(), 20000u);  // no added token matches; every '<' is its byte token
     // One real match in the middle is still found.
     const auto hit = tok.encode(std::string(100, '<') + "<|tok_79999|>" + std::string(100, '<'), true);
@@ -133,10 +141,10 @@ TEST(TokenizerLimits, SharedPrefixVocabularyEncodesInBoundedTime) {
     }
     const Tokenizer tok = Tokenizer::from_spec(std::move(s));
     const std::string text(100000, '<');
-    const auto t0 = std::chrono::steady_clock::now();
+    const double t0 = thread_cpu_seconds();
     const auto ids = tok.encode(text, true);
-    const double enc = seconds_since(t0);
-    std::printf("4096 shared-prefix tokens: encode 100 KB of '<' %.3f s\n", enc);
+    const double enc = thread_cpu_seconds() - t0;
+    std::printf("4096 shared-prefix tokens: encode 100 KB of '<' %.3f s CPU\n", enc);
     EXPECT_EQ(ids.size(), text.size());
     if (kCheckTiming) EXPECT_LT(enc, 1.0);
 }

@@ -3,6 +3,7 @@
 // (never pass) when $HALO_REF_DIR/tokenizer_golden is missing.
 
 #include <gtest/gtest.h>
+#include <time.h>
 
 #include <chrono>
 #include <cstdio>
@@ -149,6 +150,14 @@ std::string case_input(const Json& c) {
 }
 
 std::vector<std::int32_t> ids_of(const Json& j) { return j.get<std::vector<std::int32_t>>(); }
+
+// CPU milliseconds consumed by the calling thread (asserted smoke bounds use CPU time so a
+// loaded machine does not fail them; see test_tokenizer_limits.cpp).
+double thread_cpu_ms() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6;
+}
 
 }  // namespace
 
@@ -496,10 +505,9 @@ TEST(TokenizerGolden, LongPromptMatchesAndReportsThroughput) {
     std::vector<std::int32_t> ids;
     double best_ms = 1e30;
     for (int rep = 0; rep < 5; ++rep) {
-        const auto t0 = std::chrono::steady_clock::now();
+        const double t0 = thread_cpu_ms();
         ids = tok.encode(text, true);
-        const auto t1 = std::chrono::steady_clock::now();
-        best_ms = std::min(best_ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
+        best_ms = std::min(best_ms, thread_cpu_ms() - t0);
     }
     EXPECT_EQ(ids, expect);
     // Cache-hostile second number: the codepoint sweep text (every BMP + plane-1 scalar),
@@ -512,7 +520,7 @@ TEST(TokenizerGolden, LongPromptMatchesAndReportsThroughput) {
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
     std::printf("[ perf ] sweep text %zu bytes -> %zu tokens: %.2f ms (%.0f tokens/s)\n", sweep_text.size(),
                 sweep_ids.size(), sweep_ms, static_cast<double>(sweep_ids.size()) / (sweep_ms / 1000.0));
-    std::printf("[ perf ] encode %zu bytes -> %zu tokens: best of 5 = %.2f ms (%.0f tokens/s)\n", text.size(),
+    std::printf("[ perf ] encode %zu bytes -> %zu tokens: best of 5 = %.2f ms CPU (%.0f tokens/s)\n", text.size(),
                 ids.size(), best_ms, static_cast<double>(ids.size()) / (best_ms / 1000.0));
 #if defined(NDEBUG) && !HALO_TEST_ASAN
     EXPECT_LT(best_ms, 100.0);  // loose dev-host bound for optimized builds; the number above is the evidence
