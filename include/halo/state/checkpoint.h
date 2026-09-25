@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <span>
 #include <vector>
@@ -32,6 +33,11 @@ struct Checkpoint {
     std::vector<std::int32_t> tokens;  ///< the prefix: state is after tokens[0..P)
     GdnSnapshot gdn;
     std::vector<float> last_hidden;    ///< trunk hidden h_{P-1}
+    /// Which sequence lineage produced it (0 = unowned). A GDN checkpoint is only bitwise
+    /// consistent with the KV rows of the sequence that computed it (a different chunking
+    /// of the same tokens gives numerically-close, not identical, rows), so the prefix
+    /// cache restores a checkpoint together with its owner's KV blocks.
+    std::uint64_t owner = 0;
     [[nodiscard]] std::uint64_t bytes() const noexcept {
         return gdn.bytes() + last_hidden.size() * sizeof(float) + tokens.size() * sizeof(std::int32_t);
     }
@@ -50,6 +56,11 @@ public:
     /// <= max_len (pass the LCP with the cached sequence, or query.size()). nullptr if none.
     /// Marks the hit most recently used. The pointer is valid until the next insert/clear.
     [[nodiscard]] const Checkpoint* find(std::span<const std::int32_t> query, std::size_t max_len);
+    /// As find(), considering only checkpoints for which usable(checkpoint) is true.
+    [[nodiscard]] const Checkpoint* find(std::span<const std::int32_t> query, std::size_t max_len,
+                                         const std::function<bool(const Checkpoint&)>& usable);
+    /// Removes every checkpoint of `owner`; returns how many.
+    std::size_t erase_owner(std::uint64_t owner) noexcept;
 
     void clear() noexcept;
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }

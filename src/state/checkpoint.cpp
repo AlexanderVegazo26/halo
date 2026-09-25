@@ -29,11 +29,30 @@ bool CheckpointStore::insert(Checkpoint c) {
 }
 
 const Checkpoint* CheckpointStore::find(std::span<const std::int32_t> query, std::size_t max_len) {
+    return find(query, max_len, [](const Checkpoint&) { return true; });
+}
+
+std::size_t CheckpointStore::erase_owner(std::uint64_t owner) noexcept {
+    std::size_t n = 0;
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        if (it->owner == owner) {
+            used_ -= it->bytes();
+            it = entries_.erase(it);
+            ++n;
+        } else {
+            ++it;
+        }
+    }
+    return n;
+}
+
+const Checkpoint* CheckpointStore::find(std::span<const std::int32_t> query, std::size_t max_len,
+                                        const std::function<bool(const Checkpoint&)>& usable) {
     const std::size_t limit = std::min(max_len, query.size());
     auto best = entries_.end();
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
         const std::size_t n = it->tokens.size();
-        if (n > limit || (best != entries_.end() && n <= best->tokens.size())) continue;
+        if (n > limit || (best != entries_.end() && n <= best->tokens.size()) || !usable(*it)) continue;
         if (std::equal(it->tokens.begin(), it->tokens.end(), query.begin())) best = it;
     }
     if (best == entries_.end()) return nullptr;

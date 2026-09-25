@@ -105,6 +105,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
     tick.phase = Tick::Phase::Empty;
     metrics_.last_cost = {};
     metrics_.last_weight_passes = 0;
+    metrics_.last_trunk_passes = 0;
     for (std::size_t i = 0; i < n; ++i) {
         const StepRequest& r = reqs[i];
         HALO_CHECK(r.seq != nullptr, ErrorCode::Api, "speculative request {}: no sequence", i);
@@ -151,6 +152,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
             model_->mtp_forward(steps, res);
             metrics_.last_cost += res.cost;
             metrics_.last_weight_passes += res.cost.weight_passes;
+    metrics_.weight_passes += res.cost.weight_passes;
             for (std::size_t j = 0; j < idx.size(); ++j) {
                 Tick::Seq& s = tick.seqs[idx[j]];
                 s.mtp_flushed = true;
@@ -187,6 +189,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
             model_->mtp_forward(steps, res);
             metrics_.last_cost += res.cost;
             metrics_.last_weight_passes += res.cost.weight_passes;
+    metrics_.weight_passes += res.cost.weight_passes;
             for (std::size_t j = 0; j < at.size(); ++j) {
                 tick.out[at[j]].drafts.push_back(res.seqs[j].argmax.at(0).index);
                 if (depth < tick.seqs[at[j]].k) tick.seqs[at[j]].mtp_hidden = std::move(res.seqs[j].hidden);
@@ -256,6 +259,9 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
     }
     metrics_.last_cost += res.cost;
     metrics_.last_weight_passes += res.cost.weight_passes;
+    metrics_.weight_passes += res.cost.weight_passes;
+    metrics_.last_trunk_passes += res.cost.weight_passes;
+    metrics_.trunk_passes += res.cost.weight_passes;
     for (std::size_t i = 0; i < n; ++i) {
         const StepRequest& r = reqs[i];
         Tick::Seq& s = tick.seqs[i];
@@ -372,6 +378,7 @@ void Speculator::flush_mtp(std::span<state::SequenceState* const> seqs) {
     model_->mtp_forward(steps, res);
     metrics_.last_cost += res.cost;
     metrics_.last_weight_passes += res.cost.weight_passes;
+    metrics_.weight_passes += res.cost.weight_passes;
     for (state::SequenceState* s : at) {
         metrics_.mtp_flush_rows += s->mtp_queue_tokens.size();
         s->mtp_queue_tokens.clear();

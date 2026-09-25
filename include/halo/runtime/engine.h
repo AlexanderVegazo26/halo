@@ -56,6 +56,11 @@ struct GenerateRequest {
     std::size_t max_tokens = 256;
     std::vector<std::vector<std::int32_t>> stop_token_seqs;  // besides EOS
     std::vector<std::string> stop_strings;
+    /// Additive (WS-G M3, D-013): prompt token offsets where a GDN prefix checkpoint is
+    /// worth taking (e.g. the template's preamble end and user-message starts converted to
+    /// token positions). Optional; the engine also checkpoints at prompt end - k and at a
+    /// fixed spacing. Out-of-range or too-closely-spaced hints are ignored.
+    std::vector<std::size_t> checkpoint_hints;
 };
 
 struct GenerateResult {
@@ -78,10 +83,37 @@ struct EngineStats {
     std::uint64_t prefix_cache_misses = 0;
     std::uint64_t speculative_attempts = 0;
     std::uint64_t speculative_accepts = 0;
+    // Additive (WS-G M3): scheduler and cost-model observability.
+    std::uint64_t ticks = 0;                       ///< batched forward ticks run
+    std::uint64_t prefix_cache_reused_tokens = 0;  ///< prompt tokens restored instead of recomputed
+    std::uint64_t mtp_fallbacks = 0;               ///< ticks retried with k = 0 after MTP-KV exhaustion
+    std::uint32_t last_tick_weight_passes = 0;     ///< trunk + MTP weight passes of the last tick
+    std::uint64_t last_tick_predicted_bytes = 0;   ///< cost-model weight bytes of the last tick (D-011)
 };
 
 // Thread-safe. generate() may be called concurrently from several API threads; the
 // implementation schedules them (batched decode, prefix cache) internally.
+//
+// Callback threading guarantee (WS-G M3, relied on by src/api):
+//   * The TokenCallback is invoked ONLY on the thread that called generate(), never on an
+//     engine-internal thread. The engine's worker produces tokens into a per-request queue;
+//     generate() drains that queue and calls the callback. A slow callback (e.g. an SSE
+//     write to a slow client) therefore delays only its own request's delivery — the
+//     batch keeps decoding, and that request's tokens buffer (at most max_tokens of them).
+//   * Calls for one request are sequential and in token order.
+//   * Returning false (or throwing) cancels the request: no further callbacks are made,
+//     the worker retires the sequence at its next tick, and generate() returns with
+//     FinishReason::Cancelled and `tokens` = exactly the tokens passed to the callback
+//     (an exception from the callback is rethrown after the sequence is retired).
+//   * EOS is delivered as a TokenEvent with is_eos = true and an empty piece, and is part
+//     of `tokens` (FinishReason::Stop).
+//   * A stop string ends generation after the token whose decoded text completes it; that
+//     token's piece is delivered unchanged (callers that must hide the stop string strip it).
+// Invalid requests (empty prompt, token ids outside the vocabulary, prompt >= context,
+// max_tokens == 0, invalid SamplingParams / JSON schema) throw halo::Error(Api) from
+// generate() before anything is scheduled (Error(Unsupported) for a JSON-schema construct
+// the grammar compiler does not support). Failures during generation are reported as
+// FinishReason::Error with `error` set.
 class Engine {
 public:
     virtual ~Engine() = default;

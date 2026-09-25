@@ -173,6 +173,9 @@ struct Metrics {
     std::uint64_t predicted_bytes = 0;  ///< sum of CostModel predictions over sequence-steps
     models::StepCost last_cost;         ///< measured traffic of the last tick (all forwards)
     std::uint32_t last_weight_passes = 0;  ///< trunk + MTP weight passes of the last tick
+    std::uint32_t last_trunk_passes = 0;   ///< trunk weight passes of the last tick (1 per verify)
+    std::uint64_t trunk_passes = 0;        ///< cumulative trunk weight passes
+    std::uint64_t weight_passes = 0;       ///< cumulative trunk + MTP weight passes
 };
 
 /// Per-tick working state (one entry per StepRequest, same order).

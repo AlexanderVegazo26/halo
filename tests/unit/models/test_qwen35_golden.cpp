@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <map>
 #include <numeric>
+#include <tuple>
 
 #include "halo/backends/cpu/ops.h"
 #include "halo/tensor/quant.h"
@@ -702,15 +703,19 @@ double measure_rho(const halo::model::NormalizedModel& q, const halo::model::Nor
     return rho;
 }
 
-class Qwen35Quant : public ::testing::TestWithParam<const char*> {};
+// One instance per (file, prompt): three prompts in one test took ~1000 s under ASan with
+// the full suite running in parallel, too close to ctest's 1500 s default timeout.
+class Qwen35Quant : public ::testing::TestWithParam<std::tuple<const char*, const char*>> {};
 
 }  // namespace
 
 TEST_P(Qwen35Quant, BitIdenticalToF32ForwardOverDequantizedWeights) {
     const auto golden = Golden::load();
     if (!golden) GTEST_SKIP() << "golden data missing under " << halo::test::tiny_dir();
-    const auto qt = TinyModel::load(GetParam(), 64);
-    if (!qt) GTEST_SKIP() << GetParam() << " missing under " << halo::test::tiny_dir();
+    const char* const file = std::get<0>(GetParam());
+    const char* const p = std::get<1>(GetParam());
+    const auto qt = TinyModel::load(file, 64);
+    if (!qt) GTEST_SKIP() << file << " missing under " << halo::test::tiny_dir();
     // At least one non-F32 matrix, or the differential is vacuous.
     ASSERT_NE(qt->nm->layer(0).ffn_down.type(), halo::DType::F32);
     ASSERT_NE(qt->nm->output().type(), halo::DType::F32);
@@ -725,7 +730,7 @@ TEST_P(Qwen35Quant, BitIdenticalToF32ForwardOverDequantizedWeights) {
     ASSERT_EQ(qt->model->has_mtp(), dq.model->has_mtp());
 
     const std::size_t E = qt->model->n_embd();
-    for (const char* p : kPrompts) {
+    {
         SCOPED_TRACE(p);
         const QuantRun a = run_quant(*qt, *golden, p);
         const QuantRun b = run_quant(dq, *golden, p);
@@ -739,7 +744,7 @@ TEST_P(Qwen35Quant, BitIdenticalToF32ForwardOverDequantizedWeights) {
             EXPECT_EQ(a.mtp.seqs[0].logits, b.mtp.seqs[0].logits);
         }
         // Diagnostic only (see above): error growth against the transformers golden.
-        std::printf("[%s/%s] layer_in rel rms err vs golden:", GetParam(), p);
+        std::printf("[%s/%s] layer_in rel rms err vs golden:", file, p);
         for (std::size_t li = 0; li < kLayers; ++li) {
             const auto ref = golden->f32(std::string(p) + ".layer_in." + std::to_string(li));
             const auto e = row_err(a.trunk.prefill.layer_inputs[li].data(), ref.data(), ref.size());
@@ -751,14 +756,16 @@ TEST_P(Qwen35Quant, BitIdenticalToF32ForwardOverDequantizedWeights) {
         (void)E;
     }
     const auto f32p = halo::test::tiny_dir() / "tiny-f32.gguf";
-    if (std::filesystem::exists(f32p)) {
+    if (std::string(p) == "p0" && std::filesystem::exists(f32p)) {
         const auto f32 = halo::model::NormalizedModel::load(f32p);
-        std::printf("[%s] rho (max relative RMS weight error vs tiny-f32) %.5f\n", GetParam(), measure_rho(*qt->nm, f32));
+        std::printf("[%s] rho (max relative RMS weight error vs tiny-f32) %.5f\n", file, measure_rho(*qt->nm, f32));
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(Files, Qwen35Quant, ::testing::Values("tiny-q8_0.gguf", "tiny-q4_k_m.gguf", "tiny-q6_k.gguf"),
+INSTANTIATE_TEST_SUITE_P(Files, Qwen35Quant,
+                         ::testing::Combine(::testing::Values("tiny-q8_0.gguf", "tiny-q4_k_m.gguf", "tiny-q6_k.gguf"),
+                                            ::testing::Values("p0", "p1", "p2")),
                          [](const auto& info) {
-                             const std::string n = info.param;
-                             return n.substr(5, n.size() - 10);  // tiny-XXX.gguf -> XXX
+                             const std::string n = std::get<0>(info.param);
+                             return n.substr(5, n.size() - 10) + "_" + std::get<1>(info.param);  // tiny-XXX.gguf -> XXX_pN
                          });

@@ -142,9 +142,14 @@ Toks oracle(const Toks& g, std::size_t m, std::size_t k, std::size_t wrong, std:
 
 // ---- the key invariant: greedy MTP ON == MTP OFF ----------------------------------------
 
-TEST_F(Spec, GreedyWithRealMtpDraftsEqualsPlainGreedyAndGolden) {
+// One instance per prompt keeps each ctest well under the default timeout under ASan
+// (the three prompts in one test took ~610 s there).
+class SpecPrompt : public Spec, public ::testing::WithParamInterface<const char*> {};
+
+TEST_P(SpecPrompt, GreedyWithRealMtpDraftsEqualsPlainGreedyAndGolden) {
     constexpr std::size_t kN = 16;
-    for (const char* p : {"p0", "p1", "p2"}) {
+    {
+        const char* p = GetParam();
         SCOPED_TRACE(p);
         const Toks pr = prompt(p);
         auto off = spec(GateMode::Off);
@@ -168,6 +173,8 @@ TEST_F(Spec, GreedyWithRealMtpDraftsEqualsPlainGreedyAndGolden) {
         }
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(Prompts, SpecPrompt, ::testing::Values("p0", "p1", "p2"));
 
 TEST_F(Spec, OracleDraftsAcceptEveryDepthAndStayIdenticalToPlain) {
     constexpr std::size_t kK = 3, kN = 24;
