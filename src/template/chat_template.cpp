@@ -2,18 +2,29 @@
 
 #include <minja/minja.hpp>
 
+#include <pthread.h>
+
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <ctime>
+#include <exception>
 #include <limits>
 
 #include "halo/core/error.h"
 
+// Fail closed: without the in-tree patch minja has no limits at all (security review S-3).
+// A FETCHCONTENT_SOURCE_DIR_MINJA override or a stale _deps directory would otherwise build
+// silently against unlimited upstream minja.
+#if !defined(MINJA_HALO_LIMITS) || MINJA_HALO_LIMITS < 1
+#error "minja is missing cmake/patches/minja-halo-limits.patch (see cmake/HaloDeps.cmake)"
+#endif
+
 namespace halo::chat {
 namespace {
 
-constexpr std::size_t kMaxTemplateBytes = std::size_t{1} << 20;
-constexpr std::int64_t kMaxRangeLength = 100000;
+constexpr std::uint64_t kMaxRangeLength = 100000;
+constexpr std::string_view kLimitPrefix = "chat template limit exceeded: ";
 constexpr std::string_view kTurnHeader = "<|im_start|>";
 
 // ---- Python str.strip() for Jinja's `trim` ------------------------------------------------
@@ -174,19 +185,30 @@ std::string rewrite_undefined_tests(std::string_view src) {
 
 // A `{% macro %}` is stored in the context it is defined in and captures that context, so
 // every render that defines a macro (both Qwen templates do) forms a shared_ptr cycle that
-// leaks the whole context chain (~17 KB per render; found by LeakSanitizer). Nulling the
-// top-level variables after rendering breaks the cycle. Macros defined inside loops or
-// other macros would live in child contexts and are not reached; neither template has any.
+// leaks the whole context chain (~17 KB per render; found by LeakSanitizer); `{% call %}`
+// does the same with `caller`. Nulling the variables of those contexts after rendering
+// breaks the cycles: the top-level context, plus every context the patched minja recorded
+// in the render budget (macros defined inside loops or other macros, call blocks; S-10).
 struct ContextCycleBreaker {
     std::shared_ptr<minja::Context> ctx;
-    explicit ContextCycleBreaker(std::shared_ptr<minja::Context> c) : ctx(std::move(c)) {}
+    minja::RenderBudget& budget;
+    ContextCycleBreaker(std::shared_ptr<minja::Context> c, minja::RenderBudget& b) : ctx(std::move(c)), budget(b) {}
     ContextCycleBreaker(const ContextCycleBreaker&) = delete;
     ContextCycleBreaker& operator=(const ContextCycleBreaker&) = delete;
     ~ContextCycleBreaker() {
-        try {
-            for (const auto& key : ctx->keys()) ctx->set(key, minja::Value());
-        } catch (...) {  // allocation failure while clearing: the cycle leaks, nothing worse
+        minja::RenderBudget* const installed = minja::current_budget;
+        minja::current_budget = nullptr;  // clearing must not be charged (or throw)
+        const auto clear = [](const std::shared_ptr<minja::Context>& c) {
+            try {
+                for (const auto& key : c->keys()) c->set(key, minja::Value());
+            } catch (...) {  // allocation failure while clearing: the cycle leaks, nothing worse
+            }
+        };
+        clear(ctx);
+        for (const auto& weak : budget.contexts) {
+            if (const auto c = weak.lock()) clear(c);
         }
+        minja::current_budget = installed;
     }
 };
 
@@ -195,7 +217,19 @@ struct RaiseState {
     std::string message;
 };
 
-std::int64_t range_length(minja::ArgumentsValue& args) {
+// Number of elements range(start, end, step) produces: ceil((end - start) / step), or 0.
+// Exact in unsigned 64-bit arithmetic (the difference of two int64 values fits).
+std::uint64_t range_length(std::int64_t start, std::int64_t end, std::int64_t step) noexcept {
+    if (step == 0) return 0;  // the builtin raises
+    const bool up = step > 0;
+    if (up ? end <= start : end >= start) return 0;
+    const std::uint64_t span = up ? static_cast<std::uint64_t>(end) - static_cast<std::uint64_t>(start)
+                                  : static_cast<std::uint64_t>(start) - static_cast<std::uint64_t>(end);
+    const std::uint64_t stride = up ? static_cast<std::uint64_t>(step) : std::uint64_t{0} - static_cast<std::uint64_t>(step);
+    return span / stride + (span % stride != 0 ? 1 : 0);
+}
+
+std::uint64_t range_length(minja::ArgumentsValue& args) {
     std::array<std::int64_t, 3> v{0, 0, 1};  // start, end, step
     if (args.args.size() == 1) {
         v[1] = args.args[0].get<std::int64_t>();
@@ -207,10 +241,7 @@ std::int64_t range_length(minja::ArgumentsValue& args) {
         if (name == "end") v[1] = value.get<std::int64_t>();
         if (name == "step") v[2] = value.get<std::int64_t>();
     }
-    const auto [start, end, step] = v;
-    if (step == 0) return 0;  // the builtin raises
-    const long double n = (static_cast<long double>(end) - static_cast<long double>(start)) / static_cast<long double>(step);
-    return n <= 0 ? 0 : (n >= static_cast<long double>(std::numeric_limits<std::int64_t>::max()) ? std::numeric_limits<std::int64_t>::max() : static_cast<std::int64_t>(n) + 1);
+    return range_length(v[0], v[1], v[2]);
 }
 
 void install_globals(const std::shared_ptr<minja::Context>& ctx, const std::shared_ptr<RaiseState>& raise,
@@ -239,7 +270,7 @@ void install_globals(const std::shared_ptr<minja::Context>& ctx, const std::shar
     const minja::Value builtin_range = minja::Context::builtins()->get("range");
     ctx->set("range", minja::Value::callable([builtin_range](const std::shared_ptr<minja::Context>& c,
                                                            minja::ArgumentsValue& args) -> minja::Value {
-        if (range_length(args) > kMaxRangeLength) {
+        if (range_length(args) > kMaxRangeLength) {  // exactly kMaxRangeLength is allowed (S-10)
             throw std::runtime_error("range() longer than " + std::to_string(kMaxRangeLength) + " elements");
         }
         return builtin_range.call(c, args);
@@ -330,26 +361,101 @@ void compute_offsets(const OrderedJson& messages, bool add_generation_prompt, Re
     }
 }
 
+// Runs `fn` to completion on a new thread with a `stack_bytes` stack (0: on this thread)
+// and rethrows whatever it threw. minja's lexer uses std::regex, whose libstdc++ executor
+// recurses once per matched character; the source-size cap bounds that recursion and this
+// stack makes the bound independent of the caller's thread.
+template <typename Fn>
+void run_on_stack(std::size_t stack_bytes, Fn&& fn) {
+    if (stack_bytes == 0) {
+        fn();
+        return;
+    }
+    struct Job {
+        Fn* fn;
+        std::exception_ptr error;
+    };
+    Job job{&fn, nullptr};
+    pthread_attr_t attr;
+    HALO_CHECK(pthread_attr_init(&attr) == 0, ErrorCode::Memory, "pthread_attr_init failed");
+    const int set = pthread_attr_setstacksize(&attr, stack_bytes);
+    pthread_t thread{};
+    const int created = set == 0 ? pthread_create(
+                                       &thread, &attr,
+                                       [](void* p) -> void* {
+                                           auto* j = static_cast<Job*>(p);
+                                           try {
+                                               (*j->fn)();
+                                           } catch (...) {
+                                               j->error = std::current_exception();
+                                           }
+                                           return nullptr;
+                                       },
+                                       &job)
+                                 : set;
+    pthread_attr_destroy(&attr);
+    HALO_CHECK(created == 0, ErrorCode::Memory, "cannot start the template parser thread ({} byte stack): {}",
+               stack_bytes, std::strerror(created));
+    pthread_join(thread, nullptr);
+    if (job.error) std::rethrow_exception(job.error);
+}
+
+minja::Limits to_minja(const TemplateLimits& l) {
+    minja::Limits m;
+    m.max_depth = l.max_render_depth;
+    m.max_steps = l.max_steps;
+    m.max_loop_iterations = l.max_loop_iterations;
+    m.max_output_bytes = l.max_output_bytes;
+    m.max_string_bytes = l.max_string_bytes;
+    m.max_alloc_bytes = l.max_alloc_bytes;
+    return m;
+}
+
+// Installs a render budget on this thread for the scope (restoring any outer one).
+class ScopedBudget {
+public:
+    explicit ScopedBudget(minja::RenderBudget& b) noexcept : prev_(minja::current_budget) { minja::current_budget = &b; }
+    ~ScopedBudget() { minja::current_budget = prev_; }
+    ScopedBudget(const ScopedBudget&) = delete;
+    ScopedBudget& operator=(const ScopedBudget&) = delete;
+
+private:
+    minja::RenderBudget* prev_;
+};
+
+constexpr std::array<std::string_view, 5> kReservedVariables = {"messages", "tools", "bos_token", "eos_token",
+                                                               "add_generation_prompt"};
+
 }  // namespace
 
 struct ChatTemplate::Impl {
     std::string source;
     std::string bos;
     std::string eos;
+    TemplateLimits limits;
     std::shared_ptr<minja::TemplateNode> root;
 };
 
 ChatTemplate::ChatTemplate(std::string source, std::string bos_token, std::string eos_token)
+    : ChatTemplate(std::move(source), std::move(bos_token), std::move(eos_token), TemplateLimits{}) {}
+
+ChatTemplate::ChatTemplate(std::string source, std::string bos_token, std::string eos_token,
+                           const TemplateLimits& limits)
     : impl_(std::make_unique<Impl>()) {
     HALO_CHECK(!source.empty(), ErrorCode::Config, "chat template is empty");
-    HALO_CHECK(source.size() <= kMaxTemplateBytes, ErrorCode::Config, "chat template is {} bytes (limit {})",
-               source.size(), kMaxTemplateBytes);
+    HALO_CHECK(limits.max_source_bytes == 0 || source.size() <= limits.max_source_bytes, ErrorCode::Config,
+               "chat template is {} bytes (limit {})", source.size(), limits.max_source_bytes);
     impl_->source = std::move(source);
     impl_->bos = std::move(bos_token);
     impl_->eos = std::move(eos_token);
+    impl_->limits = limits;
     try {
-        impl_->root = minja::Parser::parse(rewrite_undefined_tests(impl_->source), minja::Options{/*trim_blocks=*/true, /*lstrip_blocks=*/true,
-                                                                         /*keep_trailing_newline=*/false});
+        const std::string rewritten = rewrite_undefined_tests(impl_->source);
+        const minja::Options options{/*trim_blocks=*/true, /*lstrip_blocks=*/true, /*keep_trailing_newline=*/false,
+                                     /*max_depth=*/limits.max_parse_depth};
+        run_on_stack(limits.parse_stack_bytes, [&] { impl_->root = minja::Parser::parse(rewritten, options); });
+    } catch (const Error&) {
+        throw;
     } catch (const std::exception& e) {
         throw_error(ErrorCode::Config, "cannot parse chat template: {}", e.what());
     }
@@ -388,6 +494,10 @@ RenderResult ChatTemplate::render(const OrderedJson& messages, const OrderedJson
             if (k == "enable_thinking" || k == "preserve_thinking" || k == "add_vision_id") {
                 HALO_CHECK(v.is_boolean(), ErrorCode::Api, "template variable '{}' must be a boolean", k);
             }
+            // S-8: extra_context must not replace the conversation, the tools or the tokens
+            // (and so desynchronise the message offsets computed from `messages`).
+            HALO_CHECK(std::find(kReservedVariables.begin(), kReservedVariables.end(), k) == kReservedVariables.end(),
+                       ErrorCode::Api, "template variable '{}' is reserved and cannot be set in extra_context", k);
         }
     }
 
@@ -403,18 +513,27 @@ RenderResult ChatTemplate::render(const OrderedJson& messages, const OrderedJson
     }
     auto raise = std::make_shared<RaiseState>();
     RenderResult r;
+    minja::RenderBudget budget;
+    budget.limits = to_minja(impl_->limits);
     try {
+        const ScopedBudget scope{budget};
         auto ctx = minja::Context::make(minja::Value(vars));
-        const ContextCycleBreaker breaker{ctx};
+        const ContextCycleBreaker breaker{ctx, budget};
         install_globals(ctx, raise, options.now.value_or(std::chrono::system_clock::now()));
         r.prompt = impl_->root->render(ctx);
+    } catch (const minja::LimitExceeded& e) {
+        throw_error(ErrorCode::Api, "{}{}", kLimitPrefix, e.what());
     } catch (const std::exception& e) {
         if (raise->raised) throw_error(ErrorCode::Api, "chat template raised: {}", raise->message);
         throw_error(ErrorCode::Api, "chat template rendering failed: {}", e.what());
     }
+    r.stats = RenderStats{budget.peak_depth, budget.steps, budget.loop_iterations, budget.output_bytes,
+                          budget.alloc_bytes};
     compute_offsets(msgs, options.add_generation_prompt, r);
     return r;
 }
+
+const TemplateLimits& ChatTemplate::limits() const noexcept { return impl_->limits; }
 
 std::string ChatTemplate::apply(const OrderedJson& messages, const OrderedJson& tools,
                                 const RenderOptions& options) const {

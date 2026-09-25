@@ -11,9 +11,18 @@ set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
 
 # Jinja-subset template engine (MIT) — header-only; we only need the include dir.
+# HALO carries a pinned patch (security review S-3; docs/security-hardening.md): resource
+# limits, linear lexing, iterative Value teardown. URL_HASH still verifies the upstream
+# archive; apply_patch.cmake verifies the patch file against its own SHA256 and is
+# idempotent. src/template/chat_template.cpp refuses to compile against unpatched minja, so a
+# FETCHCONTENT_SOURCE_DIR_MINJA override must point at a patched tree.
+set(HALO_MINJA_PATCH "${CMAKE_CURRENT_LIST_DIR}/patches/minja-halo-limits.patch")
+set(HALO_MINJA_PATCH_SHA256 54da3b56abf72b152a15db5ecd308af727ab5b416f84fbdff700f2e720f5e275)
 FetchContent_Declare(minja
   URL https://github.com/google/minja/archive/021c2293c187789ef13d56c6cfd89c9b134fd80f.tar.gz
-  URL_HASH SHA256=dc3ddd37497b79a4cd35fd41550e22b3b0139439de8be6eab3d2d024fed47bb4)
+  URL_HASH SHA256=dc3ddd37497b79a4cd35fd41550e22b3b0139439de8be6eab3d2d024fed47bb4
+  PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${HALO_MINJA_PATCH} -DPATCH_SHA256=${HALO_MINJA_PATCH_SHA256}
+                -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply_patch.cmake)
 FetchContent_Populate(minja)
 add_library(halo_minja INTERFACE)
 target_include_directories(halo_minja SYSTEM INTERFACE ${minja_SOURCE_DIR}/include)

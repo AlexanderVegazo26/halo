@@ -7,11 +7,22 @@
 // no polyfills (HF applies none), a Python-compatible `trim`, `raise_exception` surfaced
 // as a typed halo::Error(Api), a capped `range`, and a deterministic `strftime_now`.
 //
-// Untrusted-template limits (minja 021c229): there is no {% include %}/{% import %}, so a
-// template cannot read files; there is no recursion depth, loop-iteration or output-size
-// limit inside minja. HALO bounds what it can from outside: template source <= 1 MiB,
-// `range()` <= 100000 elements. A template with unbounded macro recursion can still
-// exhaust the stack — only templates from model files the operator chose are rendered.
+// Untrusted templates (security review S-3, S-8, S-10; docs/security-hardening.md): chat
+// templates come from model files downloaded from Hugging Face and are treated as hostile.
+// minja 021c229 has no {% include %}/{% import %}, so a template cannot read files. HALO
+// builds minja with an in-tree patch (cmake/patches/minja-halo-limits.patch) that counts
+// the work of every parse and render against TemplateLimits:
+//   - parse (constructor): source size, parser nesting depth; the parse runs on a dedicated
+//     thread with a large, known stack (std::regex in minja's lexer recurses per character);
+//     a violated limit throws halo::Error(Config);
+//   - render: render depth, steps, loop iterations, output bytes, largest single value and
+//     cumulative value bytes; a violated limit throws halo::Error(Api) whose message starts
+//     with "chat template limit exceeded: ". Render runs on the caller's thread; at the
+//     default limits it needs at most kMaxRenderStackBytes of stack (measured, see below).
+//   - `range()` is capped at 100000 elements (a range of exactly 100000 is allowed).
+//
+// Defaults are multiples of what the real Qwen3.8 templates need on large conversations;
+// they are documented per field. A limit of 0 disables it (tests only).
 //
 // minja semantic gaps handled at the boundary (each is golden- or unit-tested):
 //   - no `is undefined` test: the source is rewritten to `is not defined` before parsing;
@@ -26,6 +37,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -36,6 +48,53 @@
 namespace halo::chat {
 
 using OrderedJson = nlohmann::ordered_json;
+
+/// Stack a render() needs at the default TemplateLimits: at the render-depth cap (1024) the
+/// peak measured by stack painting is ~1.2 MiB (RelWithDebInfo) and ~2.9 MiB (ASan + Debug)
+/// (test RenderAtDepthCapFitsTheDocumentedStack). Render on a thread with at least this.
+inline constexpr std::size_t kMaxRenderStackBytes = std::size_t{4} << 20;
+
+/// Resource limits applied to one template (see the file comment). 0 disables a limit
+/// (tests only). "Measured" figures are the Qwen3.8 ggml/unsloth templates rendering a
+/// 4002-message agentic conversation with 64 tools (2.2 MB prompt, about twice a 262K-token
+/// context; test DefaultsLeaveHeadroomOverRealTemplates, which asserts >= 4x headroom).
+struct TemplateLimits {
+    /// Template source size. Real Qwen templates are ~9-10 KB. (Was 1 MiB before S-3.)
+    std::size_t max_source_bytes = std::size_t{64} << 10;
+    /// Parser recursion depth: each nesting level of brackets, filters, `~`, `not`, if-else
+    /// expressions and blocks counts. Violations throw Error(Config).
+    std::size_t max_parse_depth = 256;
+    /// Stack of the dedicated parse thread (virtual; touched lazily); 0 parses on the
+    /// caller's thread, which a 64 KiB single token can overflow (tested).
+    std::size_t parse_stack_bytes = std::size_t{256} << 20;
+    /// Nesting of node renders + expression evaluations + value traversals. Measured: 20.
+    std::size_t max_render_depth = 1024;
+    /// Node renders + expression evaluations + charged builtin work (substring searches,
+    /// container scans). Measured: 0.86M. A hostile template reaches the cap in ~4 s on the
+    /// dev host (D-001), the slowest bound; steps cost ~1 us each.
+    std::uint64_t max_steps = 4'000'000;
+    /// For-loop iterations, filtering passes included. Measured: 36K.
+    std::uint64_t max_loop_iterations = 1'000'000;
+    /// Bytes written by output nodes, summed over nested buffers (macro bodies, {% set %}
+    /// blocks, filters); an upper bound of the prompt size. Measured: 3.6 MB.
+    std::uint64_t max_output_bytes = std::uint64_t{64} << 20;
+    /// Largest single value one operation may build: string bytes, or container elements x
+    /// sizeof(minja::Value) (~80 B; about 400K elements). Checked before the known
+    /// amplifiers (repeat, replace, join, indent, split, tojson indent) and on every result.
+    std::uint64_t max_string_bytes = std::uint64_t{32} << 20;
+    /// Cumulative bytes of string values produced by expressions or stored into containers,
+    /// plus one slot per container element stored. Measured: 21 MB.
+    std::uint64_t max_alloc_bytes = std::uint64_t{1} << 30;
+};
+
+/// Work one render used (for observability and for sizing TemplateLimits).
+struct RenderStats {
+    std::size_t peak_depth = 0;
+    std::uint64_t steps = 0;
+    std::uint64_t loop_iterations = 0;
+    std::uint64_t output_bytes = 0;
+    std::uint64_t alloc_bytes = 0;
+};
 
 struct RenderOptions {
     bool add_generation_prompt = true;
@@ -74,13 +133,18 @@ struct RenderResult {
     std::optional<std::size_t> preamble_end;
     /// Start of the generation prompt (`<|im_start|>assistant\n...`) when requested.
     std::optional<std::size_t> generation_prompt_start;
+    /// Resources the render used, measured against TemplateLimits.
+    RenderStats stats;
 };
 
 class ChatTemplate {
 public:
-    /// Parses `source`. Throws halo::Error(Config) if it is empty, larger than 1 MiB, or
-    /// minja cannot parse it.
+    /// Parses `source` with the default TemplateLimits. Throws halo::Error(Config) if it is
+    /// empty, larger than TemplateLimits::max_source_bytes (64 KiB), nested deeper than
+    /// max_parse_depth, or minja cannot parse it.
     explicit ChatTemplate(std::string source, std::string bos_token = {}, std::string eos_token = {});
+    /// As above with explicit limits (also applied to every render()).
+    ChatTemplate(std::string source, std::string bos_token, std::string eos_token, const TemplateLimits& limits);
     ChatTemplate(ChatTemplate&&) noexcept;
     ChatTemplate& operator=(ChatTemplate&&) noexcept;
     ChatTemplate(const ChatTemplate&) = delete;
@@ -89,8 +153,10 @@ public:
 
     /// Renders `messages` (array of objects) with optional `tools` (array, or null for
     /// none). Deterministic for identical inputs. Throws halo::Error(Api) when the template
-    /// calls raise_exception (message = the template's text) or rendering fails on the
-    /// given input, and for malformed arguments (messages not an array, etc.).
+    /// calls raise_exception (message = the template's text), rendering fails on the given
+    /// input, a TemplateLimits bound is exceeded ("chat template limit exceeded: ..."), and
+    /// for malformed arguments (messages not an array, extra_context overriding a reserved
+    /// variable — messages, tools, bos_token, eos_token, add_generation_prompt — etc.).
     [[nodiscard]] RenderResult render(const OrderedJson& messages, const OrderedJson& tools,
                                       const RenderOptions& options) const;
 
@@ -99,6 +165,7 @@ public:
                                     const RenderOptions& options) const;
 
     [[nodiscard]] const std::string& source() const noexcept;
+    [[nodiscard]] const TemplateLimits& limits() const noexcept;
 
     struct Impl;
 

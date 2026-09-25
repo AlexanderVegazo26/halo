@@ -1,0 +1,2 @@
+# Patch files are hashed (cmake/HaloDeps.cmake): never convert line endings.
+* -text
