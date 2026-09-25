@@ -354,6 +354,17 @@ struct AddRmsNormArgs {
     float eps = 1e-6f;
 };
 
+/// [GDN gates] qwen35's per-head gate inputs (src/models/qwen35.cpp): beta = sigmoid(b) and
+/// g = ssm_a * softplus(a + dt_bias), fused; the same expressions as the CPU forward's
+/// cpu::sigmoid, dt_bias add, cpu::softplus (torch threshold 20) and ssm_a multiply. b, a:
+/// rows x [n_v] (the ssm_beta / ssm_alpha projections); dt_bias, ssm_a: [n_v]. beta may
+/// alias b exactly and g may alias a exactly (the CPU forward works in place).
+struct GdnGateArgs {
+    BufferView b{}, a{}, dt_bias{}, ssm_a{}, beta{}, g{};
+    std::uint32_t rows = 0;
+    std::uint32_t n_v = 0;
+};
+
 /// Variant choice per operator (names from the kernel registry, registry.h).
 struct OpsOptions {
     std::string gdn_recurrent = "gdn_recurrent_b128";
@@ -372,6 +383,8 @@ struct OpsOptions {
     std::string get_rows = "get_rows_b256";
     std::string add = "add_b256";
     std::string add_rms_norm = "add_rms_norm_b128";
+    std::string gdn_gate = "gdn_gate_b64";
+    std::string gemm = "gemm_t16x16_b256";
 };
 
 class Ops {
@@ -423,6 +436,11 @@ public:
     void add(const Target& target, const EltwiseArgs& args) const;
     /// [ADD + RMS_NORM]
     void add_rms_norm(const Target& target, const AddRmsNormArgs& args) const;
+    /// [GDN gates]
+    void gdn_gates(const Target& target, const GdnGateArgs& args) const;
+    /// [QUANT_GEMM] prefill: the GemvArgs contract (n_vec = T token rows), tiled 16 x 16 so a
+    /// dequantized W tile serves 16 tokens; bit-identical to dequantize_row + cpu::matmul.
+    void gemm(const Target& target, const GemvArgs& args) const;
 
     /// Reads a status word (device: synchronizes the target stream, then copies it) and
     /// throws Error(Kernel) naming the set bits; returns normally when it is zero.
@@ -448,6 +466,8 @@ private:
     unsigned rows_block_ = 0;
     unsigned add_block_ = 0;
     unsigned addnorm_block_ = 0;
+    unsigned gate_block_ = 0;
+    unsigned gemm_block_ = 0;
 };
 
 }  // namespace halo::hip

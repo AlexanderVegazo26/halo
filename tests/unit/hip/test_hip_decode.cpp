@@ -208,5 +208,65 @@ TEST(HipDecodeDevice, AddAndFusedAddRmsNormVsCpuComposition) {
     check_add_norm(3, 5120, 0, r);
 }
 
+// ---- GDN gates -------------------------------------------------------------------------------
+
+void check_gdn_gates(std::uint32_t rows, bool in_place, Runner& r) {
+    SCOPED_TRACE(r.name());
+    SCOPED_TRACE(testing::Message() << "gdn_gates rows " << rows << " in_place " << in_place);
+    constexpr std::uint32_t kNv = 48;  // qwen35 value heads (D-003)
+    std::mt19937 rng(1300 + rows);
+    std::vector<float> b = uniform(rng, rows * kNv, -8.0f, 8.0f), a = uniform(rng, rows * kNv, -6.0f, 6.0f);
+    std::vector<float> dt = uniform(rng, kNv, -2.0f, 2.0f), ssm_a = uniform(rng, kNv, -3.0f, -0.01f);
+    a[0] = 25.0f;   // a + dt_bias > 20: softplus is the identity branch
+    a[1] = -40.0f;  // exp underflows toward 0
+    b[2] = 95.0f;   // sigmoid saturates
+    a[3] = 100.0f;  // exp(t) overflows to inf: only the threshold branch gives t (the CPU's value)
+    std::vector<float> beta(rows * kNv, 999.0f), g(rows * kNv, 999.0f);
+    // CPU composition, statement for statement as src/models/qwen35.cpp (in place on beta/alpha).
+    std::vector<float> rbeta = b, ralpha = a;
+    cpu::sigmoid(cpu::ConstRows(rbeta.data(), rows, kNv, kNv), cpu::Rows(rbeta.data(), rows, kNv, kNv));
+    for (std::size_t rr = 0; rr < rows; ++rr) {
+        for (std::size_t j = 0; j < kNv; ++j) ralpha[rr * kNv + j] += dt[j];
+    }
+    cpu::softplus(cpu::ConstRows(ralpha.data(), rows, kNv, kNv), cpu::Rows(ralpha.data(), rows, kNv, kNv));
+    for (std::size_t rr = 0; rr < rows; ++rr) {
+        for (std::size_t j = 0; j < kNv; ++j) ralpha[rr * kNv + j] = ssm_a[j] * ralpha[rr * kNv + j];
+    }
+    const Buffer bb = r.make(b), ba = r.make(a), bdt = r.make(dt), bsa = r.make(ssm_a), bbeta = r.make(beta),
+                 bg = r.make(g);
+    GdnGateArgs args;
+    args.b = bb;
+    args.a = ba;
+    args.dt_bias = bdt;
+    args.ssm_a = bsa;
+    args.beta = in_place ? BufferView(bb) : BufferView(bbeta);
+    args.g = in_place ? BufferView(ba) : BufferView(bg);
+    args.rows = rows;
+    args.n_v = kNv;
+    Ops().gdn_gates(r.target(), args);
+    r.finish();
+    r.fetch(bb, b);
+    r.fetch(ba, a);
+    r.fetch(bbeta, beta);
+    r.fetch(bg, g);
+    EXPECT_TRUE(matches(rbeta, in_place ? b : beta, r.exact(), "beta = sigmoid(b)"));
+    EXPECT_TRUE(matches(ralpha, in_place ? a : g, r.exact(), "g = ssm_a * softplus(a + dt_bias)"));
+}
+
+TEST(HipDecodeEmu, GdnGatesBitExactVsCpuForwardComposition) {
+    for (auto& r : emulation_runners()) {
+        check_gdn_gates(1, true, *r);    // decode, in place like the CPU forward
+        check_gdn_gates(5, false, *r);   // MTP verify rows
+        check_gdn_gates(70, true, *r);
+    }
+}
+
+TEST(HipDecodeDevice, GdnGatesVsCpuForwardComposition) {
+    HALO_REQUIRE_HIP_DEVICE();
+    DeviceRunner r;
+    check_gdn_gates(1, true, r);
+    check_gdn_gates(5, false, r);
+}
+
 }  // namespace
 }  // namespace halo::hip::test

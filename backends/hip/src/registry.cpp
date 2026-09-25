@@ -12,7 +12,7 @@ namespace {
 
 constexpr std::string_view kGdnDecisions = "D-003 D-004(5,6) D-012 D-016";
 
-constexpr std::array<KernelVariant, 25> kVariants{{
+constexpr std::array<KernelVariant, 27> kVariants{{
     {"GATED_DELTANET", "recurrent", "gdn_recurrent_b128", "k_gdn_recurrent", 128,
      "grid (n_v, ceil(d_v/128)); thread = one value column, S[:,c] in registers (d_k <= 128)",
      kGdnDecisions, true},
@@ -70,6 +70,12 @@ constexpr std::array<KernelVariant, 25> kVariants{{
     {"ADD", "", "add_b256", "k_eltwise", 256, "grid (rows, ceil(cols/256)); thread = one element", "D-004", true},
     {"ADD_RMS_NORM", "", "add_rms_norm_b128", "k_add_norm", 128,
      "grid rows; residual add phase, then the RMS_NORM phases over the written h (CPU order)", "D-004", true},
+    {"GDN_GATE", "", "gdn_gate_b64", "k_gdn_gate", 64, "grid (rows, ceil(n_v/64)); thread = one head: sigmoid(b), ssm_a*softplus(a+dt_bias)",
+     "D-004(4)", true},
+    {"QUANT_GEMM", "", "gemm_t16x16_b256", "k_gemm", 256,
+     "grid (ceil(N/16), ceil(T/16)); 16x16 output tile, K in LDS chunks of 64 (W dequantized once per tile); "
+     "thread = one output with the CPU dot's 8 partial sums",
+     "D-007 D-014", true},
 }};
 
 }  // namespace

@@ -134,4 +134,41 @@ HALO_HD void add_norm_body(Exec& ex, NormShared& sh, const AddNormParams& p, uns
     norm_body(ex, sh, np, bx, by);
 }
 
+// ---- GDN gates (qwen35 forward, src/models/qwen35.cpp) ----------------------------------
+// beta = sigmoid(b);  g = ssm_a * softplus(a + dt_bias), per value head j — the CPU forward's
+// cpu::sigmoid, the `alpha += dt_bias` loop, cpu::softplus and `alpha = a[j] * alpha`, fused;
+// same expressions and operand order, so bitwise with the host libm.
+
+struct GdnGateParams {
+    const float* b = nullptr;
+    std::uint64_t b_stride = 0;
+    const float* a = nullptr;
+    std::uint64_t a_stride = 0;
+    const float* dt_bias = nullptr;  // [n_v]
+    const float* ssm_a = nullptr;    // [n_v], = -exp(A_log)
+    float* beta = nullptr;           // may equal b (exact alias)
+    std::uint64_t beta_stride = 0;
+    float* g = nullptr;              // may equal a (exact alias)
+    std::uint64_t g_stride = 0;
+    unsigned rows = 0;
+    unsigned n_v = 0;
+};
+
+inline Launch gdn_gate_launch(unsigned rows, unsigned n_v, unsigned block) {
+    return Launch{rows, (n_v + block - 1) / block, block};
+}
+
+template <class Exec>
+HALO_HD void gdn_gate_body(Exec& ex, DecNoRegs&, const GdnGateParams& p, unsigned bx, unsigned by) {
+    ex.phase([&](unsigned tid, DecNoRegs&) {
+        const unsigned j = by * ex.block_dim() + tid;
+        if (j >= p.n_v) return;
+        const float bv = p.b[static_cast<std::uint64_t>(bx) * p.b_stride + j];
+        const float av = p.a[static_cast<std::uint64_t>(bx) * p.a_stride + j];
+        const float t = av + p.dt_bias[j];
+        p.beta[static_cast<std::uint64_t>(bx) * p.beta_stride + j] = sigmoidf(bv);
+        p.g[static_cast<std::uint64_t>(bx) * p.g_stride + j] = p.ssm_a[j] * softplusf(t);
+    });
+}
+
 }  // namespace halo::hip::kern

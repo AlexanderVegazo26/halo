@@ -56,6 +56,17 @@ HALO_HD inline float hexp(float x) {
 #endif
 }
 
+HALO_HD inline float hlog1p(float x) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return ::log1pf(x);
+#else
+    return std::log1p(x);
+#endif
+}
+
+/// cpu::detail::softplus (torch, beta 1, threshold 20).
+HALO_HD inline float softplusf(float x) { return x > 20.0f ? x : hlog1p(hexp(x)); }
+
 HALO_HD inline float hsqrt(float x) {
 #if defined(__HIP_DEVICE_COMPILE__)
     return ::sqrtf(x);  // correctly rounded (HIP default -fhip-fp32-correctly-rounded-divide-sqrt)

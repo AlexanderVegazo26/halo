@@ -275,6 +275,10 @@ Ops::Ops(OpsOptions options) : options_(std::move(options)) {
     rows_block_ = block_of("GET_ROWS", "", options_.get_rows);
     add_block_ = block_of("ADD", "", options_.add);
     addnorm_block_ = block_of("ADD_RMS_NORM", "", options_.add_rms_norm);
+    gate_block_ = block_of("GDN_GATE", "", options_.gdn_gate);
+    gemm_block_ = block_of("QUANT_GEMM", "", options_.gemm);
+    HALO_CHECK(gemm_block_ == kern::kGemmBlock, ErrorCode::Config, "HIP: GEMM variant block {} must be {} (16x16 tile)",
+               gemm_block_, kern::kGemmBlock);
     attn_exact_ = find_variant("ATTENTION", options_.attention).kernels.find("exact") != std::string_view::npos;
     HALO_CHECK(attn_block_ >= 32 && attn_block_ <= kern::kAttnMaxBlock, ErrorCode::Config,
                "HIP: attention variant block {} not in [32, {}]", attn_block_, kern::kAttnMaxBlock);
@@ -978,6 +982,49 @@ void Ops::add_rms_norm(const Target& target, const AddRmsNormArgs& a) const {
     p.eps = a.eps;
     dispatch(target, &detail::launch_add_norm, &detail::emulate_add_norm, p,
              kern::add_norm_launch(a.rows, addnorm_block_), kOp);
+}
+
+}  // namespace halo::hip
+
+// ---- GDN gates / QUANT_GEMM -----------------------------------------------------------------
+
+namespace halo::hip {
+
+void Ops::gdn_gates(const Target& target, const GdnGateArgs& a) const {
+    constexpr const char* kOp = "hip::gdn_gates";
+    HALO_CHECK(a.n_v >= 1, ErrorCode::Kernel, "{}: n_v must be >= 1", kOp);
+    if (a.rows == 0) return;
+    const Rows b = resolve(target, a.b, a.rows, a.n_v, kOp, "b");
+    const Rows al = resolve(target, a.a, a.rows, a.n_v, kOp, "a");
+    const Rows dt = resolve(target, a.dt_bias, 1, a.n_v, kOp, "dt_bias");
+    const Rows sa = resolve(target, a.ssm_a, 1, a.n_v, kOp, "ssm_a");
+    const Rows beta = resolve(target, a.beta, a.rows, a.n_v, kOp, "beta");
+    const Rows g = resolve(target, a.g, a.rows, a.n_v, kOp, "g");
+    check_alias_exact_or_disjoint(b, beta, kOp, "b");
+    check_alias_exact_or_disjoint(al, g, kOp, "a");
+    check_disjoint(beta, "beta", {{&al, "a"}, {&dt, "dt_bias"}, {&sa, "ssm_a"}, {&g, "g"}}, kOp);
+    check_disjoint(g, "g", {{&b, "b"}, {&dt, "dt_bias"}, {&sa, "ssm_a"}}, kOp);
+    kern::GdnGateParams p;
+    p.b = b.ptr;
+    p.b_stride = b.stride;
+    p.a = al.ptr;
+    p.a_stride = al.stride;
+    p.dt_bias = dt.ptr;
+    p.ssm_a = sa.ptr;
+    p.beta = beta.ptr;
+    p.beta_stride = beta.stride;
+    p.g = g.ptr;
+    p.g_stride = g.stride;
+    p.rows = a.rows;
+    p.n_v = a.n_v;
+    dispatch(target, &detail::launch_gdn_gate, &detail::emulate_gdn_gate, p,
+             kern::gdn_gate_launch(a.rows, a.n_v, gate_block_), kOp);
+}
+
+void Ops::gemm(const Target& target, const GemvArgs& a) const {
+    constexpr const char* kOp = "hip::gemm";
+    const GemvPlan g = plan_gemv(target, a, gemv_block_, gemv_generic_, false, kOp);
+    dispatch(target, &detail::launch_gemm, &detail::emulate_gemm, g.p, kern::gemm_launch(a.rows, a.n_vec), kOp);
 }
 
 }  // namespace halo::hip

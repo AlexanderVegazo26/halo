@@ -128,6 +128,18 @@ __global__ void __launch_bounds__(1024) k_add_norm(AddNormParams p) {
     add_norm_body(ex, sh, p, blockIdx.x, blockIdx.y);
 }
 
+__global__ void __launch_bounds__(1024) k_gdn_gate(GdnGateParams p) {
+    __shared__ DecNoRegs sh;
+    dev::DeviceExec<DecNoRegs> ex;
+    gdn_gate_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
+__global__ void __launch_bounds__(kGemmBlock) k_gemm(GemvParams p) {
+    __shared__ GemmShared sh;
+    dev::DeviceExec<GemmRegs> ex;
+    gemm_body(ex, sh, p, blockIdx.x, blockIdx.y);
+}
+
 template <class K, class P>
 int launch(K kernel, const P& p, const Launch& l, void* stream) {
     hipLaunchKernelGGL(kernel, dim3(l.grid_x, l.grid_y, 1), dim3(l.block, 1, 1), 0,
@@ -156,5 +168,7 @@ int launch_attn_online(const AttnParams& p, const Launch& l, void* s) { return l
 int launch_kv_write(const KvWriteParams& p, const Launch& l, void* s) { return launch(k_kv_write, p, l, s); }
 int launch_get_rows(const GetRowsParams& p, const Launch& l, void* s) { return launch(k_get_rows, p, l, s); }
 int launch_add_norm(const AddNormParams& p, const Launch& l, void* s) { return launch(k_add_norm, p, l, s); }
+int launch_gdn_gate(const GdnGateParams& p, const Launch& l, void* s) { return launch(k_gdn_gate, p, l, s); }
+int launch_gemm(const GemvParams& p, const Launch& l, void* s) { return launch(k_gemm, p, l, s); }
 
 }  // namespace halo::hip::detail

@@ -187,8 +187,13 @@ void check_gemv(const GemvCase& c, const std::string& variant, Runner& r) {
     a.cols = c.cols;
     a.n_vec = c.n_vec;
     OpsOptions o;
-    o.gemv = variant;
-    Ops(o).gemv(r.target(), a);
+    const bool is_gemm = variant == "gemm_t16x16_b256";
+    if (!is_gemm) o.gemv = variant;
+    if (is_gemm) {
+        Ops(o).gemm(r.target(), a);
+    } else {
+        Ops(o).gemv(r.target(), a);
+    }
     r.finish();
     r.fetch(by, y);
     std::vector<float> yd(static_cast<std::size_t>(c.n_vec) * c.rows);
@@ -198,7 +203,7 @@ void check_gemv(const GemvCase& c, const std::string& variant, Runner& r) {
         for (std::size_t i = c.rows; i < ys; ++i) pad_bad += y[t * ys + i] != 999.0f ? 1u : 0u;
     }
     EXPECT_EQ(pad_bad, 0u) << "y padding overwritten";
-    if (variant == "gemv_generic_b64") {
+    if (variant == "gemv_generic_b64" || is_gemm) {  // both reproduce the CPU dot order
         EXPECT_TRUE(matches(ref.y, yd, true, "y (generic, bitwise vs cpu::matmul)"));
     } else {
         EXPECT_TRUE(within_bound(c, ref, yd));
@@ -232,6 +237,38 @@ TEST(HipGemvEmu, AllTypesVsTensorDequantAndCpuMatmul) {
             for (auto& r : emulation_runners()) check_gemv(c, v, *r);
         }
     }
+}
+
+// QUANT_GEMM (prefill): same contract and the same checks; the tile keeps the CPU dot's
+// 8-lane order, so it must be bitwise equal to dequantize_row + cpu::matmul.
+std::vector<GemvCase> gemm_cases() {
+    std::vector<GemvCase> v;
+    std::uint32_t seed = 300;
+    // The main pack types first (D-014 census: Q5_K, IQ4_XS, Q4_K, Q6_K), then the rest.
+    for (DType t : {DType::Q5_K, DType::IQ4_XS, DType::Q4_K, DType::Q6_K, DType::Q8_0, DType::IQ4_NL, DType::Q3_K,
+                    DType::IQ3_S, DType::Q4_0, DType::F16, DType::F32}) {
+        const bool plain = t == DType::F32 || t == DType::F16;
+        // 37 rows x 17 tokens: partial weight-row and token tiles; K = 5120 = 80 LDS chunks.
+        v.push_back({.type = t, .rows = 37, .cols = plain ? 100u : 5120u, .n_vec = 17, .stride_pad = plain ? 4u : 3u,
+                     .offset = plain ? 4u : 1u, .x_pad = 5, .y_pad = 3, .seed = ++seed});
+        v.push_back({.type = t, .rows = 16, .cols = plain ? 64u : 256u, .n_vec = 2, .seed = ++seed});  // one tile
+    }
+    // Three token tiles (T = 40, the last partial), so every token-tile offset is exercised.
+    v.push_back({.type = DType::Q5_K, .rows = 20, .cols = 512, .n_vec = 40, .seed = ++seed});
+    v.push_back({.type = DType::IQ4_XS, .rows = 33, .cols = 768, .n_vec = 40, .seed = ++seed});
+    return v;
+}
+
+TEST(HipGemmEmu, PrefillTileBitExactVsTensorDequantAndCpuMatmul) {
+    for (const GemvCase& c : gemm_cases()) {
+        for (auto& r : emulation_runners()) check_gemv(c, "gemm_t16x16_b256", *r);
+    }
+}
+
+TEST(HipGemmDevice, PrefillTileVsTensorDequantAndCpuMatmul) {
+    HALO_REQUIRE_HIP_DEVICE();
+    DeviceRunner r;
+    for (const GemvCase& c : gemm_cases()) check_gemv(c, "gemm_t16x16_b256", r);
 }
 
 TEST(HipGemvDevice, AllTypesVsTensorDequantAndCpuMatmul) {

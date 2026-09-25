@@ -142,3 +142,21 @@ void emulate_add_norm(const AddNormParams& p, const Launch& l, bool reverse) {
 }
 
 }  // namespace halo::hip::detail
+
+namespace halo::hip::detail {
+
+using namespace kern;
+
+void emulate_gdn_gate(const GdnGateParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<DecNoRegs, DecNoRegs>(l, reverse, [&](auto& ex, DecNoRegs& sh, unsigned bx, unsigned by) {
+        gdn_gate_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_gemm(const GemvParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<GemmRegs, GemmShared>(l, reverse, [&](auto& ex, GemmShared& sh, unsigned bx, unsigned by) {
+        gemm_body(ex, sh, p, bx, by);
+    });
+}
+
+}  // namespace halo::hip::detail

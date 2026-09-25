@@ -1,6 +1,6 @@
 # HALO HIP backend (WS-K)
 
-Status: **milestones M1–M6 complete**.
+Status: **milestones M1–M7 complete**.
 - M1: the host runtime and the GATED_DELTANET family.
 - M2: quantized GEMV.
 - M3: the LM head with fused argmax, TOP_K, RMS_NORM, PARTIAL_ROPE, SWIGLU and MUL_SIGMOID.
@@ -14,6 +14,7 @@ Status: **milestones M1–M6 complete**.
   - Q4_0 GEMV for the ggml-org MTP pack (D-006).
 
   See "One qwen35 decode step" for the per-op status.
+- M7: the fused GDN-gate kernel, which closes the decode-step gap, and a tiled prefill GEMM.
 
 What remains is listed under "Not done".
 
@@ -425,6 +426,19 @@ In place is also different:
   - **ADD + RMS_NORM:** against `cpu::add` then `cpu::rms_norm`, at 1 × 5120 with h
     aliasing a, 3 × 5120, and 4 × 37 with h aliasing b. The same inputs check plain ADD
     against `cpu::add`.
+- **M7 tests.**
+  - **GDN gates** (`test_hip_decode`): 48 heads × 1, 5 and 70 rows, in place and out of
+    place, bitwise vs the CPU forward's statement sequence. The inputs include
+    a + dt_bias > 20, a = −40, a = 100 (where exp overflows, so only the threshold
+    branch gives the CPU's value) and b = 95.
+  - **QUANT_GEMM** (`test_hip_gemv`), bitwise vs `dequantize_row` + `cpu::matmul`, all 11
+    types, main pack types first:
+    - 37 rows × 17 tokens × K 5120 (partial tiles, 80 LDS chunks) with byte-offset
+      weights and strided x/y;
+    - one exact 16 × 16 tile at K 256;
+    - F16/F32 at K 100, which has a partial chunk and a 4-element tail;
+    - T = 40 for Q5_K and IQ4_XS: three token tiles, the last partial. A tile-offset
+      bug survived T ≤ 24 until this case was added.
 - **`test_hip_kv`** (M6; needs `kv_cache`): writes into a real KvPool with a fragmented
   table, layer 1 of 2, and every float of the pool pre-filled. After the write, the
   **whole pool** must be byte-identical to `SequenceKv::write` on the same inputs. Cases:
@@ -479,6 +493,12 @@ at `-O2` (RelWithDebInfo).
 | `k_kv_write` | 7 | 0 | 0 | — |
 | `k_get_rows` | 17 | 0 | 0 | — |
 | `k_add_norm` | 11 | 0 | 36 | — |
+| `k_gdn_gate` | 16 | 0 | 0 | — |
+| `k_gemm` | 31 | 0 | 16384 | — |
+
+The GEMM's LDS tiles are 8 KiB. The other 8 KiB is its 8 per-thread partial sums (× 256
+threads), which the compiler placed in LDS (promote-alloca), as with the online attention
+accumulator.
 
 The online kernel's per-thread accumulator array (8 floats × 256 threads = 8 KiB) was
 placed in LDS by the compiler (promote-alloca) rather than in registers. That is why it
@@ -533,6 +553,12 @@ until the EVO-X2 runs.
    - A flash-decoding split over key ranges, with a combine step, and LDS-staged K/V tiles
      are the tuning path.
    - The exact variant is serial by design and is not for production.
+7. **The prefill GEMM (M7) is a correctness-first tile.**
+   - Each thread owns one output, with no register blocking.
+   - W is dequantized element by element through `wq_elem` into LDS, with no packed loads.
+   - The x tile is re-staged for every 16 weight rows.
+   - It is the autotuner's first GEMM candidate, not a tuned kernel. Larger tiles and
+     per-sub-block dequant are the next variants.
 
 ## M6 decode primitives
 
@@ -542,6 +568,8 @@ until the EVO-X2 runs.
 | GET_ROWS | `k_get_rows` | `get_rows_b256` | `out[t] = dequantize_row(W[ids[t]])` for every GEMV weight type; the pack's `token_embd` is Q4_K. An id outside [0, n_rows) sets `kStatusBadIndex`. | bitwise vs `tensor::dequantize_row` (pure dequant, so bitwise on the device too) |
 | ADD | `k_eltwise` | `add_b256` | `cpu::add`; out may alias either input | bitwise |
 | ADD + RMS_NORM | `k_add_norm` | `add_rms_norm_b128` | `h = a + b` (h may alias a or b), then `y = rms_norm(h)·w`, where the norm phases read the rounded h after a barrier | bitwise vs `cpu::add` then `cpu::rms_norm` |
+| GDN gates (M7) | `k_gdn_gate` | `gdn_gate_b64` | `beta = sigmoid(b)` and `g = ssm_a·softplus(a + dt_bias)`, per value head, with the CPU forward's expressions and operand order (`src/models/qwen35.cpp`: cpu::sigmoid, the dt_bias add, cpu::softplus with the threshold-20 branch, then `ssm_a · x`). beta may alias b and g may alias a. | bitwise vs that CPU composition, including the softplus branch where exp overflows |
+| QUANT_GEMM (M7, prefill) | `k_gemm` | `gemm_t16x16_b256` (a separate variant from the GEMVs, for the autotuner) | The GemvArgs contract with T = n_vec token rows. A 16 × 16 output tile per workgroup; K is staged in LDS chunks of 64, so each W element is dequantized once per 16 tokens instead of once per token. Each thread keeps the CPU dot's 8 interleaved partial sums: element i goes to lane i mod 8 in ascending i, then the tail and combine as `cpu::detail::dot`. | **bitwise** vs `dequantize_row` + `cpu::matmul`, for all 11 types. No bound is needed: the order is the CPU's. |
 
 **Q4_0 decision.**
 - D-006 requires both MTP packagings to load, and D-014 keeps "ggml-org Q4_K_M plus a
@@ -564,8 +592,7 @@ to every row marked covered.
 | per layer: `attn_norm` | RMS_NORM, or the fused ADD + RMS_NORM with the previous residual | covered, M3 / M6 |
 | **GDN layer** (48 per step): `attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha` projections | QUANT_GEMV (Q5_K, Q4_K, IQ4_NL, Q8_0, …) | covered, M2 / M5 |
 | conv1d over qkv + SiLU, conv state + slots | CONV1D_SHORT | covered, M1 |
-| `beta = sigmoid(b)` | SIGMOID | **missing** (48 floats per token) |
-| `g = ssm_a · softplus(a + dt_bias)` | ADD, SOFTPLUS, MUL (ssm_a per head) | ADD covered; **SOFTPLUS and MUL missing** (48 floats) |
+| `beta = sigmoid(b)`, `g = ssm_a · softplus(a + dt_bias)` | GDN gates (fused, bitwise vs the CPU forward's sigmoid, add, softplus, mul) | covered, M7 |
 | q/k L2 norm, q scale, delta rule, state + slots | GATED_DELTANET recurrent (D-016 in-kernel) | covered, M1 |
 | `o = rmsnorm(o; ssm_norm) · silu(z)` | GATED_NORM | covered, M1 |
 | `ssm_out` | QUANT_GEMV | covered |
@@ -584,10 +611,9 @@ to every row marked covered.
 | sampling | TOP_K (k ≤ 1024), then the CPU sampler | covered, M3 |
 | **MTP (blk.64, D-005):** `enorm(embed)` and `hnorm(h)` into the two halves of one buffer | GET_ROWS + RMS_NORM into offset views (no CONCAT op is needed) | covered |
 | `eh_proj`, then one attention block + FFN, `shared_head_norm`, the shared LM head | the rows above; Q4_0 for the ggml-org MTP file | covered (Q4_0: M6) |
-| **Prefill** (T ≫ 1) | chunked GDN (M1); GEMV with n_vec = T; attention with T > 1 | functional; **no GEMM or prefill-attention kernel** (performance) |
+| **Prefill** (T ≫ 1) | chunked GDN (M1); QUANT_GEMM, a 16 × 16 tile, bitwise (M7); attention with T > 1 (the decode kernel) | covered; no dedicated prefill-attention kernel (performance) |
 
-The decode step is covered except for three trivial element-wise ops on 48-float vectors
-(SIGMOID, SOFTPLUS, MUL). A fused GDN-gate kernel would be the natural shape for them.
+Every op of the decode step is covered, in emulation. None has executed on a device.
 Wiring these ops into a model forward or a `Backend` implementation is deliberately left
 out of `backends/hip`. It is to be designed once, by one owner, after the Engine lands.
 
@@ -607,7 +633,7 @@ out of `backends/hip`. It is to be designed once, by one owner, after the Engine
 - **Device execution of anything.** D-001. The first EVO-X2 run is also the first
   ROCm 7.1 → HIP 7.15 compatibility check.
 - **GEMV:**
-  - a prefill GEMM;
+  - register blocking and packed-load dequant in the prefill GEMM (debt 7);
   - a wave64 comparison;
   - the remaining D-007 dequant types (Q4_1, Q5_0, Q5_1, Q2_K, BF16). None is in either pack.
     Q4_0 was added in M6.
