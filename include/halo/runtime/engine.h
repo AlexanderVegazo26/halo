@@ -30,6 +30,13 @@ struct EngineConfig {
     int mtp_max_draft = 2;
     bool prefix_cache = true;
     std::optional<std::uint64_t> max_memory_bytes;
+    // Additive (WS-G M4, TRD §64): consume an autotune profile database at creation.
+    /// Path of the profile DB (opened read-only; a missing file = no profiles). Absent = off.
+    std::optional<std::string> profile_db;
+    /// Platform (BIOS/EC) power-mode label of the profile key; required with profile_db.
+    std::string platform_power_mode;
+    /// ISA label of the profile key; default = the CPU ISA of this process.
+    std::optional<std::string> isa_target;
 };
 
 struct ModelInfo {
@@ -89,6 +96,10 @@ struct EngineStats {
     std::uint64_t mtp_fallbacks = 0;               ///< ticks retried with k = 0 after MTP-KV exhaustion
     std::uint32_t last_tick_weight_passes = 0;     ///< trunk + MTP weight passes of the last tick
     std::uint64_t last_tick_predicted_bytes = 0;   ///< cost-model weight bytes of the last tick (D-011)
+    // Additive (WS-G M4): kernel configuration in effect and where it came from (TRD §56).
+    std::uint32_t threads = 0;                     ///< worker thread-pool size
+    std::uint32_t gdn_chunk = 0;                   ///< chunked-GDN prefill chunk
+    std::string tuning;                            ///< e.g. "MATMUL=Exact(threads=2); GATED_DELTANET=Exact(chunk=32)"
 };
 
 // Thread-safe. generate() may be called concurrently from several API threads; the

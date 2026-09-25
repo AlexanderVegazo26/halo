@@ -9,6 +9,7 @@
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <list>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <utility>
 
+#include "halo/autotune/lookup.h"
 #include "halo/backends/cpu/thread_pool.h"
 #include "halo/core/error.h"
 #include "halo/core/log.h"
@@ -24,6 +26,7 @@
 #include "halo/model/model.h"
 #include "halo/models/qwen35.h"
 #include "halo/runtime/cpu_engine.h"
+#include "halo/runtime/profile.h"
 #include "halo/sampling/sampler.h"
 #include "halo/speculative/speculative.h"
 #include "halo/state/checkpoint.h"
@@ -166,6 +169,7 @@ private:
     void retire(Active& a, FinishReason why, const std::string& error = {});
     void deliver(Request& r, std::vector<TokenEvent>& events, bool done);
     void checkpoint(Active& a);
+    void apply_profile();
 
     EngineConfig cfg_;
     CpuEngineOptions opts_;
@@ -180,6 +184,10 @@ private:
     memory::MemoryPlan plan_;
     std::optional<std::int32_t> eos_;
     std::size_t max_draft_ = 0;
+    std::size_t threads_ = 1;
+    std::size_t gdn_chunk_ = 64;
+    std::size_t prefill_chunk_ = 256;
+    std::string tuning_ = "off";
 
     std::unique_ptr<kv_cache::KvPool> kv_pool_;
     std::unique_ptr<kv_cache::KvPool> mtp_pool_;
@@ -214,11 +222,15 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     HALO_CHECK(cfg.mtp_max_draft >= 0 && cfg.mtp_max_draft <= 8, ErrorCode::Config, "mtp_max_draft {} outside [0, 8]",
                cfg.mtp_max_draft);
     HALO_CHECK(opts.prefill_chunk >= 1 && opts.kv_block_tokens >= 1, ErrorCode::Config, "bad prefill chunk / KV block size");
+    HALO_CHECK(!cfg.profile_db || !cfg.platform_power_mode.empty(), ErrorCode::Config,
+               "profile_db needs platform_power_mode (part of the profile key, TRD §57)");
     nm_ = std::make_unique<model::NormalizedModel>(model::NormalizedModel::load(cfg.model_path));
     if (cfg.mtp_path) nm_->attach_mtp(*cfg.mtp_path);
-    pool_ = std::make_unique<cpu::ThreadPool>(cfg.threads > 0 ? static_cast<std::size_t>(cfg.threads)
-                                                              : cpu::ThreadPool::default_threads());
-    model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get());
+    apply_profile();
+    pool_ = std::make_unique<cpu::ThreadPool>(threads_);
+    models::Qwen35Options mo;
+    mo.gdn_chunk = gdn_chunk_;
+    model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
     const model::TokenizerMetadata meta = nm_->tokenizer();
     tok_ = std::make_unique<tokenizer::Tokenizer>(tokenizer::Tokenizer::from_spec(models::vocab_spec(meta)));
     HALO_CHECK(meta.chat_template.has_value() && !meta.chat_template->empty(), ErrorCode::Model,
@@ -255,6 +267,8 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     ckpt_spacing_ = pr.prefix_checkpoints.spacing_tokens;
 
     // ---- pools, slots ------------------------------------------------------------------
+    // Prefill chunks stay a multiple of the GDN chunk (chunk boundaries line up).
+    prefill_chunk_ = std::max(gdn_chunk_, opts.prefill_chunk / gdn_chunk_ * gdn_chunk_);
     const std::size_t bt = opts.kv_block_tokens;
     const std::size_t per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;  // +1: one COW copy
     cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
@@ -318,7 +332,52 @@ EngineStats CpuEngine::stats() const {
     const std::lock_guard lk(mu_);
     EngineStats s = stats_;
     s.queued_requests = pending_.size();
+    // What is actually in effect (not what was requested): the live pool and model.
+    s.threads = static_cast<std::uint32_t>(pool_->size());
+    s.gdn_chunk = static_cast<std::uint32_t>(model_->gdn_chunk());
+    s.tuning = tuning_;
     return s;
+}
+
+// TRD §64 / §56: read the profile once at creation (read-only snapshot; no tuning here).
+void CpuEngine::apply_profile() {
+    threads_ = cfg_.threads > 0 ? static_cast<std::size_t>(cfg_.threads) : cpu::ThreadPool::default_threads();
+    gdn_chunk_ = 64;
+    if (!cfg_.profile_db) {
+        tuning_ = "off";
+        return;
+    }
+    const autotune::ProfileKey key = engine_profile_key(cfg_, opts_.hardware_root);  // Error(Config) w/o power mode
+    const std::filesystem::path db(*cfg_.profile_db);
+    const autotune::ProfileLookup lookup =
+        std::filesystem::exists(db) ? autotune::ProfileLookup::open(db) : autotune::ProfileLookup::empty();
+    const auto& hp = nm_->hparams();
+    const auto describe = [](const autotune::LookupResult& r) {
+        std::string s(autotune::to_string(r.source));
+        if (r.candidate) s += "(" + r.candidate->to_string() + ")";
+        return s;
+    };
+    const auto measured = [](const autotune::LookupResult& r) {
+        return r.candidate && (r.source == autotune::SelectionSource::Exact || r.source == autotune::SelectionSource::Compatible);
+    };
+    const autotune::LookupResult mm = autotune::select_kernel(lookup, key, matmul_op_key(hp), "cpu", matmul_candidates(), nullptr, {});
+    const autotune::LookupResult gd = autotune::select_kernel(lookup, key, gdn_op_key(hp), "cpu", gdn_candidates(), nullptr, {});
+    std::string note;
+    if (measured(mm)) {
+        if (cfg_.threads > 0) {
+            note = " [explicit threads override the profile]";
+        } else {
+            threads_ = static_cast<std::size_t>(mm.candidate->get("threads"));
+        }
+    }
+    if (measured(gd)) gdn_chunk_ = static_cast<std::size_t>(gd.candidate->get("chunk"));
+    tuning_ = std::format("MATMUL={}; GATED_DELTANET={}{}{}", describe(mm), describe(gd), note,
+                          std::filesystem::exists(db) ? "" : " [no profile database]");
+    for (const auto& r : {mm, gd}) {
+        for (const auto& why : r.rejections) HALO_WARN("runtime", "profile rejected: {}", why);
+    }
+    HALO_INFO("runtime", "kernel profile ({} entries): {}; threads {}, GDN chunk {}", lookup.size(), tuning_, threads_,
+              gdn_chunk_);
 }
 
 // ---- caller side ---------------------------------------------------------------------
@@ -661,7 +720,7 @@ void CpuEngine::tick() {
         q.greedy = a.r->fast_greedy;
         const Toks& prompt = a.r->req.prompt;
         if (a.prompt_done < prompt.size()) {
-            std::size_t end = std::min(prompt.size(), a.prompt_done + opts_.prefill_chunk);
+            std::size_t end = std::min(prompt.size(), a.prompt_done + prefill_chunk_);
             if (a.next_ckpt < a.ckpt_at.size()) end = std::min(end, a.ckpt_at[a.next_ckpt]);
             q.prefill = std::span(prompt).subspan(a.prompt_done, end - a.prompt_done);
             q.want_output = end == prompt.size();

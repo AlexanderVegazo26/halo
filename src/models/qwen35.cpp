@@ -109,6 +109,7 @@ struct Qwen35::Impl {
     // GDN
     cpu::GdnDims gdn_dims;
     std::size_t conv_k = 0, conv_c = 0, key_dim = 0, value_dim = 0;
+    std::size_t gdn_chunk = 64;
 
     std::vector<LayerW> layers;
     std::vector<float> output_norm;
@@ -240,7 +241,7 @@ struct Qwen35::Impl {
         const cpu::GdnQkParams qk{.qk_l2norm = true,
                                   .q_scale = 1.0f / std::sqrt(static_cast<float>(gdn_dims.d_k))};
         if (chunked) {
-            cpu::gated_delta_rule_chunked(gdn_dims, in, state, o, qk, 64, pool, slots);
+            cpu::gated_delta_rule_chunked(gdn_dims, in, state, o, qk, gdn_chunk, pool, slots);
         } else {
             cpu::gated_delta_rule_recurrent(gdn_dims, in, state, o, qk, pool, slots);
         }
@@ -372,8 +373,14 @@ struct Qwen35::Impl {
 
 // ---------------------------------------------------------------------------------------
 
-Qwen35::Qwen35(const model::NormalizedModel& m, cpu::ThreadPool* pool) : model_(&m), impl_(std::make_unique<Impl>()) {
+Qwen35::Qwen35(const model::NormalizedModel& m, cpu::ThreadPool* pool) : Qwen35(m, pool, Qwen35Options{}) {}
+
+Qwen35::Qwen35(const model::NormalizedModel& m, cpu::ThreadPool* pool, const Qwen35Options& options)
+    : model_(&m), impl_(std::make_unique<Impl>()) {
+    HALO_CHECK(options.gdn_chunk >= 1 && options.gdn_chunk <= 4096, ErrorCode::Config, "qwen35: GDN chunk {} outside [1, 4096]",
+               options.gdn_chunk);
     Impl& I = *impl_;
+    I.gdn_chunk = options.gdn_chunk;
     const auto& hp = m.hparams();
     I.hp = &hp;
     I.pool = pool;
@@ -433,6 +440,7 @@ const model::Qwen35HParams& Qwen35::hparams() const noexcept { return *impl_->hp
 bool Qwen35::has_mtp() const noexcept { return impl_->mtp.has_value(); }
 std::size_t Qwen35::n_vocab() const noexcept { return impl_->n_vocab; }
 std::size_t Qwen35::n_embd() const noexcept { return impl_->E; }
+std::size_t Qwen35::gdn_chunk() const noexcept { return impl_->gdn_chunk; }
 std::uint64_t Qwen35::trunk_weight_bytes() const noexcept { return impl_->trunk_bytes; }
 std::uint64_t Qwen35::lm_head_bytes() const noexcept { return impl_->head_bytes; }
 std::uint64_t Qwen35::mtp_block_bytes() const noexcept { return impl_->mtp ? impl_->mtp->bytes : 0; }

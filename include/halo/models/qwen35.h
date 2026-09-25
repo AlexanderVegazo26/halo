@@ -146,11 +146,20 @@ struct ForwardOptions {
     bool capture_layer_inputs = false;
 };
 
+/// Construction-time kernel choices (the CPU tunables the autotuner can set, TRD §64).
+struct Qwen35Options {
+    /// Chunk length of the chunked GDN prefill (transformers uses 64). Any value >= 1 is the
+    /// same function within fp32 tolerance; results are bitwise reproducible per value.
+    std::size_t gdn_chunk = 64;
+};
+
 class Qwen35 {
 public:
     /// `model` and `pool` must outlive this object. pool may be null (single-threaded).
     /// Throws Error(Unsupported) for weight types without dequantization.
     Qwen35(const model::NormalizedModel& model, cpu::ThreadPool* pool);
+    /// As above with explicit kernel options. Error(Config) for gdn_chunk outside [1, 4096].
+    Qwen35(const model::NormalizedModel& model, cpu::ThreadPool* pool, const Qwen35Options& options);
     ~Qwen35();
     Qwen35(const Qwen35&) = delete;
     Qwen35& operator=(const Qwen35&) = delete;
@@ -160,6 +169,7 @@ public:
     [[nodiscard]] bool has_mtp() const noexcept;
     [[nodiscard]] std::size_t n_vocab() const noexcept;
     [[nodiscard]] std::size_t n_embd() const noexcept;
+    [[nodiscard]] std::size_t gdn_chunk() const noexcept;
 
     [[nodiscard]] kv_cache::KvLayout kv_layout(std::size_t block_tokens = 16) const;
     [[nodiscard]] kv_cache::KvLayout mtp_kv_layout(std::size_t block_tokens = 16) const;
