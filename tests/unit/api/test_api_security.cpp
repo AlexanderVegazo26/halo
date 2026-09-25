@@ -103,6 +103,113 @@ TEST(ApiErrorsHttp, EngineFailuresAreGenericAndSurvivable) {
     expect_alive(ts);
 }
 
+TEST(ApiErrorsHttp, EngineRejectionBeforeAnyTokenIs400) {
+    // Review R-4: Error(Api) / Error(Unsupported) from generate() means the *request* is
+    // wrong (engine.h); it must not become a retry-inviting 500 "generation failed".
+    TestServer ts;
+    ErrorCode code = ErrorCode::Api;
+    ts.engine->script = [&](const auto&, int) {
+        Script s;
+        s.throw_error = code == ErrorCode::Api ? "invalid SamplingParams: min_p above top_p" : "grammar nests deeper than 256";
+        s.throw_code = code;
+        return s;
+    };
+    const Json anth = Json{{"max_tokens", 10}, {"messages", Json::array({{{"role", "user"}, {"content", "x"}}})}};
+    for (const ErrorCode c : {ErrorCode::Api, ErrorCode::Unsupported}) {
+        code = c;
+        const bool unsupported = c == ErrorCode::Unsupported;
+        auto r = ts.post("/v1/chat/completions", user_chat("x"));
+        expect_openai_error(r, 400, "invalid_request_error");
+        const Json j = Json::parse(r->body);
+        if (unsupported) {
+            EXPECT_EQ(j.at("error").at("code"), "unsupported_parameter");
+            EXPECT_NE(j.at("error").at("message").get<std::string>().find("nests deeper"), std::string::npos);
+        } else {
+            EXPECT_TRUE(j.at("error").at("code").is_null());
+            EXPECT_NE(j.at("error").at("message").get<std::string>().find("min_p"), std::string::npos);
+        }
+        expect_anthropic_error(ts.post("/v1/messages", anth), 400, "invalid_request_error");
+        expect_openai_error(ts.post("/v1/completions", Json{{"prompt", "x"}}), 400, "invalid_request_error");
+        // Streaming: the status line (200) and the first event are already out, so the typed
+        // error arrives as an error event of the client-error type, never server_error.
+        Json b = user_chat("x");
+        b["stream"] = true;
+        auto s = ts.client()->Post("/v1/chat/completions", b.dump(), "application/json");
+        ASSERT_TRUE(s);
+        EXPECT_EQ(s->status, 200);
+        bool saw_error = false;
+        for (const auto& e : parse_sse(s->body)) {
+            if (e.data == "[DONE]") continue;
+            const Json d = Json::parse(e.data);
+            if (!d.contains("error")) continue;
+            saw_error = true;
+            EXPECT_EQ(d.at("error").at("type"), "invalid_request_error") << e.data;
+            if (unsupported) EXPECT_EQ(d.at("error").at("code"), "unsupported_parameter");
+        }
+        EXPECT_TRUE(saw_error) << s->body;
+        EXPECT_EQ(s->body.find("server_error"), std::string::npos) << s->body;
+        Json ab = anth;
+        ab["stream"] = true;
+        s = ts.client()->Post("/v1/messages", ab.dump(), "application/json");
+        ASSERT_TRUE(s);
+        bool saw_anth_error = false;
+        for (const auto& e : parse_sse(s->body)) {
+            if (e.event != "error") continue;
+            saw_anth_error = true;
+            EXPECT_EQ(Json::parse(e.data).at("error").at("type"), "invalid_request_error") << e.data;
+        }
+        EXPECT_TRUE(saw_anth_error) << s->body;
+    }
+    // A Backend failure is still a 500 with a generic message.
+    code = ErrorCode::Backend;
+    auto r500 = ts.post("/v1/chat/completions", user_chat("x"));
+    expect_openai_error(r500, 500, "server_error");
+    EXPECT_EQ(Json::parse(r500->body).at("error").at("message"), "generation failed")
+        << "a backend failure is not reclassified as a client error";
+    expect_alive(ts);
+}
+
+#if HALO_API_HAVE_SAMPLING
+TEST(ApiErrorsHttp, InvalidSchemasAreRejectedAtParseTime) {
+    // R-4, preferred fix: the schema is compiled while the request is parsed, so both
+    // streaming and non-streaming requests get a real 400 status and the engine never runs.
+    TestServer ts;
+    const Json unsupported = Json::parse(R"({"type":"object","properties":{"a":{"type":"string","pattern":"(?=x)y"}}})");
+    const Json malformed = Json::parse(R"({"type":"object","required":"a"})");
+    for (const bool stream : {false, true}) {
+        Json b = user_chat("x");
+        b["stream"] = stream;
+        b["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "n"}, {"schema", unsupported}}}};
+        auto r = ts.post("/v1/chat/completions", b);
+        expect_openai_error(r, 400, "invalid_request_error");
+        EXPECT_EQ(Json::parse(r->body).at("error").at("code"), "unsupported_parameter") << r->body;
+        EXPECT_EQ(Json::parse(r->body).at("error").at("param"), "response_format.json_schema.schema");
+        b["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "n"}, {"schema", malformed}}}};
+        r = ts.post("/v1/chat/completions", b);
+        expect_openai_error(r, 400, "invalid_request_error");
+        EXPECT_TRUE(Json::parse(r->body).at("error").at("code").is_null()) << r->body;
+        Json a = Json{{"max_tokens", 10},
+                      {"stream", stream},
+                      {"messages", Json::array({{{"role", "user"}, {"content", "x"}}})},
+                      {"output_config", {{"format", {{"type", "json_schema"}, {"schema", unsupported}}}}}};
+        expect_anthropic_error(ts.post("/v1/messages", a), 400, "invalid_request_error");
+    }
+    // A supported schema passes through unchanged.
+    Json ok = user_chat("x");
+    const Json schema = Json::parse(R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})");
+    ok["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "n"}, {"schema", schema}}}};
+    ASSERT_EQ(ts.post("/v1/chat/completions", ok)->status, 200);
+    const auto calls = ts.engine->calls();
+    ASSERT_EQ(calls.size(), 1u) << "rejected schemas never reach the engine";
+    EXPECT_EQ(Json::parse(calls.at(0).request.sampling.json_schema.value()), schema);
+    // Oversized schemas are refused before compiling.
+    api::ServerConfig small;
+    small.max_tool_schema_bytes = 32;
+    TestServer ts2(small);
+    expect_openai_error(ts2.post("/v1/chat/completions", ok), 400, "invalid_request_error");
+}
+#endif
+
 // ---- body and JSON limits (A-2, S-2) -------------------------------------------------------
 
 TEST(ApiLimits, OversizeBodyIs413BeforeParsing) {

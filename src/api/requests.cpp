@@ -4,6 +4,11 @@
 #include <format>
 #include <limits>
 
+#include "halo/core/error.h"
+#if HALO_API_HAVE_SAMPLING
+#include "halo/sampling/structured.h"
+#endif
+
 namespace halo::api {
 
 namespace {
@@ -123,6 +128,24 @@ std::vector<std::string> parse_stop(const Json& body, std::string_view key, cons
     return out;
 }
 
+/// Structured-output schema: size-capped, then compiled with the sampler's grammar compiler
+/// so an invalid or unsupported schema is a 400 before anything is streamed (review R-4).
+/// The engine compiles it again from SamplingParams::json_schema and stays authoritative.
+std::string checked_schema(const Json& schema, const ServerConfig& cfg, const std::string& where) {
+    check_schema_size(schema, cfg, where);
+    std::string text = dump(schema);
+#if HALO_API_HAVE_SAMPLING
+    try {
+        (void)sampling::Grammar::from_json_schema(text);
+    } catch (const halo::Error& e) {
+        const ApiErrorInfo info = classify_exception(e);
+        throw RequestError(e.code() == ErrorCode::Unsupported ? ErrorKind::Unsupported : ErrorKind::InvalidRequest,
+                           info.message, where);
+    }
+#endif
+    return text;
+}
+
 /// Sampling fields shared by the OpenAI routes (plus llama.cpp-style extensions).
 void parse_openai_sampling(const Json& b, SamplingParams& s) {
     if (auto v = opt_number(b, "temperature", "temperature", 0.0, 2.0)) s.temperature = static_cast<float>(*v);
@@ -155,7 +178,7 @@ void parse_stream(const Json& b, bool& stream, bool& include_usage) {
     }
 }
 
-void parse_response_format(const Json& b, SamplingParams& s) {
+void parse_response_format(const Json& b, SamplingParams& s, const ServerConfig& cfg) {
     const Json* rf = field(b, "response_format");
     if (rf == nullptr) return;
     require_object(*rf, "response_format");
@@ -175,7 +198,7 @@ void parse_response_format(const Json& b, SamplingParams& s) {
         if (!schema->is_object() && !schema->is_boolean()) {
             bad("response_format.json_schema.schema", "must be a JSON Schema object");
         }
-        s.json_schema = dump(*schema);
+        s.json_schema = checked_schema(*schema, cfg, "response_format.json_schema.schema");
         return;
     }
     bad("response_format.type", "must be one of text, json_object, json_schema");
@@ -458,7 +481,7 @@ void append_anthropic_message(const Json& m, const std::string& w, Json& out) {
     flush_text();
 }
 
-void parse_anthropic_structured(const Json& body, SamplingParams& s) {
+void parse_anthropic_structured(const Json& body, SamplingParams& s, const ServerConfig& cfg) {
     // Canonical: output_config.format; deprecated alias: output_format. Same shape:
     // {"type":"json_schema","schema":{...}}.
     const Json* fmt = nullptr;
@@ -476,7 +499,7 @@ void parse_anthropic_structured(const Json& body, SamplingParams& s) {
     if (type != "json_schema") bad(join_path(where, "type"), "must be json_schema");
     const Json* schema = field(*fmt, "schema");
     if (schema == nullptr || !schema->is_object()) bad(join_path(where, "schema"), "must be a JSON Schema object");
-    s.json_schema = dump(*schema);
+    s.json_schema = checked_schema(*schema, cfg, join_path(where, "schema"));
 }
 
 }  // namespace
@@ -501,7 +524,7 @@ ChatJob parse_openai_chat(const Json& body, const ServerConfig& cfg) {
     (void)opt_bool(body, "parallel_tool_calls", "parallel_tool_calls");  // accepted, not enforced (docs/api.md)
     parse_openai_thinking(body, job);
     parse_openai_sampling(body, job.sampling);
-    parse_response_format(body, job.sampling);
+    parse_response_format(body, job.sampling, cfg);
     job.max_tokens = parse_max_tokens(body, cfg, "max_completion_tokens", "max_tokens");
     job.stop = parse_stop(body, "stop", cfg, true);
     parse_stream(body, job.stream, job.include_usage);
@@ -611,7 +634,7 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
     if (auto v = opt_number(body, "temperature", "temperature", 0.0, 1.0)) job.sampling.temperature = static_cast<float>(*v);
     if (auto v = opt_number(body, "top_p", "top_p", 0.0, 1.0)) job.sampling.top_p = static_cast<float>(*v);
     if (auto v = opt_int(body, "top_k", "top_k", 0, 1 << 20)) job.sampling.top_k = static_cast<int>(*v);
-    parse_anthropic_structured(body, job.sampling);
+    parse_anthropic_structured(body, job.sampling, cfg);
     job.stop = parse_stop(body, "stop_sequences", cfg, false);
     job.stream = opt_bool(body, "stream", "stream").value_or(false);
     job.include_usage = true;

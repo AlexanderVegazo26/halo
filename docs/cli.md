@@ -70,7 +70,7 @@ their settings in this order:
 | `server.cors_origins` | `--cors-origins a,b` | `HALO_CORS_ORIGINS` | none |
 | `server.allowed_hosts` | `--allowed-hosts` | `HALO_ALLOWED_HOSTS` | none |
 | `server.served_model_name` | `--served-model-name` | `HALO_SERVED_MODEL_NAME` | the engine's model id |
-| `server.max_concurrent` | `--max-concurrent` | `HALO_MAX_CONCURRENT` | `runtime.parallel` |
+| `server.max_concurrent` | `--max-concurrent` | `HALO_MAX_CONCURRENT` | `runtime.parallel` (`serve` caps it there) |
 | `server.max_queue` | `--max-queue` | `HALO_MAX_QUEUE` | 16 |
 | `server.max_body_bytes` | `--max-body-bytes` | `HALO_MAX_BODY_BYTES` | 8 MiB |
 | `server.max_tokens_cap` | `--max-tokens-cap` | `HALO_MAX_TOKENS_CAP` | 32768 |
@@ -165,6 +165,9 @@ Example config file:
 - **What it does.** Starts the HTTP API; see `docs/api.md`, "Running the server".
 - **Early refusal.** A non-loopback `--host` without an API key is refused before the model
   is loaded, unless `--allow-unauthenticated-remote` is given.
+- **Concurrency cap.** `--max-concurrent` is capped at `--parallel`, and the cap is printed
+  on stderr. Requests beyond the engine's sequences then wait in the API queue, where
+  `queue_timeout` and shutdown apply (`docs/api.md`, "Cancellation").
 - **Signals.** SIGINT or SIGTERM stops the server gracefully. SIGPIPE is ignored.
 - **`--print-config`** prints the resolved configuration and exits. It does not need the
   runtime.

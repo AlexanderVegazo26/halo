@@ -192,7 +192,12 @@ runtime::GenerateResult FakeEngine::generate(const runtime::GenerateRequest& req
     } leave{this};
 
     const Script s = script(req, index);
-    if (s.throw_error) throw_error(ErrorCode::Backend, "{}", *s.throw_error);
+    if (s.throw_error) throw_error(s.throw_code, "{}", *s.throw_error);
+    // The Engine contract's up-front validation (engine.h): the API must never send these.
+    HALO_CHECK(!req.prompt.empty(), ErrorCode::Api, "empty prompt");
+    HALO_CHECK(info_.context_length == 0 || req.prompt.size() < info_.context_length, ErrorCode::Api,
+               "prompt of {} tokens does not fit the {}-token context", req.prompt.size(), info_.context_length);
+    HALO_CHECK(req.max_tokens > 0, ErrorCode::Api, "max_tokens is 0");
 
     runtime::GenerateResult r;
     r.prompt_tokens = req.prompt.size();

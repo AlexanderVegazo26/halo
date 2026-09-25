@@ -264,6 +264,17 @@ TEST(CliConfig, EngineAndServerConfigMapping) {
     EXPECT_EQ(ec.max_sequences, 2u);
     EXPECT_FALSE(ec.mtp_enabled);
     EXPECT_FALSE(ec.prefix_cache);
+    // Review R-3: more API slots than engine sequences would park requests where no timeout
+    // or cancellation reaches them; serve caps --max-concurrent at --parallel and says so.
+    std::size_t seen_concurrent = 0;
+    auto r2 = cli_run({"serve", "m.gguf", "--port", "0", "--parallel", "2", "--max-concurrent", "8"},
+                      CliOptions().with_factory(ff.factory()).with_serving([&](api::ApiServer& s, std::function<void()> stop) {
+                          seen_concurrent = s.config().max_concurrent;
+                          stop();
+                      }));
+    ASSERT_EQ(r2.rc, 0) << r2.err;
+    EXPECT_EQ(seen_concurrent, 2u);
+    EXPECT_NE(r2.err.find("--max-concurrent 8 exceeds --parallel 2"), std::string::npos) << r2.err;
 #else
     EXPECT_EQ(r.rc, 2);
 #endif

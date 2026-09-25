@@ -5,6 +5,8 @@
 #include <exception>
 #include <format>
 
+#include "halo/core/error.h"
+
 namespace halo::api {
 
 // ---- StopMatcher ---------------------------------------------------------------------------
@@ -192,6 +194,7 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
     std::optional<runtime::GenerateResult> result;
     const auto call = [&](const runtime::GenerateRequest& r) {
         ++out.engine_calls;
+        const std::size_t tokens_before = out.completion_tokens;
         try {
             result = engine.generate(r, cb);
         } catch (const std::exception& e) {
@@ -199,6 +202,15 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
             out.cause = StopCause::Error;
             out.error = e.what();
             out.public_error = "generation failed";
+            // The Engine contract (engine.h) throws Error(Api) / Error(Unsupported) for an
+            // invalid request *before* anything is scheduled: keep that typed error so the
+            // client gets a 400 instead of a retry-inviting 500 (review R-4).
+            const auto* he = dynamic_cast<const halo::Error*>(&e);
+            if (he != nullptr && out.completion_tokens == tokens_before &&
+                (he->code() == ErrorCode::Api || he->code() == ErrorCode::Unsupported)) {
+                out.client_error = classify_exception(e);
+                out.public_error = out.client_error->message;
+            }
         }
     };
 
@@ -218,6 +230,12 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
             // client went away while closing
         } else if (out.completion_tokens >= req.max_tokens) {
             length_after_budget = true;
+        } else if (spec.context_length != 0 && req.prompt.size() + observed.size() + spec.close_reasoning_tokens.size() + 1 >
+                                                    spec.context_length) {
+            // The continuation prompt (prompt + reasoning + "\n</think>\n\n") would not leave
+            // room for one answer token in the context: end like max_tokens (review N-3).
+            length_after_budget = true;
+            out.warnings.push_back("the reasoning budget was reached but the context is full; no room was left for the answer");
         } else {
             runtime::GenerateRequest r2 = req;
             r2.prompt.insert(r2.prompt.end(), observed.begin(), observed.end());

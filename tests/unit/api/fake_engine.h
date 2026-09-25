@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "halo/core/error.h"
 #include "halo/runtime/engine.h"
 #include "halo/template/chat_template.h"
 #include "halo/tokenizer/tokenizer.h"
@@ -27,7 +28,8 @@ struct Script {
     std::string text;                        ///< emitted output (special tokens parsed)
     std::chrono::milliseconds delay{0};      ///< sleep before each token
     bool eos = true;                         ///< end with an EOS event after `text`
-    std::optional<std::string> throw_error;  ///< throw halo::Error(Backend, ...) instead
+    std::optional<std::string> throw_error;  ///< throw halo::Error(throw_code, ...) instead
+    ErrorCode throw_code = ErrorCode::Backend;  ///< Api / Unsupported mimic an engine-side request rejection
     std::optional<runtime::FinishReason> finish;  ///< report this instead of Stop/Length
     std::string error_text;                  ///< GenerateResult::error with finish == Error
 };
@@ -46,7 +48,8 @@ public:
     /// Byte-level synthetic tokenizer (256 byte tokens, no merges) with the Qwen added tokens
     /// (<|im_start|>, <|im_end|>, <|endoftext|> Control; <think>, </think>, <tool_call>,
     /// </tool_call>, <tool_response>, </tool_response> UserDefined; one Unused) and a small
-    /// ChatML template. Always available.
+    /// ChatML template. Always available. Like the real engine (engine.h), generate() throws
+    /// Error(Api) for an empty prompt, a prompt >= the context, or max_tokens == 0.
     static std::unique_ptr<FakeEngine> synthetic(std::size_t context_length = 4096);
     /// The real Qwen3.8 tokenizer.json + chat_template.jinja from HALO_REF_DIR; nullptr (with
     /// `why` set) when the files are missing.

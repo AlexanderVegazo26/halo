@@ -527,7 +527,16 @@ int cmd_serve(const std::vector<std::string>& args, Context& ctx) {
     }
 #if HALO_CLI_HAVE_API
     const runtime::EngineConfig ec = engine_config(cfg);
-    const api::ServerConfig sc = server_config(cfg);
+    api::ServerConfig sc = server_config(cfg);
+    // More API slots than engine sequences would park the extra requests inside the engine,
+    // where queue_timeout, request_timeout, disconnect and stop() cannot reach them until
+    // they produce a token (review R-3). Keep the queueing in the API's admission control.
+    if (sc.max_concurrent > ec.max_sequences) {
+        *ctx.err << std::format("halo serve: --max-concurrent {} exceeds --parallel {}; using {} (extra requests queue "
+                                "in the API, where timeouts and cancellation apply)\n",
+                                sc.max_concurrent, ec.max_sequences, ec.max_sequences);
+        sc.max_concurrent = ec.max_sequences;
+    }
     // Fail before the (slow) model load on an unsafe bind (PRD §12, review A-6).
     HALO_CHECK(api::is_loopback_host(sc.host) || sc.api_key || sc.allow_unauthenticated_remote, ErrorCode::Config,
                "server.host {} is not a loopback address: set an API key (HALO_API_KEY) or "

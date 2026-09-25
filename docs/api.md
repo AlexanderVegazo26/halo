@@ -118,7 +118,7 @@ These implement PRD §12 and the security review of 2026-09-24 (`docs/reviews/`)
 | `max_concurrent` | 4 | Generations holding a slot at once. |
 | `max_queue` | 16 | Generations waiting for a slot. When the queue is full: **429** plus `Retry-After: 1`. |
 | `queue_timeout` | 30 s | A queued request that waits longer gets **503** plus `Retry-After: 1`. |
-| `request_timeout` | 600 s | Wall-clock limit for one generation. It ends like `max_tokens`, with a warning. |
+| `request_timeout` | 600 s | Wall-clock limit for one generation, checked each time the engine delivers a token. The generation then ends like `max_tokens`, with a warning. Time spent in engine prefill before the first token is not interrupted (see "Cancellation"). |
 | `default_max_tokens` | 8192 | Used when a request gives none. It is clamped to the context. |
 | `max_tokens_cap` | 32768 | A request asking for more gets 400. |
 | `reasoning_output_reserve` | 512 | Output headroom kept free of reasoning. See "Reasoning". |
@@ -131,11 +131,20 @@ The admission cap applies only to generation routes. `/tokenize`, `/apply-templa
 bounds them. The prompt is rendered and tokenized **before** admission, on the HTTP worker
 thread (see "Known gaps").
 
-**Cancellation.**
+**Cancellation.** The API can stop an engine request only from its token callback, which
+the engine calls once per generated token.
 - **Client disconnect.** A streaming client that disconnects is detected on the next write
   that fails. The token callback then returns false and the engine stops that request. A
   non-streaming client that disconnects is detected by polling the socket once per token.
-- **Shutdown.** `ApiServer::stop()` cancels in-flight generations. Queued requests get 503.
+- **Shutdown.** `ApiServer::stop()` cancels generations that are producing tokens. Requests
+  waiting in the API's admission queue get 503.
+- **Limitation: before the first token.**
+  - Nothing can reach a request that is still prefilling (a long prompt) or waiting for an
+    engine sequence. Disconnect, `request_timeout` and `stop()` all take effect at its first
+    token, so `stop()` may wait for such requests to finish prefill.
+  - This needs an engine-side cancel path, which WS-G is adding (review R-3).
+  - Until then, `halo serve` caps `--max-concurrent` at `--parallel`, so that requests queue
+    in the API, where `queue_timeout` and shutdown apply, rather than inside the engine.
 
 ## Chat request mapping
 
@@ -153,7 +162,7 @@ thread (see "Known gaps").
 | `temperature` (0–2), `top_p`, `top_k`, `min_p`, `typical_p`, `repetition_penalty`, `presence_penalty`, `frequency_penalty` (±2), `seed` | Passed to `SamplingParams`. |
 | `max_completion_tokens`, or else `max_tokens` | Must be at least 1 and at most `max_tokens_cap`. If it does not fit in the context it is clamped, with a warning. |
 | `stop` | A string or an array. Stop sequences are matched on content, never on reasoning, and are excluded from the output. |
-| `response_format` | `text`; `json_object` sets `SamplingParams::json_object`; `json_schema` sets `SamplingParams::json_schema` to the serialized `json_schema.schema`. Enforcement (constrained decoding) belongs to the engine. |
+| `response_format` | `text`; `json_object` sets `SamplingParams::json_object`; `json_schema` sets `SamplingParams::json_schema` to the serialized `json_schema.schema`. The schema is capped at `max_tool_schema_bytes` and compiled when the request is parsed, so an invalid schema gets 400 `invalid_request_error` and an unsupported construct gets 400 `unsupported_parameter`, before any streaming starts. Constrained decoding is done by the engine. |
 | `stream`, `stream_options.include_usage` | SSE; see below. |
 | `n` > 1, `logprobs: true`, `top_logprobs`, non-empty `logit_bias` | 400 `unsupported_parameter`. |
 | Other fields (`user`, `metadata`, `store`, …) | Ignored. |
@@ -365,9 +374,14 @@ Tests: `PromptFixture.*` and `PromptReal.*` (the real Qwen tokenizer and templat
   worker thread before admission. They are bounded by the body and content caps but have no
   separate stack-size or time budget. A hostile *model* template (review S-3) can still
   crash or hang a worker. The fix belongs in `src/template`.
-- **Structured output is not enforced here.** `json_schema` / `json_object` are passed
-  through in `SamplingParams`. The engine (WS-G/WS-H) is responsible for constrained
-  decoding.
+- **Structured output.** Schemas are compiled at parse time (see the OpenAI and Anthropic
+  tables), but the constrained decoding itself is done by the engine (WS-G/WS-H).
+- **Engine rejections.** When the engine rejects a request with a typed Api or Unsupported
+  error before producing a token, a non-streaming request gets a 400 in the API's format
+  (`invalid_request_error`, or `unsupported_parameter` for OpenAI). A streaming request has
+  already sent `200` and its first event, so it receives the same typed error object as an
+  error event. Schema errors never reach this path, because they are caught at parse time.
+- **Cancellation before the first token.** See "Cancellation" (review R-3).
 - **Transport limits are fixed.** Header count and size are httplib's compile-time defaults:
   100 headers, 8 KiB per header line, 8 KiB request URI.
 - **No TLS.** Terminate TLS in a reverse proxy (PRD §12, "TLS via deployment layer").

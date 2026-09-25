@@ -581,5 +581,35 @@ TEST(ApiAnthropic, MaxTokensStopReason) {
     EXPECT_EQ(j.at("usage").at("output_tokens"), 5);
 }
 
+TEST(ApiAnthropic, BudgetContinuationSkippedWhenContextIsFull) {
+    // Review N-3. 64-token context, a 22-token prompt, so max_tokens is clamped to 42. The
+    // explicit budget of 40 closes reasoning at 40 tokens; the continuation prompt
+    // (22 + 40 + close) would not fit, so generation ends like max_tokens instead of sending
+    // the engine an over-long prompt (which it rejects, and which used to become a 500).
+    TestServer ts({}, FakeEngine::synthetic(/*context_length=*/64));
+    ts.engine->script = [](const auto&, int) { return sc(std::string(100, 't'), std::chrono::milliseconds(0), false); };
+    Json b = user_messages("x", 60);
+    b["thinking"] = {{"type", "enabled"}, {"budget_tokens", 40}};
+    auto r = ts.post("/v1/messages", b);
+    ASSERT_EQ(r->status, 200) << r->body;
+    const Json j = Json::parse(r->body);
+    EXPECT_EQ(j.at("stop_reason"), "max_tokens");
+    EXPECT_EQ(j.at("content").at(0).at("thinking"), std::string(40, 't'));
+    EXPECT_NE(j.value("warnings", Json::array()).dump().find("context is full"), std::string::npos) << j.dump();
+    const auto calls = ts.engine->calls();
+    ASSERT_EQ(calls.size(), 1u) << "no continuation call";
+    EXPECT_EQ(calls.at(0).request.prompt.size(), 22u);
+    EXPECT_EQ(calls.at(0).request.max_tokens, 42u);
+    // With room left, the continuation still happens.
+    b["thinking"] = {{"type", "enabled"}, {"budget_tokens", 20}};
+    ts.engine->script = [](const auto&, int call) {  // call index counts across requests
+        return call == 1 ? sc(std::string(100, 't'), std::chrono::milliseconds(0), false) : sc("ok");
+    };
+    r = ts.post("/v1/messages", b);
+    ASSERT_EQ(r->status, 200) << r->body;
+    EXPECT_EQ(ts.engine->calls().size(), 3u);
+    EXPECT_EQ(Json::parse(r->body).at("content").at(1).at("text"), "ok");
+}
+
 }  // namespace
 }  // namespace halo::test

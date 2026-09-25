@@ -36,6 +36,7 @@
 
 #include "halo/runtime/engine.h"
 #include "halo/template/output_parser.h"
+#include "json_util.h"
 
 namespace halo::api {
 
@@ -71,6 +72,9 @@ struct GenerationSpec {
     std::optional<std::int32_t> think_start, think_end;
     std::optional<std::chrono::steady_clock::time_point> deadline;
     std::size_t max_output_nesting = 256;  // 0 = unchecked
+    /// Model context (tokens); 0 = unknown. The reasoning-budget continuation is skipped
+    /// when prompt + observed + close would not fit (review N-3).
+    std::size_t context_length = 0;
 };
 
 struct GenerationOutcome {
@@ -89,6 +93,10 @@ struct GenerationOutcome {
     std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
     std::string error;         // internal detail (logs only)
     std::string public_error;  // safe to show the client (set with cause == Error)
+    /// Set when the engine rejected the request itself before producing any token
+    /// (halo::Error Api / Unsupported from generate(), e.g. an invalid or unsupported JSON
+    /// schema): the client's fault, reported as 400 in the calling API's format (review R-4).
+    std::optional<ApiErrorInfo> client_error;
 };
 
 /// Runs a generation. Never throws for engine-side failures: they are reported as

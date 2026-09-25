@@ -466,6 +466,7 @@ struct ApiServer::Impl {
         s.think_end = specials.think_end();
         if (cfg.request_timeout.count() > 0) s.deadline = std::chrono::steady_clock::now() + cfg.request_timeout;
         s.max_output_nesting = cfg.max_output_nesting;
+        s.context_length = ctx;
         if (parse_output) {
             if (explicit_budget) {
                 s.reasoning_budget = std::min(*explicit_budget, max);
@@ -491,13 +492,18 @@ struct ApiServer::Impl {
         if (o.cause == StopCause::Client || o.cause == StopCause::Shutdown) metrics.cancelled += 1;
         if (o.reasoning_closed_early) metrics.budget_closes += 1;
         for (const auto& w : o.warnings) HALO_WARN(kLog, "{}", sanitize_for_log(w));
-        if (o.cause == StopCause::Error) HALO_ERROR(kLog, "generation failed: {}", sanitize_for_log(o.error));
+        if (o.cause == StopCause::Error && o.client_error) {
+            HALO_INFO(kLog, "request rejected by the engine: {}", sanitize_for_log(o.error));
+        } else if (o.cause == StopCause::Error) {
+            HALO_ERROR(kLog, "generation failed: {}", sanitize_for_log(o.error));
+        }
         return o;
     }
 
     /// Client-facing error for a failed generation (never the engine's internal text, A-9).
     static ApiErrorInfo stream_error(const GenerationOutcome& o) {
         if (o.cause == StopCause::Shutdown) return {ErrorKind::Overloaded, "server is shutting down", std::nullopt, std::nullopt};
+        if (o.client_error) return *o.client_error;
         return {ErrorKind::Server, o.public_error.empty() ? "generation failed" : o.public_error, std::nullopt,
                 std::nullopt};
     }
@@ -524,7 +530,8 @@ struct ApiServer::Impl {
             CollectSink sink(req);
             const GenerationOutcome o = run(*spec, sink);
             if (o.cause == StopCause::Error || o.cause == StopCause::Shutdown) {
-                throw RequestError(stream_error(o).kind, stream_error(o).message);
+                const ApiErrorInfo e = stream_error(o);
+                throw RequestError(e.kind, e.message, e.param, e.code);
             }
             if (o.cause == StopCause::Client) return;  // nobody to answer
             res.set_content(dump(fam == ApiFamily::OpenAI ? openai_chat_json(o, m) : anthropic_json(o, m)),
@@ -569,7 +576,8 @@ struct ApiServer::Impl {
             CollectSink sink(req);
             const GenerationOutcome o = run(*spec, sink);
             if (o.cause == StopCause::Error || o.cause == StopCause::Shutdown) {
-                throw RequestError(stream_error(o).kind, stream_error(o).message);
+                const ApiErrorInfo e = stream_error(o);
+                throw RequestError(e.kind, e.message, e.param, e.code);
             }
             if (o.cause == StopCause::Client) return;
             Json j = {{"id", m.id},
