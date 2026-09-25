@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
@@ -83,6 +84,50 @@ TEST(VkBuffer, StagingRoundTripExercisesGpuCopyPath) {
     std::vector<float> got(5);
     b.download(std::span<float>(got), 8);
     EXPECT_EQ(got, (std::vector<float>{src[2], 1.0f, 2.0f, 3.0f, src[6]}));
+}
+
+TEST(VkBuffer, StagingIsBoundedReusedAndChunked) {
+    // Code review N-1: one staging buffer per context, capacity ContextOptions::staging_bytes,
+    // reused by every staged transfer; larger transfers are split into chunks. A 4 KiB
+    // capacity forces many chunks, including a partial last one and odd offsets.
+    hv::ContextOptions opts;
+    opts.force_staging = true;
+    opts.staging_bytes = 4096;
+    HALO_VK_CONTEXT_OR_SKIP(ctx, opts);
+    EXPECT_EQ(ctx->staging_stats().allocations, 0u) << "staging is created lazily";
+    const std::size_t n = 100003;  // bytes: 24 full chunks + a 1715-byte tail
+    std::vector<std::uint8_t> src(n);
+    for (std::size_t i = 0; i < n; ++i) src[i] = static_cast<std::uint8_t>((i * 131u + 7u) >> 3);
+    hv::Buffer b = hv::Buffer::create(ctx, n + 16, hv::MemoryUsage::DeviceLocal);
+    const std::vector<std::uint8_t> zeros(n + 16, 0);
+    b.upload(std::span<const std::uint8_t>(zeros));
+    const std::uint64_t chunks0 = ctx->staging_stats().chunks;
+    b.upload(std::span<const std::uint8_t>(src), 5);  // odd destination offset
+    const std::uint64_t per = (n + 4095) / 4096;
+    EXPECT_EQ(ctx->staging_stats().chunks - chunks0, per);
+    std::vector<std::uint8_t> got(n);
+    b.download(std::span<std::uint8_t>(got), 5);
+    EXPECT_EQ(got, src) << "chunked upload + download round trip";
+    std::vector<std::uint8_t> edges(16);
+    b.download(std::span<std::uint8_t>(edges.data(), 5), 0);
+    b.download(std::span<std::uint8_t>(edges.data() + 5, 11), n + 5);
+    EXPECT_TRUE(std::all_of(edges.begin(), edges.end(), [](std::uint8_t x) { return x == 0; }))
+        << "bytes outside [5, 5 + n) were written";
+    // A small transfer after the large ones reuses the same buffer.
+    const std::vector<std::uint8_t> tiny{1, 2, 3};
+    b.upload(std::span<const std::uint8_t>(tiny), 4097);
+    std::vector<std::uint8_t> tiny_back(3);
+    b.download(std::span<std::uint8_t>(tiny_back), 4097);
+    EXPECT_EQ(tiny_back, tiny);
+    const hv::Context::StagingStats st = ctx->staging_stats();
+    EXPECT_EQ(st.allocations, 1u) << "one staging buffer for the whole context";
+    EXPECT_EQ(st.capacity, 4096u);
+    std::cout << "[vk-staging] capacity " << st.capacity << " B, allocations " << st.allocations << ", chunks "
+              << st.chunks << "\n";
+
+    hv::ContextOptions bad;
+    bad.staging_bytes = 0;
+    EXPECT_THROW((void)hv::Context::create(bad), halo::Error);
 }
 
 TEST(VkBuffer, RejectsZeroSizeAndOutOfRangeTransfers) {

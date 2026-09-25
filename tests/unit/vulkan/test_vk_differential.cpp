@@ -30,6 +30,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "cpu_kernels/reference.h"
@@ -368,6 +369,186 @@ TEST(VkDiffGdn, FusedQkvRowReadThroughViewsWithoutCopies) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     fused_qkv_case(ctx, k_small, 6, 51, "fused qkv small dims T=6");
     fused_qkv_case(ctx, k_real, 2, 52, "fused qkv real dims T=2");
+}
+
+// ---------------------------------------------------------------- long trajectory (S-5)
+
+TEST(VkDiffGdn, LongTrajectoryPrefillThenDecodeMatchesCpu) {
+    // Code review S-5: the CPU long-trajectory test's shape on Vulkan. T_pre = 4096 rows in
+    // ONE T-row dispatch (the only multi-row form the Vulkan op has), then 64 single-row
+    // dispatches, state in place throughout. CPU on the same host arrays: chunked prefill,
+    // then 64 recurrent decode calls (the CPU engine's path). Reduced heads (1 key, 2
+    // value) at the real head size 128; raw q/k with in-kernel L2 (D-016).
+    // Bound: the file-header one at T = 4160, bound_vk = T (2 d_k + 48) u (worst case,
+    // linear in T: ~0.08 * scale here) + Model G for the CPU. Both decay bands are run;
+    // the slow band (exp(g) >= 0.95, beta ~ 1) is the long-memory one.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const GdnCase c{2, 1, 128, 128};
+    const std::size_t T_pre = 4096, T_dec = 64, T = T_pre + T_dec;
+    for (const bool slow : {false, true}) {
+        const std::string what = std::string("long trajectory T=4096+64 ") + (slow ? "slow decay" : "fast decay");
+        hv::Ops ops(ctx);
+        const GdnData d = make_gdn(c, T, QkInput::Raw, slow ? 61 : 62, slow);
+        const std::size_t qc = c.qk_cols(), vc = c.v_cols(), nv = c.n_v;
+        // CPU.
+        GdnOut cpu{std::vector<float>(T * vc), d.s0};
+        const auto rows = [&](std::size_t t0, std::size_t n) {
+            return hc::GdnInputs{hc::ConstRows(d.q.data() + t0 * qc, n, qc, qc),
+                                 hc::ConstRows(d.k.data() + t0 * qc, n, qc, qc),
+                                 hc::ConstRows(d.v.data() + t0 * vc, n, vc, vc),
+                                 hc::ConstRows(d.g.data() + t0 * nv, n, nv, nv),
+                                 hc::ConstRows(d.beta.data() + t0 * nv, n, nv, nv)};
+        };
+        hc::gated_delta_rule_chunked(c.cpu(), rows(0, T_pre), cpu.state, hc::Rows(cpu.out.data(), T_pre, vc, vc),
+                                     hc::GdnQkParams{});
+        for (std::size_t t = T_pre; t < T; ++t) {
+            hc::gated_delta_rule_recurrent(c.cpu(), rows(t, 1), cpu.state, hc::Rows(cpu.out.data() + t * vc, 1, vc, vc),
+                                           hc::GdnQkParams{});
+        }
+        // Vulkan: one buffer per operand holding all T rows; views select the rows.
+        hv::Buffer q = upload(ctx, std::span<const float>(d.q));
+        hv::Buffer k = upload(ctx, std::span<const float>(d.k));
+        hv::Buffer v = upload(ctx, std::span<const float>(d.v));
+        hv::Buffer g = upload(ctx, std::span<const float>(d.g));
+        hv::Buffer beta = upload(ctx, std::span<const float>(d.beta));
+        hv::Buffer state = upload(ctx, std::span<const float>(d.s0), hv::MemoryUsage::HostVisible);
+        hv::Buffer out = hv::Buffer::create(ctx, T * vc * 4, hv::MemoryUsage::HostCached);
+        auto args = [&](std::size_t t0, std::size_t n) {
+            hv::GdnDecodeArgs a;
+            a.q = hv::BufferView(q, t0 * qc * 4, n * qc * 4);
+            a.k = hv::BufferView(k, t0 * qc * 4, n * qc * 4);
+            a.v = hv::BufferView(v, t0 * vc * 4, n * vc * 4);
+            a.g = hv::BufferView(g, t0 * nv * 4, n * nv * 4);
+            a.beta = hv::BufferView(beta, t0 * nv * 4, n * nv * 4);
+            a.state = state;
+            a.out = hv::BufferView(out, t0 * vc * 4, n * vc * 4);
+            a.n_v = c.n_v;
+            a.n_k = c.n_k;
+            a.d_k = c.d_k;
+            a.d_v = c.d_v;
+            a.n_tokens = static_cast<std::uint32_t>(n);
+            return a;
+        };
+        {
+            hv::Stream s(ctx);
+            ops.gated_delta_rule_decode(s, args(0, T_pre));
+            s.submit_and_wait();
+        }
+        hv::Stream s(ctx);  // the 64 decode steps recorded into one stream (barriers between)
+        for (std::size_t t = T_pre; t < T; ++t) ops.gated_delta_rule_decode(s, args(t, 1));
+        s.submit_and_wait();
+        const GdnOut vk{download<float>(out, T * vc), download<float>(state, c.state_n())};
+        const GdnScales sc = gdn_scales(d, true, 1.0 / std::sqrt(128.0));
+        check_gdn(d, vk, cpu, sc, what);
+        for (float x : vk.state) ASSERT_TRUE(std::isfinite(x)) << what;
+        // The worst-case linear bound above is ~0.08 * scale at this length, far too loose
+        // to see a small systematic drift. Second check, random-walk model: the Vulkan
+        // kernel has the same non-expansive structure as the CPU one (same per-token
+        // operations, dot products of length d_k), so each is within Model G of exact and
+        // they are within 2 x Model G of each other (tolerance.h). This is a model, not a
+        // proven bound; it is what a per-token bias (e.g. a mis-rounded decay) violates.
+        const std::size_t sh = std::size_t{c.d_k} * c.d_v;
+        double worst_rw = 0;
+        for (std::size_t j = 0; j < nv; ++j) {
+            double eo = 0, es = 0;
+            for (std::size_t t = 0; t < T; ++t)
+                for (std::size_t b = 0; b < c.d_v; ++b) {
+                    const std::size_t i = t * vc + j * c.d_v + b;
+                    eo = std::max(eo, std::abs(double(vk.out[i]) - double(cpu.out[i])));
+                }
+            for (std::size_t e = 0; e < sh; ++e)
+                es = std::max(es, std::abs(double(vk.state[j * sh + e]) - double(cpu.state[j * sh + e])));
+            const double to = 2.0 * ct::tol_gdn(T, c.d_k, sc.out[j]) + ct::kDenormFloor;
+            const double ts = 2.0 * ct::tol_gdn(T, c.d_k, sc.state[j]) + ct::kDenormFloor;
+            EXPECT_LE(eo, to) << what << " head " << j << " out (random-walk model)";
+            EXPECT_LE(es, ts) << what << " head " << j << " state (random-walk model)";
+            worst_rw = std::max({worst_rw, eo / to, es / ts});
+        }
+        std::cout << "[vk-diff] " << what << ": worst |vk-cpu| / (2 x Model G) = " << worst_rw << "\n";
+    }
+}
+
+TEST(VkDiffGdn, InPlaceMultiRowWithSlotsMatchesCpu) {
+    // Code review S-5: a T-row call with rollback slots and the state IN PLACE (state_out
+    // unset), state and slots in one arena at odd element offsets with guards. Compared
+    // with cpu::gated_delta_rule_recurrent with slots on the same inputs; slots beyond T
+    // stay untouched; slot 0 is bitwise the final state.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    for (const auto& [c, T, K] : {std::tuple{k_small, std::size_t{5}, std::size_t{4}},
+                                  std::tuple{k_small, std::size_t{3}, std::size_t{6}},
+                                  std::tuple{k_real, std::size_t{4}, std::size_t{4}}}) {
+        const std::string what = "in-place T=" + std::to_string(T) + " K=" + std::to_string(K) + " n_v=" +
+                                 std::to_string(c.n_v);
+        hv::Ops ops(ctx);
+        const GdnData d = make_gdn(c, T, QkInput::Raw, 70 + T * 10 + K);
+        const std::size_t S = c.state_n(), qc = c.qk_cols(), vc = c.v_cols(), nv = c.n_v;
+        const std::size_t s_off = 3, sl_off = s_off + S + 5;
+        const float sentinel = 42.0f;
+        std::vector<float> arena(sl_off + K * S + 7, sentinel);
+        std::copy(d.s0.begin(), d.s0.end(), arena.begin() + static_cast<std::ptrdiff_t>(s_off));
+        hv::Buffer q = upload(ctx, std::span<const float>(d.q));
+        hv::Buffer k = upload(ctx, std::span<const float>(d.k));
+        hv::Buffer v = upload(ctx, std::span<const float>(d.v));
+        hv::Buffer g = upload(ctx, std::span<const float>(d.g));
+        hv::Buffer beta = upload(ctx, std::span<const float>(d.beta));
+        hv::Buffer bar = upload(ctx, std::span<const float>(arena), hv::MemoryUsage::HostVisible);
+        hv::Buffer out = hv::Buffer::create(ctx, T * vc * 4, hv::MemoryUsage::HostCached);
+        hv::GdnDecodeArgs a;
+        a.q = q;
+        a.k = k;
+        a.v = v;
+        a.g = g;
+        a.beta = beta;
+        a.state = hv::BufferView(bar, s_off * 4, S * 4);
+        a.state_slots = hv::BufferView(bar, sl_off * 4, K * S * 4);
+        a.out = out;
+        a.n_v = c.n_v;
+        a.n_k = c.n_k;
+        a.d_k = c.d_k;
+        a.d_v = c.d_v;
+        a.n_tokens = static_cast<std::uint32_t>(T);
+        a.n_slots = static_cast<std::uint32_t>(K);
+        hv::Stream s(ctx);
+        ops.gated_delta_rule_decode(s, a);
+        s.submit_and_wait();
+        const auto after = download<float>(bar, arena.size());
+
+        GdnOut cpu{std::vector<float>(T * vc), d.s0};
+        std::vector<float> cpu_slots(K * S, sentinel);
+        const hc::GdnInputs in{hc::ConstRows(d.q.data(), T, qc, qc), hc::ConstRows(d.k.data(), T, qc, qc),
+                               hc::ConstRows(d.v.data(), T, vc, vc), hc::ConstRows(d.g.data(), T, nv, nv),
+                               hc::ConstRows(d.beta.data(), T, nv, nv)};
+        hc::gated_delta_rule_recurrent(c.cpu(), in, cpu.state, hc::Rows(cpu.out.data(), T, vc, vc), hc::GdnQkParams{},
+                                       nullptr, cpu_slots);
+        const auto slice = [&](std::size_t off) {
+            return std::vector<float>(after.begin() + static_cast<std::ptrdiff_t>(off),
+                                      after.begin() + static_cast<std::ptrdiff_t>(off + S));
+        };
+        const GdnOut vk{download<float>(out, T * vc), slice(s_off)};
+        const GdnScales sc = gdn_scales(d, true, 1.0 / std::sqrt(double(c.d_k)));
+        check_gdn(d, vk, cpu, sc, what + " out + in-place final state");
+        for (std::size_t sl = 0; sl < K; ++sl) {
+            const std::vector<float> got = slice(sl_off + sl * S);
+            const std::vector<float> want(cpu_slots.begin() + static_cast<std::ptrdiff_t>(sl * S),
+                                          cpu_slots.begin() + static_cast<std::ptrdiff_t>((sl + 1) * S));
+            if (sl < T) {
+                // A slot is the state after T - sl rows: same bound at that length.
+                GdnData dt = d;
+                dt.T = T - sl;
+                GdnOut vs{std::vector<float>(dt.T * vc, 0.0f), got}, cs{std::vector<float>(dt.T * vc, 0.0f), want};
+                check_gdn(dt, vs, cs, sc, what + " slot " + std::to_string(sl));
+            } else {
+                EXPECT_TRUE(std::all_of(got.begin(), got.end(), [&](float x) { return x == sentinel; }))
+                    << what << " slot " << sl << " (>= T) must be untouched";
+            }
+        }
+        EXPECT_EQ(std::memcmp(slice(sl_off).data(), vk.state.data(), S * 4), 0) << what << ": slot 0 != final state";
+        for (std::size_t i = 0; i < arena.size(); ++i) {
+            const bool in_state = i >= s_off && i < s_off + S;
+            const bool in_slots = i >= sl_off && i < sl_off + std::min(T, K) * S;
+            if (!in_state && !in_slots) EXPECT_EQ(after[i], sentinel) << what << ": arena guard " << i;
+        }
+    }
 }
 
 TEST(VkDiffGdn, NonFiniteQScaleIsRejectedLikeCpu) {

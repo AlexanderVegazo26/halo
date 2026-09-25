@@ -49,7 +49,8 @@ public:
     [[nodiscard]] bool host_visible() const noexcept { return mapped_ != nullptr; }
 
     /// Copy bytes into the buffer at `offset`. Direct memcpy when host-visible (plus a
-    /// flush for non-coherent memory), otherwise through a staging buffer + GPU copy.
+    /// flush for non-coherent memory), otherwise through the context's bounded, reused
+    /// staging buffer in chunks (ContextOptions::staging_bytes) + GPU copies.
     /// Throws Error(Memory) if [offset, offset+size) exceeds the buffer.
     void upload(std::span<const std::byte> data, VkDeviceSize offset = 0);
     /// Copy bytes out of the buffer at `offset` (invalidate for non-coherent memory).

@@ -261,6 +261,72 @@ TEST(CpuGdn, RealLayerDimsShortSequence) {
     std::printf("[tol] gdn real dims (48v/16k/128) T=70 worst err/tol: recurrent %.3g chunked %.3g\n", wr, wc);
 }
 
+TEST(CpuGdn, LongTrajectoryChunkedPrefillThenRecurrentDecodeMatchesFp64) {
+    // Code review S-5: a real-length trajectory. T = 4096 rows of chunked prefill followed
+    // by 64 recurrent decode steps continuing from the prefill state, against one fp64
+    // recurrence over all 4160 rows; outputs of both phases and the state after each phase
+    // are checked. Reduced head count (1 key head, 2 value heads) at the real head size
+    // d_k = d_v = 128.
+    //
+    // Tolerance: Model G at the total length (tolerance.h), 8 eps sqrt(T (d_k + 64)) * scale,
+    // i.e. ~1.3e-3 * scale at T = 4160. It rests on the recursion being non-expansive
+    // (exp(g) <= 1, beta in (0, 1), ||k||_2 = 1 after the in-kernel L2 norm), so rounding
+    // errors from different tokens add as a random walk rather than being amplified. The
+    // long-memory regime (WeakDecay: exp(g) >= 0.999, the state carries ~1000s of tokens)
+    // is the one where that accumulation actually happens; Model mixes heads with memory
+    // from ~100 tokens to ~1. Both are run.
+    const GdnDims dims{1, 2, 128, 128, GdnHeadMapping::Tiled};
+    const std::size_t T_pre = 4096, T_dec = 64, T = T_pre + T_dec;
+    for (const Regime rg : {Regime::Model, Regime::WeakDecay}) {
+        const Data d = make(dims, T, rg, true, 4096 + static_cast<std::uint64_t>(rg));
+        const std::string what = std::string("long trajectory ") + regime_name(rg);
+        // fp64 over all rows, with the state snapshot after the prefill.
+        const GdnRefDims rd{dims.n_k_heads, dims.n_v_heads, dims.d_k, dims.d_v, true};
+        const double qs = 1.0 / std::sqrt(static_cast<double>(dims.d_k));
+        std::vector<double> ref_state(d.s0.begin(), d.s0.end()), terms_pre, terms_dec;
+        const std::vector<double> ref_pre = gdn_ref(rd, T_pre, d.q, d.k, d.v, d.g, d.beta, ref_state, true, qs, &terms_pre);
+        const std::vector<double> ref_state_pre = ref_state;
+        const auto tail = [&](const std::vector<float>& x, std::size_t cols) {
+            return std::span<const float>(x.data() + T_pre * cols, T_dec * cols);
+        };
+        const std::vector<double> ref_dec =
+            gdn_ref(rd, T_dec, tail(d.q, d.qk_cols()), tail(d.k, d.qk_cols()), tail(d.v, d.v_cols()),
+                    tail(d.g, dims.n_v_heads), tail(d.beta, dims.n_v_heads), ref_state, true, qs, &terms_dec);
+        // CPU: chunked prefill, then recurrent decode one step per call (the decode loop).
+        const Result pre = run(d, Form::Chunked, 0, T_pre, d.s0);
+        std::vector<float> state = pre.state;
+        std::vector<float> dec_out;
+        for (std::size_t t = 0; t < T_dec; ++t) {
+            const Result step = run(d, Form::Recurrent, T_pre + t, 1, state);
+            state = step.state;
+            dec_out.insert(dec_out.end(), step.out.begin(), step.out.end());
+        }
+        const std::size_t nv = dims.n_v_heads, dv = dims.d_v;
+        double worst = 0;
+        auto check_rows = [&](const std::vector<float>& got, const std::vector<double>& want,
+                              const std::vector<double>& terms, std::size_t rows, std::size_t tol_len, const char* ph) {
+            for (std::size_t j = 0; j < nv; ++j) {
+                double so = 0, eo = 0;
+                for (std::size_t t = 0; t < rows; ++t)
+                    for (std::size_t c = 0; c < dv; ++c) {
+                        const std::size_t i = t * nv * dv + j * dv + c;
+                        so = std::max(so, terms[i]);
+                        eo = std::max(eo, std::abs(got[i] - want[i]));
+                    }
+                const double to = tol_gdn(tol_len, dims.d_k, so) + kDenormFloor;
+                EXPECT_LE(eo, to) << what << " " << ph << " head " << j << " out err " << eo << " scale " << so;
+                worst = std::max(worst, eo / to);
+            }
+        };
+        check_rows(pre.out, ref_pre, terms_pre, T_pre, T_pre, "prefill");
+        check_rows(dec_out, ref_dec, terms_dec, T_dec, T, "decode");
+        worst = std::max(worst, check_state(d, T_pre, pre.state, ref_state_pre, 1.0, what + " state after prefill"));
+        worst = std::max(worst, check_state(d, T, state, ref_state, 1.0, what + " final state"));
+        for (float x : state) ASSERT_TRUE(std::isfinite(x)) << what;
+        std::printf("[tol] gdn %s T=%zu+%zu worst err/tol %.3g\n", what.c_str(), T_pre, T_dec, worst);
+    }
+}
+
 // ------------------------------------------------------------------- state continuity
 
 TEST(CpuGdn, StateContinuityUnderArbitrarySplits) {

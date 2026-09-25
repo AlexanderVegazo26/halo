@@ -84,6 +84,11 @@ struct ContextOptions {
     /// Route Buffer::upload/download through a staging buffer + GPU copy even when the
     /// destination is host-visible. Exercises the staging path on UMA/CPU devices.
     bool force_staging = false;
+    /// Capacity of the context's one reusable staging buffer (code review N-1). Staged
+    /// transfers larger than this are split into chunks of at most this many bytes, so
+    /// host-side staging memory is bounded no matter how large a weight upload is. Must be
+    /// > 0; clamped to maxMemoryAllocationSize.
+    std::uint64_t staging_bytes = 16ull << 20;
     /// Initial VkPipelineCache contents (e.g. from a previous run). Ignored with a log
     /// line when the driver rejects it; the driver validates its own header.
     std::vector<std::byte> pipeline_cache_data;
@@ -118,6 +123,20 @@ public:
     void copy_buffer_sync(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset,
                           VkDeviceSize dst_offset, VkDeviceSize size);
 
+    /// Staged transfers used by Buffer::upload/download (code review N-1): the data goes
+    /// through the context's single reusable staging buffer (created on first use, never
+    /// grown past ContextOptions::staging_bytes) in chunks of at most that size, each
+    /// chunk one synchronous GPU copy. Serialized with other transfers on this context.
+    void staged_upload(VkBuffer dst, VkDeviceSize dst_offset, std::span<const std::byte> data);
+    void staged_download(VkBuffer src, VkDeviceSize src_offset, std::span<std::byte> out);
+
+    struct StagingStats {
+        VkDeviceSize capacity = 0;      ///< bytes of the staging buffer (0 = not created yet)
+        std::uint64_t allocations = 0;  ///< staging buffers ever created (1 once used)
+        std::uint64_t chunks = 0;       ///< GPU copies issued by staged transfers
+    };
+    [[nodiscard]] StagingStats staging_stats() const;
+
     /// Current VkPipelineCache contents (driver-validated header + blob). Pair it with
     /// `shader_set_hash()` when persisting.
     [[nodiscard]] std::vector<std::byte> pipeline_cache_data() const;
@@ -143,10 +162,26 @@ private:
     bool force_staging_ = false;
 
     std::mutex queue_mutex_;
-    std::mutex transfer_mutex_;
+    mutable std::mutex transfer_mutex_;
     VkCommandPool transfer_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer transfer_cmd_ = VK_NULL_HANDLE;
     VkFence transfer_fence_ = VK_NULL_HANDLE;
+
+    // Reusable staging buffer (guarded by transfer_mutex_). Raw handles rather than a
+    // Buffer: a Buffer holds a shared_ptr to its Context, which would be a cycle here.
+    void copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, VkDeviceSize dst_offset,
+                     VkDeviceSize size);
+    void ensure_staging_locked();
+    void flush_staging_locked(VkDeviceSize size) const;
+    void invalidate_staging_locked(VkDeviceSize size) const;
+    VkDeviceSize staging_capacity_ = 0;
+    VkBuffer staging_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory_ = VK_NULL_HANDLE;
+    VkDeviceSize staging_alloc_size_ = 0;
+    VkMemoryPropertyFlags staging_flags_ = 0;
+    std::byte* staging_mapped_ = nullptr;
+    std::uint64_t staging_allocations_ = 0;
+    std::uint64_t staging_chunks_ = 0;
 };
 
 /// JSON for one device (all fields of DeviceInfo, flags decoded).

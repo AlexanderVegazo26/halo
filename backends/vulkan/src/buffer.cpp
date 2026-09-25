@@ -144,11 +144,8 @@ void Buffer::upload(std::span<const std::byte> data, VkDeviceSize offset) {
         flush(offset, data.size());
         return;
     }
-    Buffer staging = Buffer::create(ctx_, data.size(), MemoryUsage::HostVisible);
-    HALO_CHECK(staging.mapped_ != nullptr, ErrorCode::Memory, "staging buffer is not host-visible");
-    std::memcpy(staging.mapped_, data.data(), data.size());
-    staging.flush(0, data.size());
-    ctx_->copy_buffer_sync(staging.buffer_, buffer_, 0, offset, data.size());
+    // Bounded, reused staging buffer owned by the context; chunked (code review N-1).
+    ctx_->staged_upload(buffer_, offset, data);
 }
 
 void Buffer::download(std::span<std::byte> out, VkDeviceSize offset) const {
@@ -161,11 +158,7 @@ void Buffer::download(std::span<std::byte> out, VkDeviceSize offset) const {
         std::memcpy(out.data(), mapped_ + offset, out.size());
         return;
     }
-    Buffer staging = Buffer::create(ctx_, out.size(), MemoryUsage::HostCached);
-    HALO_CHECK(staging.mapped_ != nullptr, ErrorCode::Memory, "staging buffer is not host-visible");
-    ctx_->copy_buffer_sync(buffer_, staging.buffer_, offset, 0, out.size());
-    staging.invalidate(0, out.size());
-    std::memcpy(out.data(), staging.mapped_, out.size());
+    ctx_->staged_download(buffer_, offset, out);
 }
 
 }  // namespace halo::vulkan

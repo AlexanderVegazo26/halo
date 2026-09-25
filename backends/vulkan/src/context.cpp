@@ -1,5 +1,6 @@
 #include "halo/backends/vulkan/context.h"
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <string>
@@ -174,6 +175,8 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
     auto ctx = std::make_shared<Context>(Key{});
     ctx->instance_ = Instance::create(options.instance);
     ctx->force_staging_ = options.force_staging;
+    HALO_CHECK(options.staging_bytes > 0, ErrorCode::Backend, "ContextOptions::staging_bytes must be > 0");
+    ctx->staging_capacity_ = options.staging_bytes;
     const auto& devices = ctx->instance_->devices();
     HALO_CHECK(!devices.empty(), ErrorCode::Device, "no Vulkan physical devices enumerated");
 
@@ -240,6 +243,9 @@ Context::~Context() {
     // Teardown only: all child objects hold a shared_ptr to this Context, so they are
     // gone; wait for anything still queued before destroying the device.
     vkDeviceWaitIdle(device_);
+    if (staging_mapped_ != nullptr) vkUnmapMemory(device_, staging_memory_);
+    if (staging_buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(device_, staging_buffer_, nullptr);
+    if (staging_memory_ != VK_NULL_HANDLE) vkFreeMemory(device_, staging_memory_, nullptr);
     if (transfer_fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, transfer_fence_, nullptr);
     if (transfer_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, transfer_pool_, nullptr);
     if (pipeline_cache_ != VK_NULL_HANDLE) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
@@ -258,6 +264,116 @@ void Context::submit(VkCommandBuffer cmd, VkFence fence) {
 void Context::copy_buffer_sync(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset,
                                VkDeviceSize dst_offset, VkDeviceSize size) {
     const std::scoped_lock lock(transfer_mutex_);
+    copy_locked(src, dst, src_offset, dst_offset, size);
+}
+
+namespace {
+
+// [0, size) of a mapped allocation rounded out to nonCoherentAtomSize, clamped.
+VkMappedMemoryRange staging_range(VkDeviceMemory mem, VkDeviceSize size, VkDeviceSize atom, VkDeviceSize alloc) {
+    VkMappedMemoryRange r{};
+    r.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    r.memory = mem;
+    r.offset = 0;
+    const VkDeviceSize end = (size + atom - 1) / atom * atom;
+    r.size = end >= alloc ? VK_WHOLE_SIZE : end;
+    return r;
+}
+
+}  // namespace
+
+void Context::ensure_staging_locked() {
+    if (staging_buffer_ != VK_NULL_HANDLE) return;
+    VkDeviceSize cap = staging_capacity_;
+    if (info_.max_memory_allocation_size > 0) cap = std::min(cap, info_.max_memory_allocation_size);
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = cap;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    detail::vk_check(vkCreateBuffer(device_, &bci, nullptr, &buf), "vkCreateBuffer(staging)");
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(device_, buf, &req);
+    // Cached host memory serves both directions (downloads read it on the host); non-coherent
+    // types are flushed / invalidated around each chunk.
+    const auto type = choose_memory_type(info_.memory_types, req.memoryTypeBits, MemoryUsage::HostCached);
+    if (!type) {
+        vkDestroyBuffer(device_, buf, nullptr);
+        throw_error(ErrorCode::Memory, "no host-visible memory type for the staging buffer");
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = *type;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkResult r = vkAllocateMemory(device_, &mai, nullptr, &mem);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(device_, buf, nullptr);
+        detail::vk_check(r, "vkAllocateMemory(staging)");
+    }
+    void* p = nullptr;
+    r = vkBindBufferMemory(device_, buf, mem, 0);
+    if (r == VK_SUCCESS) r = vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &p);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(device_, buf, nullptr);
+        vkFreeMemory(device_, mem, nullptr);
+        detail::vk_check(r, "staging bind/map");
+    }
+    staging_buffer_ = buf;
+    staging_memory_ = mem;
+    staging_alloc_size_ = req.size;
+    staging_flags_ = info_.memory_types[*type].flags;
+    staging_mapped_ = static_cast<std::byte*>(p);
+    staging_capacity_ = cap;
+    ++staging_allocations_;
+}
+
+void Context::flush_staging_locked(VkDeviceSize size) const {
+    if ((staging_flags_ & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) return;
+    const VkMappedMemoryRange r = staging_range(staging_memory_, size, info_.non_coherent_atom_size, staging_alloc_size_);
+    detail::vk_check(vkFlushMappedMemoryRanges(device_, 1, &r), "vkFlushMappedMemoryRanges(staging)");
+}
+
+void Context::invalidate_staging_locked(VkDeviceSize size) const {
+    if ((staging_flags_ & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) return;
+    const VkMappedMemoryRange r = staging_range(staging_memory_, size, info_.non_coherent_atom_size, staging_alloc_size_);
+    detail::vk_check(vkInvalidateMappedMemoryRanges(device_, 1, &r), "vkInvalidateMappedMemoryRanges(staging)");
+}
+
+void Context::staged_upload(VkBuffer dst, VkDeviceSize dst_offset, std::span<const std::byte> data) {
+    const std::scoped_lock lock(transfer_mutex_);
+    ensure_staging_locked();
+    for (std::size_t done = 0; done < data.size();) {
+        const std::size_t n = static_cast<std::size_t>(std::min<VkDeviceSize>(data.size() - done, staging_capacity_));
+        std::memcpy(staging_mapped_, data.data() + done, n);
+        flush_staging_locked(n);
+        copy_locked(staging_buffer_, dst, 0, dst_offset + done, n);
+        ++staging_chunks_;
+        done += n;
+    }
+}
+
+void Context::staged_download(VkBuffer src, VkDeviceSize src_offset, std::span<std::byte> out) {
+    const std::scoped_lock lock(transfer_mutex_);
+    ensure_staging_locked();
+    for (std::size_t done = 0; done < out.size();) {
+        const std::size_t n = static_cast<std::size_t>(std::min<VkDeviceSize>(out.size() - done, staging_capacity_));
+        copy_locked(src, staging_buffer_, src_offset + done, 0, n);
+        invalidate_staging_locked(n);
+        std::memcpy(out.data() + done, staging_mapped_, n);
+        ++staging_chunks_;
+        done += n;
+    }
+}
+
+Context::StagingStats Context::staging_stats() const {
+    const std::scoped_lock lock(transfer_mutex_);
+    return {staging_buffer_ != VK_NULL_HANDLE ? staging_capacity_ : 0, staging_allocations_, staging_chunks_};
+}
+
+void Context::copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, VkDeviceSize dst_offset,
+                          VkDeviceSize size) {
     detail::vk_check(vkResetCommandBuffer(transfer_cmd_, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
