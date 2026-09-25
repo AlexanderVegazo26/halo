@@ -38,7 +38,7 @@ constexpr const char* kUsage =
     "  tokenize <model.gguf>  tokenize text with the model's tokenizer\n"
     "  template <model.gguf>  render a chat with the model's chat template\n"
     "  bench micro|model|system   benchmark suites (docs/benchmarks.md)\n"
-    "  tune                   autotuning (not implemented in v0.2)\n"
+    "  tune                   autotune kernels into the profile DB; --list shows the lookup\n"
     "  version                print the version and the components in this build\n"
     "\n"
     "Configuration: command line > HALO_* environment > JSON config file (--config / HALO_CONFIG).\n"
@@ -60,14 +60,13 @@ int dispatch(const std::string& cmd, const std::vector<std::string>& rest, Conte
     if (cmd == "tokenize") return cmd_tokenize(rest, ctx);
     if (cmd == "template") return cmd_template(rest, ctx);
     if (cmd == "bench" || cmd == "benchmark") return cmd_bench(rest, ctx);
-    if (cmd == "tune") {
-        *ctx.err << "halo tune: not implemented in v0.2\n";
-        return kExitUsage;
-    }
+    if (cmd == "tune") return cmd_tune(rest, ctx);
     if (cmd == "version" || cmd == "--version") {
         *ctx.out << "halo 0.2.0\n"
                  << "components: api " << (have_api() ? "yes" : "no") << ", runtime " << (have_runtime() ? "yes" : "no")
-                 << ", profiling " << (have_profiling() ? "yes" : "no") << "\n";
+                 << ", profiling " << (have_profiling() ? "yes" : "no") << ", autotune "
+                 << (HALO_CLI_HAVE_AUTOTUNE ? (HALO_CLI_HAVE_AUTOTUNE_CPU ? "yes (cpu ops)" : "yes (no ops)") : "no")
+                 << "\n";
         return kExitOk;
     }
     throw UsageError("unknown command '" + cmd + "'\n" + kUsage);

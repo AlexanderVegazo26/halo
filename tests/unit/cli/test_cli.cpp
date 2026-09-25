@@ -18,6 +18,7 @@
 #include "config.h"
 #include "fake_engine.h"
 #include "halo/core/error.h"
+#include "hashing.h"
 
 #if HALO_CLI_HAVE_API
 #include <httplib.h>
@@ -154,7 +155,9 @@ TEST(Cli, UsageAndExitCodes) {
     EXPECT_NE(r.err.find("needs a value"), std::string::npos);
     r = cli_run({"tune", "m.gguf"});
     EXPECT_EQ(r.rc, 2);
-    EXPECT_NE(r.err.find("not implemented in v0.2"), std::string::npos);
+    EXPECT_NE(r.err.find(HALO_CLI_HAVE_AUTOTUNE ? "no positional arguments" : "not part of this build"),
+              std::string::npos)
+        << r.err;
     r = cli_run({"version"});
     EXPECT_EQ(r.rc, 0);
     EXPECT_NE(r.out.find("halo 0.2.0"), std::string::npos);
@@ -644,6 +647,144 @@ TEST(CliBench, SystemSuiteOverFakeEngine) {
     r = cli_run({"bench", "system", "m.gguf", "--host-label", "fake"}, CliOptions().with_factory(ff.factory()));
     EXPECT_EQ(r.rc, 2) << "--workload is required";
 }
+#endif
+
+// ---- tune ----------------------------------------------------------------------------------
+
+TEST(CliHashing, Sha256KnownAnswers) {
+    // FIPS 180-4 / NIST CSRC example vectors.
+    EXPECT_EQ(cli::sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    EXPECT_EQ(cli::sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(cli::sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    EXPECT_EQ(cli::sha256_hex(std::string(1000000, 'a')),
+              "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    // Streaming over a file larger than one 4 MiB read equals the one-shot digest.
+    const std::string big(9u << 20, 'x');
+    const auto p = temp_file("hash.bin", big);
+    EXPECT_EQ(cli::sha256_file_hex(p), cli::sha256_hex(big));
+    fs::remove(p);
+    EXPECT_THROW((void)cli::sha256_file_hex("/nonexistent/file"), halo::Error);
+    EXPECT_EQ(cli::pack_id("t", std::nullopt), cli::sha256_hex("halo.pack/1\ntrunk=t\nmtp=none\n"));
+}
+
+
+#if HALO_CLI_HAVE_AUTOTUNE
+TEST(CliTune, RequiredFlagsAndStrategyRules) {
+    REQUIRE_FILE(tiny_model());
+    const std::string m = tiny_model().string();
+    const std::string root = fixture_root("no_gpu").string();
+    const auto db = fs::temp_directory_path() / ("halo_cli_test_" + std::to_string(::getpid()) + "_rules.db");
+    const std::vector<std::string> base = {"--db", db.string(), "--root", root};
+    const auto run = [&](std::vector<std::string> extra) {
+        std::vector<std::string> args = {"tune"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        args.insert(args.end(), base.begin(), base.end());
+        return cli_run(args);
+    };
+    auto r = run({"--host-label", "t", "--power-mode", "p"});
+    EXPECT_EQ(r.rc, 2);
+    EXPECT_NE(r.err.find("--model is required"), std::string::npos) << r.err;
+    r = run({"--model", m, "--power-mode", "p"});
+    EXPECT_EQ(r.rc, 2);
+    EXPECT_NE(r.err.find("--host-label is required"), std::string::npos) << r.err;
+    r = run({"--model", m, "--host-label", "t"});
+    EXPECT_EQ(r.rc, 2);
+    EXPECT_NE(r.err.find("--power-mode is required"), std::string::npos) << r.err;
+    r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--backend", "vulkan"});
+    EXPECT_EQ(r.rc, 2);
+    EXPECT_NE(r.err.find("CPU reference kernels only"), std::string::npos) << r.err;
+    r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--strategy", "heuristic"});
+    EXPECT_EQ(r.rc, 2);
+    EXPECT_NE(r.err.find("needs a cost-model calibration"), std::string::npos) << r.err;
+    r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--strategy", "bayesian"});
+    EXPECT_EQ(r.rc, 2);
+    r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--ops", "CONV"});
+    EXPECT_EQ(r.rc, 2) << r.err;
+    EXPECT_NE(r.err.find("unknown operator 'CONV'"), std::string::npos) << r.err;
+    // --list on a database that does not exist: a typed error, and nothing is created.
+    r = run({"--list", "--model", m, "--host-label", "t", "--power-mode", "p"});
+    EXPECT_EQ(r.rc, 1);
+    EXPECT_FALSE(fs::exists(db)) << "--list must open read-only";
+}
+
+#if HALO_CLI_HAVE_AUTOTUNE_CPU
+TEST(CliTune, TunesTinyModelThenListShowsTheLookup) {
+    REQUIRE_FILE(tiny_model());
+    const std::string m = tiny_model().string();
+    const std::string root = fixture_root("no_gpu").string();
+    const std::string tag = std::to_string(::getpid());
+    const auto db = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_tune.db");
+    const auto report = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_tune.json");
+    const auto listrep = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_list.json");
+    for (const auto& p : {db, report, listrep}) fs::remove(p);
+    // The shapes are the tiny model's; the stability gate is relaxed because ctest -j loads
+    // the host (instability rejection is covered in test_tuner.cpp with a ManualClock).
+    const std::vector<std::string> shape = {"--model", m, "--threads", "1,2", "--gdn-tokens", "64", "--chunks", "16,32",
+                                            "--db", db.string(), "--root", root, "--host-label", "cli-test"};
+    std::vector<std::string> args = {"tune", "--power-mode", "performance", "--max-cv", "1e9", "--no-bandwidth",
+                                     "--report", report.string()};
+    args.insert(args.end(), shape.begin(), shape.end());
+    auto r = cli_run(args);
+    ASSERT_EQ(r.rc, 0) << r.out << r.err;
+    EXPECT_NE(r.out.find("strategy: exhaustive (no cost-model calibration"), std::string::npos) << r.out;
+    EXPECT_NE(r.out.find("gpu cpu (cpu-only)"), std::string::npos) << r.out;
+    std::ifstream f(report);
+    const json rep = json::parse(f);
+    f.close();
+    ASSERT_EQ(rep.at("ops").size(), 2u);
+    std::map<std::string, std::string> winners;
+    for (const auto& op : rep.at("ops")) {
+        ASSERT_FALSE(op.at("winner").is_null()) << op.dump();
+        EXPECT_TRUE(op.at("persisted").get<bool>());
+        EXPECT_EQ(op.at("candidates").size(), op.at("family") == "MATMUL" ? 2u : 4u);
+        winners[op.at("family").get<std::string>()] = op.at("winner").get<std::string>();
+    }
+    EXPECT_EQ(rep.at("host_label"), "cli-test");
+    ASSERT_TRUE(fs::exists(db));
+
+    // --list: the same key finds both winners at §56 step 1 (exact).
+    std::vector<std::string> list = {"tune", "--list", "--power-mode", "performance", "--report", listrep.string()};
+    list.insert(list.end(), shape.begin(), shape.end());
+    r = cli_run(list);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.out.find("opened read-only"), std::string::npos);
+    std::ifstream lf(listrep);
+    json lj = json::parse(lf);
+    lf.close();
+    EXPECT_EQ(lj.at("winners"), 2);
+    for (const auto& op : lj.at("ops")) {
+        EXPECT_EQ(op.at("step"), "exact") << op.dump();
+        EXPECT_EQ(op.at("candidate"), winners.at(op.at("family").get<std::string>()));
+    }
+    // A different power mode is a must-match field: nothing is selected, and why is shown.
+    list[3] = "balanced";
+    r = cli_run(list);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    std::ifstream lf2(listrep);
+    lj = json::parse(lf2);
+    lf2.close();
+    for (const auto& op : lj.at("ops")) {
+        EXPECT_EQ(op.at("step"), "none") << op.dump();
+        EXPECT_FALSE(op.at("rejections").empty());
+    }
+    EXPECT_NE(r.out.find("POWER_MODE"), std::string::npos) << r.out;
+    EXPECT_NE(r.out.find("run `halo tune`"), std::string::npos);
+    // A calibrated run uses the heuristic prefilter and measures host bandwidth first.
+    std::vector<std::string> heur = {"tune", "--power-mode", "performance", "--max-cv", "1e9", "--gflops-per-thread",
+                                     "1.0", "--heuristic-keep", "1", "--ops", "MATMUL", "--allow-nonconformant",
+                                     "--warmup", "1", "--iterations", "3"};
+    heur.insert(heur.end(), shape.begin(), shape.end());
+    r = cli_run(heur);
+    ASSERT_EQ(r.rc, 0) << r.out << r.err;
+    EXPECT_NE(r.out.find("strategy: heuristic"), std::string::npos) << r.out;
+    EXPECT_NE(r.out.find("host bandwidth: read median"), std::string::npos) << r.out;
+    EXPECT_NE(r.out.find("1 candidates measured"), std::string::npos) << r.out;
+    for (const auto& p : {db, report, listrep}) fs::remove(p);
+    fs::remove(fs::path(db.string() + "-wal"));
+    fs::remove(fs::path(db.string() + "-shm"));
+}
+#endif
 #endif
 
 }  // namespace

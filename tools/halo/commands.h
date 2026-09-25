@@ -19,6 +19,7 @@ int cmd_template(const std::vector<std::string>& args, Context& ctx);
 int cmd_run(const std::vector<std::string>& args, Context& ctx);
 int cmd_serve(const std::vector<std::string>& args, Context& ctx);
 int cmd_bench(const std::vector<std::string>& args, Context& ctx);
+int cmd_tune(const std::vector<std::string>& args, Context& ctx);
 
 /// "12.3 GiB" style (binary units).
 [[nodiscard]] std::string human_bytes(std::uint64_t b);

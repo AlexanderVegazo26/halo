@@ -7,7 +7,7 @@
 //   tokenize  tokenize text with a model's tokenizer
 //   template  render a chat with a model's chat template
 //   bench     benchmark suites (halo_profiling); micro runs without a model
-//   tune      not implemented in v0.2 (exit 2)
+//   tune      autotune the CPU kernels into the profile DB; --list shows the lookup
 //
 // The command logic lives in a library (halo_cli) so tests drive it in-process: `run_cli`
 // takes the arguments, the output streams, the environment and an engine factory instead

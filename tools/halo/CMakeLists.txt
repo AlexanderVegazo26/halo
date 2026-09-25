@@ -6,12 +6,15 @@
 #   halo_api          serve; chat prompts use the API's special-token protection
 #   halo_profiling    bench
 #   halo_backend_cpu  bench micro kernels
+#   halo_autotune     tune (halo_autotune_cpu supplies the CPU TunableOps)
 set(_halo_cli_deps halo_model halo_memory halo_hardware halo_tokenizer halo_template halo_core
                    nlohmann_json::nlohmann_json Threads::Threads)
 set(_have_runtime 0)
 set(_have_api 0)
 set(_have_profiling 0)
 set(_have_cpu 0)
+set(_have_autotune 0)
+set(_have_autotune_cpu 0)
 if(TARGET halo_runtime)
   list(APPEND _halo_cli_deps halo_runtime)
   set(_have_runtime 1)
@@ -29,12 +32,23 @@ if(TARGET halo_profiling)
   endif()
 endif()
 
-add_library(halo_cli STATIC cli.cpp args.cpp config.cpp model_io.cpp commands.cpp bench.cpp)
+if(TARGET halo_autotune)
+  list(APPEND _halo_cli_deps halo_autotune)
+  set(_have_autotune 1)
+  if(TARGET halo_autotune_cpu)
+    list(APPEND _halo_cli_deps halo_autotune_cpu)
+    set(_have_autotune_cpu 1)
+  endif()
+endif()
+
+add_library(halo_cli STATIC cli.cpp args.cpp config.cpp model_io.cpp commands.cpp bench.cpp tune.cpp hashing.cpp)
 target_include_directories(halo_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(halo_cli PUBLIC ${_halo_cli_deps} PRIVATE halo_warnings)
 target_compile_definitions(halo_cli PUBLIC HALO_CLI_HAVE_RUNTIME=${_have_runtime} HALO_CLI_HAVE_API=${_have_api}
-                                           HALO_CLI_HAVE_PROFILING=${_have_profiling} HALO_CLI_HAVE_CPU=${_have_cpu})
-message(STATUS "halo CLI: runtime=${_have_runtime} api=${_have_api} profiling=${_have_profiling} cpu_kernels=${_have_cpu}")
+                                           HALO_CLI_HAVE_PROFILING=${_have_profiling} HALO_CLI_HAVE_CPU=${_have_cpu}
+                                           HALO_CLI_HAVE_AUTOTUNE=${_have_autotune}
+                                           HALO_CLI_HAVE_AUTOTUNE_CPU=${_have_autotune_cpu})
+message(STATUS "halo CLI: runtime=${_have_runtime} api=${_have_api} profiling=${_have_profiling} cpu_kernels=${_have_cpu} autotune=${_have_autotune} autotune_cpu=${_have_autotune_cpu}")
 
 add_executable(halo_cli_main main.cpp)
 set_target_properties(halo_cli_main PROPERTIES OUTPUT_NAME halo)
