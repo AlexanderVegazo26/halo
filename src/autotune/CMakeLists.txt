@@ -4,7 +4,7 @@
 # halo_autotune_cpu   TunableOps over the CPU reference kernels (links halo_backend_cpu); only
 #                     built when the cpu backend is selected.
 halo_module(autotune
-  SOURCES sqlite.cpp profile_key.cpp cost_model.cpp types.cpp db.cpp lookup.cpp tuner.cpp
+  SOURCES sqlite.cpp profile_key.cpp cost_model.cpp types.cpp db.cpp lookup.cpp tuner.cpp baseline_store.cpp
   DEPS halo_core halo_profiling halo_hardware nlohmann_json::nlohmann_json SQLite::SQLite3)
 target_compile_definitions(halo_autotune PRIVATE HALO_VERSION_STRING="${PROJECT_VERSION}")
 

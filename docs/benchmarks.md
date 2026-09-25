@@ -1,8 +1,10 @@
 # HALO benchmarks: harness, records, workloads
 
-Status: WS-J Milestone 1 (the `halo_profiling` library) and Milestone 3 (the autotuner
-and profile database, `halo_autotune`; see the last section). Baseline adapters (TRD §51,
-Milestone 2) are not described here yet.
+Status: all three WS-J milestones.
+
+- Milestone 1: the `halo_profiling` library.
+- Milestone 2: the baseline adapters (TRD §51), in the section "Baseline adapters".
+- Milestone 3: the autotuner and the profile database (`halo_autotune`).
 
 > **D-001.** A number produced on the development host (WSL, CPU reference kernels, or a
 > fake engine in unit tests) exercises the harness only. It is never a HALO performance
@@ -395,3 +397,167 @@ The CLI flow (TRD §64):
 6. Call `tune()` and write the `TuneReport` JSON.
 
 At start-up the runtime calls `ProfileLookup::open`, then `select_kernel` for each operator.
+
+## Baseline adapters (TRD §51), `baseline.h`
+
+Three adapters produce `halo.bench.record/1` records with `suite = "baseline"`. Each run
+returns a `SuiteArtifact` built the same way as the M1 suites:
+
+- before/after hardware snapshots
+- thermal and power-mode verdicts
+- per-configuration summaries
+- `valid`
+
+A tool failure is never an exception. It becomes a `FAILED:` note and makes the artifact
+invalid. Tool failures include:
+
+- a non-zero exit
+- a timeout
+- unparsable output
+- a mismatch between the backend the binary reports and the configured backend
+- a mismatch between the build commit and the `--version` commit
+
+| Adapter | Entry point | Talks to |
+|---|---|---|
+| llama-bench | `run_llama_bench(LlamaBenchConfig)` | `llama-bench -o json`, run with argv only |
+| llama-server (MTP) | `run_llama_server(LlamaServerConfig)` | spawns `llama-server`, waits for `GET /health` = 200, then sends `POST /completion` (`cache_prompt: false`, `stream: false`) |
+| Ollama | `run_ollama(OllamaConfig)` | `GET /api/version`, `GET /api/tags` (model digest), `POST /api/generate` (`stream: false`) |
+
+The configured backend is a config field (`vulkan` / `hip` / `cpu`) and is checked against
+the `backends` string the binary reports. The expected names are the ggml registry names at
+bd4f514:
+
+| Configured backend | Expected name | Source |
+|---|---|---|
+| `vulkan` | `Vulkan` | `GGML_VK_NAME` |
+| `hip` | `ROCm` | `GGML_CUDA_NAME` under `GGML_USE_HIP` |
+| `cpu` | `CPU` | |
+
+The `llama-server` MTP flags follow the engine report (docs/strix-halo-qwen38-engine-report.md
+§5.2 / §7): `--spec-type draft-mtp --spec-draft-n-max 2`. Other report flags such as
+`--kv-unified -b 512 -ub 256` go in `extra_args`.
+
+### TRD §51 checklist: what every run records
+
+- binary version and commit: `invocation.version` / `.commit`, from `--version`, which
+  llama.cpp prints on stderr. For Ollama, this comes from `/api/version`.
+- backend and driver versions:
+  - `backend`
+  - `driver`: `vulkan <api> (mesa …)` or `rocm <version>`, taken from the hardware state
+  - `hardware_before` / `hardware_after`
+- full command line: `invocation.argv`, which is the exact argv that was exec'd.
+- model hash: `model_hash`, the streamed SHA-256 of the GGUF (`sha256_file`, 4 MiB chunks).
+  Ollama records `ollama-digest:<digest>`, which is Ollama's model digest, not a GGUF hash.
+- environment: `invocation.environment`. This holds only the variables passed explicitly,
+  plus inherited `RADV_`/`AMD_`/`HSA_`/`ROCR_`/`HIP_`/`GGML_`/`VK_`/`LLAMA_`/`OLLAMA_`/`MESA_`
+  variables. The full parent environment is never recorded.
+- power mode: `power_mode`, plus the artifact's `power_mode_pinned`.
+- results: see the mode/context contract below.
+
+**PACK_ID.** `make_pack_id(trunk_sha256, mtp_sha256)` is SHA-256 over
+`"halo.pack/1\ntrunk=<hex>\nmtp=<hex|none>\n"`. It is the one definition used for the profile
+key (TRD §57).
+
+### Mode / context contract (the `latest_run` query key)
+
+| Engine | mode | Metric | context |
+|---|---|---|---|
+| llama-bench pp | `pp<p>` or `pp<p>@d<depth>` | `prompt_tps` | depth + p |
+| llama-bench tg | `tg<n>` or `tg<n>@d<depth>` | `decode_tps` | depth + n |
+| llama-bench pg | `pp<p>+tg<n>` (`@d…`) | `extra.combined_tps` | depth + p + n |
+| llama-server | `completion` / `mtp_completion` | `prompt_tps`, `decode_tps` (MTP off) / `decode_effective_tps` (MTP on), `mtp_acceptance` | prompt_n + predicted_n |
+| Ollama | `generate` | `prompt_tps` = prompt_eval_count / prompt_eval_duration, `decode_tps` = eval_count / eval_duration (**durations are ns**) | prompt + eval counts |
+
+Notes on the table:
+
+- llama-bench writes one record per sample (`repetition` = sample index).
+- `mtp_acceptance` = draft_n_accepted / draft_n. A measured 0 is stored as 0. When
+  `draft_n = 0` it is null.
+- `ttft_ms` is null for `llama-server`, because non-streaming `/completion` does not expose it.
+- `quantization` is taken from llama-bench `model_type`, using its last token. This is a
+  heuristic, and the record says so in `extra.quantization_source`.
+
+### Stored baselines
+
+`autotune::store_baseline(ProfileDb&, artifact, allow_invalid = false)` stores
+`aggregate_records(artifact)`:
+
+- one record per configuration
+- each metric is the **median** of the measured samples
+- the per-metric `SampleStats` are kept under `extra.aggregate`
+- `kind` is `"baseline"`
+
+The result is queryable with `ProfileDb::latest_run("baseline", backend, pack, context,
+mode)`. An invalid artifact is refused unless `allow_invalid` is set. When it is set, the
+record is marked `extra.aggregate.artifact_valid = false`. A run with an unpinned power mode
+or thermal drift therefore never becomes the latest baseline by default.
+
+### Process and network safety
+
+- **Subprocesses** (`subprocess.h`):
+  - `posix_spawn` with an argv vector; there is no shell and no PATH search.
+  - An explicit envp.
+  - stdout and stderr are read concurrently with `poll`, and each is capped.
+  - The child runs in its own process group. On timeout the group gets SIGTERM, then SIGKILL
+    after a grace period.
+  - The child is always reaped.
+  - `ChildProcess`, used for `llama-server`, tears the group down in its destructor.
+- **HTTP** (`http_client.h`):
+  - Numeric loopback only (`127.0.0.1` / `::1`).
+  - The header block, `Content-Length` and chunked body are all bounded.
+  - Every call has a timeout.
+
+### Intended `halo bench baseline` flags (for WS-I)
+
+```
+halo bench baseline llama-bench  --binary PATH --model PATH --backend vulkan|hip|cpu
+                                 [-p 512] [-n 128] [-d 0,32768] [-r 5] [-ngl 999] [-fa on] [-t N]
+halo bench baseline llama-server --binary PATH --model PATH --backend vulkan|hip [--no-mtp]
+                                 [--draft 2] [--ctx 8192] [--port 18084] [--prompt TEXT] [--n-predict 128]
+halo bench baseline ollama       [--port 11434] --model NAME [--prompt TEXT] [--n-predict 128]
+common:  --host-label LABEL --power-mode LABEL --db PATH [--store] [--allow-invalid] --out FILE.json
+```
+
+### Dev-host coverage
+
+The dev host has a CPU-only llama.cpp build at commit bd4f514, in
+`$HOME/llama-build-wsj/bin`. That is the only place `llama-bench` exists:
+`/root/llama.cpp/build/bin` has `llama-server` but no `llama-bench`.
+
+The integration tests run real `llama-bench` and `llama-server --spec-type draft-mtp` on the
+tiny model. The Vulkan and HIP configurations are covered by the argv and parser tests only.
+
+Ollama is covered by a hand-written fixture based on the Ollama API docs, and by
+`run_ollama` against an in-process fake server. The fixture provenance is in
+`tests/unit/profiling/fixtures/README.md`.
+
+To reproduce the integration-test binaries, use commit bd4f514 in `/root/llama.cpp`:
+
+```
+cmake -S /root/llama.cpp -B /root/llama-build-wsj -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DGGML_VULKAN=OFF -DGGML_HIP=OFF -DLLAMA_BUILD_SERVER=ON
+cmake --build /root/llama-build-wsj --target llama-bench llama-server
+```
+
+If this build is missing, the tests skip and name the missing path. Set `HALO_LLAMA_BIN_DIR`
+(an environment variable, or the CMake cache variable of the same name) to point them at
+another bin directory.
+
+### Known gaps per adapter
+
+- **llama-server:**
+  - `ttft_ms` is always null, because the endpoint is non-streaming.
+  - There is no context-depth knob. The prompt is caller text, so measuring at a 32K or 128K
+    depth needs a caller-built long prompt. This is not implemented.
+- **Ollama:** the HTTP API does not expose some of what TRD §51 asks for:
+  - no commit
+  - no real backend (the record says `ollama`)
+  - no driver (left empty)
+  - no server command line (`invocation.argv` describes the request instead)
+  - no server environment
+
+  `model_hash` holds Ollama's manifest digest, not a GGUF SHA-256. The adapter has never run
+  against a real Ollama server.
+- **pack_hash:** set only when `model_hash` is a real SHA-256 and the pack is a single file.
+  A separate MTP GGUF has to be hashed by the caller and passed to `make_pack_id`.
