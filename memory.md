@@ -33,12 +33,9 @@ Resume the MVP build from this file. It is updated at every milestone commit; th
 - **Interruptions:** the org's monthly spend limit has cut off every agent several times.
   - To resume, SendMessage each agent: "you were cut off; check for half-applied edits, leftover mutations and stale shells; continue".
   - If agent IDs are gone (new session), relaunch with the workstream's prompt file plus a "state at interruption" block built from `git status` and that agent's `status_<WS>.md`.
-- **Session scratchpad (session d2c57405):**
-  `C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\`
-  - `agents.md`: map from workstream to agent id.
-  - `status_<WS>.md`: each agent's own progress file.
-  - `prompt_*.txt` / `resume2_*.txt`: workstream prompts.
-  - `wip2-snapshot.tgz`: an older snapshot of work in progress.
+- **Tracked handoff copies: use these first.** `docs/dev/handoff/` holds `prompts/` (every workstream brief), `status/` (each agent's last status file) and `agents.md`. They survive a new session; the originals in the session scratchpad may be cleared.
+  - Session scratchpad (session d2c57405, may be gone): `C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\`. Agents write live `status_<WS>.md` there.
+  - Agent ids in `agents.md` are valid only in session d2c57405.
 
 ## 3. MVP status (TRD §66). Evidence is on the dev host unless stated.
 | MVP item | Status | Notes |
@@ -60,6 +57,25 @@ Resume the MVP build from this file. It is updated at every milestone commit; th
 The `halo` CLI provides `inspect`, `devices`, `tokenize`, `template`, `run`, `serve`, `bench` and `tune`. `run`, `serve` and `bench` work end to end on the real CPU engine (tiny model).
 
 Last full-tree build (`8065734`): 545 tests, 543 pass, 2 skipped. The skips are the opt-in bandwidth test and a labelled F-1 skip.
+
+## 3a. MVP exit criteria
+The MVP is **code-complete on the dev host** when all of these hold:
+- BI-1..BI-6 are merged.
+- One `Qwen35::forward` runs over the CPU, HIP-emulation and Vulkan (lavapipe) backends, each differential against the CPU on the tiny goldens.
+- `halo run --backend vulkan` on lavapipe reproduces the golden tokens, and `--backend hip` fails cleanly with a "no device" error.
+- The Vulkan op set is full, including chunked GDN.
+- `halo tune` enumerates the GPU variants, with emulation and lavapipe results labelled non-conformant.
+- The real 27B CPU smoke run passes, and its greedy tokens agree with llama.cpp CPU where HALO's top-1 margin is clearly large.
+- The separate-MTP-file path (D-006) is exercised at engine level.
+- The phase reviews are clean.
+
+Hardware verification is **pending**, gated on the EVO-X2 (BI-7):
+- device execution;
+- RADV;
+- the ROCm 7.1 → HIP 7.15 compatibility check;
+- every efficiency NFR.
+
+Report the status as "code-complete on dev host, hardware verification pending", never as "MVP done".
 
 ## 4. What remains for the MVP, in order
 1. **In flight (§5):** the WS-G M5 engine fixes, the WS-I M5 API fixes, and WS-BI-1.
@@ -86,6 +102,9 @@ Agent ids are in `scratchpad/agents.md`.
 | WS-G M5 | Code-review engine fixes R-1 (per-sequence failure, D-017), R-2 (the worker can never terminate the process), R-3 (engine cancel path before the first token), R-5(a) failure-injection tests, N-1, N-2, N-4 | src/runtime, src/speculative, src/state, src/kv_cache and their tests, tests/unit/integration |
 | WS-I M5 | F-1 (structured output with thinking on); `halo tune` key contract via `runtime::engine_profile_key`; one SHA-256 (TD-12/13); bench F-2/F-3; security S-13 (header deadlines), S-16/A-5, S-17..S-22; then wire the API to G's cancel path | src/api, tools/halo, tests/unit/{api,cli}, docs/{api,cli}.md |
 | WS-BI-1 | Backend interface + CPU adapter; the qwen35 forward over `Backend&`, bit-identical to today | src/models, include/halo/models, tests/unit/models, the new backend module |
+| WS-F2 (V1–V4) | Vulkan op fill per ADR-001 BI-5 / docs/vulkan.md: conv, norms, RoPE with head stride, SwiGLU, gates, add/norm, get_rows, KV write, paged attention, chunked GDN, GEMM, more matvec types, LM head + top-k | backends/vulkan, include/halo/backends/vulkan, tests/unit/vulkan, docs/vulkan.md |
+| WS-S27 | Real 27B CPU smoke run: download UD-Q4_K_XL into WSL /root/models, integrity-check it, `halo inspect`/`run`, compare with llama.cpp CPU. Writes findings only | docs/dev/smoke-27b.md only |
+| WS-X | EVO-X2 field kit: portable build (HALO_MARCH), `scripts/package.sh` → dist/halo-evox2-<sha>.tar.gz, `scripts/evox2/collect.sh` (full log/evidence bundle for this agent), `build-native.sh`, docs/evox2.md | scripts/evox2, scripts/package.sh, root CMakeLists (options/install), core log (additive), docs/evox2.md, .gitignore |
 
 Finished workstreams: WS-A..F (phase 1), F2 (Vulkan review fixes), H (sampling), J (bench + autotune + security fixes), K (HIP ops), L (parser hardening).
 
@@ -104,7 +123,7 @@ Finished workstreams: WS-A..F (phase 1), F2 (Vulkan review fixes), H (sampling),
 
 ## 7. Resume checklist
 1. `git log --oneline -15` and `git status --porcelain`. Uncommitted paths belong to the workstreams in §5.
-2. Read each in-flight workstream's `status_<WS>.md` in the scratchpad.
+2. Read each in-flight workstream's status file: the live one in the session scratchpad if it still exists, else `docs/dev/handoff/status/`.
 3. Snapshot the uncommitted work before relaunching anything:
    `git ls-files --others --exclude-standard` plus `git diff`, packed into a tgz.
 4. Continue the agents (SendMessage), or relaunch them from their prompt files with a "state at interruption" block.

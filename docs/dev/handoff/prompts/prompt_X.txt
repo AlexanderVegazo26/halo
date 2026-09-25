@@ -1,0 +1,102 @@
+You are implementing workstream WS-X of HALO: the EVO-X2 field kit. HALO is a C++23 inference runtime for Qwen3.8-27B on AMD Strix Halo (repo C:\Users\avega\Documents\personal\halo, branch halo-v0.2, a shared working tree where other agents are editing).
+
+The owner develops on this dev host, which has NO AMD GPU (D-001), and will run HALO on the GMKtec EVO-X2 (Ubuntu 26.04.1, kernel 7.0, HIP 7.15.26333 / ROCm runtime 1.21, gfx1151, 128 GiB with a ~96 GiB GPU pool; see docs/strix-halo-qwen38-engine-report.md).
+
+The owner wants three things:
+- (1) a way to capture ALL the logs and evidence needed to judge whether execution on the EVO-X2 is what we expect. The resulting bundle will be brought back here and fed to this coding agent to improve HALO.
+- (2) a built executable package to copy to and run on the EVO-X2.
+- (3) the EVO-X2 run steps, which the orchestrator will put in the README from your docs.
+
+FIRST, read:
+- docs/dev/AGENT_BRIEF.md (WSL build via script files, NO commits, Definition of Done);
+- memory.md;
+- docs/DECISIONS.md (D-001, D-014, D-017);
+- docs/cli.md, docs/benchmarks.md, docs/hip.md, docs/vulkan.md;
+- the engine report above;
+- scripts/build.sh, CMakeLists.txt, cmake/*.cmake, tools/halo/CMakeLists.txt, tests/CMakeLists.txt.
+
+## Scope (you own ONLY)
+- scripts/evox2/** and scripts/package.sh (new);
+- the ROOT CMakeLists.txt, for build options and install rules only;
+- cmake/HaloInstall.cmake (new, optional);
+- docs/evox2.md (new);
+- .gitignore (add dist/).
+- Additive changes to include/halo/core/log.h and src/core/log.cpp, if needed for log capture (see below).
+
+Do NOT edit:
+- tools/halo, src/api, src/runtime, src/models, backends/**, tests/unit/**.
+- If a CLI flag is needed (e.g. --log-file or --log-level), write the exact request (file:line, the proposed flag) in your report. Prefer environment variables read by log.cpp, so that no CLI change is needed.
+
+## 1. Portable build + package
+- **CPU target.** The root CMakeLists uses -march=native (HALO_NATIVE), and a dev-host binary may crash on Zen 5. Add a HALO_MARCH cache option (e.g. x86-64-v3 for packages; "native" remains possible) without changing default dev behaviour, then build the package with a portable target.
+  - Check which -march the dev host supports: Zen 5 has AVX-512, so x86-64-v4 may be fine for the target, but the dev host must be able to run the package's tests. Choose, and justify.
+- **Package script.** scripts/package.sh builds Release with HALO_BUILD_HIP=ON (CMAKE_HIP_ARCHITECTURES gfx1151), Vulkan ON and the server ON, then creates dist/halo-evox2-<gitsha>.tar.gz containing:
+  - bin/halo;
+  - every gtest binary, plus a manifest listing them with their working directories and required fixtures;
+  - the test fixtures they need, and any data files the binaries load at runtime (bench/workloads; SPIR-V shaders if they are not embedded; check);
+  - the scripts/evox2/* tooling;
+  - a BUILDINFO file: git sha, dirty flag, compiler, ROCm version used to build (7.1 here vs 7.15 on the target; say it plainly), cmake options, and the build date.
+- **Shared libraries.** Document them (ldd): libamdhip64 from /opt/rocm on the target, libvulkan, sqlite3, glibc. Set an RPATH or ship a run wrapper so the binaries find /opt/rocm/lib on the target. Do NOT bundle system or ROCm libraries.
+- **Native build.** Provide scripts/evox2/build-native.sh, which builds from source ON the EVO-X2 against its own ROCm 7.15, with -march=native and gfx1151. This is the fallback if the prebuilt binary's ROCm 7.1 build doesn't load. Also list the apt packages needed.
+- **Verify the package on the dev host.** Unpack it into a clean dir in WSL, run bin/halo version and devices, and run the tests through the kit. The HIP device tests must SKIP with the D-001 reason, and everything else must pass.
+
+## 2. Log / evidence capture: scripts/evox2/collect.sh
+One command that produces halo-diag-<hostname>-<utc>.tar.gz, containing everything needed to judge a run, organized by directory, with a top-level manifest.json and SUMMARY.md (pass/fail/skip per step, exit codes, durations). Each step:
+- runs with a timeout;
+- never aborts the whole collection;
+- records its exact command line, exit code, stdout, stderr and duration.
+
+Steps:
+- **System facts:** uname -a, /etc/os-release, lscpu, free, numactl -H, lsmem.
+- **GPU and driver facts:**
+  - dmesg amdgpu/kfd lines (with sudo if available, else note it);
+  - rocminfo, rocm-smi --showall (and amd-smi if present), /opt/rocm/.info/version, hipconfig --full;
+  - vulkaninfo --summary, and the full vulkaninfo to a file;
+  - clinfo if present;
+  - the kernel cmdline;
+  - the amdgpu sysfs (pp_dpm_*, power_dpm_force_performance_level, gpu_busy_percent, mem_info_*, the gtt/vram sizes, hwmon temps/power);
+  - the platform power profile if readable.
+  - Capture thermal and power state before and after the whole run, and once per step if cheap.
+- **HALO facts:** halo version; halo devices --verify --json; ldd of every binary.
+- **All tests**, with gtest XML (--gtest_output=xml:...) per binary, and HIP/Vulkan device tests enabled. On the EVO-X2 they should RUN; that is the point. Include the opt-in full bandwidth benchmark (HALO_BANDWIDTH_FULL=1).
+  - Also run the Vulkan tests once with RADV (select the RADV ICD explicitly via VK_DRIVER_FILES / VK_ICD_FILENAMES) and once with AMDVLK if installed.
+  - Record the HIP/HSA env (HSA_OVERRIDE_GFX_VERSION must NOT be set; record it if it is).
+- **With a model path given (--model <gguf> [--mtp <gguf>]):**
+  - halo inspect --json;
+  - a short greedy halo run at trace log level (at the current MVP stage this runs on the CPU engine; record which backend actually ran);
+  - halo bench micro and model with --host-label and --power-mode from the args;
+  - halo tune --list;
+  - llama.cpp baselines if a llama.cpp build path is given.
+  - Generation logs at the most verbose level HALO supports.
+- **Structured and redacted.**
+  - Every HALO log is at trace level, captured as JSON lines if log.h supports that. If it doesn't, add the minimal, additive support: env vars such as HALO_LOG_LEVEL, HALO_LOG_FORMAT=json and HALO_LOG_FILE, read at first use and documented in log.h.
+  - Redact secrets (API keys, tokens) and anything matching *KEY*/*TOKEN*/*SECRET*/*PASSWORD* in env dumps.
+  - Record hostnames and usernames only as given, with an --anonymize option.
+- **Resource usage:** peak RSS and time per step (/usr/bin/time -v), plus the GPU memory used before and after (rocm-smi).
+- **Triage-friendly output.** The bundle's SUMMARY.md must be written so an agent can triage it: first the failures and their log paths, then the expected-vs-actual checklist.
+- **Test collect.sh on the dev host.** It must complete, with the GPU steps reporting "not available" cleanly, and it must produce a valid bundle. Show a SUMMARY.md excerpt in your report.
+
+## 3. docs/evox2.md
+Cover:
+- prerequisites and apt packages;
+- the ROCm version notes;
+- copying the package;
+- running the kit;
+- where models go (an ext4 path; the UD-Q4_K_XL file and the optional MTP file);
+- the exact commands in order:
+  1. verify the environment;
+  2. run the tests;
+  3. collect the bundle;
+  4. run a model;
+  5. serve on loopback only (D-017);
+  6. bring the bundle back, and what to tell the coding agent;
+- what "expected" looks like at the current MVP stage. Be honest: the model forward does NOT yet run on the GPU (ADR-001 BI-1..BI-6 are in progress). On the EVO-X2 today the useful evidence is the HIP/Vulkan device tests, the bandwidth and tier measurements, the llama.cpp baselines, and the CPU-engine run;
+- troubleshooting (ROCm/HIP load failures, then the native-build fallback).
+
+## Run shape
+- M1 = package + build options; M2 = collect.sh; M3 = docs + the final package build.
+- STOP at each boundary and report in your handback message: files, commands, test evidence, and the proposed commit message.
+- Keep the live status file status_X.md in C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\ current.
+- Prefix scratchpad tooling with x_.
+- NEVER launch programs on the Windows host; everything runs in WSL.
+- Keep dist/ artifacts out of git.
