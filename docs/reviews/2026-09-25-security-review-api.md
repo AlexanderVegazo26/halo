@@ -288,3 +288,55 @@ Nothing has been accepted. S-13 blocks non-loopback deployment unless the owner 
 - a decision that non-loopback deployments must sit behind a proxy with connection and header timeouts.
 
 S-14 inherits the S-3 rationale question from the previous review: "models are operator-selected", weakened by Hugging Face being an untrusted source. That decision belongs to the owner too.
+
+## Re-test at adb3c46 (2026-09-25)
+
+The original findings above are unchanged. This section records re-tests of S-14 and S-16 against `adb3c46`, which contains `09b7c22` (the pinned minja limits patch) and `8235c3b` (the tokenizer S-6/S-7 fixes).
+
+- **Build:** `git archive adb3c46` into a fresh build directory, `/root/halo-build-secapi2`. The minja patch was applied at FetchContent: the `MINJA_HALO_LIMITS` marker is present in `_deps/minja-src`. The old `/root/halo-build-secapi` tree has no marker.
+- **Baseline at this commit (measured):** `test_template` 40/40, `test_api` 64/64, `test_profiling` 85/85, `test_autotune` 49/49, all passed.
+- **Setup:** the same method as before. The tiny GGUF was re-templated with `gguf_new_metadata --chat-template`, then served with `halo serve --parallel 2 --max-queue 2 --request-timeout 5` and an API key.
+- **Timings:** these are from a quiet host (load about 5). A first run at load average about 90 (other agents building) showed the same verdicts, with roughly 3× the times.
+
+### S-14: mitigated at adb3c46 (Verified); the residual is Low and folded into S-16
+
+| Template | At 6a54d3f | At adb3c46: one chat request | Server after | SIGTERM |
+|---|---|---|---|---|
+| `{% macro f(n) %}{{ f(n + 1) }}{% endmacro %}{{ f(0) }}` | **process died, SIGSEGV (rc 139)** | 400 "template render depth limit (1024) exceeded", 0.06 s | alive; `/health` 200 | exits 0 in 0.11 s |
+| nested `range(99999)` loops | no reply in 25 s; shutdown hung more than 8 min | 400 "loop iteration limit (1000000) exceeded", 1.1–1.8 s | alive | exits 0 in 0.28 s |
+| `'x' * 1000000` printed 99,999 times | (OOM class, previous review) | 400 "output size limit (67108864) exceeded", 0.36–0.40 s | alive | exits 0 in 0.42 s |
+| `{{ 'x' * 100000000 }}` | 100 MB output | 400 "value size limit (33554432) exceeded", 0.07–0.09 s | alive | exits 0 in 0.34 s |
+| exponential macro `f(40)` | not run | 400 "step limit (4000000) exceeded", 1.9–3.5 s | alive | exits 0 in 0.25 s |
+| 5000 parentheses | parse crash (previous review) | `halo serve` refuses to start: `CONFIG_ERROR: … Template nesting too deep (limit 256)` | — | — |
+| 100 KB comment | parse crash (previous review) | `halo serve` refuses to start: `CONFIG_ERROR: chat template is 100011 bytes (limit 65536)` | — | — |
+
+For each template, four concurrent hostile requests finished in 0.08–2.6 s, and `/health` answered 200 afterwards.
+
+**Verdict:**
+- **The S-14 failure modes are gone.** The process no longer dies, render no longer hangs, and shutdown is no longer blocked. The `server.h` claim "one failing request never takes the process down" now holds for the template paths tested.
+- **What remains is bounded, not closed.** Each hostile-template request still costs up to the step budget, about 1–3.5 s of CPU here and about 4 s by `docs/security-hardening.md`. That cost is paid on an HTTP worker **before admission**. This is the S-16 mechanism, and it is still open (below).
+- **S-14 is re-graded from Medium to Low** (malicious-model precondition, bounded cost).
+- **Requirement status:**
+  - A-5 stays **Partial**: there is a render budget, but no separate bounded pool, and render still happens before admission.
+  - A-8 stays **Not met**: there is still no template SHA-256 allowlist or warning.
+  - A-12's S-3 regression tests now exist (`test_template_limits.cpp` via `test_template`, 40/40). I did not mutation-test them.
+
+### S-16: unchanged at adb3c46 (Verified); stays Medium
+
+Both builds were measured back to back in one session with the same requests. The table shows three repetitions each.
+
+| Request | 6a54d3f | adb3c46 |
+|---|---|---|
+| chat with a 7 MiB tool description (400 `context_length_exceeded`, 1,359,538 tokens) | 1.01–1.04 s | 1.08–1.16 s |
+| chat with about 4 MiB of user content (400, 776,758 tokens) | 0.61–0.66 s | 0.61–0.67 s |
+| `/tokenize` on 4 MiB | 0.14–0.17 s | 0.15–0.16 s |
+| `/apply-template` on 4 MiB with `tokenize:true` | 0.74–0.81 s | 0.74–0.82 s |
+
+- **Unchanged within noise.** The tokenizer trie (`8235c3b`) targets hostile vocabularies (S-6); it does not change the cost of benign text, and it was not expected to.
+- **Still open:** rendering and tokenizing still run before `admit()`, and `/tokenize` and `/apply-template` are still not admitted.
+- **The mitigation stands as written:** admit, or take a cheap pre-admission token, before rendering.
+
+### Updated counts after the re-test
+
+- **Counts:** High 1 (S-13), Medium 2 (S-15, S-16), Low 8 (S-14 re-graded, plus S-17 to S-22 and S-24), Informational 5.
+- **Gate:** S-13 still blocks non-loopback deployment. With a loopback-only posture, nothing blocks.
