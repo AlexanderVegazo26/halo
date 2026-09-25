@@ -3,7 +3,7 @@
 Resume the MVP build from this file. It is updated at every milestone commit; the
 **Last updated** line and **In flight** section say how fresh it is.
 
-**Last updated:** 2026-09-25, at commit `9babebe` (branch `halo-v0.2`).
+**Last updated:** 2026-09-25, at commit `7d447d6` (branch `halo-v0.2`).
 
 ## 1. What HALO is and what "done" means
 - **What it is:** a C++23 inference runtime for Qwen3.8-27B on AMD Strix Halo (GMKtec EVO-X2, Radeon 8060S, gfx1151).
@@ -99,7 +99,7 @@ Agent ids are in `scratchpad/agents.md`.
 
 | Workstream | Doing | Owns |
 |---|---|---|
-| WS-G M5 | Code-review engine fixes R-1 (per-sequence failure, D-017), R-2 (the worker can never terminate the process), R-3 (engine cancel path before the first token), R-5(a) failure-injection tests, N-1, N-2, N-4 | src/runtime, src/speculative, src/state, src/kv_cache and their tests, tests/unit/integration |
+| WS-G M6 | (M5 engine review fixes committed as 1f4d826.) D-006 separate-MTP-file path at engine level (split tiny fixture + tests); R-5(b) draft-chain golden (depth 2/3) or a documented llama.cpp cross-check | src/runtime, src/speculative, src/state, src/kv_cache and their tests, tests/unit/integration |
 | WS-I M5 | F-1 (structured output with thinking on); `halo tune` key contract via `runtime::engine_profile_key`; one SHA-256 (TD-12/13); bench F-2/F-3; security S-13 (header deadlines), S-16/A-5, S-17..S-22; then wire the API to G's cancel path | src/api, tools/halo, tests/unit/{api,cli}, docs/{api,cli}.md |
 | WS-BI-1 | Backend interface + CPU adapter; the qwen35 forward over `Backend&`, bit-identical to today | src/models, include/halo/models, tests/unit/models, the new backend module |
 | WS-F2 (V1–V4) | Vulkan op fill per ADR-001 BI-5 / docs/vulkan.md: conv, norms, RoPE with head stride, SwiGLU, gates, add/norm, get_rows, KV write, paged attention, chunked GDN, GEMM, more matvec types, LM head + top-k | backends/vulkan, include/halo/backends/vulkan, tests/unit/vulkan, docs/vulkan.md |
