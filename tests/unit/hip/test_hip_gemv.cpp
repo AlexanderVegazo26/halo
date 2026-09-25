@@ -1,4 +1,4 @@
-// QUANT_GEMV of the HIP backend (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q3_K, IQ3_S),
+// QUANT_GEMV of the HIP backend (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q3_K, IQ3_S, Q4_0),
 // differentially tested
 // against halo::tensor::dequantize_row + halo::cpu::matmul on the same input bytes
 // (TRD §30, review M-2).
@@ -92,6 +92,9 @@ std::vector<std::byte> make_weights(const GemvCase& c, std::uint64_t row_bytes, 
                 break;
             case DType::IQ3_S:  // f16 d at the start of each 110-byte block
                 for (std::uint32_t b = 0; b < c.cols / 256; ++b) put16(row + 110 * b, b == 0 ? 2e-6f : scale(rng));
+                break;
+            case DType::Q4_0:  // f16 d at the start of each 18-byte block of 32
+                for (std::uint32_t b = 0; b < c.cols / 32; ++b) put16(row + 18 * b, b == 0 ? 2e-6f : scale(rng));
                 break;
             default:
                 break;
@@ -207,7 +210,7 @@ std::vector<GemvCase> gemv_cases() {
     std::uint32_t seed = 100;
     // D-014 order, then the second tier the UD-Q4_K_XL pack needs (IQ4_XS, IQ4_NL, Q3_K, IQ3_S).
     for (DType t : {DType::Q4_K, DType::Q5_K, DType::Q6_K, DType::Q8_0, DType::F16, DType::F32, DType::IQ4_XS,
-                    DType::IQ4_NL, DType::Q3_K, DType::IQ3_S}) {
+                    DType::IQ4_NL, DType::Q3_K, DType::IQ3_S, DType::Q4_0}) {  // Q4_0: ggml-org MTP pack (D-006)
         const bool plain = t == DType::F32 || t == DType::F16;
         GemvCase a{.type = t, .rows = 37, .cols = plain ? 100u : 512u, .seed = ++seed};  // plain: dot tail (100 % 8)
         v.push_back(a);
@@ -264,7 +267,7 @@ TEST(HipGemvEmu, RejectsUnsupportedTypesAndBadShapes) {
             EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << e.what();
         }
     };
-    a.wtype = DType::Q4_0;
+    a.wtype = DType::Q4_1;  // in D-007, not a HIP GEMV type
     expect(ErrorCode::Unsupported, "no HIP GEMV kernel");
     a.wtype = DType::Q8_0;
     a.cols = 100;

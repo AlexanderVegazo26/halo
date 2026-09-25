@@ -16,7 +16,7 @@
 namespace halo::hip {
 
 static_assert(kStatusPositiveG == kern::kStatusPositiveG && kStatusNaN == kern::kStatusNaN &&
-              kStatusBadBlock == kern::kStatusBadBlock);
+              kStatusBadBlock == kern::kStatusBadBlock && kStatusBadIndex == kern::kStatusBadIndex);
 
 namespace {
 
@@ -271,6 +271,10 @@ Ops::Ops(OpsOptions options) : options_(std::move(options)) {
     swiglu_block_ = block_of("SWIGLU", "", options_.swiglu);
     mulsig_block_ = block_of("MUL_SIGMOID", "", options_.mul_sigmoid);
     attn_block_ = block_of("ATTENTION", "", options_.attention);
+    kvw_block_ = block_of("KV_WRITE", "", options_.kv_write);
+    rows_block_ = block_of("GET_ROWS", "", options_.get_rows);
+    add_block_ = block_of("ADD", "", options_.add);
+    addnorm_block_ = block_of("ADD_RMS_NORM", "", options_.add_rms_norm);
     attn_exact_ = find_variant("ATTENTION", options_.attention).kernels.find("exact") != std::string_view::npos;
     HALO_CHECK(attn_block_ >= 32 && attn_block_ <= kern::kAttnMaxBlock, ErrorCode::Config,
                "HIP: attention variant block {} not in [32, {}]", attn_block_, kern::kAttnMaxBlock);
@@ -450,6 +454,7 @@ void Ops::check_status(const Target& target, const BufferView& status) {
     if ((word & kStatusPositiveG) != 0) what += " g>0-or-NaN (chunked GATED_DELTANET requires g <= 0; nothing written)";
     if ((word & kStatusNaN) != 0) what += " NaN logit";
     if ((word & kStatusBadBlock) != 0) what += " attention block table id outside the KV pool (out is undefined)";
+    if ((word & kStatusBadIndex) != 0) what += " get_rows id outside the table (that output row is not written)";
     throw_error(ErrorCode::Kernel, "HIP kernel status 0x{:x}:{}", word, what);
 }
 
@@ -471,9 +476,10 @@ kern::WType gemv_wtype(DType t, const char* op) {
         case DType::IQ4_XS: return kern::WType::IQ4_XS;
         case DType::Q3_K: return kern::WType::Q3_K;
         case DType::IQ3_S: return kern::WType::IQ3_S;
+        case DType::Q4_0: return kern::WType::Q4_0;
         default: break;
     }
-    throw_error(ErrorCode::Unsupported, "{}: weight type id {} has no HIP GEMV kernel (F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS)",
+    throw_error(ErrorCode::Unsupported, "{}: weight type id {} has no HIP GEMV kernel (F32, F16, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS)",
                 op, static_cast<std::uint32_t>(t));
 }
 
@@ -862,6 +868,116 @@ void Ops::attention(const Target& target, const AttentionArgs& a) const {
     } else {
         dispatch(target, &detail::launch_attn_online, &detail::emulate_attn_online, p, l, kOp);
     }
+}
+
+}  // namespace halo::hip
+
+// ---- KV write / GET_ROWS / ADD / ADD + RMS_NORM ---------------------------------------------
+
+namespace halo::hip {
+
+void Ops::kv_write(const Target& target, const KvWriteArgs& a) const {
+    constexpr const char* kOp = "hip::kv_write";
+    HALO_CHECK(a.block_tokens >= 1 && a.n_layers >= 1 && a.layer < a.n_layers && a.n_pool_blocks >= 1 && a.kv_dim >= 1,
+               ErrorCode::Kernel, "{}: bad pool layout (block_tokens {}, layer {} of {}, {} blocks, kv_dim {})", kOp,
+               a.block_tokens, a.layer, a.n_layers, a.n_pool_blocks, a.kv_dim);
+    if (a.n_tokens == 0) return;
+    const std::uint64_t end = static_cast<std::uint64_t>(a.start) + a.n_tokens;
+    HALO_CHECK(end <= std::numeric_limits<std::uint32_t>::max(), ErrorCode::Kernel, "{}: position overflow", kOp);
+    const std::uint64_t n_table = (end + a.block_tokens - 1) / a.block_tokens;
+    const std::uint64_t block_floats = mul_checked(mul_checked(2ull * a.n_layers, a.block_tokens, kOp), a.kv_dim, kOp);
+    const Rows pool = resolve(target, a.kv_pool, 1, mul_checked(block_floats, a.n_pool_blocks, kOp), kOp, "kv_pool");
+    const Rows table = resolve(target, a.block_table, 1, n_table, kOp, "block_table");
+    const Rows k = resolve(target, a.k, a.n_tokens, a.kv_dim, kOp, "k");
+    const Rows v = resolve(target, a.v, a.n_tokens, a.kv_dim, kOp, "v");
+    const Rows status = resolve_status(target, a.status, kOp);
+    check_disjoint(pool, "kv_pool", {{&table, "block_table"}, {&k, "k"}, {&v, "v"}, {&status, "status"}}, kOp);
+    check_disjoint(status, "status", {{&table, "block_table"}, {&k, "k"}, {&v, "v"}}, kOp);
+    kern::KvWriteParams p;
+    p.pool = pool.ptr;
+    p.block_floats = block_floats;
+    p.k_off = static_cast<std::uint64_t>(a.layer) * 2 * a.block_tokens * a.kv_dim;
+    p.v_off = p.k_off + static_cast<std::uint64_t>(a.block_tokens) * a.kv_dim;
+    p.block_tokens = a.block_tokens;
+    p.kv_dim = a.kv_dim;
+    p.n_pool_blocks = a.n_pool_blocks;
+    p.table = reinterpret_cast<const std::uint32_t*>(table.ptr);
+    p.start = a.start;
+    p.k = k.ptr;
+    p.k_stride = k.stride;
+    p.v = v.ptr;
+    p.v_stride = v.stride;
+    p.status = reinterpret_cast<std::uint32_t*>(status.ptr);
+    zero_status(target, status);
+    dispatch(target, &detail::launch_kv_write, &detail::emulate_kv_write, p,
+             kern::kv_write_launch(a.n_tokens, a.kv_dim, kvw_block_), kOp);
+}
+
+void Ops::get_rows(const Target& target, const GetRowsArgs& a) const {
+    constexpr const char* kOp = "hip::get_rows";
+    const kern::WType wt = gemv_wtype(a.wtype, kOp);
+    HALO_CHECK(a.n_rows >= 1 && a.cols >= 1, ErrorCode::Kernel, "{}: n_rows and cols must be >= 1", kOp);
+    HALO_CHECK(a.n_rows <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()), ErrorCode::Kernel,
+               "{}: n_rows {} exceeds int32 ids", kOp, a.n_rows);
+    if (a.n_ids == 0) return;
+    const unsigned be = kern::wq_block_elems(wt);
+    HALO_CHECK(a.cols % be == 0, ErrorCode::Kernel, "{}: cols {} is not a multiple of the block size {}", kOp, a.cols,
+               be);
+    const std::uint64_t row_bytes = mul_checked(a.cols / be, kern::wq_block_bytes(wt), kOp);
+    const ByteRows w = resolve_bytes(target, a.w, a.n_rows, row_bytes, wt == kern::WType::F32 ? 4 : 1, kOp, "w");
+    const Rows ids = resolve(target, a.ids, 1, a.n_ids, kOp, "ids");
+    const Rows out = resolve(target, a.out, a.n_ids, a.cols, kOp, "out");
+    const Rows status = resolve_status(target, a.status, kOp);
+    const Rows wr{nullptr, 0, w.range};
+    check_disjoint(out, "out", {{&wr, "w"}, {&ids, "ids"}, {&status, "status"}}, kOp);
+    check_disjoint(status, "status", {{&wr, "w"}, {&ids, "ids"}}, kOp);
+    kern::GetRowsParams p;
+    p.type = wt;
+    p.w = w.ptr;
+    p.w_stride = w.stride;
+    p.n_rows = a.n_rows;
+    p.cols = a.cols;
+    p.ids = reinterpret_cast<const std::int32_t*>(ids.ptr);
+    p.out = out.ptr;
+    p.out_stride = out.stride;
+    p.status = reinterpret_cast<std::uint32_t*>(status.ptr);
+    zero_status(target, status);
+    dispatch(target, &detail::launch_get_rows, &detail::emulate_get_rows, p,
+             kern::get_rows_launch(a.n_ids, a.cols, rows_block_), kOp);
+}
+
+void Ops::add(const Target& target, const EltwiseArgs& a) const {
+    eltwise(target, a, kern::EwOp::Add, add_block_, "hip::add");
+}
+
+void Ops::add_rms_norm(const Target& target, const AddRmsNormArgs& a) const {
+    constexpr const char* kOp = "hip::add_rms_norm";
+    HALO_CHECK(a.cols >= 1, ErrorCode::Kernel, "{}: cols must be >= 1", kOp);
+    if (a.rows == 0) return;
+    const Rows ra = resolve(target, a.a, a.rows, a.cols, kOp, "a");
+    const Rows rb = resolve(target, a.b, a.rows, a.cols, kOp, "b");
+    const Rows h = resolve(target, a.h, a.rows, a.cols, kOp, "h");
+    const Rows w = resolve(target, a.w, 1, a.cols, kOp, "w");
+    const Rows y = resolve(target, a.y, a.rows, a.cols, kOp, "y");
+    check_alias_exact_or_disjoint(ra, h, kOp, "a");
+    check_alias_exact_or_disjoint(rb, h, kOp, "b");
+    check_disjoint(h, "h", {{&w, "w"}}, kOp);
+    check_disjoint(y, "y", {{&ra, "a"}, {&rb, "b"}, {&h, "h"}, {&w, "w"}}, kOp);
+    kern::AddNormParams p;
+    p.a = ra.ptr;
+    p.a_stride = ra.stride;
+    p.b = rb.ptr;
+    p.b_stride = rb.stride;
+    p.h = h.ptr;
+    p.h_stride = h.stride;
+    p.w = w.ptr;
+    p.y = y.ptr;
+    p.y_stride = y.stride;
+    p.rows = a.rows;
+    p.cols = a.cols;
+    p.eps = a.eps;
+    dispatch(target, &detail::launch_add_norm, &detail::emulate_add_norm, p,
+             kern::add_norm_launch(a.rows, addnorm_block_), kOp);
 }
 
 }  // namespace halo::hip

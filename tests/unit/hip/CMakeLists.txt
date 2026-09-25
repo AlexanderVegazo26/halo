@@ -14,6 +14,10 @@ target_include_directories(test_hip_head PRIVATE ${PROJECT_SOURCE_DIR}/backends/
 if(TARGET halo_kv_cache)
   halo_add_test(test_hip_attention SOURCES test_hip_attention.cpp LIBS halo_backend_hip halo_backend_cpu halo_kv_cache)
 else()
-  message(WARNING "HIP: halo_kv_cache is not selected (add kv_cache to HALO_ONLY); test_hip_attention "
-                  "(paged GQA attention vs cpu::attention_gqa) is NOT built")
+  message(WARNING "HIP: halo_kv_cache is not selected (add kv_cache to HALO_ONLY); test_hip_attention and "
+                  "test_hip_kv (paged attention and KV write vs halo::cpu / kv_cache) are NOT built")
+endif()
+halo_add_test(test_hip_decode SOURCES test_hip_decode.cpp LIBS halo_backend_hip halo_backend_cpu halo_tensor)
+if(TARGET halo_kv_cache)
+  halo_add_test(test_hip_kv SOURCES test_hip_kv.cpp LIBS halo_backend_hip halo_kv_cache)
 endif()

@@ -134,6 +134,7 @@ struct Launch {
 inline constexpr std::uint32_t kStatusPositiveG = 1u;  // chunked GDN: some g > 0
 inline constexpr std::uint32_t kStatusNaN = 2u;        // NaN seen by argmax/top-k
 inline constexpr std::uint32_t kStatusBadBlock = 4u;   // attention: block-table id outside the KV pool
+inline constexpr std::uint32_t kStatusBadIndex = 8u;   // get_rows: token id outside the table
 
 }  // namespace halo::hip::kern
 

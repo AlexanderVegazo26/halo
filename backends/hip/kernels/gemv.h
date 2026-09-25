@@ -34,6 +34,7 @@ enum class WType : unsigned {
     IQ4_XS = 7,
     Q3_K = 8,
     IQ3_S = 9,
+    Q4_0 = 10,   // ggml-org MTP pack blk.64 (D-006)
 };
 
 /// Elements and bytes per block of each weight type (ggml geometry).
@@ -42,7 +43,8 @@ HALO_HD inline unsigned wq_block_elems(WType t) {
         case WType::F32:
         case WType::F16: return 1;
         case WType::Q8_0:
-        case WType::IQ4_NL: return 32;
+        case WType::IQ4_NL:
+        case WType::Q4_0: return 32;
         default: return 256;
     }
 }
@@ -58,6 +60,7 @@ HALO_HD inline unsigned wq_block_bytes(WType t) {
         case WType::IQ4_XS: return 136;
         case WType::Q3_K: return 110;
         case WType::IQ3_S: return 110;
+        case WType::Q4_0: return 18;
     }
     return 0;
 }
@@ -248,6 +251,14 @@ HALO_HD inline float wq_elem(WType t, const std::uint8_t* row, unsigned i) {
             const float grid = fli(static_cast<int>((tensor::detail::iq3s_grid[g] >> (8u * j)) & 0xFFu));
             const float sign = (signs[l] & tensor::detail::kmask_iq2xs[j + 4u * second]) != 0u ? -1.f : 1.f;
             return db * grid * sign;
+        }
+        case WType::Q4_0: {  // block_q4_0 { f16 d; u8 qs[16]; } — quant.cpp deq_q4_0
+            const std::uint8_t* blk = row + 18u * (i / 32u);
+            const unsigned r = i % 32u;
+            const float d = h2f(ld16(blk));
+            const std::uint8_t qb = blk[2u + r % 16u];
+            const int q = static_cast<int>(r < 16u ? (qb & 0x0Fu) : (qb >> 4)) - 8;
+            return fli(q) * d;
         }
     }
     return 0.0f;

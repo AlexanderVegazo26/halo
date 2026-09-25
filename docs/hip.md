@@ -1,12 +1,19 @@
 # HALO HIP backend (WS-K)
 
-Status: **milestones M1–M5 complete**.
+Status: **milestones M1–M6 complete**.
 - M1: the host runtime and the GATED_DELTANET family.
 - M2: quantized GEMV.
 - M3: the LM head with fused argmax, TOP_K, RMS_NORM, PARTIAL_ROPE, SWIGLU and MUL_SIGMOID.
 - M4: the PARTIAL_ROPE head stride (TD-9) and GQA ATTENTION over the paged KV cache.
 - M5: GEMV for the D-014 second-tier types (IQ4_XS, IQ4_NL, Q3_K, IQ3_S). With them, every
   weight type of the canonical UD-Q4_K_XL pack has a HIP GEMV.
+- M6: decode primitives.
+  - KV write into the kv_cache pool;
+  - GET_ROWS (embedding lookup) for every GEMV type;
+  - ADD, and the fused ADD + RMS_NORM;
+  - Q4_0 GEMV for the ggml-org MTP pack (D-006).
+
+  See "One qwen35 decode step" for the per-op status.
 
 What remains is listed under "Not done".
 
@@ -340,8 +347,8 @@ In place is also different:
   - **Gated norm:** 48 heads × 128. Also cols 37 with out = x at block 32, out = z with a
     strided view, and cols 5.
 - **`test_hip_gemv`** runs the emulation in both orders against `tensor::dequantize_row`
-  followed by `cpu::matmul` on the same bytes. There are 20 shapes: 2 per type for all ten
-  types, each through all three variants.
+  followed by `cpu::matmul` on the same bytes. There are 22 shapes: 2 per type for all eleven
+  types (Q4_0 added in M6), each through all three variants.
   - **Weights:** random quants with finite f16 scales. Every row includes one subnormal
     f16 scale (or subnormal element for F16 and F32), which exercises the fp16 subnormal
     path.
@@ -411,6 +418,21 @@ In place is also different:
   with rot 64 and θ = 10⁷. Q must be bitwise equal to `cpu::partial_rope_neox` on a
   de-interleaved copy, and the gate halves must be untouched. `head_stride < head_dim` is
   rejected.
+- **`test_hip_decode`** (M6) runs both emulation orders, all bitwise.
+  - **GET_ROWS:** all 11 GEMV types against `tensor::dequantize_row`, with first, last and
+    repeated ids, plus the pack's Q4_K `token_embd` at 5120 columns. A bad id raises
+    `Error(Kernel)`.
+  - **ADD + RMS_NORM:** against `cpu::add` then `cpu::rms_norm`, at 1 × 5120 with h
+    aliasing a, 3 × 5120, and 4 × 37 with h aliasing b. The same inputs check plain ADD
+    against `cpu::add`.
+- **`test_hip_kv`** (M6; needs `kv_cache`): writes into a real KvPool with a fragmented
+  table, layer 1 of 2, and every float of the pool pre-filled. After the write, the
+  **whole pool** must be byte-identical to `SequenceKv::write` on the same inputs. Cases:
+  - 13 + 5 rows across the 16-row block boundary;
+  - a decode step into a partial block;
+  - a 12-row prefill over 3 blocks of 5.
+
+  A bad block id raises `Error(Kernel)`.
 - **Device tests.** Each scenario above also exists as a `…Device…` test. They skip on
   the dev host.
   - GDN, conv and norm compare against `halo::cpu` within `|err| ≤ 2e-5 + 1e-5·|ref|`.
@@ -454,6 +476,9 @@ at `-O2` (RelWithDebInfo).
 | `k_attn_check` | 3 | 0 | 0 | 16 |
 | `k_attn_exact` | 27 | 0 | 2056 | 16 |
 | `k_attn_online` | 28 | 0 | 10252 | 16 |
+| `k_kv_write` | 7 | 0 | 0 | — |
+| `k_get_rows` | 17 | 0 | 0 | — |
+| `k_add_norm` | 11 | 0 | 36 | — |
 
 The online kernel's per-thread accumulator array (8 floats × 256 threads = 8 KiB) was
 placed in LDS by the compiler (promote-alloca) rather than in registers. That is why it
@@ -509,6 +534,63 @@ until the EVO-X2 runs.
      are the tuning path.
    - The exact variant is serial by design and is not for production.
 
+## M6 decode primitives
+
+| Op | Kernel | Variant | Contract | Accepted by |
+|---|---|---|---|---|
+| KV write | `k_kv_write` | `kv_write_b256` | `kv_cache::SequenceKv::write`: K and V rows at positions start … start+T−1 of `layer`, through the block table, into the same pool layout attention reads. Blocks must be exclusively owned; copy-on-write stays in `SequenceKv::reserve`. A bad block id sets `kStatusBadBlock` and that row is not written. | the **whole pool** byte-identical to `SequenceKv::write` on the same pool |
+| GET_ROWS | `k_get_rows` | `get_rows_b256` | `out[t] = dequantize_row(W[ids[t]])` for every GEMV weight type; the pack's `token_embd` is Q4_K. An id outside [0, n_rows) sets `kStatusBadIndex`. | bitwise vs `tensor::dequantize_row` (pure dequant, so bitwise on the device too) |
+| ADD | `k_eltwise` | `add_b256` | `cpu::add`; out may alias either input | bitwise |
+| ADD + RMS_NORM | `k_add_norm` | `add_rms_norm_b128` | `h = a + b` (h may alias a or b), then `y = rms_norm(h)·w`, where the norm phases read the rounded h after a barrier | bitwise vs `cpu::add` then `cpu::rms_norm` |
+
+**Q4_0 decision.**
+- D-006 requires both MTP packagings to load, and D-014 keeps "ggml-org Q4_K_M plus a
+  separate MTP file" supported and tested.
+- That pack's `blk.64` weights are Q4_0 (D-007). So the runtime does load a Q4_0 file,
+  and Q4_0 GEMV is in scope.
+- halo::tensor dequantizes Q4_0 (`deq_q4_0`; D-007's list), so there was no blocker.
+- `wq_elem` reproduces its `fl(q − 8) · d` exactly. GEMV and GET_ROWS accept Q4_0.
+
+## One qwen35 decode step: ops and HIP status
+
+These are the ops of the D-004/D-005 layer semantics at T = 1 (and T = K for MTP verify),
+with the HIP op that covers each. "Emulated" means compiled for gfx1151 and verified in
+emulation against halo::cpu / halo::tensor, but never executed on a device. That applies
+to every row marked covered.
+
+| Step | Op(s) | HIP status |
+|---|---|---|
+| token embedding | GET_ROWS (Q4_K) | covered, M6 |
+| per layer: `attn_norm` | RMS_NORM, or the fused ADD + RMS_NORM with the previous residual | covered, M3 / M6 |
+| **GDN layer** (48 per step): `attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha` projections | QUANT_GEMV (Q5_K, Q4_K, IQ4_NL, Q8_0, …) | covered, M2 / M5 |
+| conv1d over qkv + SiLU, conv state + slots | CONV1D_SHORT | covered, M1 |
+| `beta = sigmoid(b)` | SIGMOID | **missing** (48 floats per token) |
+| `g = ssm_a · softplus(a + dt_bias)` | ADD, SOFTPLUS, MUL (ssm_a per head) | ADD covered; **SOFTPLUS and MUL missing** (48 floats) |
+| q/k L2 norm, q scale, delta rule, state + slots | GATED_DELTANET recurrent (D-016 in-kernel) | covered, M1 |
+| `o = rmsnorm(o; ssm_norm) · silu(z)` | GATED_NORM | covered, M1 |
+| `ssm_out` | QUANT_GEMV | covered |
+| residual | ADD, or fused into the next ADD + RMS_NORM | covered, M6 |
+| **Attention layer** (16 per step): `attn_q` (interleaved [Q \| gate]), `attn_k`, `attn_v` | QUANT_GEMV | covered |
+| q/k per-head norm | RMS_NORM with per-head row views (row stride 512 on the interleaved q) | covered, M3 |
+| partial RoPE, 64 of 256 dims, θ 10⁷ | PARTIAL_ROPE (head_stride 512 on q) | covered, M3 / M4 |
+| append K/V | KV write | covered, M6 |
+| GQA attention over the paged cache | ATTENTION (q_head_stride 512) | covered, M4 |
+| `attn · sigmoid(gate)` | MUL_SIGMOID with row views (gate stride 512) | covered, M3 |
+| `attn_output`, residual | QUANT_GEMV, ADD | covered |
+| **FFN:** `post_attention_norm` | fused ADD + RMS_NORM | covered, M6 |
+| `ffn_gate`, `ffn_up`, SwiGLU, `ffn_down`, residual | QUANT_GEMV (IQ4_XS, Q4_K, Q5_K, Q3_K, IQ3_S, …), SWIGLU, ADD | covered, M2 / M3 / M5 |
+| **Head:** `output_norm` | RMS_NORM | covered |
+| greedy | LM head GEMV (Q6_K) + fused argmax | covered, M3 |
+| sampling | TOP_K (k ≤ 1024), then the CPU sampler | covered, M3 |
+| **MTP (blk.64, D-005):** `enorm(embed)` and `hnorm(h)` into the two halves of one buffer | GET_ROWS + RMS_NORM into offset views (no CONCAT op is needed) | covered |
+| `eh_proj`, then one attention block + FFN, `shared_head_norm`, the shared LM head | the rows above; Q4_0 for the ggml-org MTP file | covered (Q4_0: M6) |
+| **Prefill** (T ≫ 1) | chunked GDN (M1); GEMV with n_vec = T; attention with T > 1 | functional; **no GEMM or prefill-attention kernel** (performance) |
+
+The decode step is covered except for three trivial element-wise ops on 48-float vectors
+(SIGMOID, SOFTPLUS, MUL). A fused GDN-gate kernel would be the natural shape for them.
+Wiring these ops into a model forward or a `Backend` implementation is deliberately left
+out of `backends/hip`. It is to be designed once, by one owner, after the Engine lands.
+
 ## TRD §63 acceptance status
 
 | Item | Status |
@@ -516,7 +598,7 @@ until the EVO-X2 runs.
 | gfx1151 (or logged gfx11-generic) build succeeds | **Met on the dev host (compile).** gfx1151 by default. A generic ISA needs explicit opt-in and is logged. |
 | Device discovery succeeds; tier probing succeeds | **Discovery implemented, unverified on a device.** On the dev host it fails cleanly with `hipErrorNoDevice`. Tier probing belongs to the hardware module and is not part of this backend. |
 | GPU allocations succeed on GTT and carveout | **Implemented** (`HostPinned` = GTT, `Device` = carveout). The test exists but is unverified (skipped). |
-| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS), LM head with fused argmax, argmax, top-k, RoPE (with head stride), SwiGLU, sigmoid gate, and GQA attention over the paged KV cache. |
+| Core operators execute; custom GDN and GEMV kernels exist | **The kernels exist** and are compiled and emulation-verified, but have not executed on a device. They cover: GDN (recurrent and chunked), conv1d, gated and plain RMS norm, GEMV (F32, F16, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_NL, IQ4_XS), GET_ROWS, KV write, ADD and ADD + RMS_NORM, LM head with fused argmax, argmax, top-k, RoPE (with head stride), SwiGLU, sigmoid gate, and GQA attention over the paged KV cache. |
 | Reference-vs-HIP correctness passes | **Emulation passes.** It is bit for bit everywhere except two variants that sum in a different order, each within its own derived bound: the wave-GEMV logits (whose argmax index still equals the CPU's) and online attention. **Device: unverified.** |
 | Benchmark suite executes reproducibly | **Not started.** |
 
@@ -527,8 +609,8 @@ until the EVO-X2 runs.
 - **GEMV:**
   - a prefill GEMM;
   - a wave64 comparison;
-  - the remaining D-007 dequant types (Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, BF16). None is in
-    UD-Q4_K_XL, but ggml-org's MTP pack is Q4_0.
+  - the remaining D-007 dequant types (Q4_1, Q5_0, Q5_1, Q2_K, BF16). None is in either pack.
+    Q4_0 was added in M6.
 - **Attention and kernels:**
   - a prefill (T ≫ 1) attention variant;
   - a split-K decode variant (debt 6);

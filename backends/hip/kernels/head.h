@@ -295,7 +295,7 @@ HALO_HD void rope_body(Exec& ex, RopeShared& sh, const RopeParams& p, unsigned b
 
 // ---- SWIGLU / MUL_SIGMOID (element-wise; out may alias an input exactly) --------------
 
-enum class EwOp : unsigned { SwiGlu = 0, MulSigmoid = 1 };
+enum class EwOp : unsigned { SwiGlu = 0, MulSigmoid = 1, Add = 2 };
 
 struct EwParams {
     EwOp op = EwOp::SwiGlu;
@@ -325,7 +325,7 @@ HALO_HD void ew_body(Exec& ex, EwShared&, const EwParams& p, unsigned bx, unsign
         const float a = p.a[static_cast<std::uint64_t>(bx) * p.a_stride + c];
         const float b = p.b[static_cast<std::uint64_t>(bx) * p.b_stride + c];
         p.out[static_cast<std::uint64_t>(bx) * p.out_stride + c] =
-            p.op == EwOp::SwiGlu ? siluf(a) * b : a * sigmoidf(b);
+            p.op == EwOp::SwiGlu ? siluf(a) * b : p.op == EwOp::MulSigmoid ? a * sigmoidf(b) : a + b;
     });
 }
 

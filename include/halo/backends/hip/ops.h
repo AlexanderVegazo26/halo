@@ -159,7 +159,8 @@ struct GatedNormArgs {
 /// QUANT_GEMV / MATMUL for decode (cpu::matmul with a dequantized WeightMatrix):
 ///   y[t][n] = sum_i x[t][i] * W[n][i],  t < n_vec, n < rows, i < cols.
 ///  - wtype: F32, F16, Q8_0, Q4_K, Q5_K, Q6_K and the D-014 second tier IQ4_XS, IQ4_NL, Q3_K,
-///    IQ3_S (ggml block layouts; DECISIONS D-007, D-014; every type of the UD-Q4_K_XL pack).
+///    IQ3_S (every type of the UD-Q4_K_XL pack), and Q4_0 (the ggml-org MTP pack, D-006)
+///    (ggml block layouts; DECISIONS D-007, D-014).
 ///    Other types raise Error(Unsupported). cols must be a multiple of the block size.
 ///  - w: `rows` rows of row_bytes(wtype, cols) bytes; the view's row_stride (0 = dense) is
 ///    the byte distance between rows. Quantized/F16 rows may start at any byte; F32 rows
@@ -304,6 +305,55 @@ struct AttentionArgs {
     BufferView status{};
 };
 
+/// Status bit: GET_ROWS saw a token id outside [0, n_rows).
+inline constexpr std::uint32_t kStatusBadIndex = 8u;
+
+/// [KV write] Appends n_tokens K and V rows at history positions start .. start+n_tokens-1 of
+/// `layer`, through the block table — exactly kv_cache::SequenceKv::write (same pool layout
+/// as AttentionArgs). Every block the rows fall into must be exclusively owned by this
+/// sequence (refcount 1): copy-on-write of shared prefix blocks is kv_cache's job
+/// (SequenceKv::reserve), not this kernel's. k, v: n_tokens rows of [kv_dim]. status: zeroed
+/// by the op; kStatusBadBlock for a table id >= n_pool_blocks (that row is not written).
+struct KvWriteArgs {
+    BufferView kv_pool{};
+    std::uint32_t n_pool_blocks = 0;
+    std::uint32_t n_layers = 1;
+    std::uint32_t layer = 0;
+    std::uint32_t block_tokens = 16;
+    std::uint32_t kv_dim = 0;
+    BufferView block_table{};
+    std::uint32_t start = 0;
+    std::uint32_t n_tokens = 1;
+    BufferView k{}, v{};
+    BufferView status{};
+};
+
+/// [GET_ROWS] Embedding lookup: out[t] = dequantize_row(W[ids[t]]) for any GEMV weight type
+/// (the pack's token_embd is Q4_K). Bit-identical to tensor::dequantize_row. w: n_rows rows of
+/// row_bytes(wtype, cols) (row_stride 0 = dense); ids: n_ids int32; out: n_ids rows of
+/// [cols]. status: zeroed by the op; kStatusBadIndex for an id outside [0, n_rows) (that row
+/// of out is not written).
+struct GetRowsArgs {
+    DType wtype = DType::F32;
+    BufferView w{};
+    std::uint32_t n_rows = 0;
+    std::uint32_t cols = 0;
+    BufferView ids{};
+    std::uint32_t n_ids = 1;
+    BufferView out{};
+    BufferView status{};
+};
+
+/// [ADD + RMS_NORM fused] h = a + b, then y = rms_norm(h) * w — bit-identical to cpu::add
+/// followed by cpu::rms_norm. h may alias a or b exactly (in-place residual); y must not
+/// overlap a, b, h or w.
+struct AddRmsNormArgs {
+    BufferView a{}, b{}, h{}, w{}, y{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+    float eps = 1e-6f;
+};
+
 /// Variant choice per operator (names from the kernel registry, registry.h).
 struct OpsOptions {
     std::string gdn_recurrent = "gdn_recurrent_b128";
@@ -318,6 +368,10 @@ struct OpsOptions {
     std::string swiglu = "swiglu_b256";
     std::string mul_sigmoid = "mul_sigmoid_b256";
     std::string attention = "attn_online_b128";
+    std::string kv_write = "kv_write_b256";
+    std::string get_rows = "get_rows_b256";
+    std::string add = "add_b256";
+    std::string add_rms_norm = "add_rms_norm_b128";
 };
 
 class Ops {
@@ -361,6 +415,14 @@ public:
     void attention(const Target& target, const AttentionArgs& args) const;
     [[nodiscard]] std::uint64_t attention_workspace_bytes(std::uint32_t n_tokens, std::uint32_t n_head,
                                                           std::uint32_t q_offset) const;
+    /// [KV write]; then check_status(status).
+    void kv_write(const Target& target, const KvWriteArgs& args) const;
+    /// [GET_ROWS]; then check_status(status).
+    void get_rows(const Target& target, const GetRowsArgs& args) const;
+    /// [ADD] out = a + b (cpu::add); out may alias a or b exactly.
+    void add(const Target& target, const EltwiseArgs& args) const;
+    /// [ADD + RMS_NORM]
+    void add_rms_norm(const Target& target, const AddRmsNormArgs& args) const;
 
     /// Reads a status word (device: synchronizes the target stream, then copies it) and
     /// throws Error(Kernel) naming the set bits; returns normally when it is zero.
@@ -382,6 +444,10 @@ private:
     unsigned mulsig_block_ = 0;
     unsigned attn_block_ = 0;
     bool attn_exact_ = false;
+    unsigned kvw_block_ = 0;
+    unsigned rows_block_ = 0;
+    unsigned add_block_ = 0;
+    unsigned addnorm_block_ = 0;
 };
 
 }  // namespace halo::hip

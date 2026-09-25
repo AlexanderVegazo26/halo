@@ -118,3 +118,27 @@ void emulate_attn_online(const AttnParams& p, const Launch& l, bool reverse) {
 }
 
 }  // namespace halo::hip::detail
+
+namespace halo::hip::detail {
+
+using namespace kern;
+
+void emulate_kv_write(const KvWriteParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<DecNoRegs, DecNoRegs>(l, reverse, [&](auto& ex, DecNoRegs& sh, unsigned bx, unsigned by) {
+        kv_write_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_get_rows(const GetRowsParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<DecNoRegs, DecNoRegs>(l, reverse, [&](auto& ex, DecNoRegs& sh, unsigned bx, unsigned by) {
+        get_rows_body(ex, sh, p, bx, by);
+    });
+}
+
+void emulate_add_norm(const AddNormParams& p, const Launch& l, bool reverse) {
+    emu::run_grid<NormRegs, NormShared>(l, reverse, [&](auto& ex, NormShared& sh, unsigned bx, unsigned by) {
+        add_norm_body(ex, sh, p, bx, by);
+    });
+}
+
+}  // namespace halo::hip::detail

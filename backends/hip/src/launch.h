@@ -7,6 +7,7 @@
 #include "kernels/gdn.h"
 #include "kernels/gemv.h"
 #include "kernels/attention.h"
+#include "kernels/decode.h"
 #include "kernels/head.h"
 
 namespace halo::hip::detail {
@@ -28,6 +29,9 @@ int launch_eltwise(const kern::EwParams& p, const kern::Launch& l, void* stream)
 int launch_attn_check(const kern::AttnParams& p, const kern::Launch& l, void* stream);
 int launch_attn_exact(const kern::AttnParams& p, const kern::Launch& l, void* stream);
 int launch_attn_online(const kern::AttnParams& p, const kern::Launch& l, void* stream);
+int launch_kv_write(const kern::KvWriteParams& p, const kern::Launch& l, void* stream);
+int launch_get_rows(const kern::GetRowsParams& p, const kern::Launch& l, void* stream);
+int launch_add_norm(const kern::AddNormParams& p, const kern::Launch& l, void* stream);
 
 // Host emulators (reverse = run threads and blocks in reverse order).
 void emulate_gdn_recurrent(const kern::GdnRecParams& p, const kern::Launch& l, bool reverse);
@@ -46,5 +50,8 @@ void emulate_eltwise(const kern::EwParams& p, const kern::Launch& l, bool revers
 void emulate_attn_check(const kern::AttnParams& p, const kern::Launch& l, bool reverse);
 void emulate_attn_exact(const kern::AttnParams& p, const kern::Launch& l, bool reverse);
 void emulate_attn_online(const kern::AttnParams& p, const kern::Launch& l, bool reverse);
+void emulate_kv_write(const kern::KvWriteParams& p, const kern::Launch& l, bool reverse);
+void emulate_get_rows(const kern::GetRowsParams& p, const kern::Launch& l, bool reverse);
+void emulate_add_norm(const kern::AddNormParams& p, const kern::Launch& l, bool reverse);
 
 }  // namespace halo::hip::detail

@@ -12,7 +12,7 @@ namespace {
 
 constexpr std::string_view kGdnDecisions = "D-003 D-004(5,6) D-012 D-016";
 
-constexpr std::array<KernelVariant, 21> kVariants{{
+constexpr std::array<KernelVariant, 25> kVariants{{
     {"GATED_DELTANET", "recurrent", "gdn_recurrent_b128", "k_gdn_recurrent", 128,
      "grid (n_v, ceil(d_v/128)); thread = one value column, S[:,c] in registers (d_k <= 128)",
      kGdnDecisions, true},
@@ -63,6 +63,13 @@ constexpr std::array<KernelVariant, 21> kVariants{{
     {"ATTENTION", "", "attn_exact_b128", "k_attn_check, k_attn_exact", 128,
      "grid (T, n_head); the CPU's three passes and sequential sums (bit-identical, serial, slow)", "D-004",
      false},
+    {"KV_WRITE", "", "kv_write_b256", "k_kv_write", 256,
+     "grid (T, ceil(kv_dim/256)); thread = one K and one V element through the block table", "D-012 D-013", true},
+    {"GET_ROWS", "", "get_rows_b256", "k_get_rows", 256,
+     "grid (n_ids, ceil(cols/256)); thread = one element, wq_elem dequant (any GEMV weight type)", "D-007", true},
+    {"ADD", "", "add_b256", "k_eltwise", 256, "grid (rows, ceil(cols/256)); thread = one element", "D-004", true},
+    {"ADD_RMS_NORM", "", "add_rms_norm_b128", "k_add_norm", 128,
+     "grid rows; residual add phase, then the RMS_NORM phases over the written h (CPU order)", "D-004", true},
 }};
 
 }  // namespace
