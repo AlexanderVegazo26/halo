@@ -273,3 +273,27 @@ backend scales beyond what its parameters say. The API has one named default, id
 Vulkan and HIP: `q_scale` omitted (`std::nullopt`) means `1/sqrt(d_k)`, and `qk_l2norm` defaults
 to `true`. A caller that wants no scaling passes `q_scale = 1.0f`. The qwen35 forward always
 passes both fields explicitly.
+
+## D-017 — Backend interface, failure isolation, state ring, v0.2 serving scope (owner, 2026-09-25)
+- **ADR-001 accepted** (docs/adr/ADR-001-backend-interface.md). Backends expose one typed,
+  per-op, async interface. The host syncs once per step. There is exactly one qwen35
+  forward over any backend, and fused ops are defined as fixed sequences of `halo::cpu`
+  calls.
+- **Frozen CPU contract, additive change allowed.** `include/halo/backends/cpu/ops.h` may
+  gain the three ring-based state overloads (recurrent GDN, chunked GDN, conv) that ADR-001
+  §5.3 needs to close TD-1. The existing overloads stay until the owner sets a sunset.
+- **Failure isolation.** A data error in one sequence (NaN logit, sampler or grammar error)
+  fails only that sequence; the rest of its batch commits. This needs commit-after-status
+  ordering and supersedes today's whole-batch failure (review 2026-09-25 R-1).
+- **GDN rollback-state default: the atomic ring** (P = K+1 states per sequence with MTP,
+  one extra state when MTP is off). A failed step leaves GDN and KV untouched. D-012's
+  "K x 150 MiB" means K copies beyond the live state. No in-place mode is required for v0.2.
+- **v0.2 serving scope is loopback-only.** A non-loopback bind needs the explicit opt-in
+  flag, and the docs require a reverse proxy that enforces connection and header timeouts.
+  Header and read deadlines are still implemented. Security finding S-13 is therefore
+  graded Medium for v0.2 and does not block release.
+- **Still open** (ADR-001 §8): Q3 (copy vs. import mmapped weights on GPU), Q5 (graph
+  replay: a later ADR after EVO-X2 launch-overhead measurements), Q6 (whether Vulkan may
+  fall back to CPU per op), Q7 (hip-emulation timings kept out of `hip` profiles). Pending
+  answers, the ADR's proposals apply: copy at load, no graph replay yet, no Vulkan CPU
+  fallback, a separate `hip-emulation` profile label.

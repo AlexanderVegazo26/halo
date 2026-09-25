@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-09-25). Needs the owner's answers in §8 before WS-BI-2 starts. |
+| Status | **Accepted** (2026-09-25, owner; see DECISIONS.md D-017). §8 Q1, Q2, Q4 answered; Q3, Q5, Q6, Q7 open. |
 | Decider | Project owner. Author: solution-architect. |
 | Tier | 3 (structural: a cross-cutting contract that is expensive to reverse once three backends build against it). |
 | Supersedes on acceptance | The `Backend` block in `docs/dev/ARCHITECTURE.md` ("Key interfaces → Backend", including the contract "`forward` must equal composing `run_op`"). It also resolves the deferred item "variants()/run_op() interface" in `include/halo/models/qwen35.h`. |
