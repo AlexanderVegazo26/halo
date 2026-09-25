@@ -144,13 +144,13 @@ TEST(ApiErrors, SanitizeForLog) {
 TEST(ApiErrors, NativeErrorBodies) {
     const api::ApiErrorInfo e{api::ErrorKind::InvalidRequest, "must be a number", "temperature", std::nullopt};
     const Json o = api::openai_error_body(e);
-    EXPECT_EQ(o["error"]["type"], "invalid_request_error");
-    EXPECT_EQ(o["error"]["param"], "temperature");
-    EXPECT_TRUE(o["error"]["code"].is_null());
+    EXPECT_EQ(o.at("error").at("type"), "invalid_request_error");
+    EXPECT_EQ(o.at("error").at("param"), "temperature");
+    EXPECT_TRUE(o.at("error").at("code").is_null());
     const Json a = api::anthropic_error_body(e);
-    EXPECT_EQ(a["type"], "error");
-    EXPECT_EQ(a["error"]["type"], "invalid_request_error");
-    EXPECT_EQ(a["error"]["message"], "temperature: must be a number");
+    EXPECT_EQ(a.at("type"), "error");
+    EXPECT_EQ(a.at("error").at("type"), "invalid_request_error");
+    EXPECT_EQ(a.at("error").at("message"), "temperature: must be a number");
     EXPECT_EQ(api::http_status(api::ErrorKind::RateLimited), 429);
     EXPECT_EQ(api::http_status(api::ErrorKind::Overloaded), 503);
     EXPECT_EQ(api::http_status(api::ErrorKind::MediaType), 415);
@@ -354,8 +354,8 @@ TEST(ApiRequests, TemplateKwargsAllowlist) {
     Json ok = Json::parse(R"({"messages":[{"role":"user","content":"hi"}],
         "chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":true}})");
     const auto job = api::parse_openai_chat(ok, cfg);
-    EXPECT_EQ(job.render.extra_context["enable_thinking"], false);
-    EXPECT_EQ(job.render.extra_context["preserve_thinking"], true);
+    EXPECT_EQ(job.render.extra_context.at("enable_thinking"), false);
+    EXPECT_EQ(job.render.extra_context.at("preserve_thinking"), true);
     EXPECT_TRUE(job.thinking_disabled);
 }
 
@@ -400,10 +400,10 @@ TEST(ApiRequests, ReasoningEffortMapping) {
     auto job = api::parse_openai_chat(
         Json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})"), cfg);
     EXPECT_TRUE(job.thinking_disabled);
-    EXPECT_EQ(job.render.extra_context["enable_thinking"], false);
+    EXPECT_EQ(job.render.extra_context.at("enable_thinking"), false);
     job = api::parse_openai_chat(Json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"})"),
                                  cfg);
-    EXPECT_EQ(job.render.extra_context["reasoning_effort"], "xhigh");
+    EXPECT_EQ(job.render.extra_context.at("reasoning_effort"), "xhigh");
     EXPECT_THROW((void)api::parse_openai_chat(
                      Json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"ultra"})"), cfg),
                  RequestError);

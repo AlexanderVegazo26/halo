@@ -2,8 +2,36 @@
 
 HALO serves one model over HTTP/1.1. It speaks the OpenAI Chat Completions and Completions
 formats and the Anthropic Messages format, and it has a few utility routes. The server is
-`halo::api::ApiServer` (`include/halo/api/server.h`), built on cpp-httplib. The `halo serve`
-CLI command that will start it is not written yet (planned for the next WS-I milestone).
+`halo::api::ApiServer` (`include/halo/api/server.h`), built on cpp-httplib. `halo serve` starts it (see "Running the server").
+
+## Running the server
+
+```
+halo serve --model model.gguf [--mtp mtp.gguf] [--host 127.0.0.1] [--port 8080] [--ctx N]
+           [--parallel N] [--backend auto|cpu|vulkan|hip] [--cors-origins a,b]
+           [--allowed-hosts h1,h2] [--served-model-name NAME] [--max-queue N]
+           [--max-concurrent N] [--max-body-bytes N] [--max-tokens-cap N]
+           [--default-max-tokens N] [--request-timeout S] [--allow-unauthenticated-remote]
+           [--config file.json] [--print-config]
+```
+
+- **Where settings come from** (TRD §44): the command line, then `HALO_*` environment
+  variables (for example `HALO_PORT` or `HALO_API_KEY`; `halo serve --help` lists every
+  one), then a JSON config file given by `--config` or `HALO_CONFIG`, then the built-in
+  defaults. The config file has `model`, `runtime` and `server` sections. It is parsed
+  strictly: an unknown setting or a wrong type is an error. **YAML is not supported in
+  v0.2.**
+- **API key.** Pass it as `HALO_API_KEY` rather than `--api-key`: other local users can read
+  a process's command line.
+- **Check the configuration.** `--print-config` prints the resolved configuration, with the
+  source of every value and the API key redacted, and exits without loading the model.
+- **Unsafe binds fail early.** A non-loopback `--host` with no API key is refused before the
+  model is loaded.
+- **Stopping.** SIGINT or SIGTERM stops the server gracefully: in-flight generations are
+  cancelled and queued requests get 503. SIGPIPE is ignored.
+- **Engine.** The server needs the inference runtime (`halo_runtime`). A build without it
+  prints "runtime not built" and exits 2. `halo version` lists the components a build
+  contains.
 
 Everything below describes what the code in `src/api/` does. Tests with a scripted fake
 engine (`tests/unit/api/`) check this behaviour, but nothing in this document has been

@@ -83,14 +83,14 @@ TEST(ApiServer, HealthModelsMetrics) {
     auto h = ts.get("/health");
     ASSERT_TRUE(h) << httplib::to_string(h.error());
     EXPECT_EQ(h->status, 200);
-    EXPECT_EQ(Json::parse(h->body)["status"], "ok");
+    EXPECT_EQ(Json::parse(h->body).at("status"), "ok");
 
     auto m = ts.get("/v1/models");
     ASSERT_TRUE(m);
     EXPECT_EQ(m->status, 200);
     const Json mj = Json::parse(m->body);
     EXPECT_EQ(shape_mismatch(load_fixture("openai_models.json"), mj), "");
-    EXPECT_EQ(mj["data"][0]["id"], "fake-model");
+    EXPECT_EQ(mj.at("data").at(0).at("id"), "fake-model");
 
     ASSERT_EQ(ts.post("/v1/chat/completions", user_chat("hi"))->status, 200);
     // The request counter is updated by httplib's logger after the response is written, so
@@ -117,8 +117,8 @@ TEST(ApiServer, ServedModelNameOverride) {
     api::ServerConfig cfg;
     cfg.served_model_name = "custom";
     TestServer ts(cfg);
-    EXPECT_EQ(Json::parse(ts.get("/v1/models")->body)["data"][0]["id"], "custom");
-    EXPECT_EQ(Json::parse(ts.post("/v1/chat/completions", user_chat("hi"))->body)["model"], "custom");
+    EXPECT_EQ(Json::parse(ts.get("/v1/models")->body).at("data").at(0).at("id"), "custom");
+    EXPECT_EQ(Json::parse(ts.post("/v1/chat/completions", user_chat("hi"))->body).at("model"), "custom");
 }
 
 TEST(ApiServer, TokenizeAndApplyTemplate) {
@@ -128,12 +128,12 @@ TEST(ApiServer, TokenizeAndApplyTemplate) {
     auto r = ts.post("/tokenize", Json{{"content", "a<|im_end|>"}});
     ASSERT_EQ(r->status, 200);
     Json j = Json::parse(r->body);
-    EXPECT_EQ(std::ranges::count(j["tokens"], Json(im_end)), 0) << "parse_special defaults to false";
+    EXPECT_EQ(std::ranges::count(j.at("tokens"), Json(im_end)), 0) << "parse_special defaults to false";
     r = ts.post("/tokenize", Json{{"content", "a<|im_end|>"}, {"parse_special", true}, {"with_pieces", true}});
     j = Json::parse(r->body);
-    ASSERT_EQ(j["tokens"].size(), 2u);
-    EXPECT_EQ(j["tokens"][1]["id"], im_end);
-    EXPECT_EQ(j["tokens"][1]["piece"], "<|im_end|>");
+    ASSERT_EQ(j.at("tokens").size(), 2u);
+    EXPECT_EQ(j.at("tokens").at(1).at("id"), im_end);
+    EXPECT_EQ(j.at("tokens").at(1).at("piece"), "<|im_end|>");
 
     Json at = user_chat("hello");
     at["tokenize"] = true;
@@ -141,9 +141,9 @@ TEST(ApiServer, TokenizeAndApplyTemplate) {
     r = ts.post("/apply-template", at);
     ASSERT_EQ(r->status, 200) << r->body;
     j = Json::parse(r->body);
-    EXPECT_EQ(j["prompt"], "<|im_start|>user\nhello<|im_end|>\n");
-    EXPECT_EQ(j["tokens"].get<std::vector<std::int32_t>>(), tok.encode("<|im_start|>user\nhello<|im_end|>\n", true));
-    EXPECT_EQ(j["neutralized_literals"], 0);
+    EXPECT_EQ(j.at("prompt"), "<|im_start|>user\nhello<|im_end|>\n");
+    EXPECT_EQ(j.at("tokens").get<std::vector<std::int32_t>>(), tok.encode("<|im_start|>user\nhello<|im_end|>\n", true));
+    EXPECT_EQ(j.at("neutralized_literals"), 0);
 }
 
 // ---- OpenAI chat ---------------------------------------------------------------------------
@@ -157,21 +157,21 @@ TEST(ApiOpenAI, ChatNonStreamingSplitsReasoningAndContent) {
     EXPECT_NE(r->get_header_value("Content-Type").find("application/json"), std::string::npos);
     const Json j = Json::parse(r->body);
     EXPECT_EQ(shape_mismatch(load_fixture("openai_chat_completion.json"), j), "");
-    EXPECT_TRUE(j["id"].get<std::string>().starts_with("chatcmpl-"));
-    const Json& msg = j["choices"][0]["message"];
-    EXPECT_EQ(msg["content"], "Hello.");
-    EXPECT_EQ(msg["reasoning_content"], "Let me think.");
+    EXPECT_TRUE(j.at("id").get<std::string>().starts_with("chatcmpl-"));
+    const Json& msg = j.at("choices").at(0).at("message");
+    EXPECT_EQ(msg.at("content"), "Hello.");
+    EXPECT_EQ(msg.at("reasoning_content"), "Let me think.");
     EXPECT_FALSE(msg.contains("tool_calls"));
-    EXPECT_EQ(j["choices"][0]["finish_reason"], "stop");
+    EXPECT_EQ(j.at("choices").at(0).at("finish_reason"), "stop");
     // Byte-level tokenizer: "Let me think." (13) + </think> = 14 reasoning tokens;
     // + "\n\nHello." (8) + EOS = 23 generated.
-    EXPECT_EQ(j["usage"]["completion_tokens_details"]["reasoning_tokens"], 14);
-    EXPECT_EQ(j["usage"]["completion_tokens"], 23);
+    EXPECT_EQ(j.at("usage").at("completion_tokens_details").at("reasoning_tokens"), 14);
+    EXPECT_EQ(j.at("usage").at("completion_tokens"), 23);
     const auto calls = ts.engine->calls();
     ASSERT_EQ(calls.size(), 1u);
-    EXPECT_EQ(j["usage"]["prompt_tokens"], calls[0].request.prompt.size());
+    EXPECT_EQ(j.at("usage").at("prompt_tokens"), calls.at(0).request.prompt.size());
     EXPECT_EQ(ts.engine->prompt_text(0), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n");
-    EXPECT_TRUE(calls[0].request.stop_strings.empty()) << "stop sequences are applied by the API layer";
+    EXPECT_TRUE(calls.at(0).request.stop_strings.empty()) << "stop sequences are applied by the API layer";
 }
 
 TEST(ApiOpenAI, SamplingParametersReachTheEngine) {
@@ -210,23 +210,23 @@ TEST(ApiOpenAI, ChatStreamingEventSequence) {
     ASSERT_GE(ev.size(), 4u);
     const Json chunk_shape = load_fixture("openai_chat_chunk.json");
     std::string reasoning, content;
-    const std::string id = ev[0]["id"];
-    EXPECT_EQ(ev[0]["choices"][0]["delta"]["role"], "assistant");
+    const std::string id = ev.at(0).at("id");
+    EXPECT_EQ(ev.at(0).at("choices").at(0).at("delta").at("role"), "assistant");
     for (std::size_t i = 0; i + 1 < ev.size(); ++i) {
         EXPECT_EQ(shape_mismatch(chunk_shape, ev[i]), "") << ev[i].dump();
-        EXPECT_EQ(ev[i]["id"], id);
-        const Json& d = ev[i]["choices"][0]["delta"];
-        if (d.contains("reasoning_content")) reasoning += d["reasoning_content"].get<std::string>();
-        if (d.contains("content")) content += d["content"].get<std::string>();
-        if (i + 2 < ev.size()) EXPECT_TRUE(ev[i]["choices"][0]["finish_reason"].is_null());
+        EXPECT_EQ(ev[i].at("id"), id);
+        const Json& d = ev[i].at("choices").at(0).at("delta");
+        if (d.contains("reasoning_content")) reasoning += d.at("reasoning_content").get<std::string>();
+        if (d.contains("content")) content += d.at("content").get<std::string>();
+        if (i + 2 < ev.size()) EXPECT_TRUE(ev[i].at("choices").at(0).at("finish_reason").is_null());
     }
     EXPECT_EQ(reasoning, "Hmm.");
     EXPECT_EQ(content, "Hello there.");
-    EXPECT_EQ(ev[ev.size() - 2]["choices"][0]["finish_reason"], "stop");
+    EXPECT_EQ(ev[ev.size() - 2].at("choices").at(0).at("finish_reason"), "stop");
     // include_usage: a final chunk with empty choices and the usage object.
     const Json& u = ev.back();
-    EXPECT_TRUE(u["choices"].empty());
-    EXPECT_EQ(u["usage"]["completion_tokens_details"]["reasoning_tokens"], 5);
+    EXPECT_TRUE(u.at("choices").empty());
+    EXPECT_EQ(u.at("usage").at("completion_tokens_details").at("reasoning_tokens"), 5);
     EXPECT_EQ(s.headers.find("Content-Type")->second.find("text/event-stream"), 0u);
 }
 
@@ -238,14 +238,14 @@ TEST(ApiOpenAI, ToolCallNonStreamingAndStreaming) {
     auto r = ts.post("/v1/chat/completions", b);
     ASSERT_EQ(r->status, 200) << r->body;
     Json j = Json::parse(r->body);
-    const Json& msg = j["choices"][0]["message"];
-    EXPECT_EQ(j["choices"][0]["finish_reason"], "tool_calls");
-    EXPECT_TRUE(msg["content"].is_null()) << "content is null when only tool calls were produced";
-    ASSERT_EQ(msg["tool_calls"].size(), 1u);
-    EXPECT_EQ(shape_mismatch(load_fixture("openai_tool_call.json"), msg["tool_calls"][0]), "");
-    EXPECT_EQ(msg["tool_calls"][0]["function"]["name"], "get_weather");
-    EXPECT_EQ(Json::parse(msg["tool_calls"][0]["function"]["arguments"].get<std::string>()), Json({{"city", "Paris"}}));
-    EXPECT_TRUE(msg["tool_calls"][0]["id"].get<std::string>().starts_with("call_"));
+    const Json& msg = j.at("choices").at(0).at("message");
+    EXPECT_EQ(j.at("choices").at(0).at("finish_reason"), "tool_calls");
+    EXPECT_TRUE(msg.at("content").is_null()) << "content is null when only tool calls were produced";
+    ASSERT_EQ(msg.at("tool_calls").size(), 1u);
+    EXPECT_EQ(shape_mismatch(load_fixture("openai_tool_call.json"), msg.at("tool_calls").at(0)), "");
+    EXPECT_EQ(msg.at("tool_calls").at(0).at("function").at("name"), "get_weather");
+    EXPECT_EQ(Json::parse(msg.at("tool_calls").at(0).at("function").at("arguments").get<std::string>()), Json({{"city", "Paris"}}));
+    EXPECT_TRUE(msg.at("tool_calls").at(0).at("id").get<std::string>().starts_with("call_"));
     // The tools reached the template.
     EXPECT_NE(ts.engine->prompt_text(0).find("\"get_weather\""), std::string::npos);
 
@@ -256,23 +256,23 @@ TEST(ApiOpenAI, ToolCallNonStreamingAndStreaming) {
     EXPECT_TRUE(done);
     std::vector<Json> deltas;
     for (const auto& e : ev) {
-        const Json& d = e["choices"][0]["delta"];
-        if (d.contains("tool_calls")) deltas.push_back(d["tool_calls"][0]);
+        const Json& d = e.at("choices").at(0).at("delta");
+        if (d.contains("tool_calls")) deltas.push_back(d.at("tool_calls").at(0));
     }
     ASSERT_EQ(deltas.size(), 1u);
-    EXPECT_EQ(deltas[0]["index"], 0);
-    EXPECT_EQ(deltas[0]["function"]["name"], "get_weather");
-    EXPECT_EQ(Json::parse(deltas[0]["function"]["arguments"].get<std::string>()), Json({{"city", "Paris"}}));
-    EXPECT_EQ(ev.back()["choices"][0]["finish_reason"], "tool_calls");
+    EXPECT_EQ(deltas.at(0).at("index"), 0);
+    EXPECT_EQ(deltas.at(0).at("function").at("name"), "get_weather");
+    EXPECT_EQ(Json::parse(deltas.at(0).at("function").at("arguments").get<std::string>()), Json({{"city", "Paris"}}));
+    EXPECT_EQ(ev.back().at("choices").at(0).at("finish_reason"), "tool_calls");
 }
 
 TEST(ApiOpenAI, ToolRoundTripRendersHistory) {
     TestServer ts;
     Json b = user_chat("weather in Paris?");
     b["tools"] = weather_tools_openai();
-    b["messages"].push_back(Json::parse(R"({"role":"assistant","content":null,"tool_calls":[{"id":"call_1",
+    b.at("messages").push_back(Json::parse(R"({"role":"assistant","content":null,"tool_calls":[{"id":"call_1",
         "type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]})"));
-    b["messages"].push_back(Json::parse(R"({"role":"tool","tool_call_id":"call_1","content":"Sunny, 21C"})"));
+    b.at("messages").push_back(Json::parse(R"({"role":"tool","tool_call_id":"call_1","content":"Sunny, 21C"})"));
     auto r = ts.post("/v1/chat/completions", b);
     ASSERT_EQ(r->status, 200) << r->body;
     const std::string p = ts.engine->prompt_text(0);
@@ -294,12 +294,12 @@ TEST(ApiOpenAI, StructuredOutputPassthrough) {
     EXPECT_EQ(ts.post("/v1/chat/completions", b)->status, 400);
     const auto calls = ts.engine->calls();
     ASSERT_EQ(calls.size(), 3u);
-    EXPECT_EQ(Json::parse(calls[0].request.sampling.json_schema.value()), schema);
-    EXPECT_FALSE(calls[0].request.sampling.json_object);
-    EXPECT_TRUE(calls[1].request.sampling.json_object);
-    EXPECT_FALSE(calls[1].request.sampling.json_schema.has_value());
-    EXPECT_FALSE(calls[2].request.sampling.json_object);
-    EXPECT_FALSE(calls[2].request.sampling.json_schema.has_value());
+    EXPECT_EQ(Json::parse(calls.at(0).request.sampling.json_schema.value()), schema);
+    EXPECT_FALSE(calls.at(0).request.sampling.json_object);
+    EXPECT_TRUE(calls.at(1).request.sampling.json_object);
+    EXPECT_FALSE(calls.at(1).request.sampling.json_schema.has_value());
+    EXPECT_FALSE(calls.at(2).request.sampling.json_object);
+    EXPECT_FALSE(calls.at(2).request.sampling.json_schema.has_value());
 }
 
 TEST(ApiOpenAI, StopSequencesTruncateContent) {
@@ -308,8 +308,8 @@ TEST(ApiOpenAI, StopSequencesTruncateContent) {
     Json b = user_chat("hi");
     b["stop"] = Json::array({"lo.", "zzz"});
     Json j = Json::parse(ts.post("/v1/chat/completions", b)->body);
-    EXPECT_EQ(j["choices"][0]["message"]["content"], "Hel");
-    EXPECT_EQ(j["choices"][0]["finish_reason"], "stop");
+    EXPECT_EQ(j.at("choices").at(0).at("message").at("content"), "Hel");
+    EXPECT_EQ(j.at("choices").at(0).at("finish_reason"), "stop");
     EXPECT_TRUE(ts.engine->calls().at(0).cancelled) << "a matched stop sequence ends the engine call";
     // Streaming never leaks a partial stop sequence.
     b["stream"] = true;
@@ -317,8 +317,8 @@ TEST(ApiOpenAI, StopSequencesTruncateContent) {
     bool done = false;
     std::string content;
     for (const auto& e : data_events(s.body, done)) {
-        const Json& d = e["choices"][0]["delta"];
-        if (d.contains("content")) content += d["content"].get<std::string>();
+        const Json& d = e.at("choices").at(0).at("delta");
+        if (d.contains("content")) content += d.at("content").get<std::string>();
     }
     EXPECT_EQ(content, "Hel");
 }
@@ -329,9 +329,9 @@ TEST(ApiOpenAI, ReasoningEffortNoneDisablesThinking) {
     Json b = user_chat("hi");
     b["reasoning_effort"] = "none";
     Json j = Json::parse(ts.post("/v1/chat/completions", b)->body);
-    EXPECT_EQ(j["choices"][0]["message"]["content"], "Hello.");
-    EXPECT_FALSE(j["choices"][0]["message"].contains("reasoning_content"));
-    EXPECT_EQ(j["usage"]["completion_tokens_details"]["reasoning_tokens"], 0);
+    EXPECT_EQ(j.at("choices").at(0).at("message").at("content"), "Hello.");
+    EXPECT_FALSE(j.at("choices").at(0).at("message").contains("reasoning_content"));
+    EXPECT_EQ(j.at("usage").at("completion_tokens_details").at("reasoning_tokens"), 0);
     EXPECT_TRUE(ts.engine->prompt_text(0).ends_with("<think>\n\n</think>\n\n"));
 }
 
@@ -349,18 +349,18 @@ TEST(ApiOpenAI, ReasoningBudgetClosesThinkBlockAndLeavesHeadroom) {
     const Json j = Json::parse(r->body);
     const auto calls = ts.engine->calls();
     ASSERT_EQ(calls.size(), 2u);
-    EXPECT_TRUE(calls[0].cancelled);
-    EXPECT_EQ(calls[0].request.max_tokens, 40u);
-    EXPECT_EQ(calls[1].request.max_tokens, 20u);
+    EXPECT_TRUE(calls.at(0).cancelled);
+    EXPECT_EQ(calls.at(0).request.max_tokens, 40u);
+    EXPECT_EQ(calls.at(1).request.max_tokens, 20u);
     // The continuation context is prompt + the 20 reasoning tokens + "\n</think>\n\n".
     const auto& tok = ts.engine->tokenizer();
-    auto expect_prompt = calls[0].request.prompt;
+    auto expect_prompt = calls.at(0).request.prompt;
     for (int i = 0; i < 20; ++i) expect_prompt.push_back(tok.encode("r", false).at(0));
     for (const auto t : tok.encode("\n</think>\n\n", true)) expect_prompt.push_back(t);
-    EXPECT_EQ(calls[1].request.prompt, expect_prompt);
-    EXPECT_EQ(j["choices"][0]["message"]["content"], "Answer.");
-    EXPECT_EQ(j["choices"][0]["message"]["reasoning_content"], std::string(20, 'r'));
-    EXPECT_EQ(j["usage"]["completion_tokens_details"]["reasoning_tokens"], 20);
+    EXPECT_EQ(calls.at(1).request.prompt, expect_prompt);
+    EXPECT_EQ(j.at("choices").at(0).at("message").at("content"), "Answer.");
+    EXPECT_EQ(j.at("choices").at(0).at("message").at("reasoning_content"), std::string(20, 'r'));
+    EXPECT_EQ(j.at("usage").at("completion_tokens_details").at("reasoning_tokens"), 20);
     ASSERT_TRUE(j.contains("warnings"));
     EXPECT_NE(j.value("warnings", Json::array()).dump().find("reasoning budget"), std::string::npos);
     EXPECT_NE(ts.get("/metrics")->body.find("halo_api_reasoning_budget_closes_total 1"), std::string::npos);
@@ -377,8 +377,8 @@ TEST(ApiOpenAI, EmptyContentDiagnostic) {
     Json b = user_chat("hi");
     b["max_tokens"] = 10;
     const Json j = Json::parse(ts.post("/v1/chat/completions", b)->body);
-    EXPECT_EQ(j["choices"][0]["message"]["content"], "");
-    EXPECT_EQ(j["choices"][0]["finish_reason"], "length");
+    EXPECT_EQ(j.at("choices").at(0).at("message").at("content"), "");
+    EXPECT_EQ(j.at("choices").at(0).at("finish_reason"), "length");
     EXPECT_NE(j.value("warnings", Json::array()).dump().find("no content was produced"), std::string::npos) << j.dump();
 }
 
@@ -395,7 +395,7 @@ TEST(ApiOpenAI, MaxTokensDefaultsAndContextClamp) {
     EXPECT_NE(j.value("warnings", Json::array()).dump().find("max_tokens reduced"), std::string::npos);
     auto r = ts.post("/v1/chat/completions", user_chat(std::string(80, 'x')));
     EXPECT_EQ(r->status, 400);
-    EXPECT_EQ(Json::parse(r->body)["error"]["code"], "context_length_exceeded");
+    EXPECT_EQ(Json::parse(r->body).at("error").at("code"), "context_length_exceeded");
 }
 
 // ---- OpenAI completions --------------------------------------------------------------------
@@ -407,7 +407,7 @@ TEST(ApiOpenAI, CompletionsRawTextBothModes) {
     ASSERT_EQ(r->status, 200) << r->body;
     const Json j = Json::parse(r->body);
     EXPECT_EQ(shape_mismatch(load_fixture("openai_completion.json"), j), "");
-    EXPECT_EQ(j["choices"][0]["text"], "</think> raw <tool_call>") << "no output parsing on /v1/completions";
+    EXPECT_EQ(j.at("choices").at(0).at("text"), "</think> raw <tool_call>") << "no output parsing on /v1/completions";
     EXPECT_EQ(ts.engine->prompt_text(0), "Once upon");
 
     const auto s = post_stream(ts, "/v1/completions", Json{{"prompt", "x"}, {"stream", true}});
@@ -416,11 +416,11 @@ TEST(ApiOpenAI, CompletionsRawTextBothModes) {
     const auto ev = data_events(s.body, done);
     EXPECT_TRUE(done);
     for (const auto& e : ev) {
-        EXPECT_EQ(e["object"], "text_completion");
-        text += e["choices"][0]["text"].get<std::string>();
+        EXPECT_EQ(e.at("object"), "text_completion");
+        text += e.at("choices").at(0).at("text").get<std::string>();
     }
     EXPECT_EQ(text, "</think> raw <tool_call>");
-    EXPECT_EQ(ev.back()["choices"][0]["finish_reason"], "stop");
+    EXPECT_EQ(ev.back().at("choices").at(0).at("finish_reason"), "stop");
 }
 
 // ---- Anthropic -----------------------------------------------------------------------------
@@ -435,14 +435,14 @@ TEST(ApiAnthropic, MessagesNonStreaming) {
     const Json j = Json::parse(r->body);
     EXPECT_EQ(shape_mismatch(load_fixture("anthropic_message.json"), j), "");
     const Json blocks = load_fixture("anthropic_blocks.json");
-    ASSERT_EQ(j["content"].size(), 2u);
-    EXPECT_EQ(shape_mismatch(blocks["thinking"], j["content"][0]), "");
-    EXPECT_EQ(shape_mismatch(blocks["text"], j["content"][1]), "");
-    EXPECT_EQ(j["content"][0]["thinking"], "Thinking.");
-    EXPECT_EQ(j["content"][1]["text"], "Hi!");
-    EXPECT_EQ(j["stop_reason"], "end_turn");
-    EXPECT_TRUE(j["id"].get<std::string>().starts_with("msg_"));
-    EXPECT_EQ(j["usage"]["input_tokens"], ts.engine->calls().at(0).request.prompt.size());
+    ASSERT_EQ(j.at("content").size(), 2u);
+    EXPECT_EQ(shape_mismatch(blocks.at("thinking"), j.at("content").at(0)), "");
+    EXPECT_EQ(shape_mismatch(blocks.at("text"), j.at("content").at(1)), "");
+    EXPECT_EQ(j.at("content").at(0).at("thinking"), "Thinking.");
+    EXPECT_EQ(j.at("content").at(1).at("text"), "Hi!");
+    EXPECT_EQ(j.at("stop_reason"), "end_turn");
+    EXPECT_TRUE(j.at("id").get<std::string>().starts_with("msg_"));
+    EXPECT_EQ(j.at("usage").at("input_tokens"), ts.engine->calls().at(0).request.prompt.size());
     EXPECT_TRUE(ts.engine->prompt_text(0).starts_with("<|im_start|>system\nBe kind.<|im_end|>\n"));
 }
 
@@ -460,16 +460,16 @@ TEST(ApiAnthropic, MessagesStreamingEventSequence) {
     for (const auto& e : ev) {
         names.push_back(e.event);
         const Json d = Json::parse(e.data);
-        EXPECT_EQ(d["type"], e.event) << "event name and data.type agree";
+        EXPECT_EQ(d.at("type"), e.event) << "event name and data.type agree";
         if (fx.contains(e.event)) EXPECT_EQ(shape_mismatch(fx[e.event], d), "") << e.data;
         if (e.event == "content_block_delta") {
-            if (d["delta"]["type"] == "thinking_delta") thinking += d["delta"]["thinking"].get<std::string>();
-            if (d["delta"]["type"] == "text_delta") text += d["delta"]["text"].get<std::string>();
+            if (d.at("delta").at("type") == "thinking_delta") thinking += d.at("delta").at("thinking").get<std::string>();
+            if (d.at("delta").at("type") == "text_delta") text += d.at("delta").at("text").get<std::string>();
         }
     }
     ASSERT_GE(names.size(), 8u);
     EXPECT_EQ(names.front(), "message_start");
-    EXPECT_EQ(names[1], "content_block_start");
+    EXPECT_EQ(names.at(1), "content_block_start");
     EXPECT_EQ(names[names.size() - 2], "message_delta");
     EXPECT_EQ(names.back(), "message_stop");
     EXPECT_EQ(thinking, "Plan.");
@@ -478,12 +478,12 @@ TEST(ApiAnthropic, MessagesStreamingEventSequence) {
     std::vector<int> starts, stops;
     for (const auto& e : ev) {
         const Json d = Json::parse(e.data);
-        if (e.event == "content_block_start") starts.push_back(d["index"]);
-        if (e.event == "content_block_stop") stops.push_back(d["index"]);
+        if (e.event == "content_block_start") starts.push_back(d.at("index"));
+        if (e.event == "content_block_stop") stops.push_back(d.at("index"));
     }
     EXPECT_EQ(starts, (std::vector<int>{0, 1}));
     EXPECT_EQ(stops, (std::vector<int>{0, 1}));
-    EXPECT_EQ(Json::parse(ev[ev.size() - 2].data)["delta"]["stop_reason"], "end_turn");
+    EXPECT_EQ(Json::parse(ev[ev.size() - 2].data).at("delta").at("stop_reason"), "end_turn");
 }
 
 TEST(ApiAnthropic, ToolUseRoundTrip) {
@@ -494,11 +494,11 @@ TEST(ApiAnthropic, ToolUseRoundTrip) {
     auto r = ts.post("/v1/messages", b);
     ASSERT_EQ(r->status, 200) << r->body;
     const Json j = Json::parse(r->body);
-    EXPECT_EQ(j["stop_reason"], "tool_use");
-    const Json& last = j["content"].back();
-    EXPECT_EQ(shape_mismatch(load_fixture("anthropic_blocks.json")["tool_use"], last), "");
-    EXPECT_EQ(last["input"], Json({{"city", "Paris"}}));
-    const std::string id = last["id"];
+    EXPECT_EQ(j.at("stop_reason"), "tool_use");
+    const Json& last = j.at("content").back();
+    EXPECT_EQ(shape_mismatch(load_fixture("anthropic_blocks.json").at("tool_use"), last), "");
+    EXPECT_EQ(last.at("input"), Json({{"city", "Paris"}}));
+    const std::string id = last.at("id");
     EXPECT_TRUE(id.starts_with("toolu_"));
 
     // Streaming: a tool_use block with an input_json_delta.
@@ -508,14 +508,14 @@ TEST(ApiAnthropic, ToolUseRoundTrip) {
     bool saw_tool_start = false;
     for (const auto& e : parse_sse(s.body)) {
         const Json d = Json::parse(e.data);
-        if (e.event == "content_block_start" && d["content_block"]["type"] == "tool_use") {
+        if (e.event == "content_block_start" && d.at("content_block").at("type") == "tool_use") {
             saw_tool_start = true;
-            EXPECT_EQ(d["content_block"]["name"], "get_weather");
+            EXPECT_EQ(d.at("content_block").at("name"), "get_weather");
         }
-        if (e.event == "content_block_delta" && d["delta"]["type"] == "input_json_delta") {
-            partial += d["delta"]["partial_json"].get<std::string>();
+        if (e.event == "content_block_delta" && d.at("delta").at("type") == "input_json_delta") {
+            partial += d.at("delta").at("partial_json").get<std::string>();
         }
-        if (e.event == "message_delta") EXPECT_EQ(d["delta"]["stop_reason"], "tool_use");
+        if (e.event == "message_delta") EXPECT_EQ(d.at("delta").at("stop_reason"), "tool_use");
     }
     EXPECT_TRUE(saw_tool_start);
     EXPECT_EQ(Json::parse(partial), Json({{"city", "Paris"}}));
@@ -523,8 +523,8 @@ TEST(ApiAnthropic, ToolUseRoundTrip) {
     // Round trip: tool_use in assistant history, tool_result from the user.
     Json b2 = user_messages("weather?");
     b2["tools"] = weather_tools_anthropic();
-    b2["messages"].push_back(Json{{"role", "assistant"}, {"content", Json::array({last})}});
-    b2["messages"].push_back(Json::parse(R"({"role":"user","content":[{"type":"tool_result","tool_use_id":")" + id +
+    b2.at("messages").push_back(Json{{"role", "assistant"}, {"content", Json::array({last})}});
+    b2.at("messages").push_back(Json::parse(R"({"role":"user","content":[{"type":"tool_result","tool_use_id":")" + id +
                                          R"(","content":"Sunny"}]})"));
     ts.engine->script = [](const auto&, int) { return sc("It is sunny."); };
     ASSERT_EQ(ts.post("/v1/messages", b2)->status, 200);
@@ -545,8 +545,8 @@ TEST(ApiAnthropic, ThinkingBudgetEffortAndStructuredOutput) {
     auto r = ts.post("/v1/messages", b);
     ASSERT_EQ(r->status, 200) << r->body;
     const Json j = Json::parse(r->body);
-    EXPECT_EQ(j["content"][0]["thinking"], std::string(8, 't')) << "explicit budget_tokens is the reasoning budget";
-    EXPECT_EQ(j["content"][1]["text"], "ok");
+    EXPECT_EQ(j.at("content").at(0).at("thinking"), std::string(8, 't')) << "explicit budget_tokens is the reasoning budget";
+    EXPECT_EQ(j.at("content").at(1).at("text"), "ok");
     EXPECT_EQ(Json::parse(ts.engine->calls().at(0).request.sampling.json_schema.value()), schema);
 
     b = user_messages("x");
@@ -559,9 +559,9 @@ TEST(ApiAnthropic, ThinkingBudgetEffortAndStructuredOutput) {
     b["stop_sequences"] = Json::array({"ai"});
     ts.engine->script = [](const auto&, int) { return sc("</think>\n\nplain"); };
     const Json s = Json::parse(ts.post("/v1/messages", b)->body);
-    EXPECT_EQ(s["stop_reason"], "stop_sequence");
-    EXPECT_EQ(s["stop_sequence"], "ai");
-    EXPECT_EQ(s["content"][0]["text"], "pl");
+    EXPECT_EQ(s.at("stop_reason"), "stop_sequence");
+    EXPECT_EQ(s.at("stop_sequence"), "ai");
+    EXPECT_EQ(s.at("content").at(0).at("text"), "pl");
 
     b = user_messages("x", 16);
     b["thinking"] = {{"type", "enabled"}, {"budget_tokens", 16}};
@@ -577,8 +577,8 @@ TEST(ApiAnthropic, MaxTokensStopReason) {
     Json b = user_messages("x", 5);
     b["thinking"] = {{"type", "disabled"}};
     const Json j = Json::parse(ts.post("/v1/messages", b)->body);
-    EXPECT_EQ(j["stop_reason"], "max_tokens");
-    EXPECT_EQ(j["usage"]["output_tokens"], 5);
+    EXPECT_EQ(j.at("stop_reason"), "max_tokens");
+    EXPECT_EQ(j.at("usage").at("output_tokens"), 5);
 }
 
 }  // namespace
