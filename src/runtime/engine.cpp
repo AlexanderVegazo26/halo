@@ -107,6 +107,7 @@ struct Request {
     bool done = false;
     GenerateResult result;
     std::atomic<bool> cancel{false};
+    bool deadline_hit = false;  ///< worker-written before done (read under mu after done)
 };
 
 /// A sequence the worker is running.
@@ -126,8 +127,10 @@ struct Active {
     Clock::time_point t_last;
     std::size_t drafted = 0, accepted = 0;
     Toks forced;                  ///< draft_hook output for the current tick
+    std::size_t delivered = 0;    ///< generated tokens handed to the request's queue
     bool finished = false;
     FinishReason reason = FinishReason::Stop;
+    std::string error;            ///< set with reason == Error by a per-sequence failure (R-1)
 };
 
 /// A retired sequence kept for prefix reuse.
@@ -166,7 +169,13 @@ private:
     void ensure_capacity(std::size_t trunk_rows, std::size_t mtp_rows);
     /// Emits one token for `a`; returns true if the sequence finished.
     bool emit(Active& a, std::int32_t tok, std::vector<TokenEvent>& events);
-    void retire(Active& a, FinishReason why, const std::string& error = {});
+    /// Never throws (R-2): the cache part is best-effort, the done delivery always happens.
+    void retire(Active& a, FinishReason why, std::string error = {}) noexcept;
+    void cache_retired(Active& a);
+    /// Ends a request that never got (or no longer has) a sequence. Never throws.
+    static void finish_unscheduled(Request& r, FinishReason why, std::string error) noexcept;
+    /// R-3: the request's stop token / deadline, if either fired (Cancelled wins).
+    [[nodiscard]] static std::optional<FinishReason> expired(const Request& r) noexcept;
     void deliver(Request& r, std::vector<TokenEvent>& events, bool done);
     void checkpoint(Active& a);
     void apply_profile();
@@ -278,6 +287,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
         mtp_pool_ = std::make_unique<kv_cache::KvPool>(model_->mtp_kv_layout(bt),
                                                        opts.mtp_kv_blocks.value_or(per_seq * (cfg.max_sequences + cache_cap_)));
     }
+    free_slots_.reserve(cfg.max_sequences);
     for (std::size_t i = 0; i < cfg.max_sequences; ++i) {
         slots_.push_back(std::make_unique<state::SequenceState>(*kv_pool_, mtp_pool_.get(), model_->gdn_shape(), max_draft_ + 1));
         free_slots_.push_back(cfg.max_sequences - 1 - i);
@@ -415,12 +425,16 @@ GenerateResult CpuEngine::generate(const GenerateRequest& req, const TokenCallba
         HALO_CHECK(!stop_, ErrorCode::Api, "generate: engine is shutting down");
         r->id = next_id_++;
         pending_.push_back(r);
+        // Notify while holding mu_: the destructor cannot pass its own lock of mu_ (and so
+        // cannot destroy cv_) before this returns, and after this block generate() never
+        // touches the Engine again, so a concurrent destruction is safe.
+        cv_.notify_all();
     }
-    cv_.notify_all();
 
     // Drain this request's queue on the caller's thread (engine.h threading guarantee).
     std::vector<std::int32_t> delivered;
     bool cancelled = false;
+    std::optional<FinishReason> stopped;  // R-3: stop token / deadline seen by this thread
     std::exception_ptr cb_error;
     for (;;) {
         std::unique_lock lk(r->mu);
@@ -430,6 +444,18 @@ GenerateResult CpuEngine::generate(const GenerateRequest& req, const TokenCallba
         r->events.pop_front();
         lk.unlock();
         if (cancelled) continue;
+        // R-3: tokens the worker produced ahead of a slow callback are not delivered once
+        // the stop token or deadline fired.
+        if (req.cancel.stop_requested()) {
+            stopped = FinishReason::Cancelled;
+        } else if (req.deadline && Clock::now() >= *req.deadline) {
+            stopped = FinishReason::Length;
+        }
+        if (stopped) {
+            cancelled = true;
+            r->cancel.store(true, std::memory_order_relaxed);
+            continue;
+        }
         delivered.push_back(ev.token);
         bool keep = true;
         try {
@@ -440,8 +466,10 @@ GenerateResult CpuEngine::generate(const GenerateRequest& req, const TokenCallba
         }
         if (!keep) {
             cancelled = true;
+            // The worker polls the flag at every tick (it is never idle while this request is
+            // queued or active), so no notify on the engine is needed: after enqueueing,
+            // generate() touches only the Request, never the Engine.
             r->cancel.store(true, std::memory_order_relaxed);
-            cv_.notify_all();
         }
     }
     GenerateResult res;
@@ -451,7 +479,8 @@ GenerateResult CpuEngine::generate(const GenerateRequest& req, const TokenCallba
     }
     if (cancelled) {
         res.tokens = std::move(delivered);
-        res.finish = FinishReason::Cancelled;
+        res.finish = stopped.value_or(FinishReason::Cancelled);
+        if (stopped == FinishReason::Length) res.deadline_expired = true;
     }
     if (cb_error) std::rethrow_exception(cb_error);
     return res;
@@ -469,34 +498,89 @@ void CpuEngine::deliver(Request& r, std::vector<TokenEvent>& events, bool done) 
     r.cv.notify_all();
 }
 
+std::optional<FinishReason> CpuEngine::expired(const Request& r) noexcept {
+    if (r.cancel.load(std::memory_order_relaxed) || r.req.cancel.stop_requested()) return FinishReason::Cancelled;
+    if (r.req.deadline && Clock::now() >= *r.req.deadline) return FinishReason::Length;
+    return std::nullopt;
+}
+
+void CpuEngine::finish_unscheduled(Request& r, FinishReason why, std::string error) noexcept {
+    try {
+        const std::lock_guard lk(r.mu);
+        r.result.finish = why;
+        r.result.error = std::move(error);
+        r.result.tokens.clear();
+        r.result.prompt_tokens = r.req.prompt.size();
+        r.result.deadline_expired = r.deadline_hit;
+        r.done = true;
+    } catch (...) {
+        r.done = true;
+    }
+    r.cv.notify_all();
+}
+
 void CpuEngine::run() noexcept {
+    const auto log_error = [](const char* what, const char* msg) noexcept {
+        try {
+            HALO_ERROR("runtime", "{}: {}", what, msg);
+        } catch (...) {  // logging must not take the worker down
+        }
+    };
+    const auto fail_all = [&](const char* msg) noexcept {
+        for (Active& a : active_) {
+            slots_[a.slot]->reset();
+            a.fed.clear();
+            retire(a, FinishReason::Error, msg);
+        }
+        active_.clear();
+    };
     for (;;) {
         std::vector<std::shared_ptr<Request>> admit_now;
-        {
+        std::vector<std::pair<std::shared_ptr<Request>, FinishReason>> dropped;
+        try {
             std::unique_lock lk(mu_);
             cv_.wait(lk, [&] { return stop_ || !pending_.empty() || !active_.empty(); });
             if (stop_) break;
+            // R-3: queued requests whose stop token / deadline fired never get a slot.
+            for (auto it = pending_.begin(); it != pending_.end();) {
+                if (auto why = expired(**it)) {
+                    dropped.emplace_back(*it, *why);
+                    it = pending_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             while (!pending_.empty() && admit_now.size() < free_slots_.size()) {
                 admit_now.push_back(pending_.front());
                 pending_.pop_front();
             }
+        } catch (const std::exception& e) {
+            log_error("scheduler", e.what());
+            continue;
+        }
+        for (auto& [r, why] : dropped) {
+            r->deadline_hit = why == FinishReason::Length;
+            finish_unscheduled(*r, why, {});
         }
         for (const auto& r : admit_now) {
+            if (auto why = expired(*r)) {
+                r->deadline_hit = *why == FinishReason::Length;
+                finish_unscheduled(*r, *why, {});
+                continue;
+            }
             try {
                 admit(r);
             } catch (const std::exception& e) {
-                std::vector<TokenEvent> none;
-                {
-                    const std::lock_guard lk(r->mu);
-                    r->result.finish = FinishReason::Error;
-                    r->result.error = e.what();
-                }
-                deliver(*r, none, true);
+                finish_unscheduled(*r, FinishReason::Error, e.what());
+            } catch (...) {
+                finish_unscheduled(*r, FinishReason::Error, "admission failed");
             }
         }
+        // Cancel / deadline for admitted sequences (prefilling or decoding), polled every tick.
         for (auto it = active_.begin(); it != active_.end();) {
-            if (it->r->cancel.load(std::memory_order_relaxed)) {
-                retire(*it, FinishReason::Cancelled);
+            if (auto why = expired(*it->r)) {
+                it->r->deadline_hit = *why == FinishReason::Length;
+                retire(*it, *why);
                 it = active_.erase(it);
             } else {
                 ++it;
@@ -506,19 +590,18 @@ void CpuEngine::run() noexcept {
         try {
             tick();
         } catch (const std::exception& e) {
-            // Not recoverable for this tick's sequences (e.g. Error(Kernel) after state was
-            // modified): fail them, reset their state, keep serving.
-            HALO_ERROR("runtime", "tick failed: {}", e.what());
-            for (Active& a : active_) {
-                slots_[a.slot]->reset();
-                a.fed.clear();
-                retire(a, FinishReason::Error, e.what());
-            }
-            active_.clear();
+            // Tick-wide failure before or inside the batched step (review R-1: only these fail
+            // every sequence, e.g. Error(Kernel) after the forward modified state). Per-sequence
+            // failures in the output phase are isolated inside tick().
+            log_error("tick failed", e.what());
+            fail_all(e.what());
+        } catch (...) {
+            log_error("tick failed", "unknown exception");
+            fail_all("internal error");
         }
         for (auto it = active_.begin(); it != active_.end();) {
             if (it->finished) {
-                retire(*it, it->reason);
+                retire(*it, it->reason, std::move(it->error));
                 it = active_.erase(it);
             } else {
                 ++it;
@@ -536,15 +619,7 @@ void CpuEngine::run() noexcept {
         retire(a, FinishReason::Error, "engine shut down");
     }
     active_.clear();
-    for (const auto& r : rest) {
-        std::vector<TokenEvent> none;
-        {
-            const std::lock_guard lk(r->mu);
-            r->result.finish = FinishReason::Error;
-            r->result.error = "engine shut down";
-        }
-        deliver(*r, none, true);
-    }
+    for (const auto& r : rest) finish_unscheduled(*r, FinishReason::Error, "engine shut down");
 }
 
 void CpuEngine::admit(const std::shared_ptr<Request>& r) {
@@ -588,12 +663,7 @@ void CpuEngine::admit(const std::shared_ptr<Request>& r) {
             reused = P;
         }
     }
-    {
-        const std::lock_guard lk(mu_);
-        ++stats_.active_sequences;
-        if (cfg_.prefix_cache) (reused > 0 ? stats_.prefix_cache_hits : stats_.prefix_cache_misses)++;
-        stats_.prefix_cache_reused_tokens += reused;
-    }
+    const bool hit = reused > 0;
     {
         const std::lock_guard lk(r->mu);
         r->result.prompt_tokens = prompt.size();
@@ -623,8 +693,14 @@ void CpuEngine::admit(const std::shared_ptr<Request>& r) {
             if (a.ckpt_at.empty() || a.ckpt_at.back() < tail) a.ckpt_at.push_back(tail);
         }
     }
-    free_slots_.pop_back();
     active_.push_back(std::move(a));
+    free_slots_.pop_back();  // after the push: a failed admission never loses a slot
+    {
+        const std::lock_guard lk(mu_);
+        ++stats_.active_sequences;
+        if (cfg_.prefix_cache) (hit ? stats_.prefix_cache_hits : stats_.prefix_cache_misses)++;
+        stats_.prefix_cache_reused_tokens += reused;
+    }
 }
 
 bool CpuEngine::evict_one_cache_entry() {
@@ -647,13 +723,20 @@ void CpuEngine::ensure_capacity(std::size_t trunk_rows, std::size_t mtp_rows) {
 }
 
 void CpuEngine::checkpoint(Active& a) {
-    state::SequenceState& seq = *slots_[a.slot];
-    state::Checkpoint c;
-    c.tokens = a.fed;
-    c.gdn = seq.gdn.snapshot();
-    c.last_hidden = seq.last_hidden;
-    c.owner = a.r->id;
-    (void)ckpts_->insert(std::move(c));  // false: larger than the whole budget (always-recompute)
+    // Best-effort (D-013: always-recompute is the fallback; review R-1): a failure here
+    // costs a future prefix-cache hit, never the request.
+    try {
+        if (opts_.faults.checkpoint) opts_.faults.checkpoint();
+        state::SequenceState& seq = *slots_[a.slot];
+        state::Checkpoint c;
+        c.tokens = a.fed;
+        c.gdn = seq.gdn.snapshot();
+        c.last_hidden = seq.last_hidden;
+        c.owner = a.r->id;
+        (void)ckpts_->insert(std::move(c));  // false: larger than the whole budget
+    } catch (const std::exception& e) {
+        HALO_WARN("runtime", "prefix checkpoint at {} tokens skipped: {}", a.fed.size(), e.what());
+    }
 }
 
 bool CpuEngine::emit(Active& a, std::int32_t tok, std::vector<TokenEvent>& events) {
@@ -747,15 +830,18 @@ void CpuEngine::tick() {
     speculative::Tick t;
     bool fallback = false;
     const std::uint64_t trunk0 = spec_->metrics().trunk_passes, passes0 = spec_->metrics().weight_passes;
-    for (int attempt = 0;; ++attempt) {
+    for (;;) {
         try {
+            if (opts_.faults.before_step) opts_.faults.before_step(reqs);
             spec_->step(reqs, t);
             break;
         } catch (const Error& e) {
-            if (e.code() != ErrorCode::Memory || attempt > 8) throw;
-            // Pre-tick state is intact (Memory errors are atomic). Free cached blocks first,
-            // then fall back to plain decoding without MTP (FR-009 / M3 constraint).
+            if (e.code() != ErrorCode::Memory) throw;
+            // Pre-tick state is intact (Memory errors are atomic). Free cached blocks first
+            // (not counted as attempts: bounded by the cache size, review N-2), then fall back
+            // once to plain decoding without MTP (FR-009 / M3 constraint).
             if (evict_one_cache_entry()) continue;
+            if (fallback) throw;
             bool had_mtp = false;
             for (auto& q : reqs) {
                 if (q.seq->mtp_kv && (q.max_draft > 0 || q.seq->mtp_queue_size() > 0 || !q.prefill.empty())) {
@@ -787,6 +873,10 @@ void CpuEngine::tick() {
         const speculative::StepOutput& o = t.out[i];
         const speculative::StepRequest& q = reqs[i];
         std::vector<TokenEvent> events;
+        // Review R-1: the step committed every sequence consistently, so a failure from here
+        // on (sampler, grammar, bookkeeping, allocation) ends only this sequence.
+        try {
+        if (opts_.faults.output) opts_.faults.output(a.r->req.prompt);
         if (!q.prefill.empty()) {
             a.fed.insert(a.fed.end(), q.prefill.begin(), q.prefill.end());
             a.prompt_done += q.prefill.size();
@@ -823,11 +913,22 @@ void CpuEngine::tick() {
                 (void)emit(a, tok, events);
             }
         }
-        if (!events.empty()) deliver(*a.r, events, false);
         // The token list must describe exactly the KV rows (prefix-cache entries share them).
         HALO_CHECK(a.fed.size() == slots_[a.slot]->length(), ErrorCode::Kernel,
                    "runtime: sequence bookkeeping out of sync ({} tokens recorded, {} KV rows)", a.fed.size(),
                    slots_[a.slot]->length());
+        const std::size_t n_events = events.size();
+        if (!events.empty()) deliver(*a.r, events, false);
+        a.delivered += n_events;
+        } catch (const std::exception& e) {
+            HALO_ERROR("runtime", "sequence failed in the output phase: {}", e.what());
+            a.generated.resize(a.delivered);  // result = exactly what the caller received
+            slots_[a.slot]->reset();          // not cached: its bookkeeping may be off
+            a.fed.clear();
+            a.finished = true;
+            a.reason = FinishReason::Error;
+            a.error = e.what();
+        }
     }
     info.predicted_bytes = spec_->cost_model().spec_step(info.max_draft);
     {
@@ -842,61 +943,80 @@ void CpuEngine::tick() {
     if (opts_.on_tick) opts_.on_tick(info);
 }
 
-void CpuEngine::retire(Active& a, FinishReason why, const std::string& error) {
+void CpuEngine::cache_retired(Active& a) {
+    state::SequenceState& seq = *slots_[a.slot];
+    if (opts_.faults.retire_cache) opts_.faults.retire_cache();
+    try {
+        if (seq.mtp_kv && seq.mtp_queue_size() > 0) {
+            state::SequenceState* one[] = {&seq};
+            spec_->flush_mtp(one);
+        }
+    } catch (const std::exception& e) {  // bad_alloc included (review R-2)
+        HALO_WARN("runtime", "prefix cache: MTP catch-up for a retired sequence failed: {}", e.what());
+        seq.mtp_kv.reset();
+    }
+    // Everything that can throw happens before the KV blocks move into the cache.
+    state::Checkpoint c;
+    c.tokens = a.fed;
+    c.gdn = seq.gdn.snapshot();
+    c.last_hidden = seq.last_hidden;
+    c.owner = a.r->id;
+    CacheEntry e;
+    e.id = a.r->id;
+    e.tokens = a.fed;
+    e.kv = std::make_unique<kv_cache::SequenceKv>(std::move(seq.kv));
+    if (seq.mtp_kv && seq.mtp_queue_size() == 0) e.mtp_kv = std::make_unique<kv_cache::SequenceKv>(std::move(*seq.mtp_kv));
+    cache_.push_front(std::move(e));
+    (void)ckpts_->insert(std::move(c));  // a failure here leaves a KV-only entry (never matched, evicted later)
+    while (cache_.size() > cache_cap_) evict_one_cache_entry();
+}
+
+void CpuEngine::retire(Active& a, FinishReason why, std::string error) noexcept {
     state::SequenceState& seq = *slots_[a.slot];
     // Keep the sequence for prefix reuse (not after an error: its state may be unspecified).
+    bool cached = false;
     if (cfg_.prefix_cache && why != FinishReason::Error && !a.fed.empty() && cache_cap_ > 0) {
         try {
-            if (seq.mtp_kv && seq.mtp_queue_size() > 0) {
-                state::SequenceState* one[] = {&seq};
-                spec_->flush_mtp(one);
+            cache_retired(a);
+            cached = true;
+        } catch (const std::exception& e) {
+            try {
+                HALO_WARN("runtime", "prefix cache: retired sequence not cached: {}", e.what());
+            } catch (...) {
             }
-        } catch (const Error& e) {
-            HALO_WARN("runtime", "prefix cache: MTP catch-up for a retired sequence failed: {}", e.what());
-            seq.mtp_kv.reset();
+        } catch (...) {
         }
-        state::Checkpoint c;
-        c.tokens = a.fed;
-        c.gdn = seq.gdn.snapshot();
-        c.last_hidden = seq.last_hidden;
-        c.owner = a.r->id;
-        CacheEntry e;
-        e.id = a.r->id;
-        e.tokens = a.fed;
-        e.kv = std::make_unique<kv_cache::SequenceKv>(std::move(seq.kv));
-        if (seq.mtp_kv && seq.mtp_queue_size() == 0) e.mtp_kv = std::make_unique<kv_cache::SequenceKv>(std::move(*seq.mtp_kv));
-        cache_.push_front(std::move(e));
-        (void)ckpts_->insert(std::move(c));
-        while (cache_.size() > cache_cap_) evict_one_cache_entry();
-    } else {
-        ckpts_->erase_owner(a.r->id);
     }
+    if (!cached) ckpts_->erase_owner(a.r->id);
     seq.reset();
-    free_slots_.push_back(a.slot);
-
-    {
+    free_slots_.push_back(a.slot);  // capacity reserved at construction: no allocation
+    try {
         // Before the done event: a caller that returns from generate() never sees its own
         // sequence still counted as active.
         const std::lock_guard lk(mu_);
         --stats_.active_sequences;
+    } catch (...) {
     }
     Request& r = *a.r;
-    std::vector<TokenEvent> none;
-    {
+    try {
         const std::lock_guard lk(r.mu);
         GenerateResult& res = r.result;
-        res.tokens = a.generated;
+        res.tokens = std::move(a.generated);
         res.finish = why;
-        res.error = error;
+        res.error = std::move(error);
         res.draft_tokens = a.drafted;
         res.accepted_draft_tokens = a.accepted;
+        res.deadline_expired = r.deadline_hit;
         if (a.t_first) {
             res.ttft_ms = ms_between(r.t_submit, *a.t_first);
             const double dt = ms_between(*a.t_first, a.t_last) / 1000.0;
-            res.decode_tps = a.generated.size() > 1 && dt > 0 ? static_cast<double>(a.generated.size() - 1) / dt : 0.0;
+            res.decode_tps = res.tokens.size() > 1 && dt > 0 ? static_cast<double>(res.tokens.size() - 1) / dt : 0.0;
         }
+        r.done = true;
+    } catch (...) {
+        r.done = true;  // the caller must be released whatever happens
     }
-    deliver(r, none, true);
+    r.cv.notify_all();
 }
 
 }  // namespace

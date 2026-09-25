@@ -57,6 +57,10 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path tiny() { return halo::test::tiny_dir() / "tiny-f32.gguf"; }
+/// The profile-key tests hash and load the model several times; the 102 MB Q4_0 file keeps
+/// them well under the ASan budget (the 540 MB F32 file took ~2400 s under ctest -j). They
+/// assert tuning plumbing, not golden numerics.
+fs::path tiny_q4() { return halo::test::tiny_dir() / "tiny-q4_0.gguf"; }
 
 std::unique_ptr<halo::tokenizer::Tokenizer> tiny_tokenizer() {
     const auto nm = halo::model::NormalizedModel::load(tiny(), halo::model::GgufMode::HeaderOnly);
@@ -496,12 +500,14 @@ halo::autotune::TuneOptions tune_options() {
 TEST_F(Fx, ProfileDbWinnerIsAppliedOnTheNextLaunch) {
     TempDir d("profile");
     const auto db_path = d.path / "profiles.db";
+    if (!fs::exists(tiny_q4())) GTEST_SKIP() << "tiny-q4_0.gguf missing under " << halo::test::tiny_dir();
     EngineConfig cfg = tiny_cfg();
+    cfg.model_path = tiny_q4().string();
     cfg.max_sequences = 1;
     cfg.mtp_enabled = false;  // ASan budget: no draft head passes (MTP is not what this tests)
     cfg.profile_db = db_path.string();
     cfg.platform_power_mode = "dev-host";
-    const auto nm = halo::model::NormalizedModel::load(tiny(), halo::model::GgufMode::HeaderOnly);
+    const auto nm = halo::model::NormalizedModel::load(cfg.model_path, halo::model::GgufMode::HeaderOnly);
     const auto& hp = nm.hparams();
     const std::size_t default_threads = halo::cpu::ThreadPool::default_threads();
     // Single-candidate tunes: the winner is deterministic and differs from the defaults
@@ -525,7 +531,7 @@ TEST_F(Fx, ProfileDbWinnerIsAppliedOnTheNextLaunch) {
         halo::hardware::DiscoveryOptions dopt;
         dopt.root = "/";
         const auto hw = halo::profiling::capture_hardware_state(dopt, "dev-host");
-        const std::string trunk = halo::runtime::sha256_file_hex(tiny());  // KAT-verified above
+        const std::string trunk = halo::runtime::sha256_file_hex(cfg.model_path);  // KAT-verified above
         const std::string pack = halo::runtime::sha256_hex("halo.pack/1\ntrunk=" + trunk + "\nmtp=none\n");
         const auto simd = halo::hardware::runtime_simd_flags();
         const std::string isa = simd && simd->avx512f ? "x86-64-avx512" : simd && simd->avx2 ? "x86-64-avx2" : "x86-64";
@@ -554,25 +560,30 @@ TEST_F(Fx, ProfileDbWinnerIsAppliedOnTheNextLaunch) {
         EXPECT_EQ(s.gdn_chunk, tuned_chunk) << s.tuning;
         EXPECT_NE(s.tuning.find("MATMUL=exact"), std::string::npos) << s.tuning;
         EXPECT_NE(s.tuning.find("GATED_DELTANET=exact"), std::string::npos) << s.tuning;
-        // The tuned engine still computes the reference function: p0's 150-token prefill
-        // crosses nine 16-token GDN chunks (chunk 16 vs 64: fp32-close, same greedy tokens).
+        // The tuned engine still computes the same function as an untuned one on this file:
+        // p0's 150-token prefill crosses nine 16-token GDN chunks (chunk 16 vs 64: fp32-close,
+        // same greedy tokens).
         halo::runtime::GenerateRequest r;
         r.prompt = prompt("p0");
         r.sampling.temperature = 0.0f;
         r.max_tokens = 2;
-        EXPECT_EQ(e->generate(r, {}).tokens, prefix(gold("p0"), 2));
+        EngineConfig plain = cfg;
+        plain.profile_db.reset();
+        EXPECT_EQ(e->generate(r, {}).tokens, halo::runtime::create_cpu_engine(plain)->generate(r, {}).tokens);
     }
 }
 
 TEST_F(Fx, ProfileMismatchesAndOverridesKeepDefaultsVisibly) {
     TempDir d("profile2");
     const auto db_path = d.path / "profiles.db";
+    if (!fs::exists(tiny_q4())) GTEST_SKIP() << "tiny-q4_0.gguf missing under " << halo::test::tiny_dir();
     EngineConfig cfg = tiny_cfg();
+    cfg.model_path = tiny_q4().string();
     cfg.max_sequences = 1;
     cfg.mtp_enabled = false;
     cfg.profile_db = db_path.string();
     cfg.platform_power_mode = "dev-host";
-    const auto nm = halo::model::NormalizedModel::load(tiny(), halo::model::GgufMode::HeaderOnly);
+    const auto nm = halo::model::NormalizedModel::load(cfg.model_path, halo::model::GgufMode::HeaderOnly);
     const auto& hp = nm.hparams();
     const std::size_t default_threads = halo::cpu::ThreadPool::default_threads();
     const unsigned tuned_threads = default_threads == 1 ? 2u : 1u;

@@ -493,6 +493,31 @@ TEST_F(Spec, ChunkedPrefillMtpCatchUpEqualsDirectGoldenPairing) {
     sp.abort_draft(std::span(&q, 1), tk);
 }
 
+// ---- review N-1: a failed MTP flush must not let the queue grow ------------------------------
+
+TEST_F(Spec, FailedMtpFlushDropsMtpInsteadOfGrowingTheQueue) {
+    halo::kv_cache::KvPool small_mtp(model().mtp_kv_layout(), 2);  // 32 MTP rows: p0's 149 pairs cannot flush
+    auto s = std::make_unique<SequenceState>(*tiny_->kv_pool, &small_mtp, model().gdn_shape(), 4);
+    auto sp = spec(GateMode::Off);  // nothing drafts, so only the flush consumes the queue
+    Toks out = prefill(sp, *s, prompt("p0"));
+    EXPECT_FALSE(s->mtp_kv.has_value()) << "MTP must be dropped after the failed flush";
+    EXPECT_EQ(s->mtp_queue_size(), 0u);
+    EXPECT_EQ(sp.metrics().mtp_dropped, 1u);
+    EXPECT_EQ(small_mtp.used_blocks(), 0u);
+    while (out.size() < 6) {  // decoding continues, greedy output unaffected
+        StepRequest r;
+        r.seq = s.get();
+        r.token = out.back();
+        r.max_draft = 2;
+        const Tick t = step1(sp, r);
+        out.insert(out.end(), t.out[0].tokens.begin(), t.out[0].tokens.end());
+        EXPECT_EQ(s->mtp_queue_size(), 0u) << "no queue growth without MTP";
+    }
+    auto off = spec(GateMode::Off);
+    auto ref = seq();
+    EXPECT_EQ(out, generate(off, *ref, prompt("p0"), 6, 0));
+}
+
 // ---- batch-shaped tick -----------------------------------------------------------------------
 
 TEST_F(Spec, BatchedTickEqualsEachSequenceAlone) {

@@ -46,11 +46,32 @@ struct TickInfo {
     std::size_t max_draft = 0;           ///< deepest draft chain in the tick
     std::size_t drafted = 0;
     std::size_t accepted = 0;
-    std::uint32_t weight_passes = 0;     ///< trunk + MTP
-    std::uint32_t trunk_passes = 0;      ///< must be 1 (one batched forward per tick)
+    /// Pass counters count forward / mtp_forward *calls* (review N-4). Each call is one
+    /// weight pass by construction (every matmul runs once over all rows of the call), so a
+    /// count of 1 proves one batched forward, not a measured byte count; the byte figure is
+    /// measured_weight_bytes.
+    std::uint32_t weight_passes = 0;     ///< trunk + MTP forward calls
+    std::uint32_t trunk_passes = 0;      ///< trunk forward calls; must be 1 (one batched forward per tick)
     std::uint64_t predicted_bytes = 0;   ///< CostModel: trunk + head + max_draft * (MTP block + head)
-    std::uint64_t measured_weight_bytes = 0;  ///< models::StepCost of the tick's forwards
+    /// Weight bytes the tick's forwards accounted (models::StepCost): every matrix read,
+    /// counted once per call, plus the LM head. Excludes norm/conv vectors, so it sits just
+    /// below predicted_bytes.
+    std::uint64_t measured_weight_bytes = 0;
     bool mtp_fallback = false;           ///< retried with k = 0 after MTP-KV exhaustion
+};
+
+/// Failure injection for tests (review R-5(a)). Each hook runs on the worker thread and
+/// may throw to simulate a failure at that point; null hooks cost nothing.
+struct FaultInjection {
+    /// Before the tick's batched step (a throw here is a tick-wide failure; Error(Memory)
+    /// exercises the evict / MTP-fallback retry loop).
+    std::function<void(std::span<const speculative::StepRequest>)> before_step;
+    /// In the per-sequence output phase, after the step committed (R-1 isolation).
+    std::function<void(std::span<const std::int32_t> prompt)> output;
+    /// Inside a best-effort GDN prefix checkpoint (D-013).
+    std::function<void()> checkpoint;
+    /// Inside retirement's prefix-cache part (R-2: must never escape the worker).
+    std::function<void()> retire_cache;
 };
 
 struct CpuEngineOptions {
@@ -75,6 +96,7 @@ struct CpuEngineOptions {
     std::function<std::vector<std::int32_t>(std::span<const std::int32_t>, std::span<const std::int32_t>)> draft_hook;
     /// Called on the worker thread after every tick. Must not block or call the engine.
     std::function<void(const TickInfo&)> on_tick;
+    FaultInjection faults;  ///< tests only
 };
 
 /// Throws Error(Unsupported) for a backend other than cpu/auto, Error(Model/Io) for model

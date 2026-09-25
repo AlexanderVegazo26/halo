@@ -457,6 +457,12 @@ TEST_F(EngineTest, EveryTickIsOneTrunkPassAndRollbackNeverAddsOne) {
         EXPECT_EQ(t.trunk_passes, 1u) << "one batched trunk forward per tick";
         if (t.prefill_rows == 0) {
             EXPECT_EQ(t.weight_passes, 1u + t.max_draft) << "decode tick: 1 trunk + 1 MTP pass per draft depth";
+            // Review N-4 / R-5(c): the pass counters are call counts; the byte figure is the
+            // measured one. A decode tick reads every matrix once per call plus the heads,
+            // i.e. the cost model minus the (tiny) norm / conv vectors.
+            EXPECT_LE(t.measured_weight_bytes, t.predicted_bytes);
+            EXPECT_GE(static_cast<double>(t.measured_weight_bytes), 0.99 * static_cast<double>(t.predicted_bytes))
+                << "measured " << t.measured_weight_bytes << " vs predicted " << t.predicted_bytes;
         }
         if (t.accepted < t.drafted) ++rollback_ticks;
     }

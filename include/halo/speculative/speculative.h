@@ -170,6 +170,7 @@ struct Metrics {
     std::vector<std::uint64_t> accepted_at;  ///< [i]: steps where draft i+1 was accepted
     std::uint64_t emitted = 0;
     std::uint64_t mtp_flush_rows = 0;
+    std::uint64_t mtp_dropped = 0;      ///< sequences whose MTP was dropped after a failed flush (N-1)
     std::uint64_t predicted_bytes = 0;  ///< sum of CostModel predictions over sequence-steps
     models::StepCost last_cost;         ///< measured traffic of the last tick (all forwards)
     std::uint32_t last_weight_passes = 0;  ///< trunk + MTP weight passes of the last tick

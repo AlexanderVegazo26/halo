@@ -3,12 +3,14 @@
 // The implementation (qwen35 forward, KV + GDN state, MTP) lives in src/runtime and
 // src/models; consumers depend only on this header plus sampling.h.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -68,6 +70,31 @@ struct GenerateRequest {
     /// token positions). Optional; the engine also checkpoints at prompt end - k and at a
     /// fixed spacing. Out-of-range or too-closely-spaced hints are ignored.
     std::vector<std::size_t> checkpoint_hints;
+    /// Additive (WS-G M5, review R-3): cancellation that needs no token.
+    ///
+    /// The engine checks both fields at every scheduler tick for this request, whatever its
+    /// state: QUEUED (waiting for a sequence slot), PREFILLING or DECODING. The worst-case
+    /// latency from the event to the request ending is one tick (one batched forward, i.e.
+    /// at most one prefill chunk plus one decode step), plus the time to drain already
+    /// produced tokens.
+    ///   * `cancel.stop_requested()`             -> FinishReason::Cancelled
+    ///   * `steady_clock::now() >= *deadline`     -> FinishReason::Length with
+    ///                                              GenerateResult::deadline_expired = true
+    /// If both hold at the same check, Cancelled wins. generate() also checks both before
+    /// every callback, so tokens the worker produced ahead of a slow callback are dropped,
+    /// not delivered: once either fires, no further callback is made. generate() then
+    /// returns normally (it does not throw); `tokens` holds exactly the tokens already passed
+    /// to the callback, which may be none for a queued or prefilling request.
+    /// The KV/GDN state of a cancelled sequence stays consistent and is kept for the prefix
+    /// cache like any finished sequence.
+    ///
+    /// `cancel` is copied into the engine; std::stop_source::request_stop() is thread-safe
+    /// and may be called from any thread at any time, including before generate() (the
+    /// request then ends at its first tick without running a forward). A default-constructed
+    /// std::stop_token never requests a stop. Returning false from the TokenCallback remains
+    /// an equivalent way to cancel once tokens flow.
+    std::stop_token cancel;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
 struct GenerateResult {
@@ -80,6 +107,9 @@ struct GenerateResult {
     std::size_t draft_tokens = 0;
     std::size_t accepted_draft_tokens = 0;
     std::string error;
+    /// Additive (WS-G M5): the request ended because GenerateRequest::deadline passed
+    /// (finish == Length); distinguishes a wall-clock limit from max_tokens.
+    bool deadline_expired = false;
 };
 
 struct EngineStats {

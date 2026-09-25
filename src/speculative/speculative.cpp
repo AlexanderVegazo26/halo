@@ -398,10 +398,19 @@ void Speculator::step(std::span<const StepRequest> reqs, Tick& tick) {
     }
     try {
         flush_mtp(full);
-    } catch (const Error& e) {
-        // The tick's results and every sequence's state are valid (a failed flush changes
-        // nothing: the queue stays and is retried by the next draft or flush). Surface it.
-        HALO_WARN("speculative", "MTP catch-up flush deferred: {}", e.what());
+    } catch (const std::exception& e) {
+        // The tick's results and every sequence's trunk state are valid. Keeping the queue
+        // would let it grow without bound while nothing drafts (review N-1), so these
+        // sequences stop using MTP: their greedy output is unaffected (drafts never change
+        // emitted tokens), only speculation is lost for them.
+        HALO_WARN("speculative", "MTP catch-up flush failed ({}); {} sequence(s) continue without MTP", e.what(),
+                  full.size());
+        for (state::SequenceState* s : full) {
+            s->mtp_kv.reset();
+            s->mtp_queue_tokens.clear();
+            s->mtp_queue_hidden.clear();
+            ++metrics_.mtp_dropped;
+        }
     }
 }
 
