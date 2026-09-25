@@ -1,0 +1,15 @@
+You are resuming workstream WS-J of HALO (repo C:\Users\avega\Documents\personal\halo, branch halo-v0.2, shared working tree with five other concurrent agents).
+
+STEP 0: read your full original instructions in this file first and follow them (scope limits, no-commit rule, Definition of Done): C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\orig_J.txt
+Any "RESUME CONTEXT"/"state at interruption" block inside that file is SUPERSEDED by this addendum where they conflict.
+
+## ADDENDUM (this is attempt #2 — the previous agent was interrupted too)
+- Predecessor transcript (large JSONL; targeted grep only, never read in full): C:\Users\avega\.claude-swap-backup\sessions\1-alexander.rodriguez_tapcheck.com\projects\C--Users-avega-Documents-personal-halo\1b6a49bb-319d-4fd6-9db9-70dd4ca7b838\subagents\agent-a02e88f11d4579660.jsonl
+- Tree snapshot at the latest interruption (recovery only): C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\wip2-snapshot.tgz
+- Predecessor's last reported steps: Milestone 1 in progress: it had captured real llama-bench/llama-server fixtures (tests/unit/profiling/fixtures/*) and written include/halo/profiling/{counters,hw_state,record,stats,suite,timer,workload}.h + src/profiling/*.cpp + CMakeLists; it was writing the hardware-state header. Unknown whether anything has compiled yet or whether tests exist beyond CMakeLists.txt.
+- tests/unit/cpu_kernels/** is OFF-LIMITS (owned by WS-F2).
+- BEFORE editing anything: inventory every file in your scope (check for truncation / half-applied edits), then build your module set in your private build dir and run ctest to establish exact counts. Continue sound work; do not rewrite it.
+
+## NEW RUN SHAPE (mandatory)
+- Work ONE milestone at a time. At each milestone boundary STOP and end your turn with a report: files touched, exact ctest counts (passed/failed/skipped + skip reasons), ASan status, demonstrate-fail evidence, next step, proposed commit message. The orchestrator will integrate and commit that milestone, then message you to continue with the next one. Do not start the next milestone before being told.
+- Keep a short status file at C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\status_J.md, updated at every meaningful step (current milestone, what is green, what is half-done, next action). A future resume will read only this file, so keep it accurate.

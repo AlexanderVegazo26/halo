@@ -1,0 +1,63 @@
+You are implementing workstream WS-I of HALO (C++ LLM inference runtime for Qwen3.8-27B): the HTTP API server and the `halo` CLI. The repo is a shared working tree, and other agents are editing other directories concurrently: C:\Users\avega\Documents\personal\halo, branch halo-v0.2.
+
+FIRST read in full:
+- `docs/dev/AGENT_BRIEF.md`. It is mandatory: shared-tree rules, the WSL build, no commits, and the Definition of Done.
+- `docs/DECISIONS.md`. The amendments at the bottom override earlier text.
+- PRD §8 FR-006/FR-012/FR-013, §12 Security, §13 Observability, §14 CLI, §15 Configuration (docs/HALO_PRD_v1.1.md).
+- TRD §25, §26, §44, §45, §47, §48, §65 (docs/HALO_TRD_v1.1.md).
+- `include/halo/runtime/engine.h` and `include/halo/sampling/sampling.h`. These are the contracts you code against. The Engine implementation is being written in parallel by WS-G, so build and test against a **fake Engine** you write in your tests: a deterministic token script, a controllable delay, and cancellation observation.
+- `include/halo/tokenizer/tokenizer.h` and `include/halo/template/{chat_template.h,output_parser.h}`, both real and done. Read `docs/reviews/` too if a security review has appeared there.
+- `include/halo/model/{model.h,inspect.h}` and `include/halo/hardware/{hardware.h,checklist.h}`, `include/halo/memory/planner.h` (real and done), for the CLI's `inspect` and `devices` commands.
+- The cpp-pro skill in the brief.
+
+cpp-httplib v0.57.1 is available as CMake target `halo_httplib` (header-only, `#include <httplib.h>`), and nlohmann_json as `nlohmann_json::nlohmann_json`.
+
+Build: `HALO_BUILD_DIR=/root/halo-build-wsi bash scripts/build.sh "-DHALO_ONLY=tensor;model;tokenizer;template;hardware;memory;api;halo;api_tests;cli_tests"`. Adapt the list to your module and test-dir names. If you need the real Engine to link `tools/halo`, guard it: `if(TARGET halo_runtime)`. WS-G is creating `halo_runtime`; the CLI's run/serve must still build without it, and report "runtime not built".
+
+## Scope (you own ONLY: src/api/**, include/halo/api/**, tools/halo/**, tests/unit/api/**, tests/unit/cli/**, docs/api.md)
+
+1. **API server** (`halo_api`; PRD FR-013, TRD §25): `ApiServer(Engine&, ServerConfig)`, backed by cpp-httplib.
+   - **Endpoints:** GET /health, GET /v1/models, GET /metrics (Prometheus text format with the PRD §13 metrics that EngineStats provides), POST /v1/chat/completions, POST /v1/completions (OpenAI), POST /v1/messages (Anthropic Messages), POST /tokenize, POST /apply-template.
+   - **Chat path:** request JSON → validation with typed API errors → messages/tools mapping → `ChatTemplate::render` with the tools and the reasoning options → `Tokenizer::encode(parse_special=true)`.
+     - **Special-token injection** (security): user and tool message *content* must not be able to inject control tokens. For example, literal `<|im_start|>` inside content must not become the control token. Implement a robust approach: tokenize the template skeleton and the content separately, or escape/reject. Document the approach and test it.
+     - → `Engine::generate` with a TokenCallback → OutputParser. The parser splits reasoning from content and tool calls.
+     - → OpenAI response shape: choices[0].message with content, reasoning_content and tool_calls, plus usage including reasoning tokens.
+     - → Anthropic response shape: content blocks of type thinking, text and tool_use, stop_reason, usage.
+   - **Streaming:** SSE for both APIs. The OpenAI event format is chat.completion.chunk plus `data: [DONE]`. The Anthropic format is message_start, content_block_start/delta/stop, message_delta and message_stop events.
+     - Tool-call deltas are streamed.
+     - Client disconnect cancels generation: the callback returns false.
+   - **Reasoning budget safety** (TRD §25):
+     - Track reasoning and output tokens separately.
+     - Reserve output headroom when max_tokens is small.
+     - Accept `reasoning_effort: "none"` gracefully (it maps to enable_thinking false).
+     - Return a clear diagnostic when content is empty because reasoning used the whole budget.
+   - **Structured output:** pass `response_format` (json_schema / json_object) and the Anthropic equivalent through to SamplingParams.
+   - **Security** (PRD §12): bind 127.0.0.1 by default; optional API key (Bearer / x-api-key) compared in constant time; request body size limit; queue and concurrency caps returning 429/503; per-request max_tokens caps; configurable CORS origins (default none); no file-path parameters over the API; strict JSON parsing with typed error bodies in each API's native error format. One failing request must never crash the process (RR-005).
+2. **CLI** `tools/halo/` (PRD §14, TRD §26). One `halo` binary with subcommands:
+   - `inspect <model.gguf> [--mtp f] [--json]`: the FR-003 compatibility report via model::inspect, the memory estimate via the planner, and warnings. Header-only files should work too.
+   - `devices [--verify] [--json]`: hardware discovery plus the deployment checklist.
+   - `serve --model <m> [--mtp f] [--host] [--port] [--api-key] [--ctx] [--parallel] ...`
+   - `run <model> --prompt/-p ... [--mtp f]`: single generation, streamed to stdout.
+   - `tokenize` and `template` helpers.
+   - `bench` / `tune` stubs that print "not implemented in v0.2" and exit 2.
+   - Config resolution order (TRD §44): CLI > environment `HALO_*` > YAML/JSON config file. Supporting JSON-only config is acceptable for v0.2; say so.
+3. **Tests:**
+   - Spin up the ApiServer on an ephemeral localhost port with the fake Engine and exercise every endpoint with httplib::Client: non-streaming and streaming (parse SSE events), tools round trip, structured-output passthrough, errors (malformed JSON, oversize body, missing auth, 429 on queue cap), client-disconnect cancellation observed by the fake engine, and the special-token injection test.
+   - Golden-check response shapes against small hand-written fixtures derived from the OpenAI and Anthropic API docs.
+   - CLI: `inspect` on /root/halo-ref/tiny/tiny-q8_0.gguf and on the real header files (/root/halo-ref/*.header.gguf), and `devices` against the fixture root tests/fixtures/sysfs/evo_x2 (add a hidden `--root` flag).
+4. **`docs/api.md`:** the endpoint reference, the field support matrix, and deviations from OpenAI/Anthropic.
+
+Follow the brief's Definition of Done: ASan run, demonstrate-fail, NO commit (list your files and propose a commit message). Report test counts including skips.
+
+## RESUME CONTEXT (read before anything else)
+This workstream was started by a previous agent whose session was interrupted before it finished. Its partial, UNCOMMITTED work is already in the working tree inside your scope. Rules:
+- First inventory every file in your scope (list them, read them). Reconcile and continue that work; do NOT rewrite from scratch what is sound. Check each file for truncation or half-applied edits before building on it.
+- The predecessor's transcript is at C:\Users\avega\.claude-swap-backup\sessions\1-alexander.rodriguez_tapcheck.com\projects\C--Users-avega-Documents-personal-halo\2319f384-93ca-4c6a-85ff-6e181a08685e\subagents\agent-aed022aba1d23bd4d.jsonl (large JSONL). Use it only for targeted grep lookups (e.g. its design notes or test evidence), never read it in full.
+- A tar snapshot of the tree at interruption exists at C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\1b6a49bb-319d-4fd6-9db9-70dd4ca7b838\scratchpad\wip-snapshot.tgz (for recovery only).
+- Committed since the interruption: the security review (docs/reviews/2026-09-24-security-review.md) and the CPU half of D-016 (commit 391f11f): cpu::GdnQkParams{qk_l2norm, q_scale} now FROZEN; the bool shorthands remain for compatibility.
+- Baseline of the committed modules: 248 tests pass, 0 fail, 1 skip (Bandwidth.ConformantDefaultsDevHost, opt-in).
+
+State at interruption (WS-I):
+- src/api (admission, generation, json_util, metrics, prompt, requests, server .cpp/.h + CMakeLists.txt) and include/halo/api (prompt.h, server.h) exist. tools/halo/ does NOT exist (the CLI is unstarted); tests/unit/api and tests/unit/cli do not exist; docs/api.md does not exist.
+- Known compile error: src/api/prompt.cpp:206 uses chat::prompt_ends_in_reasoning, which exists (committed) in include/halo/template/output_parser.h; prompt.cpp is just missing that #include. Do not edit src/template.
+- The security review is now committed: docs/reviews/2026-09-24-security-review.md. Treat its S-1 (special-token injection), S-2 (stack overflow from deeply nested request JSON) and API requirements A-1..A-12 as HARD requirements for this workstream; each must be implemented or explicitly listed in your report as not done with the reason, and S-1/S-2 must have regression tests (A-12). Read the whole review.

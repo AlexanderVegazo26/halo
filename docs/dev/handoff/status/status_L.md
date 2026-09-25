@@ -1,0 +1,20 @@
+# WS-L status
+- M1 (template hardening): started. Read brief/review. Baseline build in /root/halo-build-wsl running.
+- Baseline (/root/halo-build-wsl, HALO_ONLY=tensor;model;tokenizer;template): ctest 89/89 pass, 0 skip.
+- minja 021c229 has no hooks. Plan: pinned patch (limits via thread_local budget, match_continuous regex, iterative ~Value, dump/== guards, cycle prevention, context tracking), parse on big-stack thread, comment compaction + unterminated-comment reject in HALO prescan.
+- Tier A patch (dev copy scratchpad/L/minja-dev) + HALO TemplateLimits/parse thread/S-8/S-10 + tests/unit/template/test_template_limits.cpp: release 36/36, ASan 36/36 (dev build -DFETCHCONTENT_SOURCE_DIR_MINJA=dev copy, /root/halo-build-wsl-dev[-asan]).
+- Measured: Qwen 4002-msg conv: depth 20, steps 754K, iters 36K, output 3.5MB. Render at depth cap 1024: stack 1166 KiB release / 2862 KiB ASan. Step ~1us (exp macro 20M steps=18.7s) -> max_steps=4M.
+- Red (env disable): macro SIGSEGV, 5000 parens SIGSEGV, loops SIGALRM, output SIGALRM, exp macro SIGALRM, long tokens w/o parse stack SIGSEGV; 3000 parens/100KB comment/parse paths/100MB string: exit1/4 (no or wrong error).
+- Next: Tier B (value traversal, cycles, context leaks, amplifiers, alloc), mutation runs for lexer hunks, then HaloDeps PATCH_COMMAND + stale-dir verification, docs/security-hardening.md.
+- [resume after usage limit] Killed mutation shells. Patch cmake/patches/minja-halo-limits.patch (sha 54da3b56...) + apply_patch.cmake wired into HaloDeps PATCH_COMMAND => shared tree buildable. Verified on git-archive HEAD build dir: unpatched -> reconfigure patches (marker=1), 2nd reconfigure no-op, tampered patch -> configure FATAL. Scratch tools renamed l_*.
+- Next: full ctest release + ASan without override, finish mutation evidence, docs/security-hardening.md (M1 section), handback.
+- Full ctest without override, /root/halo-build-wsl: 111/111 pass, 0 skip. ASan /root/halo-build-wsl-asan: 111/111 (after ASan time budget -> hang guard only). docs/security-hardening.md written (M1 + S-5 note).
+- Running Tier-B mutation evidence (l_muts.sh -> L/l_muts2.out).
+- [resume 2] No stale procs; all mutated sites clean (mutants only in /root/halo-mut). All mutants finished: all red except store_alloc (masked by result charge; documented). dtor needed new test MillionLevelValueIsTornDownIteratively (red SIGSEGV).
+- apply_patch.cmake message now "Delete <build>/_deps/minja-* and reconfigure". Evidence: fresh=patched once; stale(HEAD-configured) -> reconfigure patched once, re-configure no-op, build OK; script re-run -> "already applied"; hand-edited hunk context -> FATAL w/ delete msg, untouched; tampered patch -> FATAL sha.
+- Release ctest 112/112. ASan final run in progress.
+- ASan final: 112/112 pass (LSan on). M1 DONE; handback sent. Next: M2 tokenizer after orchestrator commit.
+- M1 committed as 09b7c22. M2 started 2026-09-25: trie matcher + trie dup detection + TokenizerLimits (4096 / 256 B) + S-7 dense-id check. New tests/unit/tokenizer/test_tokenizer_limits.cpp (7 tests). Release ctest 119/119. Mutants (private tree /root/l_tokmut): all red as expected, restored green. docs updated. ASan run pending.
+- M2 DONE: release 119/119, ASan 119/119. Handback sent. Next: M3 (GGUF budget S-4, output parser S-9, render-side S-2 depth walk) after commit.
+- M3 (2026-09-25): gguf budget + parse_json_bounded + render depth walk + tests done; mutants rerun after cut-off; downstream + full runs pending.
+- M3 DONE: release 127/127, ASan 127/127, downstream models 25/25 runtime 16/16 api 67/67; mutants all red. Final handback sent.

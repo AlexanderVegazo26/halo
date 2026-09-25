@@ -1,0 +1,48 @@
+You are fixing code-review findings in HALO's CPU/Vulkan operator seam. Repo: C:\Users\avega\Documents\personal\halo, branch halo-v0.2. It is a shared working tree, and other agents are editing src/models, src/runtime, src/kv_cache, src/state, src/speculative, src/sampling, src/api and tools/ concurrently. Do NOT touch those.
+
+FIRST read in full:
+- `docs/dev/AGENT_BRIEF.md`. It is mandatory: shared-tree rules, WSL build, no commits, Definition of Done.
+- `docs/reviews/2026-09-24-code-review.md`.
+- `docs/DECISIONS.md`, especially **D-016** at the bottom and D-004, D-012, D-014.
+- `include/halo/backends/cpu/ops.h`, `include/halo/backends/vulkan/ops.h`, `backends/vulkan/**`, `tests/unit/vulkan/**`, `backends/cpu/gated_delta_rule.cpp`, `tests/unit/cpu_kernels/**`, `include/halo/tensor/quant.h`.
+- The cpp-pro skill in the brief.
+
+Build with dir `/root/halo-build-wsf2` and `-DHALO_ONLY=tensor;cpu;cpu_kernels;vulkan`.
+
+## Scope
+You own ONLY: backends/cpu/**, include/halo/backends/cpu/**, tests/unit/cpu_kernels/**, backends/vulkan/**, include/halo/backends/vulkan/**, tests/unit/vulkan/**.
+
+## Fix, in this order
+1. **M-1 / D-016.**
+   - Both GDN ops (CPU recurrent and chunked; Vulkan decode/T-row) take raw q/k plus explicit `qk_l2norm` (bool) and `q_scale` (float, applied after the optional normalization). Each applies exactly those, with no implicit scaling.
+   - Implement in-kernel L2 normalization in the Vulkan shader, per head, eps 1e-6.
+   - Keep the CPU API source-compatible if reasonable, e.g. a params struct with defaults `qk_l2norm=true, q_scale=1/sqrt(d_k)`. Another agent is about to call the CPU op, so note any signature change prominently in your report and keep the change small.
+   - Update the header docs so both headers cite D-016.
+2. **M-2.**
+   - Link `halo_backend_cpu` and `halo_tensor` into test_vulkan.
+   - Replace the private Q8_0/Q4_K/Q6_K dequant port with `tensor::dequantize_row`.
+   - Make the GDN, rms_norm and argmax tests differential against `halo::cpu` on the **same input buffers**.
+   - fp64 references may remain only for error-bound scaling.
+   - Add `halo_tensor` as a PUBLIC dependency of halo_backend_vulkan (N-2).
+3. **S-3.** ARGMAX on NaN raises `Error(Kernel)` on Vulkan too: the kernel writes a NaN flag and the host throws. Add a differential test.
+4. **S-1.** A `BufferView{buffer, byte offset, bytes, row stride}` for every Vulkan op. Use the alignment-remainder push-constant technique already used for GDN state regions, and replace handle-equality aliasing checks with byte-range overlap checks. Test sub-range and arena usage: several weights in one buffer, and the fused qkv row read through q/k/v views without copies.
+5. **S-6.** `matvec_q5_k` shader (ggml block_q5_K), differential against `tensor::dequantize_row`. If cheap, also add IQ4_XS, the next UD type per D-014.
+6. **S-5.**
+   - CPU: a long-trajectory test, T ≥ 4096 (reduced head count is OK), of chunked prefill followed by 64 recurrent steps vs fp64, state included, with a justified tolerance.
+   - The same trajectory on Vulkan vs CPU; lavapipe is slow, so keep T manageable and say what you ran.
+   - A Vulkan in-place multi-row case with slots.
+7. **N-1.** Staging upload uses a bounded, reused staging buffer with chunked copies.
+
+Follow the brief's Definition of Done: ASan run, demonstrate-fail for each fix (show the new differential test goes red on the old contract), NO commit. List your files and propose a commit message. Report test counts including skips.
+
+## RESUME CONTEXT (read before anything else)
+This workstream was started by a previous agent whose session was interrupted before it finished. Its partial, UNCOMMITTED work is already in the working tree inside your scope. Rules:
+- First inventory every file in your scope (list them, read them). Reconcile and continue that work; do NOT rewrite from scratch what is sound. Check each file for truncation or half-applied edits before building on it.
+- The predecessor's transcript is at C:\Users\avega\.claude-swap-backup\sessions\1-alexander.rodriguez_tapcheck.com\projects\C--Users-avega-Documents-personal-halo\2319f384-93ca-4c6a-85ff-6e181a08685e\subagents\agent-a43d0c536ff28d447.jsonl (large JSONL). Use it only for targeted grep lookups (e.g. its design notes or test evidence), never read it in full.
+- A tar snapshot of the tree at interruption exists at C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\1b6a49bb-319d-4fd6-9db9-70dd4ca7b838\scratchpad\wip-snapshot.tgz (for recovery only).
+- Committed since the interruption: the security review (docs/reviews/2026-09-24-security-review.md) and the CPU half of D-016 (commit 391f11f): cpu::GdnQkParams{qk_l2norm, q_scale} now FROZEN; the bool shorthands remain for compatibility.
+- Baseline of the committed modules: 248 tests pass, 0 fail, 1 skip (Bandwidth.ConformantDefaultsDevHost, opt-in).
+
+State at interruption (WS-F2):
+- M-1 CPU side is DONE and committed by the orchestrator (commit 391f11f): cpu::GdnQkParams, gdn_q_scale, the template bool shorthands (fixed a -Wmissing-field-initializers break), and tests/unit/cpu_kernels/reference.h gdn_ref taking an explicit q_scale (callers in test_gdn.cpp/test_golden.cpp updated). These CPU signatures are now FROZEN because WS-G calls them: do not change them. You may add CPU tests (e.g. that q_scale is applied exactly as given, with qk_l2norm=false, shown red on the old implicit-scale code).
+- Everything else is unstarted: M-1 Vulkan side (GdnDecodeArgs qk_l2norm + q_scale, in-shader L2 norm), M-2, S-3, S-1, S-6, S-5, N-1.

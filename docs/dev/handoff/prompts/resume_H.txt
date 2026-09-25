@@ -1,0 +1,37 @@
+You are implementing workstream WS-H of HALO (C++ LLM runtime for Qwen3.8, 248,320-token vocabulary): the sampler and JSON-Schema structured output. Repo (shared working tree; other agents are editing other directories concurrently): C:\Users\avega\Documents\personal\halo, branch halo-v0.2.
+
+FIRST read in full: `docs/dev/AGENT_BRIEF.md` (mandatory: shared-tree rules, WSL build, no commits, Definition of Done), `docs/DECISIONS.md` (the amendments at the bottom override earlier text), PRD FR-007, FR-013; TRD §19, §23, §25 (docs/HALO_PRD_v1.1.md, docs/HALO_TRD_v1.1.md), `include/halo/sampling/sampling.h` (the contract: SamplingParams. Additive changes OK; list them), `include/halo/tokenizer/tokenizer.h` (you need token pieces as bytes for grammar masking), include/halo/backends/cpu/ops.h (top_k, argmax, softmax helpers you may reuse). Read the cpp-pro skill in the brief. Build: `HALO_BUILD_DIR=/root/halo-build-wsh bash scripts/build.sh "-DHALO_ONLY=tokenizer;cpu;sampling;sampling_tests"` (adapt to your module and test-dir names).
+
+## Scope (you own ONLY: src/sampling/**, include/halo/sampling/** (sampling.h additive only), tests/unit/sampling/**, python/tools/make_sampling_golden.py if needed)
+
+1. **Sampler** (`halo_sampling`), TRD §23: input is either a full logits row (248,320 floats) or a GPU-style **top-k prefiltered candidate set** (ids + logits, k ≤ 1024, TRD §19). Chain: repetition / presence / frequency penalties over the last N tokens (llama.cpp semantics; document them), grammar/JSON mask, temperature, top-k, typical-p, top-p, min-p, then a seeded draw. Deterministic for a given seed (std::mt19937_64 or a PCG you implement; record which), independent of thread count. Greedy is exact argmax with ties to the lowest id. Include an `exact_prefilter_ok(params, k)` helper stating when a top-k prefilter is exact: for example top_k ≤ k with no penalties that could promote tokens outside the prefilter. Test that prefiltered sampling equals full-row sampling in those cases. Numerically stable (log-sum-exp); rejects NaN and Inf with a typed error.
+   - Distribution tests: with fixed logits, the empirical frequencies over many draws match the analytic post-filter distribution (chi-square with a stated α). Each filter is checked against a direct reference, including edge cases: all −inf except one, ties, top_p = 1, min_p = 0, k larger than the candidate count.
+2. **Structured output** (TRD §25: "constrained decoding over the 248K vocab, implemented via token masks, not grammar loops in the hot path"):
+   - A JSON-Schema → grammar compiler for the subset agent clients send: type (object, array, string, number, integer, boolean, null), properties, required, additionalProperties false/true, enum, const, items, anyOf/oneOf, minItems/maxItems, string minLength/maxLength, pattern (reject unsupported regex features with a typed Unsupported error), nested $ref to #/$defs.
+   - `json_object` mode: any JSON object.
+   - A byte-level pushdown automaton, or an equivalent incremental JSON grammar matcher, that accepts or rejects UTF-8 bytes.
+   - A token-mask engine that computes the allowed-token bitset over the vocabulary at each step from the matcher state, using a precomputed trie of token byte strings so the mask costs well under a full vocab scan per step. Measure and report this as a dev-host number. Also `accept_token(id)` to advance, and completion detection. Tokens that end mid-UTF-8 sequence must be handled correctly (byte-level matching).
+   - Tests on the **real** 248,320-token vocabulary (construct the Tokenizer from /root/halo-ref/tokenizer.json via Tokenizer::from_hf_dir or from_hf_json):
+     - Random schema-constrained sampling runs of 200 or more always produce JSON that parses and validates against the schema. Validate in the test with a small validator you write, or with Python jsonschema through a golden file.
+     - The mask never allows a token that leads to a dead state.
+     - EOS is allowed only when the JSON is complete.
+     - Adversarial schemas: deep nesting, large enums, and unsupported keywords, which must give a typed error.
+3. A small `LogitsProcessor`-style API that the runtime (WS-G, written in parallel) will call per step:
+   - `Sampler::create(params, tokenizer*)` → `sample(logits span or candidates, history)` → token.
+   - `accept(token)`.
+   - `reset()`.
+   Document thread-safety: one sampler per sequence.
+
+Follow the brief's Definition of Done: ASan run, demonstrate-fail, NO commit (list your files and propose a commit message). Report test counts including skips, and the dev-host mask timing.
+
+## RESUME CONTEXT (read before anything else)
+This workstream was started by a previous agent whose session was interrupted before it finished. Its partial, UNCOMMITTED work is already in the working tree inside your scope. Rules:
+- First inventory every file in your scope (list them, read them). Reconcile and continue that work; do NOT rewrite from scratch what is sound. Check each file for truncation or half-applied edits before building on it.
+- The predecessor's transcript is at C:\Users\avega\.claude-swap-backup\sessions\1-alexander.rodriguez_tapcheck.com\projects\C--Users-avega-Documents-personal-halo\2319f384-93ca-4c6a-85ff-6e181a08685e\subagents\agent-a56dc757f253f0893.jsonl (large JSONL). Use it only for targeted grep lookups (e.g. its design notes or test evidence), never read it in full.
+- A tar snapshot of the tree at interruption exists at C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\1b6a49bb-319d-4fd6-9db9-70dd4ca7b838\scratchpad\wip-snapshot.tgz (for recovery only).
+- Committed since the interruption: the security review (docs/reviews/2026-09-24-security-review.md) and the CPU half of D-016 (commit 391f11f): cpu::GdnQkParams{qk_l2norm, q_scale} now FROZEN; the bool shorthands remain for compatibility.
+- Baseline of the committed modules: 248 tests pass, 0 fail, 1 skip (Bandwidth.ConformantDefaultsDevHost, opt-in).
+
+State at interruption (WS-H):
+- Files exist in src/sampling (grammar.cpp, grammar_impl.h, json_grammar.cpp/.h, json_schema.cpp, token_mask.cpp) and include/halo/sampling/structured.h. There is NO src/sampling/CMakeLists.txt yet and no tests/unit/sampling, and the core sampler chain source may not exist yet: check.
+- The predecessor's LAST edit attempt was a bash heredoc that hung and was killed; the file it was editing may be truncated or half-edited (likely token_mask.cpp or json_grammar.cpp). Verify every file is complete and coherent before building on it. Use the Edit/Write tools for file edits, not heredocs.

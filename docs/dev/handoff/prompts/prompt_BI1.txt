@@ -1,0 +1,36 @@
+You are implementing workstream WS-BI-1 of HALO, a C++23 LLM inference runtime for Qwen3.8-27B on AMD Strix Halo (repo C:\Users\avega\Documents\personal\halo, branch halo-v0.2, a shared working tree). Other agents are editing right now:
+- WS-G: src/runtime, src/speculative, src/state, tests/unit/{runtime,speculative,state,integration};
+- WS-I: src/api, tools/halo, tests/unit/{api,cli}.
+Never touch those paths.
+
+FIRST, read in full:
+- docs/dev/AGENT_BRIEF.md (mandatory: shared-tree rules, WSL build via script files, NO commits, Definition of Done);
+- docs/adr/ADR-001-backend-interface.md (ACCEPTED; this is your spec; follow §9 WS-BI-1 exactly);
+- docs/DECISIONS.md, especially D-016 and D-017 (the owner's acceptance and answers);
+- docs/dev/ARCHITECTURE.md;
+- docs/dev/TECH_DEBT.md.
+Load the cpp-pro skill.
+
+## Scope (you own ONLY)
+- The new backend-interface module the ADR names (headers under include/halo/, sources under src/, and tests under tests/unit/, using the ADR's module name);
+- src/models/**, include/halo/models/**, tests/unit/models/**.
+Do NOT edit include/halo/backends/cpu/** in WS-BI-1: the ring overloads are WS-BI-2's.
+Do NOT edit backends/hip or backends/vulkan.
+
+## Goal (ADR §9 WS-BI-1)
+- The Backend interface: types, ops, buffers, status, kernel choice, limits, per the ADR §5.
+- A CPU adapter implemented over the frozen halo::cpu calls.
+- Qwen35::forward and mtp_forward run over a Backend& (the CPU adapter), keeping the existing constructors and entry points source-compatible so WS-G's runtime and speculative code compile unchanged.
+- Gate:
+  - The new forward over the CPU adapter is bit-identical to the current forward, compared per layer, on KV, GDN state and slots, and on all tiny-model goldens (f32 plus the quant files).
+  - Every existing test still passes with an unchanged count. Measure the baseline FIRST in a private git-archive tree of HEAD.
+  - Show the equivalence test red on deliberate breaks.
+- Keep the D-011 byte/cost accounting working.
+
+## Run shape (mandatory)
+- Work milestone by milestone (propose M1/M2 splits in your first status update if the work is large), and STOP at each boundary with the report in your handback message:
+  - files, exact ctest counts (pass/fail/skip plus reasons), ASan, demonstrate-fail evidence, next step, proposed commit message.
+- Keep C:\Users\avega\AppData\Local\Temp\claude\C--Users-avega-Documents-personal-halo\d2c57405-8141-41ac-9d34-75ce2f047a53\scratchpad\status_BI1.md current. Prefix all scratchpad tooling with bi1_.
+- Build in a private tree (git archive HEAD plus your scope) or in the shared tree, using -DHALO_ONLY including tensor;model;cpu;tokenizer;template;memory;hardware;kv_cache;state;models;speculative;sampling;runtime plus your module and test dirs, so that WS-G's consumers are compiled against your change.
+- The mutation/restore gotcha: /mnt/c mtimes lag the WSL clock by about 0.6 s. Delete the object files or touch the source +2 s, and finish every mutation run with a clean ctest.
+- NEVER launch programs on the Windows host. Everything runs inside WSL via script files.
