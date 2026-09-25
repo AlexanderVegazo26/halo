@@ -1,1 +1,1 @@
-halo_add_test(test_tokenizer SOURCES test_tokenizer.cpp test_unicode.cpp LIBS halo_tokenizer)
+halo_add_test(test_tokenizer SOURCES test_tokenizer.cpp test_unicode.cpp test_tokenizer_limits.cpp LIBS halo_tokenizer)

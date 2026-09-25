@@ -10,8 +10,8 @@ the tests that cover it, and anything not done. Model files (GGUF metadata, chat
 | S-3 template DoS | M1 | mitigated |
 | S-8 reserved `extra_context` keys | M1 | mitigated |
 | S-10 `range()` off-by-one, macro leak | M1 | mitigated |
-| S-6 quadratic tokenizer | M2 | pending |
-| S-7 tokenizer.json allocation | M2 | pending |
+| S-6 quadratic tokenizer | M2 | mitigated |
+| S-7 tokenizer.json allocation | M2 | mitigated |
 | S-4 GGUF metadata amplification | M3 | pending |
 | S-9 output-parser nesting | M3 | pending |
 | S-5 SIGBUS on truncated mapping | — | out of scope (see below) |
@@ -230,6 +230,90 @@ Test files are `tests/unit/template/test_template_limits.cpp` and the existing
   them.
 - **Untrusted request data is not depth-checked here.** The S-2 render-side depth check on
   `messages`/`tools` (an iterative walk, depth 64) is planned with S-9 in M3.
+
+## Tokenizer (M2)
+
+### S-6: quadratic work on a hostile vocabulary
+
+**Mitigations:**
+- **Duplicate detection.** Added tokens are inserted into one byte trie, and an insertion
+  that ends on an occupied node is a duplicate. This replaces the pairwise O(n²) check. The
+  error message is unchanged: "added token 'X' appears twice (ids A and B)".
+- **Matching.** Added-token matching walks the same trie at each input position and keeps
+  the longest token allowed by `parse_special`. This gives exactly the old rule: leftmost
+  position, then longest allowed token, with Control tokens skipped when
+  `parse_special=false`. It is also HF's LeftmostLongest rule.
+  - A 256-entry first-byte table skips positions where no added token can start.
+  - Trie edges live in the same open-addressing table used for merges.
+- **Caps.** `TokenizerLimits` is a new field `VocabSpec::limits`, plus new
+  `from_hf_json` and `from_hf_dir` overloads.
+  - `max_added_tokens = 4096`: real Qwen3.8 vocabularies have 33.
+  - `max_added_token_bytes = 256`: the real maximum is 21.
+  - A violation throws `Error(Model)` at build. 0 disables a cap.
+
+**Cost bound:**
+- Build is linear in the total added-token bytes.
+- Encode costs at most `max_added_token_bytes` trie steps per input byte.
+- The worst case inside the default caps is a vocabulary of 4096 `'<'`-prefix tokens that
+  never complete. It encodes 100 KB of `'<'` in 0.24 s on the dev host (D-001), about
+  2.4 µs per byte.
+- *Believed, not verified:* HF's `aho-corasick` LeftmostLongest search restarts after
+  each match and has the same kind of O(text × longest token) worst case.
+
+**Tests** (in `tests/unit/tokenizer/test_tokenizer_limits.cpp`):
+
+| Test | What it checks | Result |
+|---|---|---|
+| `EightyThousandAddedTokensBuildAndEncodeQuickly` | the review's 80,000 Control tokens | build 0.18–0.26 s (was 8.8 s on the unhardened code); encode 20 KB of `'<'` in 0.0015 s (was 6.6 s); thresholds < 1 s and < 0.1 s, release only |
+| `SharedPrefixVocabularyEncodesInBoundedTime` | the worst case inside the caps | 0.24 s (unhardened: 3.4 s); threshold < 1 s |
+| `AddedTokenCountAndLengthAreCapped` | 4096 and 256 accepted, 4097 and 257 rejected, raised limits honoured | — |
+| `DuplicateAddedTokensStillRejected` | same message; prefixes are not duplicates | — |
+| `TrieMatchingEqualsLeftmostLongestReference` | 60 random overlapping vocabularies × 40 texts × both `parse_special` values, against a naive leftmost-longest reference; over 1000 added-token matches | — |
+
+**Unchanged on real data:** `TokenizerGolden.*`, the HF corpus, fuzz, codepoint and NFC
+sweeps, and the GGUF-vs-JSON vocabulary test are all still token-for-token identical.
+
+### S-7: tiny tokenizer.json, large allocation
+
+**Mitigation:**
+- `from_hf_json` sizes its vectors by the largest id. That id must now be below the number
+  of entries (vocab + added_tokens), and this is checked before any id-sized allocation.
+  `Error(Model)` says "…not below the entry count … (ids must be dense)".
+- Real files are dense: 248,077 entries, largest id 248,076.
+- An added token that repeats a vocab entry's id is still accepted.
+- **Behaviour change:** a tokenizer.json whose ids have holes is now rejected.
+
+**Tests:**
+- `TinyFileNamingAHugeIdIsRejectedWithoutAllocating`:
+  - Input: a complete, supported 728-byte tokenizer.json with vocab `{"a": 16777215}`.
+  - It runs in a forked child that resets peak RSS (`/proc/self/clear_refs`) and passes
+    only if the file is rejected with `Error(Model)` while VmHWM grows by less than 64 MiB.
+  - Unhardened code: VmHWM grew by 1,208,072 KiB (≈1.15 GiB), exit 3.
+- `DenseIdsWithAddedTokenOverlapStillLoad`: the overlap is accepted, a hole is rejected,
+  and limits apply on the HF path.
+
+### Demonstrated red (M2)
+
+Each mutant was built into a private copy of the tree and run against the
+`TokenizerLimits.*` tests (scratch tools `l_tokmut.py` and `l_tokmut.sh`):
+
+| Mutant | Tests that went red |
+|---|---|
+| `head`: the unhardened `tokenizer.cpp` from HEAD | both timing tests, the caps test, S-7 (1.15 GiB), dense ids. The reference-equivalence and duplicate tests stay green, which shows the old and new matching agree. |
+| `no_s7` | S-7 test (exit 3, 1.15 GiB); dense-id hole assertion |
+| `no_count_cap` | caps test; HF-path limit assertion |
+| `no_len_cap` | caps test |
+| `longest_first_wrong`: first terminal instead of longest | reference-equivalence test |
+| `ignore_special_filter` | reference-equivalence test; `TokenizerSpec.AddedTokensSplitFirstLongestWins` |
+
+After the mutants, the restored copy is green and byte-identical to the repo source.
+
+### Not done (M2)
+
+- **Matcher cost.** Matching is not Aho–Corasick-linear. Its cost per input byte is bounded
+  by the longest added token (256 by default), as above.
+- **GGUF path unchanged.** GGUF-sourced vocabularies arrive as vectors already bounded by
+  the GGUF parser; M3 adds the metadata budget.
 
 ## S-5 (out of scope)
 

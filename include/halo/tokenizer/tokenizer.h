@@ -46,6 +46,16 @@ enum class Normalizer : std::uint8_t {
     Nfc,  ///< HF tokenizer.json `{"type": "NFC"}`; llama.cpp does not apply it
 };
 
+/// Bounds on untrusted vocabularies (security review S-6; docs/security-hardening.md).
+/// Violations throw halo::Error(Model) when the tokenizer is built. 0 disables a limit.
+struct TokenizerLimits {
+    /// Control + UserDefined tokens. Real Qwen3.8 vocabularies have 33.
+    std::size_t max_added_tokens = 4096;
+    /// Bytes of one added token (real maximum: 21). Added-token matching costs at most
+    /// this many trie steps per input byte, whatever the vocabulary.
+    std::size_t max_added_token_bytes = 256;
+};
+
 /// Raw vocabulary, as a GGUF loader reads it (`tokenizer.ggml.*`).
 struct VocabSpec {
     /// Token strings indexed by id. Normal tokens use the GPT-2 byte-to-unicode mapping
@@ -60,6 +70,7 @@ struct VocabSpec {
     std::optional<std::int32_t> pad;
     PreTokenizer pre_tokenizer = PreTokenizer::Qwen35;
     Normalizer normalizer = Normalizer::Nfc;
+    TokenizerLimits limits{};
 };
 
 /// Token ids plus, for each token, the byte offset in the *input* text where the text that
@@ -79,17 +90,23 @@ class Tokenizer {
 public:
     /// Builds from raw vectors (the GGUF path). Throws halo::Error: Model for malformed
     /// data (bad merge, missing byte token, out-of-range special id, duplicate added
-    /// token), Unsupported for token types this implementation does not handle.
+    /// token, spec.limits exceeded), Unsupported for token types this implementation does
+    /// not handle.
     static Tokenizer from_spec(VocabSpec spec);
 
     /// Builds from HF `tokenizer.json` text; `tokenizer_config_json` (optional) supplies
     /// bos/eos/pad. Configs other than NFC + qwen35 Split + ByteLevel + BPE (no dropout,
     /// no unk, no byte fallback, merges not ignored) are rejected with Unsupported.
+    /// Token ids must be dense: the largest id must be below the number of vocab plus
+    /// added_tokens entries (Model otherwise; checked before any id-sized allocation, S-7).
     static Tokenizer from_hf_json(std::string_view tokenizer_json, std::string_view tokenizer_config_json = {});
+    static Tokenizer from_hf_json(std::string_view tokenizer_json, std::string_view tokenizer_config_json,
+                                  const TokenizerLimits& limits);
 
     /// Reads `dir/tokenizer.json` (+ `dir/tokenizer_config.json` if present). Io on read
     /// failure; files larger than 256 MiB are rejected.
     static Tokenizer from_hf_dir(const std::filesystem::path& dir);
+    static Tokenizer from_hf_dir(const std::filesystem::path& dir, const TokenizerLimits& limits);
 
     Tokenizer(Tokenizer&&) noexcept;
     Tokenizer& operator=(Tokenizer&&) noexcept;

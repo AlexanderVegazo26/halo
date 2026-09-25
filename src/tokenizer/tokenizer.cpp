@@ -166,7 +166,11 @@ struct Tokenizer::Impl {
     std::array<std::int32_t, 256> byte_to_id{};
     MergeMap merges;
     std::vector<AddedToken> added;
-    std::array<std::vector<std::uint32_t>, 256> added_by_byte;  // indices, longest first
+    // Added-token trie (S-6): node 0 is the root; edges keyed by (node, byte) in the same
+    // open-addressing table as the merges; trie_term[node] = index into `added` or -1.
+    MergeMap trie_edges;
+    std::vector<std::int32_t> trie_term;
+    std::array<bool, 256> added_first_byte{};
     std::optional<std::int32_t> bos, eos, pad;
     Normalizer normalizer = Normalizer::Nfc;
 
@@ -178,16 +182,25 @@ struct Tokenizer::Impl {
     }
 
     // Leftmost-longest added-token match at or after `from`; returns {pos, index} or
-    // {npos, 0}.
+    // {npos, 0}. At each position the trie is walked along the text and the longest token
+    // allowed by parse_special wins: the same result as the former scan of every
+    // candidate sharing the first byte, longest first (S-6). The cost per position is
+    // bounded by the longest added token (TokenizerLimits::max_added_token_bytes), not by
+    // the number of added tokens.
     [[nodiscard]] std::pair<std::size_t, std::size_t> next_added(std::string_view s, std::size_t from,
                                                                  bool parse_special) const {
         for (std::size_t p = from; p < s.size(); ++p) {
-            const auto& cands = added_by_byte[static_cast<unsigned char>(s[p])];
-            for (std::uint32_t idx : cands) {
-                const AddedToken& t = added[idx];
-                if (t.special && !parse_special) continue;
-                if (s.compare(p, t.content.size(), t.content) == 0) return {p, idx};
+            if (!added_first_byte[static_cast<unsigned char>(s[p])]) continue;
+            std::int32_t node = 0;
+            std::int32_t best = -1;
+            for (std::size_t q = p; q < s.size(); ++q) {
+                const MergeMap::Value* e = trie_edges.find(node, static_cast<unsigned char>(s[q]));
+                if (e == nullptr) break;
+                node = e->new_id;
+                const std::int32_t t = trie_term[static_cast<std::size_t>(node)];
+                if (t >= 0 && (parse_special || !added[static_cast<std::size_t>(t)].special)) best = t;
             }
+            if (best >= 0) return {p, static_cast<std::size_t>(best)};
         }
         return {std::string_view::npos, 0};
     }
@@ -209,6 +222,14 @@ std::unique_ptr<Tokenizer::Impl> Tokenizer::Impl::build(VocabSpec spec) {
     HALO_CHECK(spec.types.empty() || spec.types.size() == n, ErrorCode::Model,
                "token_type count {} != token count {}", spec.types.size(), n);
     if (spec.types.empty()) spec.types.assign(n, TokenType::Normal);
+    const TokenizerLimits limits = spec.limits;
+    {
+        const auto n_added = static_cast<std::size_t>(std::count_if(spec.types.begin(), spec.types.end(), [](TokenType t) {
+            return t == TokenType::Control || t == TokenType::UserDefined;
+        }));
+        HALO_CHECK(limits.max_added_tokens == 0 || n_added <= limits.max_added_tokens, ErrorCode::Model,
+                   "vocabulary has {} added (Control/UserDefined) tokens (limit {})", n_added, limits.max_added_tokens);
+    }
     HALO_CHECK(spec.merges.size() <= kMaxVocab, ErrorCode::Model, "merge count {} out of range",
                spec.merges.size());
 
@@ -230,6 +251,9 @@ std::unique_ptr<Tokenizer::Impl> Tokenizer::Impl::build(VocabSpec spec) {
             case TokenType::Control:
             case TokenType::UserDefined:
                 HALO_CHECK(!spec.tokens[i].empty(), ErrorCode::Model, "empty added token at id {}", id);
+                HALO_CHECK(limits.max_added_token_bytes == 0 || spec.tokens[i].size() <= limits.max_added_token_bytes,
+                           ErrorCode::Model, "added token at id {} is {} bytes (limit {})", id, spec.tokens[i].size(),
+                           limits.max_added_token_bytes);
                 impl->pieces[i] = mapped_to_bytes(spec.tokens[i]);
                 impl->added.push_back({spec.tokens[i], id, t == TokenType::Control});
                 break;
@@ -264,18 +288,32 @@ std::unique_ptr<Tokenizer::Impl> Tokenizer::Impl::build(VocabSpec spec) {
                    "merge {} references a token missing from the vocabulary", r);
         impl->merges.insert(a->second, b->second, {static_cast<std::uint32_t>(r), c->second});
     }
+    // Added tokens: one trie over all contents. An insertion ending on an occupied node is
+    // a duplicate, so detection is linear in the total content (S-6: was pairwise O(n^2)).
+    std::size_t trie_bytes = 0;
+    for (const auto& t : impl->added) trie_bytes += t.content.size();
+    impl->trie_edges.reserve(trie_bytes);
+    impl->trie_term.reserve(trie_bytes + 1);
+    impl->trie_term.push_back(-1);
     for (std::size_t i = 0; i < impl->added.size(); ++i) {
         const auto& t = impl->added[i];
-        for (std::size_t j = 0; j < i; ++j) {
-            HALO_CHECK(impl->added[j].content != t.content, ErrorCode::Model,
-                       "added token '{}' appears twice (ids {} and {})", t.content, impl->added[j].id, t.id);
+        std::int32_t node = 0;
+        for (const char ch : t.content) {
+            const auto b = static_cast<unsigned char>(ch);
+            if (const MergeMap::Value* e = impl->trie_edges.find(node, b)) {
+                node = e->new_id;
+            } else {
+                const auto child = static_cast<std::int32_t>(impl->trie_term.size());
+                impl->trie_term.push_back(-1);
+                impl->trie_edges.insert(node, b, {0, child});
+                node = child;
+            }
         }
-        impl->added_by_byte[static_cast<unsigned char>(t.content[0])].push_back(static_cast<std::uint32_t>(i));
-    }
-    for (auto& v : impl->added_by_byte) {
-        std::stable_sort(v.begin(), v.end(), [&](std::uint32_t x, std::uint32_t y) {
-            return impl->added[x].content.size() > impl->added[y].content.size();
-        });
+        std::int32_t& term = impl->trie_term[static_cast<std::size_t>(node)];
+        HALO_CHECK(term < 0, ErrorCode::Model, "added token '{}' appears twice (ids {} and {})", t.content,
+                   impl->added[static_cast<std::size_t>(term)].id, t.id);
+        term = static_cast<std::int32_t>(i);
+        impl->added_first_byte[static_cast<unsigned char>(t.content[0])] = true;
     }
     impl->by_piece.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -527,6 +565,11 @@ std::string read_file(const std::filesystem::path& p) {
 }  // namespace
 
 Tokenizer Tokenizer::from_hf_json(std::string_view tokenizer_json, std::string_view tokenizer_config_json) {
+    return from_hf_json(tokenizer_json, tokenizer_config_json, TokenizerLimits{});
+}
+
+Tokenizer Tokenizer::from_hf_json(std::string_view tokenizer_json, std::string_view tokenizer_config_json,
+                                  const TokenizerLimits& limits) {
     Json j;
     try {
         j = Json::parse(tokenizer_json);
@@ -534,6 +577,7 @@ Tokenizer Tokenizer::from_hf_json(std::string_view tokenizer_json, std::string_v
         throw_error(ErrorCode::Model, "tokenizer.json is not valid JSON: {}", e.what());
     }
     VocabSpec spec;
+    spec.limits = limits;
     try {
         require(j.is_object(), "top level must be an object");
         require(is_null_or(j, "truncation", Json()) && is_null_or(j, "padding", Json()),
@@ -577,6 +621,13 @@ Tokenizer Tokenizer::from_hf_json(std::string_view tokenizer_json, std::string_v
         };
         for (const auto& [tok, id] : vocab.items()) take_id(id);
         for (const auto& a : added) take_id(a.at("id"));
+        // S-7: the vectors are sized by the largest id, so bound it by the entries actually
+        // present first. Ids are dense in real files (an added token may repeat a vocab
+        // entry's id); an 856-byte file naming id 16777215 would otherwise allocate ~1 GiB.
+        const std::size_t entries = vocab.size() + added.size();
+        HALO_CHECK(n <= entries, ErrorCode::Model,
+                   "tokenizer.json: largest token id {} is not below the entry count {} (ids must be dense)", n - 1,
+                   entries);
         spec.tokens.assign(n, std::string());
         spec.types.assign(n, TokenType::Unused);
         for (const auto& [tok, idv] : vocab.items()) {
@@ -631,11 +682,13 @@ Tokenizer Tokenizer::from_hf_json(std::string_view tokenizer_json, std::string_v
     return from_spec(std::move(spec));
 }
 
-Tokenizer Tokenizer::from_hf_dir(const std::filesystem::path& dir) {
+Tokenizer Tokenizer::from_hf_dir(const std::filesystem::path& dir) { return from_hf_dir(dir, TokenizerLimits{}); }
+
+Tokenizer Tokenizer::from_hf_dir(const std::filesystem::path& dir, const TokenizerLimits& limits) {
     const std::string tj = read_file(dir / "tokenizer.json");
     std::string cfg;
     if (std::filesystem::exists(dir / "tokenizer_config.json")) cfg = read_file(dir / "tokenizer_config.json");
-    return from_hf_json(tj, cfg);
+    return from_hf_json(tj, cfg, limits);
 }
 
 std::vector<std::int32_t> Tokenizer::encode(std::string_view utf8, bool parse_special) const {
