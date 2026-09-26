@@ -8,9 +8,14 @@
 
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -705,6 +710,60 @@ TEST(CliOutput, OutputPathsNeverFollowSymlinksAndWriteFailuresAreErrors) {
     fs::remove(link);
     fs::remove(target);
     fs::remove(fs::temp_directory_path() / ("halo_cli_test_" + tag + "_ok.json"));
+}
+
+TEST(CliOutput, RewriteKeepsTheExistingModeAndNewFilesFollowTheUmask) {
+    // S-46: a 0600 (or 0640) report stays 0600 (0640) when rewritten; a 0600-only fixture
+    // could not tell "keep the mode" from "always 0600", hence both.
+    const std::string tag = std::to_string(::getpid());
+    for (const ::mode_t m : {::mode_t{0600}, ::mode_t{0640}}) {
+        const fs::path p = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_mode.json");
+        fs::remove(p);
+        { std::ofstream(p) << "old"; }
+        ASSERT_EQ(::chmod(p.c_str(), m), 0);
+        cli::write_file_no_follow(p, "new");
+        struct stat st {};
+        ASSERT_EQ(::stat(p.c_str(), &st), 0);
+        EXPECT_EQ(st.st_mode & 0777, m) << std::oct << "mode after rewrite " << (st.st_mode & 0777);
+        std::ifstream in(p);
+        std::string s;
+        std::getline(in, s);
+        EXPECT_EQ(s, "new");
+        fs::remove(p);
+    }
+    const ::mode_t mask = ::umask(022);
+    ::umask(mask);
+    const fs::path fresh = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_fresh.json");
+    fs::remove(fresh);
+    cli::write_file_no_follow(fresh, "{}");
+    struct stat st {};
+    ASSERT_EQ(::stat(fresh.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 0777, 0644 & ~mask) << std::oct << (st.st_mode & 0777);
+    fs::remove(fresh);
+}
+
+TEST(CliOutput, FileIdentityDetectsAnInPlaceRewriteThatRestoresSizeAndMtime) {
+    // S-46: size and mtime can be restored after an in-place rewrite (utimensat); ctime
+    // cannot be set from user space.
+    const fs::path p = fs::temp_directory_path() / ("halo_cli_test_" + std::to_string(::getpid()) + "_ident.bin");
+    { std::ofstream(p) << "aaaa"; }
+    const cli::FileIdentity before = cli::file_identity(p);
+    struct stat st {};
+    ASSERT_EQ(::stat(p.c_str(), &st), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));  // past the kernel's coarse clock tick
+    {
+        const int fd = ::open(p.c_str(), O_WRONLY | O_CLOEXEC);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::write(fd, "bbbb", 4), 4);
+        ::close(fd);
+    }
+    const timespec times[2] = {st.st_atim, st.st_mtim};
+    ASSERT_EQ(::utimensat(AT_FDCWD, p.c_str(), times, 0), 0);
+    const cli::FileIdentity after = cli::file_identity(p);
+    EXPECT_EQ(after.size, before.size) << "premise: same size";
+    EXPECT_EQ(after.mtime_ns, before.mtime_ns) << "premise: mtime restored";
+    EXPECT_FALSE(after == before) << "the rewritten file has the same identity";
+    fs::remove(p);
 }
 
 // ---- bench ---------------------------------------------------------------------------------

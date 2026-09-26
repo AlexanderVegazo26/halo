@@ -61,11 +61,26 @@ struct ServerConfig {
     /// S-16): at most `utility_concurrency` at once, `utility_queue` waiting; beyond -> 429.
     std::size_t utility_concurrency = 2;
     std::size_t utility_queue = 8;
-    /// Per-connection deadlines for reading a request (security review S-13): the time from
-    /// the connection opening (or the previous response) to the complete header block, and
-    /// from the headers to the complete body. 0 = unlimited. Linux only (see conn_guard.h).
+    /// Connections accepted and waiting for an HTTP thread; one more is closed at accept.
+    /// Keep it above the number of connections one client may hold, and threads + queue
+    /// well below the open-file limit (security review S-38).
+    std::size_t http_queue = 256;
+    /// Per-connection deadlines for reading a request (security reviews S-13, S-38): the
+    /// time from a worker starting to read the request (or from the previous response on a
+    /// keep-alive connection) to the complete header block, and from the headers to the
+    /// complete body. A connection waiting in the queue with its request buffered has no
+    /// deadline running; one that has sent nothing is timed from accept. 0 = unlimited.
+    /// Linux only (see conn_guard.h).
     std::chrono::milliseconds header_timeout{10000};
     std::chrono::milliseconds body_timeout{60000};
+    /// Connections one peer address may hold before its first request is complete (header
+    /// phase, not yet served, no complete header block buffered); the oldest beyond this
+    /// are closed. 0 = no limit (S-38).
+    std::size_t max_header_connections_per_peer = 8;
+    /// Overload shedding (S-38): when a complete request has waited a scan interval for an
+    /// HTTP thread, header-phase connections that are not a complete buffered request
+    /// (dribbling, silent or idle keep-alive) and older than this are closed. 0 = off.
+    std::chrono::milliseconds header_shed_grace{1000};
     std::chrono::seconds read_timeout{60};
     std::chrono::seconds write_timeout{60};
     std::chrono::seconds keep_alive_timeout{5};

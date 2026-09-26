@@ -69,9 +69,11 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
 - **A reverse proxy is required for every non-loopback deployment** (D-017). It must enforce
   per-client connection limits and header and body timeouts: in nginx terms, `limit_conn`,
   `client_header_timeout` and `client_body_timeout`. It also terminates TLS.
-  - HALO's own read deadlines (below) keep the server reachable, but they do not cap
-    connections per peer.
-  - Without the proxy, one peer can open enough connections to use the whole HTTP pool.
+  - HALO's own read deadlines, per-peer cap and overload shedding (below) keep `/health`
+    and complete requests served under slow-header floods, but they cannot tell apart
+    clients behind one address, and they act once per scan (200 ms).
+  - Without the proxy, a peer that holds more connections than `http_threads` plus
+    `http_queue` still gets new connections refused at accept, for everyone.
 - **API key.** An empty key is a `CONFIG_ERROR`, never "no key". The CLI treats an empty
   `HALO_API_KEY=` as unset (review S-18). When `api_key` is set, every route except
   `GET /health` and CORS preflight
@@ -96,15 +98,38 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
   - Other values pass through undecoded and the body is parsed as JSON. That covers
     unrecognized codings (`x-gzip`) and lists (`gzip, identity`). A body that really is
     compressed then fails as malformed JSON (review S-25). Nothing is ever decompressed.
-- **Read deadlines (review S-13).** Each connection must deliver a complete header block
-  within `header_timeout` (default 10 s), counted from the connection opening or from the
-  previous response, and a complete body within `body_timeout` (default 60 s). A connection
-  that misses a deadline is closed, and counted in
-  `halo_api_connection_deadline_closes_total`.
-  - This stops slow-header clients, which need no API key because auth runs after the
-    headers are read, from holding every HTTP worker. `/health` stays reachable within about
-    `header_timeout`.
-  - Enforcement is Linux-only: a watchdog scans the server's sockets (`src/api/conn_guard.h`).
+- **Read deadlines and load shedding (reviews S-13, S-38).** Slow-header clients need no
+  API key (auth runs after the headers are read), so a watchdog keeps them from holding
+  every HTTP worker. It scans the server's sockets every 200 ms (`src/api/conn_guard.h`):
+  - **Header deadline.** A complete header block must arrive within `header_timeout`
+    (default 10 s). The clock starts when a worker has read the first byte of the request,
+    or at the previous response on a keep-alive connection. A connection waiting in the
+    queue with its request already sent has no clock running, so it is not closed while it
+    waits. A connection that sends nothing is timed from accept.
+  - **Body deadline.** A complete body must arrive within `body_timeout` (default 60 s)
+    of the headers.
+  - **Per-peer cap.** One peer address may hold at most `max_header_connections_per_peer`
+    (default 8) connections that are stalled before their first request: still reading
+    headers, never served, and without a complete header block in the receive buffer. The
+    oldest beyond the cap are closed.
+  - **Overload shedding.** When a complete request has waited a whole scan interval for a
+    worker, the pool is saturated. Every connection still reading headers that is older
+    than `header_shed_grace` (default 1 s) and is not a complete buffered request is then
+    closed: dribbling, silent and idle keep-alive connections alike. Complete requests are
+    never shed, and handlers (generation, streaming) are never touched.
+  - Closed connections are counted in `halo_api_connection_deadline_closes_total` (all
+    reasons) and `halo_api_connection_closes_total{reason}` (`deadline`, `peer_limit`,
+    `overload`).
+  - Measured with the review's S-38 repro (WSL, tiny model, `--parallel 1`, so 31 HTTP
+    threads and a 256-slot queue; 100 dribblers that reconnect as soon as they are closed,
+    `/health` probed every 0.5 s with a 3 s timeout for 40 s): `/health` answered 100% of
+    probes with the dribblers on the client's own address (median 0.11 s), on one other
+    address (0.11 s), and on 100 different addresses (0.71 s). Before this change it was 0%
+    in all three cases. With 400 dribblers, more than threads plus queue, it answered 31%:
+    new connections are then refused at accept, which only the reverse proxy can prevent.
+  - Enforcement is Linux-only.
+  - Residual: a request that sends its headers promptly and then dribbles its body holds a
+    worker for up to `body_timeout`; overload shedding does not cover the body phase.
 - **Body size.** `max_body_bytes` (default 8 MiB) is enforced by httplib before the body is
   parsed. A larger body gets 413.
 - **Strict JSON.** The parser accepts RFC 8259 only: no comments, no trailing data, and valid
@@ -144,6 +169,10 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
 
 ## Resource governance
 
+`http_queue`, `max_header_connections_per_peer` and `header_shed_grace` are `ServerConfig`
+fields only for now: `halo serve` has no flag, environment variable or config-file key for
+them yet, so the CLI always uses the defaults.
+
 | Setting (`ServerConfig`) | Default | Effect |
 |---|---|---|
 | `max_concurrent` | 4 | Generations holding a slot at once. |
@@ -155,8 +184,11 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
 | `reasoning_output_reserve` | 512 | Output headroom kept free of reasoning. See "Reasoning". |
 | `max_output_nesting` | 256 | Unmatched `[`/`{` allowed in model output (review S-9). |
 | `utility_concurrency` / `utility_queue` | 2 / 8 | Admission for `/tokenize` and `/apply-template`. Beyond it: 429 (review S-16). |
-| `header_timeout` / `body_timeout` | 10 s / 60 s | Per-connection read deadlines (review S-13). 0 = unlimited. |
+| `header_timeout` / `body_timeout` | 10 s / 60 s | Per-connection read deadlines (reviews S-13, S-38). 0 = unlimited. |
+| `max_header_connections_per_peer` | 8 | Connections one address may hold before its first request (review S-38). 0 = no cap. |
+| `header_shed_grace` | 1 s | Overload shedding of header-phase connections older than this (review S-38). 0 = off. |
 | `http_threads` | 0 (`max_concurrent + max_queue + utility_concurrency + utility_queue + 4`) | Size of the HTTP worker pool. `max_queue` and `utility_queue` are capped at 4096. |
+| `http_queue` | 256 | Connections accepted and waiting for an HTTP worker (1-65536). One more is closed at accept. Every queued connection holds a descriptor; the server warns at start when `http_threads + http_queue` comes within 64 of the open-file limit. |
 | `read_timeout` / `write_timeout` / `keep_alive_timeout` | 60 s / 60 s / 5 s | Socket timeouts. At most 100 requests per keep-alive connection. |
 
 **Admission comes before the expensive work (review S-16).**
@@ -306,6 +338,9 @@ It is a superset of the OpenAI and Anthropic list shapes.
   - `halo_api_last_decode_tokens_per_second`
   - the histograms `halo_api_time_to_first_token_seconds` and
     `halo_api_generation_duration_seconds`
+  - `halo_api_connection_deadline_closes_total` and
+    `halo_api_connection_closes_total{reason}` (`deadline`, `peer_limit`, `overload`), see
+    "Read deadlines and load shedding"
 - **Engine side**, taken from `Engine::stats()` at scrape time:
   - `halo_engine_active_sequences`
   - `halo_engine_queued_requests`

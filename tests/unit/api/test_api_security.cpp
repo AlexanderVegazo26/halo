@@ -621,6 +621,10 @@ TEST(ApiLimits, SlowHeaderConnectionsCannotStarveTheServer) {
     api::ServerConfig cfg;
     cfg.http_threads = 8;
     cfg.header_timeout = std::chrono::milliseconds(1500);
+    // Overload shedding (S-38) would free the workers at about 1 s; switch it off so the
+    // header deadline is what this test exercises (tests/unit/api/test_api_guard.cpp
+    // covers shedding).
+    cfg.header_shed_grace = std::chrono::milliseconds(0);
     TestServer ts(cfg);
     std::vector<std::unique_ptr<SlowClient>> slow;
     for (int i = 0; i < 8; ++i) {

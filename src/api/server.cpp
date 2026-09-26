@@ -15,6 +15,10 @@
 #include <mutex>
 #include <thread>
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
+
 #include "admission.h"
 #include "conn_guard.h"
 #include "generation.h"
@@ -357,7 +361,8 @@ struct ApiServer::Impl {
           specials(e.tokenizer()),
           admission(cfg.max_concurrent, cfg.max_queue),
           utility(cfg.utility_concurrency, cfg.utility_queue),
-          guard(cfg.header_timeout, cfg.body_timeout) {
+          guard(GuardLimits{cfg.header_timeout, cfg.body_timeout, cfg.max_header_connections_per_peer,
+                            cfg.header_shed_grace}) {
         model_name = cfg.served_model_name.empty() ? engine.model().id : cfg.served_model_name;
         if (model_name.empty()) model_name = "halo";
         close_reasoning = engine.tokenizer().encode("\n</think>\n\n", true);
@@ -381,7 +386,7 @@ struct ApiServer::Impl {
     httplib::Server svr;
     Admission admission;
     Admission utility;  // /tokenize and /apply-template (S-16)
-    ConnectionGuard guard;  // per-connection read deadlines (S-13)
+    ConnectionGuard guard;  // per-connection read deadlines and load shedding (S-13, S-38)
     Metrics metrics;
     std::atomic<bool> stopping{false};
     std::thread thread;
@@ -779,7 +784,18 @@ struct ApiServer::Impl {
                                                           : cfg.max_concurrent + cfg.max_queue + cfg.utility_concurrency +
                                                                 cfg.utility_queue + 4;
         // httplib takes ownership of the returned queue (library contract: raw pointer).
-        svr.new_task_queue = [threads] { return new httplib::ThreadPool(threads, threads, 64); };
+        const std::size_t queue = cfg.http_queue;
+        svr.new_task_queue = [threads, queue] { return new httplib::ThreadPool(threads, threads, queue); };
+#if defined(__linux__)
+        // Every queued connection holds a descriptor (S-38): warn when the pool plus its
+        // queue can approach the open-file limit (accept then fails and the server spins).
+        rlimit rl{};
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && threads + queue + 64 > rl.rlim_cur) {
+            HALO_WARN(kLog, "http_threads + http_queue ({}) is close to the open-file limit ({}); lower http_queue or "
+                            "raise the limit",
+                      threads + queue, static_cast<std::uint64_t>(rl.rlim_cur));
+        }
+#endif
         svr.set_payload_max_length(cfg.max_body_bytes);
         svr.set_read_timeout(cfg.read_timeout);
         svr.set_write_timeout(cfg.write_timeout);
@@ -909,10 +925,17 @@ struct ApiServer::Impl {
         svr.Get("/metrics", guarded([this](const httplib::Request&, httplib::Response& res) {
             std::string text = metrics.render(engine.stats(), admission.queued(), admission.active());
             text += std::format(
-                "# HELP halo_api_connection_deadline_closes_total Connections closed for exceeding the header/body "
-                "read deadline.\n# TYPE halo_api_connection_deadline_closes_total counter\n"
-                "halo_api_connection_deadline_closes_total {}\n",
-                guard.timeouts());
+                "# HELP halo_api_connection_deadline_closes_total Connections closed while reading a request (read "
+                "deadline, per-peer limit or overload shedding).\n"
+                "# TYPE halo_api_connection_deadline_closes_total counter\n"
+                "halo_api_connection_deadline_closes_total {}\n"
+                "# HELP halo_api_connection_closes_total Connections closed while reading a request, by reason.\n"
+                "# TYPE halo_api_connection_closes_total counter\n"
+                "halo_api_connection_closes_total{{reason=\"deadline\"}} {}\n"
+                "halo_api_connection_closes_total{{reason=\"peer_limit\"}} {}\n"
+                "halo_api_connection_closes_total{{reason=\"overload\"}} {}\n",
+                guard.timeouts(), guard.closes(ConnectionGuard::Reason::Deadline),
+                guard.closes(ConnectionGuard::Reason::PeerLimit), guard.closes(ConnectionGuard::Reason::Overload));
             res.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
         }));
         svr.Post("/v1/chat/completions", guarded([this](const httplib::Request& q, httplib::Response& r) {
@@ -954,6 +977,9 @@ void validate_server_config(const ServerConfig& c) {
     // S-13: every queued request holds an HTTP thread; keep the pool a sane size.
     HALO_CHECK(c.max_queue <= 4096 && c.utility_queue <= 4096, ErrorCode::Config,
                "server.max_queue / utility_queue must be <= 4096");
+    // S-38: httplib treats a queue of 0 as unbounded (every connection then holds a
+    // descriptor until a worker takes it).
+    HALO_CHECK(c.http_queue > 0 && c.http_queue <= 65536, ErrorCode::Config, "server.http_queue must be 1-65536");
     HALO_CHECK(c.max_body_bytes > 0, ErrorCode::Config, "server.max_body_bytes must be > 0");
     HALO_CHECK(c.max_tokens_cap > 0, ErrorCode::Config, "server.max_tokens_cap must be > 0");
     HALO_CHECK(c.default_max_tokens > 0, ErrorCode::Config, "server.default_max_tokens must be > 0");
