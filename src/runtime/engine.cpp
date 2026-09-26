@@ -12,6 +12,7 @@
 #include <format>
 #include <limits>
 #include <list>
+#include <unordered_map>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -139,6 +140,10 @@ struct CacheEntry {
     Toks tokens;  ///< == kv rows
     std::unique_ptr<kv_cache::SequenceKv> kv;
     std::unique_ptr<kv_cache::SequenceKv> mtp_kv;  ///< rows for positions 1..tokens.size()-1, or null
+    /// L4: false when ckpts_->insert() failed (e.g. an oversized checkpoint) for this entry.
+    /// admit() can only ever match a live checkpoint (ckpts_->find), so such an entry holds KV
+    /// pool blocks hostage for nothing; evict_one_cache_entry() reclaims these first.
+    bool has_checkpoint = true;
 };
 
 std::size_t lcp(std::span<const std::int32_t> a, std::span<const std::int32_t> b) {
@@ -167,6 +172,10 @@ private:
     void tick();
     bool evict_one_cache_entry();
     void ensure_capacity(std::size_t trunk_rows, std::size_t mtp_rows);
+    /// L5 index upkeep: call exactly once when `it` is inserted into / about to be removed
+    /// from cache_.
+    void index_cache_entry(std::list<CacheEntry>::iterator it);
+    void unindex_cache_entry(std::list<CacheEntry>::iterator it);
     /// Emits one token for `a`; returns true if the sequence finished.
     bool emit(Active& a, std::int32_t tok, std::vector<TokenEvent>& events);
     /// Never throws (R-2): the cache part is best-effort, the done delivery always happens.
@@ -205,6 +214,12 @@ private:
     std::unique_ptr<speculative::Speculator> spec_;
     std::unique_ptr<state::CheckpointStore> ckpts_;
     std::list<CacheEntry> cache_;  // front = most recently used
+    // L5: admit()'s best-LCP scan only needs entries sharing the query's first token -- any
+    // entry that differs there has lcp() == 0, which can never beat the scan's own starting
+    // best_lcp of 0, so bucketing by first token is exact, not an approximation. Iterators into
+    // a std::list stay valid across push_front/erase-elsewhere/splice, so this index only needs
+    // updating where cache_ itself gains or loses an entry.
+    std::unordered_map<std::int32_t, std::vector<std::list<CacheEntry>::iterator>> by_first_tok_;
     std::size_t cache_cap_ = 0;
     std::size_t ckpt_spacing_ = 0;
 
@@ -634,9 +649,15 @@ void CpuEngine::admit(const std::shared_ptr<Request>& r) {
     a.dec.emplace(*tok_);
     // ---- prefix cache (D-013) -------------------------------------------------------------
     std::size_t reused = 0;
-    if (cfg_.prefix_cache && !cache_.empty()) {
+    if (cfg_.prefix_cache && !cache_.empty() && !prompt.empty()) {
+        // L5: any cache entry whose first token differs from prompt[0] has lcp() == 0, which
+        // can never beat this scan's own starting best_lcp of 0 -- so restricting the scan to
+        // the bucket for prompt[0] is exact (not an approximation of full-cache LCP).
         std::size_t best_lcp = 0;
-        for (const CacheEntry& e : cache_) best_lcp = std::max(best_lcp, lcp(prompt, e.tokens));
+        const auto bucket_it = by_first_tok_.find(prompt[0]);
+        if (bucket_it != by_first_tok_.end()) {
+            for (const auto& it : bucket_it->second) best_lcp = std::max(best_lcp, lcp(prompt, it->tokens));
+        }
         const std::size_t limit = std::min(best_lcp, prompt.size() - 1);  // >= 1 row recomputed for logits
         const state::Checkpoint* ck = nullptr;
         if (limit > 0) {
@@ -703,10 +724,30 @@ void CpuEngine::admit(const std::shared_ptr<Request>& r) {
     }
 }
 
+void CpuEngine::index_cache_entry(std::list<CacheEntry>::iterator it) {
+    if (!it->tokens.empty()) by_first_tok_[it->tokens[0]].push_back(it);
+}
+
+void CpuEngine::unindex_cache_entry(std::list<CacheEntry>::iterator it) {
+    if (it->tokens.empty()) return;
+    auto bucket_it = by_first_tok_.find(it->tokens[0]);
+    if (bucket_it == by_first_tok_.end()) return;
+    auto& bucket = bucket_it->second;
+    bucket.erase(std::remove(bucket.begin(), bucket.end(), it), bucket.end());
+    if (bucket.empty()) by_first_tok_.erase(bucket_it);
+}
+
 bool CpuEngine::evict_one_cache_entry() {
     if (cache_.empty()) return false;
-    ckpts_->erase_owner(cache_.back().id);
-    cache_.pop_back();
+    // L4: an entry with no live checkpoint can never be matched by admit() (which requires
+    // ckpts_->find to succeed), so it is pure dead weight -- reclaim it before any entry a
+    // future request could actually reuse. Search is bounded by cache_cap_ (a config value,
+    // not attacker/request controlled).
+    auto victim = std::find_if(cache_.begin(), cache_.end(), [](const CacheEntry& e) { return !e.has_checkpoint; });
+    if (victim == cache_.end()) victim = std::prev(cache_.end());  // else plain LRU: the oldest entry
+    ckpts_->erase_owner(victim->id);
+    unindex_cache_entry(victim);
+    cache_.erase(victim);
     return true;
 }
 
@@ -967,8 +1008,9 @@ void CpuEngine::cache_retired(Active& a) {
     e.tokens = a.fed;
     e.kv = std::make_unique<kv_cache::SequenceKv>(std::move(seq.kv));
     if (seq.mtp_kv && seq.mtp_queue_size() == 0) e.mtp_kv = std::make_unique<kv_cache::SequenceKv>(std::move(*seq.mtp_kv));
+    e.has_checkpoint = ckpts_->insert(std::move(c));  // L4: false leaves a KV-only entry, never matched
     cache_.push_front(std::move(e));
-    (void)ckpts_->insert(std::move(c));  // a failure here leaves a KV-only entry (never matched, evicted later)
+    index_cache_entry(cache_.begin());
     while (cache_.size() > cache_cap_) evict_one_cache_entry();
 }
 

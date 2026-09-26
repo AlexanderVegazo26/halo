@@ -175,6 +175,14 @@ ChatPrompt build_chat_prompt(const tokenizer::Tokenizer& tok, const SpecialToken
                              const chat::ChatTemplate& tmpl, const OrderedJson& messages,
                              const OrderedJson& tools, const chat::RenderOptions& options) {
     HALO_CHECK(messages.is_array(), ErrorCode::Api, "messages must be an array");
+    // M9: escape_json below recursively walks/copies messages and tools before render() ever
+    // runs its own depth check (chat_template.cpp), and this function is also a public library
+    // entry point that non-HTTP embedders can call without the API's body-parse depth cap. Guard
+    // here too so the "defense in depth" claim is actually true for the first recursive pass.
+    HALO_CHECK(chat::json_nesting_depth(messages) <= chat::kMaxJsonDepth, ErrorCode::Api,
+               "messages nests deeper than {} levels", chat::kMaxJsonDepth);
+    HALO_CHECK(chat::json_nesting_depth(tools) <= chat::kMaxJsonDepth, ErrorCode::Api,
+               "tools nests deeper than {} levels", chat::kMaxJsonDepth);
     const Literals control_only = make_literals(sp.control(), nullptr);
     const Literals control_and_markup = make_literals(sp.control(), &sp.user_defined());
 

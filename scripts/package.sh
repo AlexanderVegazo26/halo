@@ -104,6 +104,11 @@ else
     worktree) DIRTY_PATHS="$(git -C "$REPO" status --porcelain --untracked-files=all)" ;;
   esac
 fi
+
+# L9: SHA can come from a SOURCE_INFO file inside an untrusted source tarball, and flows into
+# a tar --transform expression and an output filename below; a crafted value could break the
+# transform or escape the intended path. Only accept a real hex sha (or the "unknown..." sentinel).
+[[ "$SHA" =~ ^[0-9a-f]{7,40}$ || "$SHA" == unknown000000 ]] || die "SOURCE_INFO has a malformed git_sha: '$SHA'"
 SHA12="${SHA:0:12}"
 DIRTY=false
 [[ -n "$DIRTY_PATHS" ]] && DIRTY=true
@@ -148,8 +153,22 @@ case "$SOURCE" in
     (cd "$REPO" && git ls-files -z -co --exclude-standard | while IFS= read -r -d '' f; do
         [[ -e "$f" ]] && printf '%s\0' "$f"; done | tar --null -T - -cf -) | tar -x -m -C "$NEW" ;;
   copy) tar -C "$REPO" --exclude=./dist --exclude=./build --exclude=./native --exclude=./.git \
-          --exclude=__pycache__ -cf - . | tar -x -m -C "$NEW" ;;
+          --exclude=__pycache__ \
+          --exclude=*.db --exclude=*.sqlite --exclude=*.sqlite3 --exclude=*.log \
+          --exclude=.env --exclude=.env.* --exclude=*.pem --exclude=*.key \
+          -cf - . | tar -x -m -C "$NEW" ;;
 esac
+# M8: refuse to package a tree that still carries a name matching a secret pattern, regardless
+# of --source mode (a stray .env/key/DB/model would otherwise be integrity-endorsed into the
+# shipped kit's SHA256SUMS).
+mapfile -d '' -t _secret_hits < <(find "$NEW" -type f \( \
+    -iname '*.db' -o -iname '*.sqlite' -o -iname '*.sqlite3' -o -iname '.env' -o -iname '.env.*' \
+    -o -iname '*.pem' -o -iname '*.key' \) -print0)
+if ((${#_secret_hits[@]} > 0)); then
+  printf 'package.sh: refusing to package: secret-pattern files in the staged tree:\n' >&2
+  printf '  %s\n' "${_secret_hits[@]#"$NEW/"}" >&2
+  die "remove these from $REPO (or its untracked files) before packaging"
+fi
 for p in "${OVERLAYS[@]}"; do
   [[ "$p" != /* && "$p" != *..* ]] || die "--overlay $p: must be a relative path inside the repository"
   [[ -e "$REPO/$p" ]] || die "--overlay $p: not in the working tree"

@@ -169,9 +169,9 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
 
 ## Resource governance
 
-`http_queue`, `max_header_connections_per_peer` and `header_shed_grace` are `ServerConfig`
-fields only for now: `halo serve` has no flag, environment variable or config-file key for
-them yet, so the CLI always uses the defaults.
+`halo serve` sets `http_queue`, `max_header_connections_per_peer` and `header_shed_grace`
+with `--http-queue`, `--max-header-connections-per-peer` and `--header-shed-grace-ms`
+(also `HALO_*` variables and config-file keys, see docs/cli.md).
 
 | Setting (`ServerConfig`) | Default | Effect |
 |---|---|---|
@@ -207,13 +207,10 @@ the engine calls once per generated token.
   non-streaming client that disconnects is detected by polling the socket once per token.
 - **Shutdown.** `ApiServer::stop()` cancels generations that are producing tokens. Requests
   waiting in the API's admission queue get 503.
-- **Limitation: before the first token.**
-  - Nothing can reach a request that is still prefilling (a long prompt) or waiting for an
-    engine sequence. Disconnect, `request_timeout` and `stop()` all take effect at its first
-    token, so `stop()` may wait for such requests to finish prefill.
-  - This needs an engine-side cancel path, which WS-G is adding (review R-3).
-  - Until then, `halo serve` caps `--max-concurrent` at `--parallel`, so that requests queue
-    in the API, where `queue_timeout` and shutdown apply, rather than inside the engine.
+- **Before the first token.** The engine checks `cancel`/`stop_requested`/`deadline` every
+  tick in every state (admitted, prefilling, decoding), not only from the token callback
+  (`CpuEngine::expired`). So disconnect, `request_timeout` and `stop()` all take effect
+  without waiting for a request to reach its first token.
 
 ## Chat request mapping
 

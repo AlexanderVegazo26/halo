@@ -6,3 +6,13 @@ __pycache__/
 .claude/worktrees/
 .claude/settings.local.json
 dist/
+# M8: secrets/operator artifacts that package.sh's worktree/copy modes must never ship.
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+*.pem
+*.key
+native/

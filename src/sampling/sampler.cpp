@@ -44,7 +44,8 @@ bool mask_has(std::span<const std::uint64_t> mask, std::int32_t id) noexcept {
 // ---------------------------------------------------------------------------------------
 
 void validate(const SamplingParams& p) {
-    HALO_CHECK(finite(p.temperature), ErrorCode::Api, "sampling: temperature must be finite");
+    HALO_CHECK(finite(p.temperature) && p.temperature >= 0.0f, ErrorCode::Api,
+               "sampling: temperature must be finite and >= 0 (0 = greedy), got {}", p.temperature);
     HALO_CHECK(p.top_k >= 0, ErrorCode::Api, "sampling: top_k must be >= 0 (0 = disabled), got {}", p.top_k);
     HALO_CHECK(in01(p.top_p), ErrorCode::Api, "sampling: top_p must be in [0, 1]");
     HALO_CHECK(in01(p.min_p), ErrorCode::Api, "sampling: min_p must be in [0, 1]");
@@ -227,9 +228,14 @@ double uniform01(std::mt19937_64& rng) {
 // Sampler
 // ---------------------------------------------------------------------------------------
 
-Sampler::Sampler(const SamplingParams& params, std::size_t vocab_size, std::uint64_t seed,
-                 std::unique_ptr<TokenMatcher> matcher)
-    : params_(params), vocab_size_(vocab_size), seed_(seed), rng_(seed), matcher_(std::move(matcher)) {}
+Sampler::Sampler(const SamplingParams& params, std::size_t vocab_size, std::size_t emit_vocab_size,
+                 std::uint64_t seed, std::unique_ptr<TokenMatcher> matcher)
+    : params_(params),
+      vocab_size_(vocab_size),
+      emit_vocab_size_(emit_vocab_size),
+      seed_(seed),
+      rng_(seed),
+      matcher_(std::move(matcher)) {}
 
 Sampler::Sampler(Sampler&&) noexcept = default;
 Sampler& Sampler::operator=(Sampler&&) noexcept = default;
@@ -274,7 +280,13 @@ Sampler Sampler::create(const SamplingParams& params, const tokenizer::Tokenizer
         std::random_device rd;
         seed = (std::uint64_t{rd()} << 32U) ^ std::uint64_t{rd()};
     }
-    return Sampler(params, vocab, seed, std::move(matcher));
+    // M2: unstructured sampling must not emit padded LM-head rows past the tokenizer's real
+    // vocabulary (structured output already excludes them via the TokenVocab mask).
+    std::size_t emit_vocab = cfg.emit_vocab_size;
+    if (emit_vocab == 0) emit_vocab = tokenizer != nullptr ? tokenizer->vocab_size() : vocab;
+    HALO_CHECK(emit_vocab <= vocab, ErrorCode::Api, "sampling: emit_vocab_size {} exceeds vocab_size {}", emit_vocab,
+               vocab);
+    return Sampler(params, vocab, emit_vocab, seed, std::move(matcher));
 }
 
 std::int32_t Sampler::run_chain(std::span<const std::int32_t> history) {
@@ -312,6 +324,7 @@ std::int32_t Sampler::sample(std::span<const float> logits, std::span<const std:
         if (l == -std::numeric_limits<float>::infinity()) continue;
         const auto id = static_cast<std::int32_t>(i);
         if (matcher_ && !mask_has(mask, id)) continue;
+        if (!matcher_ && i >= emit_vocab_size_) continue;  // M2: exclude padded LM-head rows
         work_.push_back(chain::Cand{id, static_cast<double>(l)});
     }
     return run_chain(history);

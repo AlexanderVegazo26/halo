@@ -72,6 +72,10 @@ struct CandidateSet {
 struct SamplerConfig {
     /// Logits row length. 0 = tokenizer->vocab_size() (required when tokenizer is null).
     std::size_t vocab_size = 0;
+    /// Real (tokenizer) vocabulary size for unstructured sampling (M2): rows at/after this
+    /// index are GGUF LM-head padding and are never emitted. 0 = tokenizer->vocab_size(), or
+    /// vocab_size (no clamp) when tokenizer is null.
+    std::size_t emit_vocab_size = 0;
     /// End-of-generation ids for structured output (allowed only once the JSON is
     /// complete). Empty = tokenizer->eos(). Must be non-Normal tokens.
     std::vector<std::int32_t> eos_ids;
@@ -180,12 +184,16 @@ public:
     [[nodiscard]] std::size_t vocab_size() const noexcept { return vocab_size_; }
 
 private:
-    Sampler(const SamplingParams& params, std::size_t vocab_size, std::uint64_t seed,
+    Sampler(const SamplingParams& params, std::size_t vocab_size, std::size_t emit_vocab_size, std::uint64_t seed,
             std::unique_ptr<TokenMatcher> matcher);
     [[nodiscard]] std::int32_t run_chain(std::span<const std::int32_t> history);
 
     SamplingParams params_;
     std::size_t vocab_size_;
+    /// Real (tokenizer) vocabulary size <= vocab_size_. Rows in [emit_vocab_size_, vocab_size_)
+    /// are GGUF LM-head padding (M2): never valid to emit in unstructured generation, since
+    /// TokenVocab-based structured output already excludes them via mask_has.
+    std::size_t emit_vocab_size_;
     std::uint64_t seed_;
     std::mt19937_64 rng_;
     std::unique_ptr<TokenMatcher> matcher_;

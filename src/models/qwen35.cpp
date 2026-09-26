@@ -768,12 +768,13 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     }
     if (I.layers.empty()) I.rms_norm(st, a.x, R, E, I.output_norm, hbuf);
     st.sync();
-    for (std::size_t si = 0; si < steps.size(); ++si) {
-        steps[si].kv->commit(steps[si].tokens.size());
-        steps[si].gdn->mark_slots_written(steps[si].tokens.size(), steps[si].n_state_slots);
-    }
 
     // ---- head ------------------------------------------------------------------------------
+    // H1/M1 (ADR-001 WS-BI-2 step 1): KV/GDN commit happens AFTER head() succeeds, not before.
+    // head() can throw (NaN logit, Error(Kernel); allocation failure, Error(Memory)/bad_alloc)
+    // after this point but before any state below is touched, so on that exception pre-tick
+    // KV/GDN state is genuinely intact — the precondition the engine's Memory-error retry
+    // already assumes (M1) and a future per-sequence fault domain (H1) will need.
     std::vector<Impl::HeadReq> reqs;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const SeqStep& s = steps[si];
@@ -791,6 +792,11 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     }
     I.head(st, I.lm_head, I.head_bytes, hbuf, reqs);
     st.sync();
+
+    for (std::size_t si = 0; si < steps.size(); ++si) {
+        steps[si].kv->commit(steps[si].tokens.size());
+        steps[si].gdn->mark_slots_written(steps[si].tokens.size(), steps[si].n_state_slots);
+    }
 }
 
 void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const {
@@ -853,8 +859,8 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     I.rms_norm(st, a.x, R, E, M.block.attn_norm, a.xn);
     I.decoder_layer(st, a, M.block, R, [&] { I.attention(st, a, *M.block.attn, 0, R, seqs, rpos); }, M.head_norm, hbuf);
     st.sync();
-    for (const MtpStep& s : steps) s.kv->commit(s.tokens.size());
 
+    // H1/M1: see the matching comment in Qwen35::forward -- commit after head() succeeds.
     std::vector<Impl::HeadReq> reqs;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const MtpStep& s = steps[si];
@@ -872,6 +878,7 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     }
     I.head(st, M.lm_head, M.lm_head.ref.n_bytes(), hbuf, reqs);
     st.sync();
+    for (const MtpStep& s : steps) s.kv->commit(s.tokens.size());
 }
 
 }  // namespace halo::models

@@ -383,11 +383,15 @@ struct ApiServer::Impl {
     SpecialTokens specials;
     std::vector<std::int32_t> close_reasoning;
     std::string model_name;
-    httplib::Server svr;
+    // Destruction order matters (H2): members are destroyed in reverse declaration
+    // order, and httplib's worker pool is joined only inside ~httplib::Server. svr
+    // must therefore be declared LAST (destroyed FIRST) so the pool is fully joined
+    // while admission/guard/metrics -- which worker threads still touch -- are alive.
     Admission admission;
     Admission utility;  // /tokenize and /apply-template (S-16)
     ConnectionGuard guard;  // per-connection read deadlines and load shedding (S-13, S-38)
     Metrics metrics;
+    httplib::Server svr;
     std::atomic<bool> stopping{false};
     std::thread thread;
     std::mutex ctl;
@@ -983,6 +987,11 @@ void validate_server_config(const ServerConfig& c) {
     HALO_CHECK(c.max_body_bytes > 0, ErrorCode::Config, "server.max_body_bytes must be > 0");
     HALO_CHECK(c.max_tokens_cap > 0, ErrorCode::Config, "server.max_tokens_cap must be > 0");
     HALO_CHECK(c.default_max_tokens > 0, ErrorCode::Config, "server.default_max_tokens must be > 0");
+    // L3: a request without max_tokens uses default_max_tokens; if an operator lowers the cap
+    // without also lowering the default, the cap's intent is silently bypassed on that path.
+    HALO_CHECK(c.default_max_tokens <= c.max_tokens_cap, ErrorCode::Config,
+               "server.default_max_tokens ({}) must be <= server.max_tokens_cap ({})", c.default_max_tokens,
+               c.max_tokens_cap);
     HALO_CHECK(c.max_json_depth >= 4, ErrorCode::Config, "server.max_json_depth must be >= 4");
     HALO_CHECK(c.port >= 0 && c.port <= 65535, ErrorCode::Config, "server.port must be 0-65535");
     HALO_CHECK(!c.host.empty(), ErrorCode::Config, "server.host must not be empty");

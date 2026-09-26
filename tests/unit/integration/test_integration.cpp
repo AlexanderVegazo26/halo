@@ -423,9 +423,8 @@ TEST_F(Api, JsonSchemaStructuredOutputValidatesAgainstTheSchema) {
 
 // Finding F-1 (src/api, WS-I): with thinking on (the Qwen template default) the generation
 // prompt opens <think>, the API's output parser starts in reasoning mode, and the grammar
-// forbids the UserDefined </think> token, so the schema-valid JSON is returned as
-// reasoning_content and `content` is empty. This test states the required behaviour; it
-// fails until F-1 is fixed (see the WS-G M4 report).
+// forbids the UserDefined </think> token, so the schema-valid JSON must still be returned as
+// `content`, not reasoning_content. Fixed (see the WS-G M4 report; commit e6ce83e).
 TEST_F(Api, JsonSchemaWithThinkingOnReturnsTheJsonAsContent) {
     const auto [content, j] = schema_chat(false);
     ASSERT_FALSE(j.is_null());

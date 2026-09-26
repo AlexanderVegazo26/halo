@@ -89,8 +89,14 @@ struct GgufTensorInfo {
     std::uint64_t n_elements = 0;
     std::uint64_t n_bytes = 0;
 
-    /// Number of ne[0]-element rows.
-    [[nodiscard]] std::int64_t rows() const noexcept { return ne[1] * ne[2] * ne[3]; }
+    /// Number of ne[0]-element rows. Computed in uint64_t (L1): a hostile header with
+    /// ne[0] == 0 passes the full-product overflow check trivially, and signed ne[1..3]
+    /// products can then overflow int64_t (UB) before any caller sees them.
+    [[nodiscard]] std::int64_t rows() const noexcept {
+        const auto r = static_cast<std::uint64_t>(ne[1]) * static_cast<std::uint64_t>(ne[2]) *
+                       static_cast<std::uint64_t>(ne[3]);
+        return static_cast<std::int64_t>(r);
+    }
 };
 
 enum class GgufMode { Full, HeaderOnly };

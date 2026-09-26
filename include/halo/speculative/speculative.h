@@ -29,10 +29,11 @@
 //                     trunk argmaxes), so commit(n_keep = r) for any 1 <= r <= the accepted
 //                     count is a consistent state: bit-identical to plain-decoding those r
 //                     rows (tested for every r). Cancelling right after verify = commit(1).
-//   - a verify that throws on validation or KV exhaustion (qwen35 forward is atomic for
-//     those) aborts the drafts, so every sequence is back at its pre-tick state. An
-//     Error(Kernel) raised inside the forward after state was modified (a NaN logit in
-//     the LM head) leaves the tick's sequences unspecified: reset() them.
+//   - a verify that throws (validation, KV exhaustion, or an Error(Kernel)/Error(Memory)
+//     from the LM head such as a NaN logit or an allocation failure) aborts the drafts and
+//     leaves every sequence at its pre-tick state: qwen35 forward commits trunk KV/GDN only
+//     after the head section succeeds (H1/M1, ADR-001 WS-BI-2 step 1), so an exception from
+//     the head section never leaves trunk state partially advanced.
 //
 // Not implemented (see the WS-G report): stochastic (non-greedy) speculative acceptance
 // (non-greedy sequences decode with k = 0), llama.cpp's p_min draft confidence gating and
@@ -101,8 +102,10 @@ public:
     [[nodiscard]] bool allow() const noexcept {
         return cfg_.mode == GateMode::Always || (cfg_.mode == GateMode::Auto && enabled_);
     }
-    /// One sequence ran a speculative step: `tokens` emitted (accepted drafts + 1, before
-    /// max_emit / stop caps) for `bytes` predicted.
+    /// One sequence ran a speculative step: `tokens` emitted (accepted drafts + 1, capped by
+    /// max_emit / a stop token -- L6: recording the uncapped count biased GateMode::Auto
+    /// toward keeping speculation on for workloads that mostly hit their token cap) for
+    /// `bytes` predicted.
     void record_spec(std::size_t tokens, std::uint64_t bytes) noexcept;
     /// One sequence ran a plain decode step (while the gate was off, or it declined).
     void record_plain() noexcept;

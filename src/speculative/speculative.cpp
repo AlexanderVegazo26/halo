@@ -350,7 +350,10 @@ void Speculator::commit(std::span<const StepRequest> reqs, Tick& tick, std::span
             metrics_.accepted += o.accepted;
             if (metrics_.accepted_at.size() < s.k) metrics_.accepted_at.resize(s.k, 0);
             for (std::size_t j = 0; j < o.accepted; ++j) ++metrics_.accepted_at[j];
-            if (r.forced_drafts.empty()) gate_.record_spec(o.accepted + 1, cost_.spec_step(s.k));
+            // L6: record what was actually kept (nk, post max_emit/stop-token cap), not
+            // accepted+1 -- the uncapped count overstated speedup for workloads that mostly
+            // hit their token cap, biasing GateMode::Auto toward keeping speculation on.
+            if (r.forced_drafts.empty()) gate_.record_spec(nk, cost_.spec_step(s.k));
         } else if (r.greedy && r.max_draft > 0 && model_->has_mtp()) {
             gate_.record_plain();
         }

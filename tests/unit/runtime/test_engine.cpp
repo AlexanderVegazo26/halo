@@ -373,6 +373,29 @@ TEST_F(EngineTest, PrefixCacheReusesCheckpointsAndMatchesRecompute) {
     EXPECT_EQ(r4.tokens, run(*plain, greedy(Toks(p0.begin(), p0.begin() + 20), 3)).tokens);
 }
 
+TEST_F(EngineTest, PrefixCacheMatchesAcrossMultipleDifferentFirstTokens) {
+    // L5: admit()'s LCP scan is bucketed by the query's first token. Retire entries under two
+    // different first tokens, then confirm a query matches the right one and a query sharing
+    // neither entry's first token is a clean miss -- not a crash and not a wrong match.
+    EngineConfig c = base_cfg();
+    c.prefix_cache = true;
+    auto e = make({}, c);
+    const Toks p0 = prompt("p0");
+    const Toks p1 = prompt("p1");
+    ASSERT_NE(p0[0], p1[0]) << "the two conversations must land in different first-token buckets";
+    (void)run(*e, greedy(p0, 4));
+    (void)run(*e, greedy(p1, 4));
+    // Re-submitting p1 exactly must hit p1's checkpoint, not p0's (different bucket).
+    const GenerateResult r = run(*e, greedy(p1, 4));
+    EXPECT_GT(r.cached_prompt_tokens, 0u);
+    // A query whose first token matches neither cached entry is a clean miss.
+    Toks other(p0.begin() + 1, p0.end());
+    ASSERT_NE(other[0], p0[0]);
+    ASSERT_NE(other[0], p1[0]);
+    const GenerateResult miss = run(*e, greedy(other, 2));
+    EXPECT_EQ(miss.cached_prompt_tokens, 0u);
+}
+
 TEST_F(EngineTest, CheckpointHintsAreTakenAndReused) {
     EngineConfig c = base_cfg();
     c.prefix_cache = true;

@@ -25,7 +25,7 @@ struct SamplingParams {
     std::optional<std::string> json_schema;
     bool json_object = false;       // any valid JSON object
 
-    [[nodiscard]] bool greedy() const noexcept { return temperature <= 0.0f; }
+    [[nodiscard]] bool greedy() const noexcept { return temperature == 0.0f; }
 };
 
 }  // namespace halo

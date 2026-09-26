@@ -304,21 +304,31 @@ Every optimization reports: baseline, candidate, absolute/percentage improvement
 
 No claim from a single run. Minimum: 5 warm-up iterations; 20 measured iterations for microbenchmarks; 3 independent end-to-end repetitions; cold vs. steady-state distinguished; power mode pinned and recorded.
 
-## PR-004 — Hardware-relative targets (v1.1 addition)
+## PR-004 — SUPERSEDED by DECISIONS.md D-011/D-014 (owner-resolved 2026-09-24)
 
-The 27B Q4_K_M weights (~17 GB) at the platform's ~256 GB/s give a theoretical dense-decode ceiling of ≈ 15 ms/token ≈ **66 tok/s**. Engineering targets:
+**This section's original arithmetic was inverted** (the true naive figure is ≈ 66 ms/token ≈
+15 tok/s, not 15 ms/token ≈ 66 tok/s) and its absolute targets are physically unreachable on
+this platform (≥ 45 tok/s batch-1 decode would need ≥ 742 GB/s of memory bandwidth against a
+≈ 256 GB/s machine — see D-011's per-step byte-traffic model, which gives a decode ceiling of
+**≈ 15.2 tok/s** at S=1, n=0, η=1). The owner resolved this in D-014: success is defined by
+**efficiency NFRs**, not the absolute tok/s numbers below, which are retained only as the
+aspirations they were originally written as:
 
-| Metric | Target | Rationale |
+| Metric | Original target (superseded, aspirational only) | D-014 replacement NFR |
 |---|---|---|
-| Decode, Q4_K_M, batch 1, 4K ctx | **≥ 45 tok/s** | ≥ 65–70% of roofline; current best local baseline ≈ 20 tok/s |
-| Decode with MTP, batch 1 | **≥ 70 tok/s effective** | Requires measured MTP acceptance; auto-disable if not profitable |
-| Prefill, 512-token prompt | **≥ 400 tok/s** | Compute-bound regime; splash reference ≈ 363 tok/s on M5 Pro |
-| Cached TTFT, 32K prefix replay | **≤ 300 ms** | Prefix caching is an agentic-workload headline metric |
-| Aggregate decode, 4 concurrent agents | **≥ 120 tok/s** | Splash reference: 170 tok/s on M5 Pro (3.9× next engine) |
-| Load time, Q4_K_M + MTP | **≤ 30 s** | Zero-copy mmap of packed weights; startup memory plan |
-| 256K context | serve within memory budget | KV ≈ 16 GB FP16; KV/state formats must keep total ≤ budget |
+| Decode, Q4_K_M, batch 1, 4K ctx | ~~≥ 45 tok/s~~ | decode bandwidth efficiency η ≥ 0.80 of measured bandwidth (S=1, n=0, 4K context) |
+| Decode with MTP, batch 1 | ~~≥ 70 tok/s effective~~ | MTP net speedup ≥ 1.5× at measured acceptance; auto-disabled below 1.05× |
+| Prefill, 512-token prompt | ≥ 400 tok/s (unaffected by the roofline error; still a target) | — |
+| Cached TTFT, 32K prefix replay | ≤ 300 ms | cached TTFT ≤ 300 ms for a 24K re-submit and for 32K multi-turn replay at ≥ 80% hits |
+| Aggregate decode, 4 concurrent agents | ~~≥ 120 tok/s~~ | above llama.cpp's same-file 22.7 tok/s at S=4 (stretch ≥ 40) |
+| Load time, Q4_K_M + MTP | ≤ 30 s (unaffected; still a target) | — |
+| 256K context | serve within memory budget (unaffected; still a target) | — |
+| Rollback cost | (not in the original) | ≤ (K−1)·0.157 GB extra, no extra weight passes |
+| Checkpoints | (not in the original) | GPU pool only |
 
-Targets are revisited each phase against measured baselines; failing a target is a planning input, not a silent miss.
+Every efficiency NFR above is unmeasured until TRD §68 Phase 0 (roofline, load-path,
+per-tier bandwidth) runs on the EVO-X2. Targets are revisited each phase against measured
+baselines; failing a target is a planning input, not a silent miss.
 
 ---
 

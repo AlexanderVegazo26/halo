@@ -1,0 +1,38 @@
+name: CI
+
+# M6 (adversarial review): a minimal CPU build + test lane so a broken commit is caught
+# automatically instead of only when a human remembers to run the WSL build scripts.
+# Vulkan/HIP are off here (no GPU runner yet, TRD §60's self-hosted gfx1151 lane is a
+# separate follow-up); ~110 tests self-skip via GTEST_SKIP without the HALO_REF_DIR
+# fixture directory (which this runner does not have) and are reported as skipped, not
+# passed or failed.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure --timeout 300

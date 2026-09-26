@@ -219,6 +219,7 @@ TEST(SamplerParams, ValidateRejectsBadValuesWithApi) {
     };
     EXPECT_EQ(bad([](SamplingParams& p) { p.temperature = NAN; }), ErrorCode::Api);
     EXPECT_EQ(bad([](SamplingParams& p) { p.temperature = INFINITY; }), ErrorCode::Api);
+    EXPECT_EQ(bad([](SamplingParams& p) { p.temperature = -1.0f; }), ErrorCode::Api);  // L2
     EXPECT_EQ(bad([](SamplingParams& p) { p.top_k = -1; }), ErrorCode::Api);
     EXPECT_EQ(bad([](SamplingParams& p) { p.top_p = 1.5f; }), ErrorCode::Api);
     EXPECT_EQ(bad([](SamplingParams& p) { p.top_p = NAN; }), ErrorCode::Api);
@@ -284,6 +285,21 @@ TEST(SamplerInput, AllNegInfExceptOneAlwaysPicksIt) {
         row[613] = -50.0f;
         for (int i = 0; i < 200; ++i) ASSERT_EQ(s.sample(row, {}), 613) << "temperature " << temp;
     }
+}
+
+TEST(SamplerInput, PaddedLmHeadRowsNeverWinUnstructuredSampling) {
+    // M2: the GGUF LM head can be padded past the tokenizer's real vocabulary. A pad row
+    // must never be emitted, even when it carries the best (or only finite) logit.
+    SamplingParams p;
+    p.temperature = 0.0f;  // greedy: the plain argmax path this finding targets
+    SamplerConfig cfg;
+    cfg.vocab_size = 10;
+    cfg.emit_vocab_size = 6;  // ids [6, 10) are padding
+    auto s = Sampler::create(p, nullptr, cfg);
+    std::vector<float> row(10, -50.0f);
+    row[8] = 5.0f;  // pad row: the best logit in the row
+    row[2] = 1.0f;  // real row: must win instead
+    EXPECT_EQ(s.sample(row, {}), 2);
 }
 
 TEST(SamplerGreedy, ExactArgmaxTiesToLowestId) {
