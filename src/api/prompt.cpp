@@ -134,6 +134,33 @@ void literal_as_text(const tokenizer::Tokenizer& tok, const SpecialTokens& sp, s
     append(out, encode_as_text(tok, sp, lit.substr(1)));
 }
 
+/// Placeholder-split tokenization shared by the main render and M10's boundary renders: same
+/// logic as build_chat_prompt's tail, factored out so a boundary render doesn't need to
+/// reconstruct `.text`, just a token count.
+std::vector<std::int32_t> tokenize_escaped_render(const tokenizer::Tokenizer& tok, const SpecialTokens& sp,
+                                                  const std::string& nonce, const std::vector<std::string>& table,
+                                                  const std::string& rendered) {
+    std::vector<std::int32_t> tokens;
+    const std::string head = std::string(kPlaceholderHead) + nonce + "Q";
+    std::size_t seg = 0, pos = 0;
+    while ((pos = rendered.find(head, pos)) != std::string::npos) {
+        std::size_t j = pos + head.size();
+        std::size_t idx = 0;
+        const auto [ptr, ec] = std::from_chars(rendered.data() + j, rendered.data() + rendered.size(), idx);
+        const auto end = static_cast<std::size_t>(ptr - rendered.data());
+        if (ec != std::errc() || end >= rendered.size() || rendered[end] != 'Z' || idx >= table.size()) {
+            ++pos;
+            continue;
+        }
+        j = end + 1;
+        if (pos > seg) append(tokens, tok.encode(std::string_view(rendered.data() + seg, pos - seg), true));
+        literal_as_text(tok, sp, table[idx], tokens);
+        seg = pos = j;
+    }
+    if (seg < rendered.size()) append(tokens, tok.encode(std::string_view(rendered.data() + seg, rendered.size() - seg), true));
+    return tokens;
+}
+
 }  // namespace
 
 SpecialTokens::SpecialTokens(const tokenizer::Tokenizer& tok) {
@@ -213,6 +240,34 @@ ChatPrompt build_chat_prompt(const tokenizer::Tokenizer& tok, const SpecialToken
     ChatPrompt out;
     const std::string rendered = tmpl.apply(msgs, tl, options);
     out.starts_in_reasoning = chat::prompt_ends_in_reasoning(rendered);
+
+    // M10 (D-013): message-boundary checkpoint hints, bounded to the last kMaxHintBoundaries
+    // messages so cost is O(K * document length) regardless of conversation length. Each
+    // boundary is the token count of rendering messages[0, i) alone (no generation prompt,
+    // since only the shared prefix up to message i's start matters) -- correct as long as the
+    // template has no lookahead into later messages, which the prefix-cache mechanism this
+    // feeds already assumes throughout (a shorter conversation's tokenization must be an exact
+    // prefix of a longer one's for prefix reuse to mean anything at all). Some templates
+    // (Qwen's included) reject a prefix that has no user message yet ("No user query found");
+    // a hint is optional metadata, so that prefix is skipped rather than failing the request.
+    if (msgs.is_array()) {
+        constexpr std::size_t kMaxHintBoundaries = 8;
+        const std::size_t total = msgs.size();
+        const std::size_t first = total > kMaxHintBoundaries ? total - kMaxHintBoundaries : 0;
+        chat::RenderOptions prefix_opts = options;
+        prefix_opts.add_generation_prompt = false;
+        for (std::size_t i = first + 1; i < total; ++i) {
+            try {
+                OrderedJson prefix = OrderedJson::array();
+                for (std::size_t j = 0; j < i; ++j) prefix.push_back(msgs[j]);
+                const std::string prendered = tmpl.apply(prefix, tl, prefix_opts);
+                out.checkpoint_hints.push_back(tokenize_escaped_render(tok, sp, nonce, table, prendered).size());
+            } catch (const std::exception&) {
+                // Not a boundary this template can render standalone (e.g. no user message
+                // yet); skip it, not the request.
+            }
+        }
+    }
 
     if (esc.replaced() == 0) {  // fast path: identical to HF apply_chat_template + tokenize
         out.tokens = tok.encode(rendered, true);

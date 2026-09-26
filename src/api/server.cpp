@@ -492,7 +492,8 @@ struct ApiServer::Impl {
     GenerationSpec make_spec(std::vector<std::int32_t> tokens, bool starts_in_reasoning, const Json& tools,
                              const SamplingParams& sampling, std::optional<std::size_t> max_tokens,
                              std::optional<std::size_t> explicit_budget, std::vector<std::string> stop,
-                             bool parse_output, ResponseMeta& m) const {
+                             bool parse_output, ResponseMeta& m,
+                             std::vector<std::size_t> checkpoint_hints = {}) const {
         const std::size_t ctx = engine.model().context_length;
         const std::size_t n = tokens.size();
         if (n == 0) throw RequestError(ErrorKind::InvalidRequest, "the prompt is empty");
@@ -511,6 +512,7 @@ struct ApiServer::Impl {
         }
         GenerationSpec s;
         s.request.prompt = std::move(tokens);
+        s.request.checkpoint_hints = std::move(checkpoint_hints);
         s.request.sampling = sampling;
         s.request.max_tokens = max;
         s.parse_output = parse_output;
@@ -584,7 +586,7 @@ struct ApiServer::Impl {
         }
         auto spec = std::make_shared<GenerationSpec>(make_spec(prompt.tokens, prompt.starts_in_reasoning, job.tools,
                                                                job.sampling, job.max_tokens, job.reasoning_budget,
-                                                               job.stop, true, m));
+                                                               job.stop, true, m, prompt.checkpoint_hints));
 
         if (!job.stream) {
             CollectSink sink(req);

@@ -66,6 +66,11 @@ struct ChatPrompt {
     std::vector<std::int32_t> tokens;  ///< what the model is fed
     bool starts_in_reasoning = false;  ///< the template left the model inside <think>
     std::size_t neutralized_literals = 0;  ///< client literals tokenized as plain text
+    /// M10 (D-013): token offsets of the last few message boundaries, for
+    /// GenerateRequest::checkpoint_hints. Bounded to a small, fixed number of the most
+    /// recent messages regardless of conversation length (an O(messages) re-render per
+    /// hint would be an O(N^2) cost for a long-running conversation).
+    std::vector<std::size_t> checkpoint_hints;
 };
 
 /// Renders `messages`/`tools` with `tmpl` and tokenizes them as described above. Throws

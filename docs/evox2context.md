@@ -98,30 +98,39 @@ is `tests/unit/models/test_qwen35_golden.cpp:623,712`
 (`BitIdenticalToF32ForwardOverDequantizedWeights`) — its reference path currently shares the
 implementation's own `dequantize_row`, so a systematic dequant bug would pass silently.
 
-### M10 — checkpoint_hints producer + planner/engine reconciliation (MEDIUM)
-Two independent pieces:
-1. **Producer**: `ChatPrompt` needs to report message-boundary token offsets so
-   `build_chat_prompt` (`src/api/prompt.cpp`) can populate `GenerateRequest::checkpoint_hints`.
-   **Correction to an earlier version of this doc**: this was previously described as
-   deferred because `docs/dev/handoff/prompts/resume_I.txt` said "do not edit src/template."
-   That was a misreading -- re-read, that note is a narrow, already-resolved instruction about
-   one specific compile error in a since-completed, since-committed workstream (WS-I), not a
-   standing prohibition on this file. **The real blocker is a design problem, not an ownership
-   one**: computing message-boundary token offsets by rendering each message-prefix and
-   diffing token counts is the obvious approach, but it costs O(messages) renders per request,
-   each O(document length) -- O(N^2) for a long conversation. This codebase explicitly
-   exercises multi-thousand-message conversations in its own tests (`test_template.cpp`'s
-   4002-message case), so a naive version of this would be a real, self-inflicted performance
-   regression, not a hypothetical one. Whoever picks this up should bound it (e.g. only compute
-   hints for the last K message boundaries, matching D-013's actual intent -- checkpoints for
-   an *ongoing* conversation's likely-reused recent prefix, not an exhaustive index of every
-   historical message) rather than rendering every prefix.
-2. **Reconciliation**: on a host-only machine, the planner reports prefix checkpoints as
-   disabled (`src/memory/planner.cpp:352-361`) while the engine silently budgets them on the
-   host anyway (`src/runtime/engine.cpp:302-316`), so `halo inspect`'s memory report
-   understates the real footprint. On the EVO-X2 a GPU tier will actually be discovered, which
-   may make this whole code path moot (checkpoints would then genuinely live in the GPU pool,
-   matching D-013) — re-check whether this finding still applies before fixing it.
+### M10 — checkpoint_hints producer (DONE) + planner/engine reconciliation (MEDIUM, still open)
+**Producer: done.** `ChatPrompt` (`include/halo/api/prompt.h`) now carries `checkpoint_hints`;
+`build_chat_prompt` (`src/api/prompt.cpp`) populates it by rendering each of the last 8
+message-boundary prefixes (no generation prompt) and recording each one's token count, bounded
+so the cost is O(8 * document length) regardless of conversation length (this codebase
+exercises multi-thousand-message conversations in its own tests, so an unbounded O(messages)
+version would have been a real, self-inflicted performance regression -- an earlier version of
+this doc flagged that as the reason to hold off; it turned out bounding it was straightforward
+once actually attempted). Some templates (Qwen's included) reject a prefix that has no user
+message yet ("No user query found in messages"); that's caught per-boundary and the boundary
+is just skipped, since a hint is optional metadata, not something worth failing the request
+over. `server.cpp`'s `make_spec` now threads `prompt.checkpoint_hints` into
+`GenerateRequest::checkpoint_hints`. Verified: `test_api` 90/90 (new regression test asserting
+exact boundary token counts, monotonicity, and the 8-hint bound on a 12-message conversation,
+plus confirming the real Qwen template's two existing injection-resistance tests still pass
+now that prefix rendering happens on every multi-message chat request), `test_cli` 28/28,
+`test_runtime` 32/32.
+
+**Correction to an earlier version of this doc**: the producer was previously described as
+blocked by `docs/dev/handoff/prompts/resume_I.txt` saying "do not edit src/template." That was
+a misreading on my part -- re-read in full, that note is a narrow, already-resolved
+instruction about one specific compile error in a since-completed, since-committed workstream
+(WS-I), not a standing prohibition on this file. Worth noting in case the same misreading
+happens again with some other historical handoff note: check what a constraint actually says
+and whether its context has since resolved, rather than treating a quoted fragment as a
+standing rule.
+
+**Reconciliation (still open)**: on a host-only machine, the planner reports prefix
+checkpoints as disabled (`src/memory/planner.cpp:352-361`) while the engine silently budgets
+them on the host anyway (`src/runtime/engine.cpp:302-316`), so `halo inspect`'s memory report
+understates the real footprint. On the EVO-X2 a GPU tier will actually be discovered, which
+may make this whole code path moot (checkpoints would then genuinely live in the GPU pool,
+matching D-013) — re-check whether this finding still applies before fixing it.
 
 ### M11 — real hardware validation
 Everything in `docs/evox2.md` that hasn't run yet: the smoke harness beyond 3×32-token
