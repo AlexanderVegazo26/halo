@@ -16,3 +16,4 @@ dist/
 *.pem
 *.key
 native/
+/cpp-bp.md
