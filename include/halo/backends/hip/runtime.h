@@ -164,6 +164,14 @@ private:
     void* stream_ = nullptr;
 };
 
+/// Copies `bytes` bytes from `src` at `src_offset` to `dst` at `dst_offset`, ordered in
+/// `stream` (hipMemcpyAsync, device-to-device; ADR-001 COPY). With `stream` == nullptr both
+/// buffers must be MemoryTier::Host (the host emulation) and the copy is a synchronous memcpy.
+/// Range-checked (Error(Memory), as upload/download); the two ranges must not overlap and
+/// the buffers' kinds must match the target (Error(Kernel)).
+void copy_async(const Stream* stream, const Buffer& dst, std::uint64_t dst_offset, const Buffer& src,
+                std::uint64_t src_offset, std::uint64_t bytes);
+
 /// A timing event (hipEvent_t). Move-only.
 class Event {
 public:

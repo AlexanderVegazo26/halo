@@ -277,6 +277,29 @@ void Stream::synchronize() const {
     check(hipStreamSynchronize(static_cast<hipStream_t>(stream_)), "hipStreamSynchronize");
 }
 
+void copy_async(const Stream* stream, const Buffer& dst, std::uint64_t dst_offset, const Buffer& src,
+                std::uint64_t src_offset, std::uint64_t bytes) {
+    HALO_CHECK(dst_offset <= dst.bytes() && bytes <= dst.bytes() - dst_offset, ErrorCode::Memory,
+               "HIP: copy of {} bytes to offset {} exceeds buffer of {}", bytes, dst_offset, dst.bytes());
+    HALO_CHECK(src_offset <= src.bytes() && bytes <= src.bytes() - src_offset, ErrorCode::Memory,
+               "HIP: copy of {} bytes from offset {} exceeds buffer of {}", bytes, src_offset, src.bytes());
+    if (bytes == 0) return;
+    const bool host = stream == nullptr;
+    HALO_CHECK((dst.tier() == MemoryTier::Host) == host && (src.tier() == MemoryTier::Host) == host, ErrorCode::Kernel,
+               "HIP: copy between {} and {} buffers on a {} target", to_string(src.tier()), to_string(dst.tier()),
+               host ? "host-emulation" : "device");
+    char* d = static_cast<char*>(dst.data()) + dst_offset;
+    const char* s = static_cast<const char*>(src.data()) + src_offset;
+    const auto di = reinterpret_cast<std::uintptr_t>(d);
+    const auto si = reinterpret_cast<std::uintptr_t>(s);
+    HALO_CHECK(di + bytes <= si || si + bytes <= di, ErrorCode::Kernel, "HIP: copy source and destination overlap");
+    if (host) {
+        std::memcpy(d, s, bytes);
+        return;
+    }
+    check(hipMemcpyAsync(d, s, bytes, hipMemcpyDefault, static_cast<hipStream_t>(stream->handle())), "hipMemcpyAsync(copy)");
+}
+
 Event::Event(const Context& ctx) {
     ctx.make_current();
     hipEvent_t e = nullptr;
