@@ -44,7 +44,10 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
                                          "matvec_iq4_xs",   "gated_delta_rule_decode",
                                          "argmax_partial", "argmax_final",   "conv1d_silu",
                                          "gated_rms_norm", "add_rms_norm",   "eltwise",
-                                         "gdn_gates",      "rope_neox"};
+                                         "gdn_gates",      "rope_neox",      "get_rows_f32",
+                                         "get_rows_q8_0",  "get_rows_q4_k",  "get_rows_q5_k",
+                                         "get_rows_q6_k",  "get_rows_iq4_xs", "kv_write",
+                                         "attention"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
         ASSERT_NE(s, nullptr);

@@ -1,6 +1,6 @@
 #version 450
-// QUANT_GEMV, ggml Q8_0 weights: y[r] = sum_c W[r,c] * x[c]. Dequantization:
-// common/dequant_q8_0.glsl (shared with get_rows_q8_0); body: common/matvec_quant_main.glsl.
+// [GET_ROWS] embedding lookup over Q8_0 weights: out[t] = dequantize_row(W[ids[t]]).
+// Dequantization: common/dequant_q8_0.glsl; body: common/get_rows_main.glsl.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
@@ -10,4 +10,4 @@ layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
 
 HALO_DEFINE_BYTE_READERS(wq)
 #include "dequant_q8_0.glsl"
-#include "matvec_quant_main.glsl"
+#include "get_rows_main.glsl"

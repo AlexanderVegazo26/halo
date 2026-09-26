@@ -118,6 +118,11 @@ public:
     void copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
               VkDeviceSize dst_offset, VkDeviceSize size);
 
+    /// Record a fill of `size` bytes at `offset` of `dst` with the 32-bit `value`
+    /// (vkCmdFillBuffer; offset and size must be non-zero multiples of 4). Ordered after
+    /// all previously recorded work, like a dispatch.
+    void fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value);
+
     /// Record a timestamp after all previously recorded work; returns its slot, or nullopt
     /// when the queue has no timestamp support or the slots are exhausted.
     std::optional<std::uint32_t> timestamp();

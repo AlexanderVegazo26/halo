@@ -1,0 +1,48 @@
+#version 450
+// [KV write] (kv_cache::SequenceKv::write): K and V rows of n_tokens tokens into the paged
+// pool block[layer][K|V][token][kv_dim] (ops.h "The paged KV pool"). One workgroup per token:
+// history row s = start + t lives in block table[s / bt], token s % bt. A table entry >=
+// n_pool_blocks sets status bit 4 (k_status_bad_block; the host zeroed the word) and that row
+// is not written. Pure copies: bit-identical.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+const uint STATUS_BAD_BLOCK = 4u;
+
+layout(std430, binding = 0) writeonly buffer Pool { float pool[]; };
+layout(std430, binding = 1) readonly buffer Tab { uint tab[]; };
+layout(std430, binding = 2) readonly buffer K { float k[]; };
+layout(std430, binding = 3) readonly buffer V { float v[]; };
+layout(std430, binding = 4) buffer St { uint st[]; };
+
+layout(push_constant) uniform Push {
+    uint n_pool_blocks;
+    uint block_floats;  // n_layers * 2 * bt * kv_dim
+    uint layer_off;     // layer * 2 * bt * kv_dim
+    uint bt;
+    uint kv_dim;
+    uint start;
+    uint n_tokens;
+    uint pool_off, tab_off, k_off, k_stride, v_off, v_stride, st_off;
+} pc;
+
+void main() {
+    const uint t = halo_group_id();
+    if (t >= pc.n_tokens) return;
+    const uint s = pc.start + t;
+    const uint id = tab[pc.tab_off + s / pc.bt];
+    if (id >= pc.n_pool_blocks) {
+        if (gl_LocalInvocationID.x == 0u) atomicOr(st[pc.st_off], STATUS_BAD_BLOCK);
+        return;
+    }
+    const uint kb = pc.pool_off + id * pc.block_floats + pc.layer_off + (s % pc.bt) * pc.kv_dim;
+    const uint vb = kb + pc.bt * pc.kv_dim;
+    const uint ks = pc.k_off + t * pc.k_stride;
+    const uint vs = pc.v_off + t * pc.v_stride;
+    for (uint d = gl_LocalInvocationID.x; d < pc.kv_dim; d += WG) {
+        pool[kb + d] = k[ks + d];
+        pool[vb + d] = v[vs + d];
+    }
+}

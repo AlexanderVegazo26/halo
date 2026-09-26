@@ -1,6 +1,6 @@
 # HALO Vulkan backend (WS-F / WS-F2)
 
-Status: a **correctness-first building-block set**, verified on lavapipe only (D-001). It covers RMS_NORM (incl. per-head q/k norm), the quantized GEMV for every UD weight type but three, the GATED_DELTANET recurrent decode (MTP-verify rows, rollback slots), ARGMAX and (V1, 2026-09-25) CONV1D+SiLU, GATED_NORM, PARTIAL_ROPE with head_stride, SWIGLU, MUL_SIGMOID, ADD, ADD+RMS_NORM and the fused GDN gates. It is **not yet a qwen35 forward**; "What the full forward still needs" below lists the missing operators.
+Status: a **correctness-first building-block set**, verified on lavapipe only (D-001). It covers RMS_NORM (incl. per-head q/k norm), the quantized GEMV for every UD weight type but three, the GATED_DELTANET recurrent decode (MTP-verify rows, rollback slots), ARGMAX and (V1, 2026-09-25) CONV1D+SiLU, GATED_NORM, PARTIAL_ROPE with head_stride, SWIGLU, MUL_SIGMOID, ADD, ADD+RMS_NORM, the fused GDN gates and (V2, 2026-09-26) GET_ROWS, KV write and paged GQA ATTENTION. It is **not yet a qwen35 forward**; "What the full forward still needs" below lists the missing operators.
 
 Code: `backends/vulkan/`, `include/halo/backends/vulkan/`, tests in `tests/unit/vulkan/`.
 
@@ -45,6 +45,19 @@ one mutation at a time. Exceptions, for the V1 layer ops:
   (`same_range`) is not detectable, because an output and its input always have the same row
   count and row size, so equal first and last bytes already imply equal strides.
 
+Exceptions for the V2 ops (GET_ROWS, KV write, ATTENTION):
+- **`precise` again.** The bit-identity of GET_ROWS to `tensor::dequantize_row` also rests on
+  `precise`, with the same lavapipe caveat.
+- **Equivalent mutant:** the `id < 0` test in GET_ROWS is redundant, because `uint(id)` of a
+  negative id is at least 2^31 and therefore always ≥ n_rows.
+- **Not mutated:** turning a bounds check from `id >= n` into `id > n` for a block id or row id.
+  The mutant kernel would read or write one block past the bound, which is undefined behaviour on
+  the device rather than a clean failure. The tests do use the boundary values: a block id equal
+  to n_pool_blocks, and a row id equal to n_rows.
+- **Shared dequantization wiring.** A single mutation in each `common/dequant_<type>.glsl`
+  (q8_0, q4_k, q5_k, q6_k, iq4_xs) turns both the GET_ROWS test and the matching `VkMatvec`
+  tests red, which shows that one piece of code serves both ops.
+
 **Caveat — the bounds are loose.** Observed |vk − cpu| is typically 1e-4 to 4e-2 of the
 bound. The long-trajectory GDN test therefore adds a second, random-walk check at 2× CPU
 Model G (see S-5 below). A small systematic drift passes the worst-case bound and fails
@@ -65,6 +78,9 @@ that check. The random-walk check is a model, not a proof.
 | SWIGLU, MUL_SIGMOID, ADD (V1) | `Ops::swiglu` / `mul_sigmoid` / `add` (`EltwiseArgs`) | `eltwise/eltwise` (spec constant) | `cpu::swiglu`, `cpu::mul_sigmoid` (gate may be the strided half of `[Q \| gate]`), `cpu::add` (**bit-identical**); out may alias a or b (the in-place residual h ≡ a, ADR-001 §5.2) | `VkLayer.SwigluMulSigmoidAdd*`, `VkLayer.EltwiseAliasingRules` |
 | ADD + RMS_NORM (V1) | `Ops::add_rms_norm` (`AddRmsNormArgs`) | `norm/add_rms_norm` | = `cpu::add` then `cpu::rms_norm` (ADR-001 §5.4): h **bit-identical**, y bounded vs CPU and **bit-identical** to `Ops::rms_norm(h)`; h may alias a or b | `VkLayer.AddRmsNorm*` |
 | GDN gates (V1) | `Ops::gdn_gates` (`GdnGateArgs`) | `eltwise/gdn_gates` | qwen35.cpp's sequence: beta = sigmoid(b); g = ssm_a · softplus(a + dt_bias), torch threshold 20, accurate log1p (series for e ≤ 0.5, because Vulkan's log is only 2^-21 absolute near 1); beta may alias b, g may alias a | `VkLayer.GdnGates*` |
+| GET_ROWS (V2) | `Ops::get_rows` (`GetRowsArgs`) | `get_rows/get_rows_{f32,q8_0,q4_k,q5_k,q6_k,iq4_xs}` | `tensor::dequantize_row` per id, for every GEMV weight type. The element dequantization lives in `common/dequant_<type>.glsl`, shared with `matvec_<type>` (same code, so the GEMV and the lookup cannot drift), evaluated uncontracted → **bit-identical**. An id outside [0, n_rows) sets `k_status_bad_index` and leaves that row unwritten | `VkRows.*` |
+| KV write (V2) | `Ops::kv_write` (`KvWriteArgs`) | `attention/kv_write` | `kv_cache::SequenceKv::write` into the pool layout `block[layer][K\|V][token][kv_dim]` through the block table → **byte-identical pool** (other layers and blocks untouched). A table entry ≥ n_pool_blocks sets `k_status_bad_block`; that row is not written | `VkKv.KvWrite*`, `VkKv.PoolLayoutIsTheDocumentedOne` |
+| ATTENTION (V2) | `Ops::attention` (`AttentionArgs`) | `attention/attention` | `cpu::attention_gqa` over the paged pool: causal, GQA head h → h / (n_head / n_kv_head), q read in place with `q_head_stride` (512 for `[Q \| gate]`). Online softmax over key tiles of `attention_workgroup` keys; scores use the CPU's 8-lane dot order. Bounded vs CPU (derivation at the top of `test_vk_kv.cpp`), observed 0.0002–0.033 of the bound (loose: the score term assumes the dot may be contracted). Bad table entries are skipped (never read) and set `k_status_bad_block`. head_dim ≤ 256 and ≤ 4 × attention_workgroup | `VkKv.Attention*`, `VkKv.KvWriteThenAttention*` |
 
 Activation bounds (V1 ops with exp/log): `|vk − cpu| ≤ f·u·|cpu| + FLT_MIN`, f derived from
 Vulkan's precision rules (exp 3 + 2|x| ULP, division 2.5 ULP) plus the CPU's libm; the
@@ -101,7 +117,7 @@ Per D-004, the layer ops, the existing Vulkan pieces and what is missing:
 
 | Needed op | Where in the model | Vulkan status | CPU reference to diff against |
 |---|---|---|---|
-| **GQA attention over the paged KV cache** (24 Q / 4 KV heads, head_dim 256, scale 1/√256, causal) | full-attention layers (every 4th) | **Missing.** Needs a paged K/V gather and online softmax. The HIP backend has one (docs/hip.md, M4) that can serve as the design reference | `cpu::attention_gqa` with `PagedRows` |
+| **GQA attention over the paged KV cache** (24 Q / 4 KV heads, head_dim 256, scale 1/√256, causal) + KV write | full-attention layers (every 4th) | **Done (V2)**: `Ops::kv_write` + `Ops::attention` over the kv_cache pool layout. Limit: the pool is one descriptor (see Known limits) | `cpu::attention_gqa` with `PagedRows`, `SequenceKv::write` |
 | **Causal depthwise conv1d + SiLU** (kernel 4, conv state of 3 rows, rollback slots per D-012) | GDN layers, over the 10240 qkv channels | **Done (V1).** The ADR-001 §5.3 state ring (out-of-place final state) is not in yet; it lands with WS-BI-2's ring fields | `cpu::causal_conv1d_silu` |
 | **Gated RMSNorm** `(x̂·w)·silu(z)` per value head (dim 128, `ssm_norm`) | GDN output | **Done (V1)** | `cpu::gated_rms_norm` |
 | **Partial NeoX RoPE with a head stride** (first 64 of 256 dims, theta 1e7) on the interleaved `[Q, gate]` rows of `attn_q` (per head 256 Q then 256 gate) | full-attention Q and K | **Done (V1)**, in place with head_stride. The CPU reference is applied per head through a strided `Rows` view (bit-identical) | `cpu::partial_rope_neox` |
@@ -115,7 +131,7 @@ Per D-004, the layer ops, the existing Vulkan pieces and what is missing:
 | **Chunked GATED_DELTANET** | prefill | **Missing.** The recurrent kernel is correct but serial in T | `cpu::gated_delta_rule_chunked` |
 | **IQ4_NL, Q3_K, IQ3_S matvec** | remaining UD types (D-014 priority list) | **Missing** | `tensor::dequantize_row` |
 | **LM head: fused matvec + argmax, TOP_K** | head | argmax building block **done**; fusion and TOP_K **missing** | `cpu::matmul_argmax`, `cpu::top_k` |
-| Token embedding lookup (`token_embd`, quantized rows) | input | **Missing.** Needs a dequantize-row kernel | `tensor::dequantize_row` |
+| Token embedding lookup (`token_embd`, quantized rows) | input | **Done (V2)**: `Ops::get_rows` | `tensor::dequantize_row` |
 
 After all of those, the forward still needs engine integration: model wiring, per-layer
 buffer planning in the GPU pool (D-002), GDN checkpoint copies (D-013), and the RADV runs
@@ -125,5 +141,7 @@ that turn every "verified on lavapipe" above into a claim about the target.
 
 - **One `Ops` per thread.** An `Ops` builds pipelines lazily into an internal cache and is not thread-safe.
 - **Transfers:** staged transfers are synchronous and serialized per context (one staging buffer). Buffers must not be in use by un-waited GPU work during upload/download.
+- **Device status words (V2):** GET_ROWS, KV write and ATTENTION each take their own 4-byte `status` view. The op zeroes it with a recorded fill (`Stream::fill`) and the kernel ORs `k_status_bad_block` (4) / `k_status_bad_index` (8) into it (the halo::hip values, ADR-001 §5.5). Read it after the wait with `read_status` and pass it to `check_status`, which raises `Error(Kernel)`. Two calls must not share a word, because the second call's fill erases the first one's bits.
+- **KV pool size (V2):** the whole pool is bound as one storage-buffer descriptor with 32-bit float indices. It must fit in maxStorageBufferRange and 2^32 floats, and a larger pool is rejected with `Error(Unsupported)`. At fp32 the 27B model's 16 attention layers take 128 KiB per token, so a 4 GiB pool holds about 32k tokens across all sequences. Lifting this needs per-layer pools or several descriptors, which is a planner and kv_cache decision.
 - **Argmax results:** the result buffer must be at least 12 bytes. Read it only through `read_argmax` / `decode_argmax`, which raise on NaN.
 - **fp32 remainders on low-alignment devices:** on a device with minStorageBufferOffsetAlignment ≤ 4, fp32 view remainders are always 0, so those shader paths are not exercised there. The fused-qkv test prints a NOTE in that case.

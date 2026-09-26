@@ -85,6 +85,14 @@ Ops::Ops(std::shared_ptr<Context> ctx, OpsOptions options) : ctx_(std::move(ctx)
     // argmax: three WG-wide shared arrays (value, index, NaN flag); rms_norm/matvec use one.
     HALO_CHECK(std::uint64_t{rw} * 12 <= info.max_shared_memory, ErrorCode::Kernel,
                "Ops: reduce_workgroup={} exceeds shared memory", rw);
+    const std::uint32_t aw = options_.attention_workgroup;
+    HALO_CHECK(std::has_single_bit(aw) && aw >= 32 && aw <= 1024 && aw <= info.max_workgroup_size[0] &&
+                   aw <= info.max_workgroup_invocations,
+               ErrorCode::Kernel, "Ops: attention_workgroup={} must be a power of two in [32, min(1024, device)]",
+               aw);
+    // attention shared memory: q tile (256 floats) + three WG-wide arrays (scores, reduction, row bases).
+    HALO_CHECK((256 + 3 * std::uint64_t{aw}) * 4 <= info.max_shared_memory, ErrorCode::Kernel,
+               "Ops: attention_workgroup={} exceeds shared memory ({} bytes)", aw, info.max_shared_memory);
 }
 
 const Kernel& Ops::kernel(const std::string& shader, std::uint32_t num_buffers, std::uint32_t push_bytes,

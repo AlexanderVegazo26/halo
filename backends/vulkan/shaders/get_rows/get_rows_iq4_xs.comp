@@ -1,6 +1,6 @@
 #version 450
-// QUANT_GEMV, ggml IQ4_XS weights: y[r] = sum_c W[r,c] * x[c]. Dequantization:
-// common/dequant_iq4_xs.glsl (shared with get_rows_iq4_xs); body: common/matvec_quant_main.glsl.
+// [GET_ROWS] embedding lookup over IQ4_XS weights: out[t] = dequantize_row(W[ids[t]]).
+// Dequantization: common/dequant_iq4_xs.glsl; body: common/get_rows_main.glsl.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
@@ -10,4 +10,4 @@ layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
 
 HALO_DEFINE_BYTE_READERS(wq)
 #include "dequant_iq4_xs.glsl"
-#include "matvec_quant_main.glsl"
+#include "get_rows_main.glsl"

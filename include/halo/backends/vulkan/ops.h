@@ -82,6 +82,9 @@ struct OpsOptions {
     std::uint32_t gdn_workgroup = 128;
     /// Largest d_k gated_delta_rule_decode accepts (shared-memory q/k tile size).
     std::uint32_t gdn_max_dk = 256;
+    /// Workgroup size of attention (power of two, 32..1024): keys per tile, and each thread
+    /// accumulates head_dim / attention_workgroup (<= 4) output elements.
+    std::uint32_t attention_workgroup = 128;
 };
 
 /// Byte size of one row of `cols` elements of weight type `t` (F32, Q8_0, Q4_K, Q5_K,
@@ -247,6 +250,106 @@ struct GdnGateArgs {
     std::uint32_t n_v = 0;
 };
 
+// ---------------------------------------------------------------- paged ops (WS-F2 V2)
+// Status words: GET_ROWS, KV write and ATTENTION detect bad data (an id or block-table entry
+// out of range) on the device. Each call takes its own 4-byte `status` view, which the op
+// zeroes (a recorded fill) before its dispatch and the kernel ORs bits into. Two calls must
+// not share a word (the second call's fill would erase the first one's bits). After the
+// stream was waited on, read it with read_status() and pass it to check_status(). Bit values
+// are halo::hip's (ADR-001 §5.5).
+inline constexpr std::uint32_t k_status_bad_block = 4u;  ///< = hip::kStatusBadBlock
+inline constexpr std::uint32_t k_status_bad_index = 8u;  ///< = hip::kStatusBadIndex
+inline constexpr std::uint64_t k_status_bytes = 4;
+
+/// Downloads the status word at `offset` of `status` (after the writing stream was waited on).
+[[nodiscard]] std::uint32_t read_status(const Buffer& status, std::uint64_t offset = 0);
+/// Throws Error(Kernel) naming `op` and the set bits when `word` is non-zero.
+void check_status(std::uint32_t word, std::string_view op);
+
+/// [GET_ROWS] embedding lookup: out[t] = tensor::dequantize_row(W[ids[t]]) for every GEMV
+/// weight type (F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS; the pack's token_embd is Q4_K).
+/// Bit-identical to tensor::dequantize_row: the kernels evaluate its expressions uncontracted
+/// (verified on lavapipe; fp16 scales are converted by unpackHalf2x16, which may flush fp16
+/// denormals on some devices).
+///  - w: n_rows rows of matvec_row_bytes(wtype, cols) (row_stride 0 = dense).
+///  - ids: n_ids int32. out: n_ids rows of [cols] fp32; must not overlap w, ids or status.
+///  - status: an id outside [0, n_rows) sets k_status_bad_index, and that row of out is not
+///    written (W is never read through it).
+struct GetRowsArgs {
+    DType wtype = DType::F32;
+    BufferView w{};
+    std::uint32_t n_rows = 0;
+    std::uint32_t cols = 0;
+    BufferView ids{};
+    std::uint32_t n_ids = 1;
+    BufferView out{};
+    BufferView status{};
+};
+
+/// The paged KV pool (a halo::kv_cache::KvPool's storage, byte for byte): n_pool_blocks
+/// blocks of n_layers * 2 * block_tokens * kv_dim fp32, block[layer][K|V][token][kv_dim]
+/// (kv_dim = n_kv_head * head_dim). History row s of a sequence lives in block
+/// block_table[s / block_tokens] (uint32 ids), token s % block_tokens.
+///
+/// Limit of this backend: the whole pool is bound as one storage-buffer descriptor, so it
+/// must fit maxStorageBufferRange and 2^32 fp32 elements; a larger pool is rejected with
+/// Error(Unsupported). (At fp32, the 27B model's 16 attention layers take 128 KiB per token,
+/// so a 4 GiB pool holds about 32k tokens in total.)
+
+/// [KV write] Writes n_tokens K and V rows at history rows start .. start+n_tokens-1 of
+/// `layer` through the block table — exactly kv_cache::SequenceKv::write. Every block the
+/// rows fall into must be owned by this sequence alone (copy-on-write is kv_cache's job).
+///  - k, v: n_tokens rows of [kv_dim]; must not overlap kv_pool.
+///  - block_table: must have an entry for every block the rows fall into.
+///  - status: a table entry >= n_pool_blocks sets k_status_bad_block; that row is not written.
+struct KvWriteArgs {
+    BufferView kv_pool{};
+    std::uint32_t n_pool_blocks = 0;
+    std::uint32_t n_layers = 1;
+    std::uint32_t layer = 0;
+    std::uint32_t block_tokens = 16;
+    std::uint32_t kv_dim = 0;
+    BufferView block_table{};
+    std::uint32_t start = 0;
+    std::uint32_t n_tokens = 1;
+    BufferView k{}, v{};
+    BufferView status{};
+};
+
+/// [ATTENTION] causal GQA softmax attention over the paged K/V history (cpu::attention_gqa).
+///  - q: n_tokens rows of n_head heads of head_dim; q_head_stride = elements between heads
+///    (0 = head_dim; 512 reads Q in place from qwen35's interleaved [Q | gate] attn_q row;
+///    give q's row_stride explicitly then).
+///  - kv_pool / layer / block_tokens / block_table: see "The paged KV pool" above; the table
+///    must cover q_offset + n_tokens rows (the last block may be partially filled).
+///  - Query t attends history rows 0 ..= q_offset + t; query head h uses KV head
+///    h / (n_head / n_kv_head); scores = (q . k) * scale, with the CPU's 8-lane dot order.
+///  - out: n_tokens rows of [n_head * head_dim]; must not overlap any operand.
+///  - status: a table entry the call needs that is >= n_pool_blocks sets k_status_bad_block;
+///    those rows are skipped (never read) and out is then undefined.
+/// Online softmax (running max, one pass over key tiles of attention_workgroup keys), so the
+/// result differs from the CPU's exact three-pass order within the bound in test_vk_kv.cpp.
+/// Limits: head_dim <= 256 and head_dim <= 4 * attention_workgroup (Error(Unsupported)).
+/// Unlike hip::AttentionArgs there is no workspace (the online form needs none).
+struct AttentionArgs {
+    BufferView q{};
+    std::uint32_t q_head_stride = 0;
+    BufferView kv_pool{};
+    std::uint32_t n_pool_blocks = 0;
+    std::uint32_t n_layers = 1;
+    std::uint32_t layer = 0;
+    std::uint32_t block_tokens = 16;
+    BufferView block_table{};
+    std::uint32_t n_head = 0;
+    std::uint32_t n_kv_head = 0;
+    std::uint32_t head_dim = 0;
+    std::uint32_t n_tokens = 1;
+    std::uint32_t q_offset = 0;
+    float scale = 1.0f;
+    BufferView out{};
+    BufferView status{};
+};
+
 class Ops {
 public:
     explicit Ops(std::shared_ptr<Context> ctx, OpsOptions options = {});
@@ -296,6 +399,13 @@ public:
     void add_rms_norm(Stream& stream, const AddRmsNormArgs& args);
     /// [GDN gates] see GdnGateArgs.
     void gdn_gates(Stream& stream, const GdnGateArgs& args);
+
+    /// [GET_ROWS] see GetRowsArgs; then check_status(read_status(...)).
+    void get_rows(Stream& stream, const GetRowsArgs& args);
+    /// [KV write] see KvWriteArgs; then check_status(read_status(...)).
+    void kv_write(Stream& stream, const KvWriteArgs& args);
+    /// [ATTENTION] see AttentionArgs; then check_status(read_status(...)).
+    void attention(Stream& stream, const AttentionArgs& args);
 
 private:
     void eltwise(Stream& stream, const EltwiseArgs& args, std::uint32_t op_code, std::string_view name);

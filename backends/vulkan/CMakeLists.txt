@@ -35,6 +35,14 @@ set(HALO_VK_SHADERS
   eltwise/eltwise
   eltwise/gdn_gates
   rope/rope_neox
+  get_rows/get_rows_f32
+  get_rows/get_rows_q8_0
+  get_rows/get_rows_q4_k
+  get_rows/get_rows_q5_k
+  get_rows/get_rows_q6_k
+  get_rows/get_rows_iq4_xs
+  attention/kv_write
+  attention/attention
   reduce/argmax_partial
   reduce/argmax_final
 )
@@ -102,6 +110,7 @@ add_library(halo_backend_vulkan STATIC
   src/stream.cpp
   src/ops.cpp
   src/ops_layer.cpp
+  src/ops_paged.cpp
   src/shaders.cpp
   src/sha256.cpp
   src/vk_util.cpp

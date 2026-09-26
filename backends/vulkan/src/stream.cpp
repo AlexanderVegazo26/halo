@@ -213,6 +213,18 @@ void Stream::copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
     needs_barrier_ = true;
 }
 
+void Stream::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value) {
+    HALO_CHECK(dst.valid(), ErrorCode::Kernel, "fill of an empty buffer");
+    HALO_CHECK(size > 0 && offset % 4 == 0 && size % 4 == 0, ErrorCode::Kernel,
+               "fill offset {} / size {} must be non-zero multiples of 4", offset, size);
+    HALO_CHECK(offset <= dst.size() && size <= dst.size() - offset, ErrorCode::Kernel,
+               "fill range [{}, +{}) exceeds the buffer ({} bytes)", offset, size, dst.size());
+    ensure_recording();
+    barrier_if_needed();
+    vkCmdFillBuffer(cmd_, dst.handle(), offset, size, value);
+    needs_barrier_ = true;
+}
+
 std::optional<std::uint32_t> Stream::timestamp() {
     if (queries_ == VK_NULL_HANDLE) return std::nullopt;
     ensure_recording();
