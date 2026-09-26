@@ -425,3 +425,35 @@ TEST(VkHead, TopKValidation) {
     EXPECT_EQ(hv::topk_workspace_bytes(2048, 40, 3), 0u);
     s.submit_and_wait();
 }
+
+TEST(VkHead, GemvSplitsWeightsLargerThanOneBindingIntoRowSlabs) {
+    // A W larger than one binding (the 248320-row LM head) runs as row slabs; the arithmetic
+    // per output row is unchanged, so the split result is bitwise the unsplit one.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const std::uint32_t rows = 53, cols = 512, n_vec = 3;
+    std::mt19937 rng(21);
+    const ref::Weights w = ref::random_weights(ref::WType::Q4_K, rows, cols, rng, 14);
+    std::vector<float> x;
+    for (std::uint32_t v = 0; v < n_vec; ++v) {
+        const auto xv = ref::random_vec(cols, rng);
+        x.insert(x.end(), xv.begin(), xv.end());
+    }
+    hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+    hv::Buffer bx = upload(ctx, std::span<const float>(x));
+    std::vector<std::vector<float>> ys;
+    for (const std::uint64_t limit : {std::uint64_t{0}, std::uint64_t{3000}, std::uint64_t{400}}) {
+        hv::OpsOptions o;
+        o.max_binding_bytes = limit;
+        hv::Ops ops(ctx, o);
+        hv::Buffer by = hv::Buffer::create(ctx, std::uint64_t{n_vec} * (rows + 2) * 4, hv::MemoryUsage::HostCached);
+        hv::Stream s(ctx);
+        ops.gemv(s, hv::GemvArgs{halo::DType::Q4_K, bw, bx, hv::BufferView(by, 0, 0, (rows + 2) * 4), rows, cols, n_vec});
+        std::cout << "[vk-head] gemv max_binding_bytes " << limit << ": " << s.dispatch_count() << " dispatch(es)\n";
+        if (limit != 0) EXPECT_GT(s.dispatch_count(), 1u) << "W was not split";
+        s.submit_and_wait();
+        auto y = download<float>(by, std::size_t{n_vec} * (rows + 2));
+        for (std::uint32_t v = 0; v < n_vec; ++v) y[std::size_t{v} * (rows + 2) + rows] = y[std::size_t{v} * (rows + 2) + rows + 1] = 0;
+        ys.push_back(std::move(y));
+    }
+    for (std::size_t i = 1; i < ys.size(); ++i) EXPECT_TRUE(bitwise(ys[i], ys[0])) << "split run " << i;
+}

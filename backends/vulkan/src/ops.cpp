@@ -165,6 +165,24 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
     const Operand oy = operand(a.y, a.n_vec, std::uint64_t{a.rows} * k_f32, Access::Floats, align, op, "y");
     require_disjoint(oy, "y", {{&ow, "W"}, {&ox, "x"}}, op);
 
+    // A W larger than one binding (e.g. the 248320-row embedding / LM head on a device with
+    // a small maxStorageBufferRange) runs as row slabs; every slab writes its own rows of y.
+    const std::uint64_t limit = detail::binding_limit(options_, ctx_->info());
+    if (ow.binding.range > limit) {
+        const std::uint64_t ws = (a.rows == 1 || a.w.row_stride == 0) ? row_bytes : a.w.row_stride;
+        const std::uint64_t ys = (a.n_vec == 1 || a.y.row_stride == 0) ? std::uint64_t{a.rows} * k_f32 : a.y.row_stride;
+        const std::uint64_t per = detail::rows_per_slab(limit, align, ws, row_bytes, op);
+        for (std::uint64_t r0 = 0; r0 < a.rows; r0 += per) {
+            const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(per, a.rows - r0));
+            GemvArgs s = a;
+            s.rows = n;
+            s.w = BufferView(*a.w.buffer, a.w.offset + r0 * ws, (n - 1) * ws + row_bytes, ws);
+            s.y = BufferView(*a.y.buffer, a.y.offset + r0 * k_f32, (a.n_vec - 1) * ys + std::uint64_t{n} * k_f32, ys);
+            gemv_impl(stream, s, op);
+        }
+        return;
+    }
+
     const std::uint32_t wg = options_.reduce_workgroup;
     struct Push {
         std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;

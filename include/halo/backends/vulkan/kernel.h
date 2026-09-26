@@ -131,6 +131,9 @@ public:
     void submit();
     /// Wait for the last submission. Throws Error(Backend) on timeout / device loss.
     void wait(std::uint64_t timeout_ns = 120'000'000'000ull);
+    /// Drop an unsubmitted recording (nothing of it executes) or, if a submission is in
+    /// flight, wait for it (errors are logged, not thrown). The stream is Idle afterwards.
+    void discard() noexcept;
     void submit_and_wait() {
         submit();
         wait();

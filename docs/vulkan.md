@@ -161,11 +161,82 @@ After all of those, the forward still needs engine integration: model wiring, pe
 buffer planning in the GPU pool (D-002), GDN checkpoint copies (D-013), and the RADV runs
 that turn every "verified on lavapipe" above into a claim about the target.
 
+## The Vulkan backend (halo::backend, V5)
+
+`make_vulkan_backend(ctx)` (`src/backend/vulkan_adapter.h`, library
+`halo_backend_vulkan_adapter`) implements `halo::backend::Backend` (ADR-001) over the ops
+above, so the one `models::Qwen35` forward runs on Vulkan. The library is separate from
+`halo_backend`, so nothing else links Vulkan. Its CMake target is created at the end of
+configuration, because `backends/` is configured after `src/`.
+
+- **Interface rules.** The adapter enforces the interface's neutral aliasing rule even where
+  a Vulkan kernel accepts more. It also checks buffer ownership, logical ranges and alignment,
+  and accepts KernelChoice 0 only. A non-empty StatusRef is `Error(Unsupported)`, as on the
+  CPU backend (see Known limits).
+- **Memory.** `allocate` returns zero-filled device memory. `import_host_readonly` makes a
+  device copy at import time. `import_host` is a device mirror: the caller's bytes are copied
+  in at import time and written back after every successful `Stream::wait()`. `abort()` never
+  writes back. Uploads and downloads are staged copies recorded in stream order, and a download
+  captures the buffer at its position in the stream.
+- **Device data errors.** A bad row id or block id, a positive g, or a NaN in TOP_K is written
+  to stream-owned status words and raised as `Error(Kernel)` by `Stream::wait()`. In that case
+  wait() skips the import write-back, so the host keeps its pre-step state. A NaN logit in the
+  LM head or ARGMAX arrives through the result's NaN word, and `decode_argmax` raises.
+- **RoPE.** The cos/sin table is built on the host from the positions. The positions must
+  therefore be a read-only host import, which is what the forward passes; device-resident
+  positions are `Error(Unsupported)`.
+- **Large weights.** gemv and get_rows process a W larger than one binding in row slabs. An
+  example is the tiny F32 model's 254 MB embedding and LM head against lavapipe's 128 MiB
+  maxStorageBufferRange. The split result is bitwise identical to the unsplit one (tested).
+- **Tests.**
+  - `tests/unit/backend/test_vulkan_backend.cpp` covers each op against the CPU backend, plus
+    the interface rules, memory semantics and device errors.
+  - `tests/unit/backend/test_vulkan_forward.cpp` is the ADR §6.3 differential: Qwen35 over
+    Vulkan against Qwen35 over the CPU backend on the tiny models. It uses the §6.2 fixture
+    dimensions and runs the Recurrent path, then the Chunked path.
+  - Pass condition, fixed before the first run: relative L2 ≤ 1e-4 per compared tensor, and
+    equal argmax tokens except for printed near-ties.
+  - Observed worst relative L2: 2.5e-6 to 1.2e-5, with no near-ties.
+  - tiny-f32, q8_0, q6_k and iq4_xs pass. tiny-q4_k_m (Q5_0) and tiny-q3_k_m (Q4_0) skip,
+    because those types are not implemented on Vulkan.
+- **Mutations.** One adapter mutation at a time, each red in the op tests and, where it
+  changes values, in the forward differential:
+  - swapped gdn_gates operands;
+  - imports never written back;
+  - device errors ignored;
+  - the RoPE head stride dropped;
+  - attention on layer 0;
+  - KV write at start + 1;
+  - swiglu accepting an alias;
+  - abort executing the recording;
+  - the chunked form ignored (red in the op test only);
+  - the LM head result offset;
+  - conv slots dropped.
+
+  Two did not go red or were not demonstrable:
+  - Removing the zero-fill stays green, because lavapipe hands out zeroed memory anyway, so
+    this is not demonstrable here.
+  - Ignoring the chunked form passes the forward differential, because the two forms agree
+    well within tau there. The op test catches it.
+
+  Detection floor of the forward differential, measured by scaling the rms_norm kernel's
+  1/rms:
+  - by 1 + 1.2e-7 (1 ulp) and 1 + 9.5e-7 (8 ulp): not detected (worst relative L2 1.0e-5
+    and 2.8e-5);
+  - by 1 + 7.6e-6 (64 ulp): detected (1.8e-4).
+
+  ADR §6.3 asks for a 1-ulp-scale mutation to be detectable. With tau = 1e-4, fixed a priori,
+  this test is about 64× coarser. Tightening tau would need a derived per-op bound for the
+  whole forward, which does not exist yet.
+
 ## Known limits and notes
 
 - **One `Ops` per thread.** An `Ops` builds pipelines lazily into an internal cache and is not thread-safe.
 - **Transfers:** staged transfers are synchronous and serialized per context (one staging buffer). Buffers must not be in use by un-waited GPU work during upload/download.
 - **Device status words (V2):** GET_ROWS, KV write and ATTENTION each take their own 4-byte `status` view. The op zeroes it with a recorded fill (`Stream::fill`) and the kernel ORs `k_status_bad_block` (4) / `k_status_bad_index` (8) into it (the halo::hip values, ADR-001 §5.5). Read it after the wait with `read_status` and pass it to `check_status`, which raises `Error(Kernel)`. Two calls must not share a word, because the second call's fill erases the first one's bits.
 - **KV pool size (V2):** the whole pool is bound as one storage-buffer descriptor with 32-bit float indices. It must fit in maxStorageBufferRange and 2^32 floats, and a larger pool is rejected with `Error(Unsupported)`. At fp32 the 27B model's 16 attention layers take 128 KiB per token, so a 4 GiB pool holds about 32k tokens across all sequences. Lifting this needs per-layer pools or several descriptors, which is a planner and kv_cache decision.
+- **Backend status words (V5):** per-sequence StatusRef owners (ADR §5.5) need the step status array of WS-BI-2, which the interface does not have yet. The Vulkan backend therefore reports device data errors batch-wide, at `wait()`.
+- **Backend state ring (V5):** the GDN and conv state ring of ADR §5.3 is not in. State is updated in place through the imported host memory, as on the CPU backend, so rollback uses the D-012 slots and `commit_rows_kept` on the host.
+- **Backend weight types (V5):** Q4_0, Q5_0, Q5_1, F16 and BF16 matrices are `Error(Unsupported)`. The MTP pack uses Q4_0 (D-006).
 - **Argmax results:** the result buffer must be at least 12 bytes. Read it only through `read_argmax` / `decode_argmax`, which raise on NaN.
 - **fp32 remainders on low-alignment devices:** on a device with minStorageBufferOffsetAlignment ≤ 4, fp32 view remainders are always 0, so those shader paths are not exercised there. The fused-qkv test prints a NOTE in that case.

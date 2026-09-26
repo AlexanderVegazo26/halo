@@ -202,6 +202,48 @@ TEST(CliConfig, PrecedenceCliOverEnvOverFile) {
     fs::remove(file);
 }
 
+TEST(CliConfig, LoadSheddingSettingsReachTheServerConfig) {
+    // S-38 settings: CLI flag, HALO_* variable and config-file key, each mapped onto
+    // api::ServerConfig; defaults are the ServerConfig defaults; out-of-range is refused.
+    std::vector<std::string> keys = cli::runtime_keys();
+    keys.insert(keys.end(), cli::server_keys().begin(), cli::server_keys().end());
+    const auto resolve = [&](std::vector<std::string> args, std::map<std::string, std::string> env) {
+        return cli::resolve_config(cli::parse_args(args, cli::config_options(keys)), env, keys);
+    };
+    const api::ServerConfig d;
+    api::ServerConfig s = cli::server_config(resolve({}, {}));
+    EXPECT_EQ(s.http_queue, d.http_queue);
+    EXPECT_EQ(s.max_header_connections_per_peer, d.max_header_connections_per_peer);
+    EXPECT_EQ(s.header_shed_grace, d.header_shed_grace);
+    s = cli::server_config(resolve(
+        {"--http-queue", "77", "--max-header-connections-per-peer", "3", "--header-shed-grace-ms", "250"}, {}));
+    EXPECT_EQ(s.http_queue, 77u);
+    EXPECT_EQ(s.max_header_connections_per_peer, 3u);
+    EXPECT_EQ(s.header_shed_grace, std::chrono::milliseconds(250));
+    s = cli::server_config(resolve({}, {{"HALO_HTTP_QUEUE", "90"},
+                                        {"HALO_MAX_HEADER_CONNECTIONS_PER_PEER", "0"},
+                                        {"HALO_HEADER_SHED_GRACE_MS", "0"}}));
+    EXPECT_EQ(s.http_queue, 90u);
+    EXPECT_EQ(s.max_header_connections_per_peer, 0u);
+    EXPECT_EQ(s.header_shed_grace, std::chrono::milliseconds(0));
+    const auto file = temp_file("shed.json",
+                                R"({"server":{"http_queue":40,"max_header_connections_per_peer":5,"header_shed_grace_ms":1500}})");
+    s = cli::server_config(resolve({"--config", file.string()}, {}));
+    EXPECT_EQ(s.http_queue, 40u);
+    EXPECT_EQ(s.max_header_connections_per_peer, 5u);
+    EXPECT_EQ(s.header_shed_grace, std::chrono::milliseconds(1500));
+    const auto refused = [&](std::vector<std::string> args) {
+        try {
+            (void)resolve(std::move(args), {});
+        } catch (const cli::UsageError&) {
+            return true;  // a CLI value outside [lo, hi]
+        }
+        return false;
+    };
+    EXPECT_TRUE(refused({"--http-queue", "0"})) << "httplib treats 0 as unbounded";
+    EXPECT_TRUE(refused({"--http-queue", "65537"}));
+}
+
 TEST(CliConfig, StrictValidation) {
     const std::vector<std::string> keys = {"server.port", "server.api_key", "runtime.prefix_cache"};
     const auto resolve = [&](std::vector<std::string> args, std::map<std::string, std::string> env) {

@@ -83,6 +83,9 @@ their settings in this order:
 | `server.allow_unauthenticated_remote` | `--allow-unauthenticated-remote` | `HALO_ALLOW_UNAUTHENTICATED_REMOTE` | false (needs `allowed_hosts`) |
 | `server.utility_concurrency` / `server.utility_queue` | `--utility-concurrency` / `--utility-queue` | `HALO_UTILITY_CONCURRENCY` / `HALO_UTILITY_QUEUE` | 2 / 8 |
 | `server.header_timeout_s` / `server.body_timeout_s` | `--header-timeout` / `--body-timeout` | `HALO_HEADER_TIMEOUT` / `HALO_BODY_TIMEOUT` | 10 / 60 |
+| `server.http_queue` | `--http-queue` | `HALO_HTTP_QUEUE` | 256 (1-65536; connections waiting for an HTTP thread, S-38) |
+| `server.max_header_connections_per_peer` | `--max-header-connections-per-peer` | `HALO_MAX_HEADER_CONNECTIONS_PER_PEER` | 8 (0 = no cap, S-38) |
+| `server.header_shed_grace_ms` | `--header-shed-grace-ms` | `HALO_HEADER_SHED_GRACE_MS` | 1000 (0 = overload shedding off, S-38) |
 | `server.completions_parse_special` | `--no-completions-parse-special` | `HALO_COMPLETIONS_PARSE_SPECIAL` | true |
 
 Example config file:

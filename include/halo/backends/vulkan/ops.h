@@ -85,6 +85,10 @@ struct OpsOptions {
     /// Workgroup size of attention (power of two, 32..1024): keys per tile, and each thread
     /// accumulates head_dim / attention_workgroup (<= 4) output elements.
     std::uint32_t attention_workgroup = 128;
+    /// Largest weight / table range one gemv or get_rows dispatch binds; larger W (e.g. a
+    /// 248320-row embedding or LM head) is processed in row slabs that each fit. 0 = the
+    /// device's maxStorageBufferRange. (A smaller value only splits more; for tests.)
+    std::uint64_t max_binding_bytes = 0;
 };
 
 /// Byte size of one row of `cols` elements of weight type `t` (F32, Q8_0, Q4_K, Q5_K,

@@ -257,3 +257,52 @@ TEST(VkRows, GetRowsValidation) {
     EXPECT_THROW(ops.get_rows(s, a), halo::Error);
     s.submit_and_wait();
 }
+
+TEST(VkRows, GetRowsSplitsTablesLargerThanOneBindingIntoSlabs) {
+    // A table larger than one binding (the 248320-row F32 embedding is 254 MB, lavapipe's
+    // maxStorageBufferRange 128 MiB) is gathered slab by slab. max_binding_bytes forces the
+    // split on a small table: same bytes out as the unsplit run, bad ids flagged once.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const std::uint32_t rows = 37, cols = 768;
+    std::mt19937 rng(10);
+    const RowsFixture f = make_rows(ref::WType::Q6_K, rows, cols, 3, rng);
+    const std::vector<std::int32_t> ids{36, 0, 5, 18, 19, 36, -2, 37, 2};
+    hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(f.arena));
+    hv::Buffer bi = upload(ctx, std::span<const std::int32_t>(ids));
+    const std::vector<float> init(ids.size() * cols, k_sentinel);
+    std::vector<std::vector<float>> outs;
+    std::vector<std::uint32_t> status;
+    for (const std::uint64_t limit : {std::uint64_t{0}, std::uint64_t{2000}, std::uint64_t{700}}) {
+        hv::OpsOptions o;
+        o.max_binding_bytes = limit;
+        hv::Ops ops(ctx, o);
+        hv::Buffer bo = upload(ctx, std::span<const float>(init), hv::MemoryUsage::HostCached);
+        hv::Buffer bs = hv::Buffer::create(ctx, 4, hv::MemoryUsage::HostCached);
+        hv::GetRowsArgs a;
+        a.wtype = halo::DType::Q6_K;
+        a.w = hv::BufferView(bw, f.lead, f.row_bytes * rows);
+        a.n_rows = rows;
+        a.cols = cols;
+        a.ids = bi;
+        a.n_ids = static_cast<std::uint32_t>(ids.size());
+        a.out = bo;
+        a.status = bs;
+        hv::Stream s(ctx);
+        ops.get_rows(s, a);
+        std::cout << "[vk-rows] max_binding_bytes " << limit << ": " << s.dispatch_count() << " dispatch(es)\n";
+        if (limit != 0) EXPECT_GT(s.dispatch_count(), 1u) << "the table was not split";
+        s.submit_and_wait();
+        outs.push_back(download<float>(bo, init.size()));
+        status.push_back(hv::read_status(bs));
+    }
+    for (std::size_t i = 1; i < outs.size(); ++i) {
+        EXPECT_TRUE(row_bitwise(outs[i].data(), outs[0].data(), outs[0].size())) << "split run " << i << " differs";
+        EXPECT_EQ(status[i], hv::k_status_bad_index);
+    }
+    EXPECT_EQ(status[0], hv::k_status_bad_index);
+    for (std::size_t r = 0; r < ids.size(); ++r) {
+        if (ids[r] < 0 || ids[r] >= static_cast<std::int32_t>(rows)) continue;
+        EXPECT_TRUE(row_bitwise(outs[2].data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
+            << "row " << r;
+    }
+}

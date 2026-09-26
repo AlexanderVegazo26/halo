@@ -213,6 +213,17 @@ void Stream::copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
     needs_barrier_ = true;
 }
 
+void Stream::discard() noexcept {
+    if (state_ == State::Submitted) {
+        const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+        if (r != VK_SUCCESS) HALO_ERROR("vulkan", "Stream::discard: fence wait failed: {}", detail::result_string(r));
+    }
+    // A Recording command buffer is never submitted; ensure_recording() resets it (and the
+    // descriptor pools) before the next recording begins.
+    state_ = State::Idle;
+    needs_barrier_ = false;
+}
+
 void Stream::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value) {
     HALO_CHECK(dst.valid(), ErrorCode::Kernel, "fill of an empty buffer");
     HALO_CHECK(size > 0 && offset % 4 == 0 && size % 4 == 0, ErrorCode::Kernel,

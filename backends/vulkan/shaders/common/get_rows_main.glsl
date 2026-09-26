@@ -19,6 +19,10 @@ layout(push_constant) uniform Push {
     uint w_off;     // sub-alignment remainder of W (quantized: bytes; f32: elements)
     uint w_stride;  // row stride of W (same unit)
     uint ids_off, o_off, o_stride, st_off;
+    // Row slab of this dispatch (a table larger than one binding is processed in slabs): W is
+    // bound from row row_base on; ids in [row_base, row_base + slab_rows) are gathered, other
+    // valid ids are left to the other slabs; flag_bad = 1 in exactly one slab dispatch.
+    uint row_base, slab_rows, flag_bad;
 } pc;
 
 void main() {
@@ -26,10 +30,12 @@ void main() {
     if (t >= pc.n_ids) return;
     const int id = ids[pc.ids_off + t];
     if (id < 0 || uint(id) >= pc.n_rows) {
-        if (gl_LocalInvocationID.x == 0u) atomicOr(st[pc.st_off], STATUS_BAD_INDEX);
+        if (pc.flag_bad != 0u && gl_LocalInvocationID.x == 0u) atomicOr(st[pc.st_off], STATUS_BAD_INDEX);
         return;
     }
-    const uint row_off = pc.w_off + uint(id) * pc.w_stride;
+    const uint rel = uint(id) - pc.row_base;  // wraps past slab_rows for ids below the slab
+    if (rel >= pc.slab_rows) return;
+    const uint row_off = pc.w_off + rel * pc.w_stride;
     const uint ob = pc.o_off + t * pc.o_stride;
     for (uint c = gl_LocalInvocationID.x; c < pc.cols; c += WG) o[ob + c] = halo_dequant(row_off, c);
 }

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "halo/backends/vulkan/buffer.h"
 #include "halo/backends/vulkan/context.h"
@@ -116,14 +117,38 @@ void Ops::get_rows(Stream& stream, const GetRowsArgs& a) {
     require_disjoint(oo, "out", {{&ow, "w"}, {&oi, "ids"}, {&os, "status"}}, op);
     require_disjoint(os, "status", {{&ow, "w"}, {&oi, "ids"}}, op);
     struct Push {
-        std::uint32_t n_rows, cols, n_ids, w_off, w_stride, ids_off, o_off, o_stride, st_off;
-    } push{a.n_rows, a.cols, a.n_ids, ow.off, ow.stride, oi.off, oo.off, oo.stride, os.off};
+        std::uint32_t n_rows, cols, n_ids, w_off, w_stride, ids_off, o_off, o_stride, st_off, row_base, slab_rows, flag_bad;
+    };
     const Kernel& k = kernel(shader, 4, sizeof(Push), {{0, k_rows_wg}}, {k_rows_wg, 1, 1});
-    const std::array bindings{ow.binding, oi.binding, oo.binding, os.binding};
     const DeviceInfo& info = ctx_->info();
     const GroupCount groups = grid_1d(a.n_ids, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+    // A table larger than one binding (e.g. the 248320-row embedding on a device with a small
+    // maxStorageBufferRange) is gathered slab by slab: each dispatch binds rows
+    // [row_base, row_base + slab_rows) and writes the ids that fall into them.
+    const std::uint64_t limit = detail::binding_limit(options_, info);
+    const std::uint64_t per =
+        ow.binding.range > limit ? detail::rows_per_slab(limit, align, ow.stride * (a.wtype == DType::F32 ? k_f32 : 1),
+                                                         row_bytes, op)
+                                 : a.n_rows;
+    const std::uint64_t ws = a.n_rows == 1 || a.w.row_stride == 0 ? row_bytes : a.w.row_stride;
+    // Validate every slab binding before recording anything.
+    std::vector<Operand> slabs;
+    for (std::uint64_t r0 = 0; r0 < a.n_rows; r0 += per) {
+        const std::uint64_t n = std::min<std::uint64_t>(per, a.n_rows - r0);
+        slabs.push_back(per == a.n_rows ? ow
+                                        : operand(BufferView(*a.w.buffer, a.w.offset + r0 * ws, (n - 1) * ws + row_bytes, ws),
+                                                  n, row_bytes, a.wtype == DType::F32 ? Access::Floats : Access::Words,
+                                                  align, op, "w (slab)"));
+    }
     zero_status(stream, a.status);
-    stream.dispatch(k, bindings, push, groups);
+    for (std::size_t si = 0; si < slabs.size(); ++si) {
+        const std::uint64_t r0 = si * per;
+        const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::uint64_t>(per, a.n_rows - r0));
+        const Push push{a.n_rows, a.cols,    a.n_ids,  slabs[si].off, slabs[si].stride, oi.off,
+                        oo.off,   oo.stride, os.off,   static_cast<std::uint32_t>(r0),  n,  si == 0 ? 1u : 0u};
+        const std::array bindings{slabs[si].binding, oi.binding, oo.binding, os.binding};
+        stream.dispatch(k, bindings, push, groups);
+    }
 }
 
 void Ops::kv_write(Stream& stream, const KvWriteArgs& a) {

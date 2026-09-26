@@ -4,3 +4,7 @@ BI  af0dfbede4f9b4d2d  (s3_BI.txt; BI-1 M2 then BI-2)
 F2  a1000d29b3945170e  (s3_F2.txt; V1..V4)
 G   adff24f853cfc6986  (s3_G.txt; M6 D-006)
 Status files: session 324d2710 scratchpad status_<WS>.md
+S27 a21d5cd5fad869ec5  (s3_S27.txt; 27B CPU smoke)
+BI3 ab45d50b72f2e7e7c  (s3_BI3.txt; HIP adapter M1)
+G   parked after M6 (7ddd18b)
+I2  a58959902a51c8aaa  (security fixes S-38/39/45/46)

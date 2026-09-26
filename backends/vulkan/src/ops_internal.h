@@ -108,6 +108,23 @@ inline void require_disjoint_or_exact(const Operand& out, std::string_view out_n
                op, out_name, out.begin, out.end, in_name, in.begin, in.end);
 }
 
+/// Largest byte range one dispatch binds for an operand that can be split into row slabs
+/// (gemv / get_rows weights): OpsOptions::max_binding_bytes, maxStorageBufferRange, 2^32 - 1.
+inline std::uint64_t binding_limit(const OpsOptions& o, const DeviceInfo& info) {
+    std::uint64_t l = info.max_storage_buffer_range;
+    if (o.max_binding_bytes != 0) l = std::min(l, o.max_binding_bytes);
+    return std::min<std::uint64_t>(l, 0xFFFFFFFFull);
+}
+
+/// Rows per slab such that `n` rows `stride` bytes apart (the last `row_bytes` long), bound at
+/// an offset remainder < align and rounded up to a word, fit in `limit` bytes.
+inline std::uint64_t rows_per_slab(std::uint64_t limit, std::uint64_t align, std::uint64_t stride, std::uint64_t row_bytes,
+                                   std::string_view op) {
+    HALO_CHECK(limit > align + 4 + row_bytes, ErrorCode::Unsupported,
+               "{}: one {}-byte row exceeds the per-dispatch binding limit of {} bytes", op, row_bytes, limit);
+    return 1 + (limit - align - 4 - row_bytes) / stride;
+}
+
 /// "<prefix>_<type>" kernel name for a weight type of matvec_row_bytes (matvec_*, get_rows_*).
 inline std::string weight_shader(std::string_view prefix, DType t) {
     std::string_view suffix;

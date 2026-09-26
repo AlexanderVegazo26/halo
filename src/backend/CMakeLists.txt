@@ -6,6 +6,18 @@ halo_module(backend
 # Reference results must not depend on HALO_NATIVE (same reason as halo_backend_cpu).
 target_compile_options(halo_backend PRIVATE -ffp-contract=off)
 
+# WS-F2 V5 (WS-BI-5): the Vulkan backend adapter, a separate library so halo_backend never links
+# Vulkan. backends/ is configured after src/, so the Vulkan target does not exist yet here; the
+# check and the target creation are deferred to the end of the top-level CMakeLists.
+function(halo_backend_add_vulkan_adapter)
+  if(TARGET halo_backend_vulkan AND TARGET halo_backend)
+    add_library(halo_backend_vulkan_adapter STATIC ${PROJECT_SOURCE_DIR}/src/backend/vulkan_adapter.cpp)
+    target_include_directories(halo_backend_vulkan_adapter PUBLIC ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(halo_backend_vulkan_adapter PUBLIC halo_backend halo_backend_vulkan PRIVATE halo_warnings)
+  endif()
+endfunction()
+cmake_language(DEFER DIRECTORY ${PROJECT_SOURCE_DIR} CALL halo_backend_add_vulkan_adapter)
+
 # WS-BI-3: the HIP backend adapter (ADR-001 §9) in its own library, so halo_models (which
 # links halo_backend) never links HIP (ADR §5.1 layering). src/ is configured before
 # backends/, so `if(TARGET halo_backend_hip)` would always be false here: guard on the same

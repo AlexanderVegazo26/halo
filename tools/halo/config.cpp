@@ -94,6 +94,14 @@ std::vector<ConfigKey> make_keys() {
           "seconds to receive a request's headers (0 = unlimited)"),
         u("server.body_timeout_s", "body-timeout", "HALO_BODY_TIMEOUT", sd.body_timeout.count() / 1000, 0, 3600,
           "seconds to receive a request's body (0 = unlimited)"),
+        u("server.http_queue", "http-queue", "HALO_HTTP_QUEUE", sd.http_queue, 1, 65536,
+          "connections waiting for an HTTP thread; one more is closed at accept (S-38)"),
+        u("server.max_header_connections_per_peer", "max-header-connections-per-peer",
+          "HALO_MAX_HEADER_CONNECTIONS_PER_PEER", sd.max_header_connections_per_peer, 0, 65536,
+          "connections one address may hold before its first request completes (0 = no cap; S-38)"),
+        u("server.header_shed_grace_ms", "header-shed-grace-ms", "HALO_HEADER_SHED_GRACE_MS",
+          sd.header_shed_grace.count(), 0, 600000,
+          "under overload, close header-phase connections older than this, milliseconds (0 = off; S-38)"),
         b("server.completions_parse_special", "no-completions-parse-special", "HALO_COMPLETIONS_PARSE_SPECIAL",
           sd.completions_parse_special, "treat special-token text in /v1/completions prompts as plain text"),
         u("server.max_body_bytes", "max-body-bytes", "HALO_MAX_BODY_BYTES", sd.max_body_bytes, 1024, 1ULL << 30,
@@ -307,7 +315,8 @@ const std::vector<std::string>& server_keys() {
         "server.allowed_hosts",  "server.served_model_name", "server.max_concurrent", "server.max_queue",
         "server.max_body_bytes", "server.max_tokens_cap", "server.default_max_tokens", "server.request_timeout_s",
         "server.allow_unauthenticated_remote", "server.allow_remote", "server.utility_concurrency", "server.utility_queue",
-        "server.header_timeout_s", "server.body_timeout_s", "server.completions_parse_special"};
+        "server.header_timeout_s", "server.body_timeout_s", "server.completions_parse_special", "server.http_queue",
+        "server.max_header_connections_per_peer", "server.header_shed_grace_ms"};
     return k;
 }
 
@@ -370,6 +379,9 @@ api::ServerConfig server_config(const ResolvedConfig& c) {
     s.header_timeout = std::chrono::seconds(c.u64("server.header_timeout_s"));
     s.body_timeout = std::chrono::seconds(c.u64("server.body_timeout_s"));
     s.completions_parse_special = c.boolean("server.completions_parse_special");
+    s.http_queue = c.u64("server.http_queue");
+    s.max_header_connections_per_peer = c.u64("server.max_header_connections_per_peer");
+    s.header_shed_grace = std::chrono::milliseconds(c.u64("server.header_shed_grace_ms"));
     return s;
 }
 
