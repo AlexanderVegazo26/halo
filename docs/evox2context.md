@@ -102,9 +102,20 @@ implementation's own `dequantize_row`, so a systematic dequant bug would pass si
 Two independent pieces:
 1. **Producer**: `ChatPrompt` needs to report message-boundary token offsets so
    `build_chat_prompt` (`src/api/prompt.cpp`) can populate `GenerateRequest::checkpoint_hints`.
-   This needs changes in `src/template/chat_template.cpp`, which another workstream's own
-   handoff notes (`docs/dev/handoff/prompts/resume_I.txt`) said not to touch while its own
-   work was in flight. Check whether that constraint still applies before touching it.
+   **Correction to an earlier version of this doc**: this was previously described as
+   deferred because `docs/dev/handoff/prompts/resume_I.txt` said "do not edit src/template."
+   That was a misreading -- re-read, that note is a narrow, already-resolved instruction about
+   one specific compile error in a since-completed, since-committed workstream (WS-I), not a
+   standing prohibition on this file. **The real blocker is a design problem, not an ownership
+   one**: computing message-boundary token offsets by rendering each message-prefix and
+   diffing token counts is the obvious approach, but it costs O(messages) renders per request,
+   each O(document length) -- O(N^2) for a long conversation. This codebase explicitly
+   exercises multi-thousand-message conversations in its own tests (`test_template.cpp`'s
+   4002-message case), so a naive version of this would be a real, self-inflicted performance
+   regression, not a hypothetical one. Whoever picks this up should bound it (e.g. only compute
+   hints for the last K message boundaries, matching D-013's actual intent -- checkpoints for
+   an *ongoing* conversation's likely-reused recent prefix, not an exhaustive index of every
+   historical message) rather than rendering every prefix.
 2. **Reconciliation**: on a host-only machine, the planner reports prefix checkpoints as
    disabled (`src/memory/planner.cpp:352-361`) while the engine silently budgets them on the
    host anyway (`src/runtime/engine.cpp:302-316`), so `halo inspect`'s memory report
