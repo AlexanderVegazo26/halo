@@ -275,12 +275,13 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
         }
         for (const auto& a : so.argmax) o.targets.push_back(a.index);
         // H1: the backend now reports a NaN logit as a poisoned row (index == -1) instead of
-        // throwing from inside the forward, so pre-tick KV/GDN state stays intact (M1) and a
-        // future milestone can fail just this sequence. Until that per-sequence fault path
-        // exists, a poisoned row must not silently become token id -1: throw here, at the
-        // same granularity (the whole tick) as before this change.
-        HALO_CHECK(std::none_of(o.targets.begin(), o.targets.end(), [](std::int32_t t) { return t < 0; }),
-                   ErrorCode::Kernel, "trunk forward: NaN logit (poisoned argmax row)");
+        // throwing from inside the forward, so pre-tick KV/GDN state stays intact (M1) and the
+        // engine can fail just this sequence instead of the whole tick. A poisoned target
+        // deliberately is not rejected here: this function runs once for every sequence in the
+        // batch, so throwing here would still fail all of them together. The engine's own
+        // per-sequence output-phase isolation (CpuEngine::tick(), review R-1) is where a
+        // poisoned token id must be caught -- see the check there before it is ever fed,
+        // sampled around, or detokenized.
         if (!is_decode(r)) {
             o.tokens = o.targets;
             o.n_keep = s.fed.size();

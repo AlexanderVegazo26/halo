@@ -926,6 +926,13 @@ void CpuEngine::tick() {
                 ++a.next_ckpt;
             }
             if (q.want_output) {
+                // H1: a poisoned argmax row (NaN logit, backend::decode_argmax) surfaces as
+                // token id -1. Caught here, inside this sequence's own try, before it is ever
+                // fed forward or detokenized -- the catch below resets just this slot, so
+                // every other sequence in the tick is unaffected.
+                if (a.r->fast_greedy) {
+                    HALO_CHECK(o.tokens.at(0) >= 0, ErrorCode::Kernel, "trunk forward: NaN logit (poisoned argmax row)");
+                }
                 const std::int32_t tok = a.r->fast_greedy ? o.tokens.at(0) : a.r->sampler->sample(o.logits, a.history);
                 if (a.r->sampler) a.r->sampler->accept(tok);
                 a.pending = tok;
@@ -940,6 +947,11 @@ void CpuEngine::tick() {
             a.drafted += o.drafts.size();
             a.accepted += o.accepted;
             if (a.r->fast_greedy) {
+                // H1: same check as the prefill branch above, before any of this sequence's
+                // poisoned tokens are pushed into a.fed (which would otherwise resurface as an
+                // invalid prompt token on a future, differently-batched tick).
+                HALO_CHECK(std::none_of(o.tokens.begin(), o.tokens.end(), [](std::int32_t t) { return t < 0; }),
+                           ErrorCode::Kernel, "trunk forward: NaN logit (poisoned argmax row)");
                 // Rows fed: pending + accepted drafts == pending + tokens[0 .. n_keep-1).
                 a.fed.push_back(a.pending);
                 for (std::size_t j = 0; j + 1 < o.tokens.size(); ++j) a.fed.push_back(o.tokens[j]);
