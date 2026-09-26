@@ -427,8 +427,6 @@ TEST_F(Api, JsonSchemaStructuredOutputValidatesAgainstTheSchema) {
 // reasoning_content and `content` is empty. This test states the required behaviour; it
 // fails until F-1 is fixed (see the WS-G M4 report).
 TEST_F(Api, JsonSchemaWithThinkingOnReturnsTheJsonAsContent) {
-    GTEST_SKIP() << "known defect F-1 (structured output with thinking on lands in reasoning_content), routed to WS-I; "
-                    "remove this skip when fixed";
     const auto [content, j] = schema_chat(false);
     ASSERT_FALSE(j.is_null());
     EXPECT_EQ(schema_violation(content), "") << j.dump();

@@ -7,6 +7,7 @@
 // The artifact (schema halo.bench.artifact/1) goes to --out ('-' = stdout). D-001: numbers
 // from a development host exercise the harness only; --host-label says where they came from.
 
+#include <algorithm>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -20,6 +21,7 @@
 #include "args.h"
 #include "commands.h"
 #include "config.h"
+#include "fsutil.h"
 #include "halo/core/error.h"
 
 #if HALO_CLI_HAVE_PROFILING
@@ -64,8 +66,12 @@ const std::vector<OptionSpec>& common_opts() {
     return o;
 }
 
+/// a + b, dropping options of b whose name a already has (e.g. --power-mode is both a
+/// bench option and a runtime setting; one flag serves both).
 std::vector<OptionSpec> join(std::vector<OptionSpec> a, const std::vector<OptionSpec>& b) {
-    a.insert(a.end(), b.begin(), b.end());
+    for (const auto& o : b) {
+        if (std::ranges::none_of(a, [&](const OptionSpec& x) { return x.name == o.name; })) a.push_back(o);
+    }
     return a;
 }
 
@@ -233,10 +239,7 @@ int finish(const profiling::SuiteArtifact& art, const ParsedArgs& a, Context& ct
     if (out == "-") {
         *ctx.out << j.dump(2) << "\n";
     } else {
-        std::ofstream f(out, std::ios::binary);
-        HALO_CHECK(f.good(), ErrorCode::Io, "cannot write {}", out);
-        f << j.dump(2) << "\n";
-        HALO_CHECK(f.good(), ErrorCode::Io, "writing {} failed", out);
+        write_file_no_follow(out, j.dump(2) + "\n");  // S-21
     }
     bool failed = false;
     for (const auto& n : art.notes) failed = failed || n.starts_with("FAILED");
@@ -334,14 +337,22 @@ struct EngineSetup {
     std::unique_ptr<runtime::Engine> engine;
 };
 
-std::optional<EngineSetup> make_engine(ParsedArgs& a, Context& ctx) {
+/// `plain_decode_only`: the requested model modes do not include mtp_decode, so an engine
+/// with MTP drafting would make "decode" numbers MTP numbers (F-3): unless --mtp-draft /
+/// HALO_MTP_DRAFT / the config file set it, drafting is turned off for the run.
+std::optional<EngineSetup> make_engine(ParsedArgs& a, Context& ctx, bool plain_decode_only = false) {
     if (a.positionals.size() > 1) throw UsageError("expected at most one model file");
     if (a.positionals.size() == 1) {
         if (a.has("model")) throw UsageError("give the model as an argument or --model, not both");
         a.values_["model"] = {a.positionals[0]};
     }
-    const ResolvedConfig cfg = resolve_config(a, ctx.env, runtime_keys());
-    EngineSetup s{engine_config(cfg), nullptr};
+    ResolvedConfig cfg = resolve_config(a, ctx.env, runtime_keys());
+    if (plain_decode_only && cfg.source("runtime.mtp_draft") == "default") {
+        cfg.entries["runtime.mtp_draft"] = {nlohmann::json(0), "default (bench: no mtp_decode mode requested)"};
+        *ctx.err << "halo bench: MTP drafting off for this run (no mtp_decode mode requested; pass --mtp-draft N to "
+                    "keep it)\n";
+    }
+    EngineSetup s{engine_config(cfg, default_profile_db(ctx.env)), nullptr};
     if (!a.has("host-label")) throw UsageError("--host-label is required (D-001: every record says where it was measured)");
     if (!ctx.engine_factory) {
         *ctx.err << "halo: " << kRuntimeNotBuilt << "\n";
@@ -363,7 +374,9 @@ int bench_model(const std::vector<std::string>& args, Context& ctx) {
                        {"w-trunk-gb", true, 0, false, false, "trunk bytes per step (GB, incl. LM head)"},
                        {"w-mtp-gb", true, 0, false, false, "MTP block bytes (GB)"},
                        {"w-head-gb", true, 0, false, false, "LM head bytes (GB)"},
-                       {"draft", true, 0, false, false, "MTP draft length n for efficiency"}});
+                       {"draft", true, 0, false, false, "MTP draft length n for efficiency"},
+                       {"concurrency-context", true, 0, false, false,
+                        "context depth of the concurrency mode's requests (default 4096)"}});
     ParsedArgs a =
         parse_args(args, opts, "usage: halo bench model <model.gguf> --host-label L [options]\n" + options_help(opts));
     profiling::ModelSuiteConfig mc;
@@ -389,7 +402,8 @@ int bench_model(const std::vector<std::string>& args, Context& ctx) {
         mc.efficiency = e;
     }
     mc.allow_nonconformant = a.flag("allow-nonconformant");
-    auto setup = make_engine(a, ctx);
+    if (auto v = a.u64("concurrency-context", 1, 1u << 22)) mc.concurrency_context = *v;  // F-2
+    auto setup = make_engine(a, ctx, !mc.modes.contains(profiling::ModelMode::MtpDecode));
     if (!setup) return kExitUsage;
     mc.identity = identity(a, setup->config.model_path, setup->config.backend);
     mc.environment = environment(a, ctx);

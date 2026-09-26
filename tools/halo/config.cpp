@@ -69,6 +69,12 @@ std::vector<ConfigKey> make_keys() {
         u("runtime.parallel", "parallel", "HALO_PARALLEL", 4, 1, 256, "concurrent sequences"),
         u("runtime.mtp_draft", "mtp-draft", "HALO_MTP_DRAFT", 2, 0, 16, "MTP draft tokens (0 = MTP off)"),
         b("runtime.prefix_cache", "no-prefix-cache", "HALO_PREFIX_CACHE", true, "disable the prefix cache"),
+        s("runtime.power_mode", "power-mode", "HALO_POWER_MODE", nullptr,
+          "platform (BIOS/EC) power mode; with it the engine applies tuned profiles (TRD §64)"),
+        s("runtime.profile_db", "profile-db", "HALO_PROFILE_DB", nullptr,
+          "autotune profile DB to apply (default with --power-mode: halo tune's default DB)"),
+        s("runtime.isa_target", "isa-target", "HALO_ISA_TARGET", nullptr,
+          "ISA label of the profile key (default: CPU ISA of this process; must match halo tune)"),
         s("server.host", "host", "HALO_HOST", sd.host, "bind address"),
         u("server.port", "port", "HALO_PORT", sd.port, 0, 65535, "TCP port (0 = ephemeral)"),
         s("server.api_key", "api-key", "HALO_API_KEY", nullptr,
@@ -79,7 +85,17 @@ std::vector<ConfigKey> make_keys() {
           "model id reported by the API"),
         u("server.max_concurrent", "max-concurrent", "HALO_MAX_CONCURRENT", nullptr, 1, 1024,
           "generations at once (default: --parallel)"),
-        u("server.max_queue", "max-queue", "HALO_MAX_QUEUE", sd.max_queue, 0, 1u << 16, "queued generations"),
+        u("server.max_queue", "max-queue", "HALO_MAX_QUEUE", sd.max_queue, 0, 4096, "queued generations"),
+        u("server.utility_concurrency", "utility-concurrency", "HALO_UTILITY_CONCURRENCY", sd.utility_concurrency, 1,
+          256, "/tokenize and /apply-template running at once"),
+        u("server.utility_queue", "utility-queue", "HALO_UTILITY_QUEUE", sd.utility_queue, 0, 4096,
+          "/tokenize and /apply-template waiting"),
+        u("server.header_timeout_s", "header-timeout", "HALO_HEADER_TIMEOUT", sd.header_timeout.count() / 1000, 0, 3600,
+          "seconds to receive a request's headers (0 = unlimited)"),
+        u("server.body_timeout_s", "body-timeout", "HALO_BODY_TIMEOUT", sd.body_timeout.count() / 1000, 0, 3600,
+          "seconds to receive a request's body (0 = unlimited)"),
+        b("server.completions_parse_special", "no-completions-parse-special", "HALO_COMPLETIONS_PARSE_SPECIAL",
+          sd.completions_parse_special, "treat special-token text in /v1/completions prompts as plain text"),
         u("server.max_body_bytes", "max-body-bytes", "HALO_MAX_BODY_BYTES", sd.max_body_bytes, 1024, 1ULL << 30,
           "request body limit"),
         u("server.max_tokens_cap", "max-tokens-cap", "HALO_MAX_TOKENS_CAP", sd.max_tokens_cap, 1, 1u << 20,
@@ -88,6 +104,8 @@ std::vector<ConfigKey> make_keys() {
           1u << 20, "max_tokens when a request gives none"),
         u("server.request_timeout_s", "request-timeout", "HALO_REQUEST_TIMEOUT", sd.request_timeout.count(), 0,
           86400, "wall-clock limit per generation, seconds (0 = none)"),
+        b("server.allow_remote", "allow-remote", "HALO_ALLOW_REMOTE", false,
+          "allow a non-loopback --host (D-017: only behind a reverse proxy with connection and header timeouts)"),
         b("server.allow_unauthenticated_remote", "allow-unauthenticated-remote", "HALO_ALLOW_UNAUTHENTICATED_REMOTE",
           false, "allow a non-loopback bind without an API key"),
     };
@@ -209,14 +227,18 @@ ResolvedConfig resolve_config(const ParsedArgs& args, const std::map<std::string
         if (file.contains(section) && file[section].contains(name)) {
             e = {from_file(k, file[section][name], *rc.config_file + ": " + k.key), "file:" + *rc.config_file};
         }
-        if (const auto it = env.find(k.env); it != env.end()) {
+        // An empty environment value counts as unset: `HALO_API_KEY=` passed through by a
+        // service unit must not silently replace a configured key (security review S-18).
+        if (const auto it = env.find(k.env); it != env.end() && !it->second.empty()) {
             e = {from_text(k, it->second, k.env, false), "env:" + k.env};
         }
         if (k.type == KeyType::Bool) {
             // Boolean CLI flags state the non-default: --no-prefix-cache / --allow-...
-            if (args.flag(k.flag)) e = {k.key == "runtime.prefix_cache" ? json(false) : json(true), "cli"};
-        } else if (auto v = args.value(k.flag)) {
-            e = {from_text(k, *v, "--" + k.flag, true), "cli"};
+            if (args.flag(k.flag)) e = {k.flag.starts_with("no-") ? json(false) : json(true), "cli"};
+        } else if (args.has(k.flag)) {
+            const std::string v = args.values(k.flag).back();
+            if (k.secret && v.empty()) throw UsageError("--" + k.flag + " must not be empty");
+            e = {from_text(k, v, "--" + k.flag, true), "cli"};
         }
         rc.entries[k.key] = std::move(e);
     }
@@ -259,8 +281,13 @@ const std::string& ResolvedConfig::source(const std::string& key) const {
 json ResolvedConfig::to_json() const {
     json j = json::object();
     for (const auto& [k, e] : entries) {
-        const bool secret = key_spec(k).secret && !e.value.is_null();
-        j[k] = {{"value", secret ? json("<redacted>") : e.value}, {"source", e.source}};
+        // Truthful about secrets without revealing them (S-18): "<redacted>" only for a
+        // non-empty value.
+        json shown = e.value;
+        if (key_spec(k).secret && e.value.is_string()) {
+            shown = e.value.get_ref<const std::string&>().empty() ? json("<empty>") : json("<redacted>");
+        }
+        j[k] = {{"value", shown}, {"source", e.source}};
     }
     if (config_file) j["config_file"] = *config_file;
     return j;
@@ -269,7 +296,8 @@ json ResolvedConfig::to_json() const {
 const std::vector<std::string>& runtime_keys() {
     static const std::vector<std::string> k = {"model.path",       "model.mtp",       "runtime.backend",
                                                "runtime.threads",  "runtime.ctx",     "runtime.parallel",
-                                               "runtime.mtp_draft", "runtime.prefix_cache"};
+                                               "runtime.mtp_draft", "runtime.prefix_cache", "runtime.power_mode",
+                                               "runtime.profile_db", "runtime.isa_target"};
     return k;
 }
 
@@ -278,11 +306,12 @@ const std::vector<std::string>& server_keys() {
         "server.host",           "server.port",          "server.api_key",         "server.cors_origins",
         "server.allowed_hosts",  "server.served_model_name", "server.max_concurrent", "server.max_queue",
         "server.max_body_bytes", "server.max_tokens_cap", "server.default_max_tokens", "server.request_timeout_s",
-        "server.allow_unauthenticated_remote"};
+        "server.allow_unauthenticated_remote", "server.allow_remote", "server.utility_concurrency", "server.utility_queue",
+        "server.header_timeout_s", "server.body_timeout_s", "server.completions_parse_special"};
     return k;
 }
 
-runtime::EngineConfig engine_config(const ResolvedConfig& c) {
+runtime::EngineConfig engine_config(const ResolvedConfig& c, const std::filesystem::path& default_profile_db) {
     runtime::EngineConfig e;
     const auto model = c.str("model.path");
     HALO_CHECK(model.has_value() && !model->empty(), ErrorCode::Config,
@@ -299,6 +328,20 @@ runtime::EngineConfig engine_config(const ResolvedConfig& c) {
     e.mtp_enabled = draft > 0;
     e.mtp_max_draft = static_cast<int>(draft == 0 ? 1 : draft);
     e.prefix_cache = c.boolean("runtime.prefix_cache");
+    // TRD §64: the engine applies tuned winners when it knows the profile DB and the power
+    // mode (a must-match field of the profile key).
+    e.isa_target = c.str("runtime.isa_target");
+    if (auto pm = c.str("runtime.power_mode")) {
+        e.platform_power_mode = *pm;
+        if (auto db = c.str("runtime.profile_db")) {
+            e.profile_db = *db;
+        } else if (!default_profile_db.empty()) {
+            e.profile_db = default_profile_db.string();
+        }
+    } else {
+        HALO_CHECK(!c.has("runtime.profile_db"), ErrorCode::Config,
+                   "runtime.profile_db needs runtime.power_mode (--power-mode): the power mode is part of the profile key");
+    }
     return e;
 }
 
@@ -306,7 +349,11 @@ api::ServerConfig server_config(const ResolvedConfig& c) {
     api::ServerConfig s;
     s.host = c.str("server.host").value_or(s.host);
     s.port = static_cast<int>(c.u64("server.port"));
-    if (auto k = c.str("server.api_key"); k && !k->empty()) s.api_key = *k;
+    if (auto k = c.str("server.api_key")) {
+        HALO_CHECK(!k->empty(), ErrorCode::Config, "server.api_key is empty ({}); remove it or set a key",
+                   c.source("server.api_key"));
+        s.api_key = *k;
+    }
     s.cors_origins = c.list("server.cors_origins");
     s.allowed_hosts = c.list("server.allowed_hosts");
     s.served_model_name = c.str("server.served_model_name").value_or("");
@@ -317,6 +364,12 @@ api::ServerConfig server_config(const ResolvedConfig& c) {
     s.default_max_tokens = c.u64("server.default_max_tokens");
     s.request_timeout = std::chrono::seconds(c.u64("server.request_timeout_s"));
     s.allow_unauthenticated_remote = c.boolean("server.allow_unauthenticated_remote");
+    s.allow_remote = c.boolean("server.allow_remote");
+    s.utility_concurrency = c.u64("server.utility_concurrency");
+    s.utility_queue = c.u64("server.utility_queue");
+    s.header_timeout = std::chrono::seconds(c.u64("server.header_timeout_s"));
+    s.body_timeout = std::chrono::seconds(c.u64("server.body_timeout_s"));
+    s.completions_parse_special = c.boolean("server.completions_parse_special");
     return s;
 }
 

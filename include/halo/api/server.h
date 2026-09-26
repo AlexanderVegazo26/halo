@@ -56,7 +56,16 @@ struct ServerConfig {
     /// it is parsed as control tokens (the client authored the whole prompt). Chat routes
     /// never do this for client-supplied strings (see prompt.h).
     bool completions_parse_special = true;
-    std::size_t http_threads = 0;  ///< 0 = max_concurrent + max_queue + 4
+    std::size_t http_threads = 0;  ///< 0 = max_concurrent + max_queue + utility_concurrency + utility_queue + 4
+    /// /tokenize and /apply-template run behind their own small admission (security review
+    /// S-16): at most `utility_concurrency` at once, `utility_queue` waiting; beyond -> 429.
+    std::size_t utility_concurrency = 2;
+    std::size_t utility_queue = 8;
+    /// Per-connection deadlines for reading a request (security review S-13): the time from
+    /// the connection opening (or the previous response) to the complete header block, and
+    /// from the headers to the complete body. 0 = unlimited. Linux only (see conn_guard.h).
+    std::chrono::milliseconds header_timeout{10000};
+    std::chrono::milliseconds body_timeout{60000};
     std::chrono::seconds read_timeout{60};
     std::chrono::seconds write_timeout{60};
     std::chrono::seconds keep_alive_timeout{5};
@@ -81,10 +90,19 @@ struct ServerConfig {
     /// any other address and this list is empty, the Host header is not checked (the API
     /// key is then mandatory, see below).
     std::vector<std::string> allowed_hosts;
+    /// D-017: v0.2 serving is loopback-only. Binding any non-loopback address is refused
+    /// (Error(Config)) unless this is set, and such a deployment requires a reverse proxy
+    /// that enforces per-client connection limits and header/body timeouts (docs/api.md).
+    bool allow_remote = false;
     /// Binding a non-loopback address without an api_key is refused (Error(Config)) unless
-    /// this is set.
+    /// this is set, and then `allowed_hosts` must be non-empty so the Host check (DNS
+    /// rebinding) stays on (security review S-20).
     bool allow_unauthenticated_remote = false;
 };
+
+/// Throws Error(Config) for a configuration ApiServer refuses (the checks its constructor
+/// runs), so callers can fail before loading a model.
+void validate_server_config(const ServerConfig& config);
 
 /// True for 127.0.0.0/8, ::1 and "localhost".
 [[nodiscard]] bool is_loopback_host(std::string_view host) noexcept;

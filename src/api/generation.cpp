@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <stop_token>
+#include <thread>
 #include <exception>
 #include <format>
 
@@ -191,6 +195,44 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
     req.stop_strings.clear();  // owned by the API (see generation.h)
     out.prompt_tokens = req.prompt.size();
 
+    // Engine-side cancel + deadline (R-3 / S-15): reach queued and prefilling requests.
+    std::stop_source cancel_source;
+    enum class Why { None, Client, Shutdown };
+    std::atomic<Why> why{Why::None};
+    req.cancel = cancel_source.get_token();
+    req.deadline = spec.deadline;
+    struct Watcher {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        std::thread thread;
+        ~Watcher() {
+            {
+                std::lock_guard lk(mu);
+                done = true;
+            }
+            cv.notify_all();
+            if (thread.joinable()) thread.join();
+        }
+    } watcher;
+    watcher.thread = std::thread([&] {
+        std::unique_lock lk(watcher.mu);
+        while (!watcher.done) {
+            watcher.cv.wait_for(lk, std::chrono::milliseconds(100), [&] { return watcher.done; });
+            if (watcher.done) break;
+            if (stopping.load(std::memory_order_relaxed)) {
+                why = Why::Shutdown;
+                cancel_source.request_stop();
+                break;
+            }
+            if (!sink.peer_connected()) {
+                why = Why::Client;
+                cancel_source.request_stop();
+                break;
+            }
+        }
+    });
+
     std::optional<runtime::GenerateResult> result;
     const auto call = [&](const runtime::GenerateRequest& r) {
         ++out.engine_calls;
@@ -214,7 +256,18 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
         }
     };
 
+    // An engine call that ended through the stop token or the deadline (no token needed).
+    const auto classify_engine_end = [&] {
+        if (!result || cancel != Cancel::None) return;
+        if (result->deadline_expired) {
+            cancel = Cancel::Deadline;
+        } else if (result->finish == runtime::FinishReason::Cancelled && cancel_source.stop_requested()) {
+            cancel = why.load() == Why::Shutdown ? Cancel::Shutdown : Cancel::Client;
+        }
+    };
+
     call(req);
+    classify_engine_end();
     if (result) out.cached_prompt_tokens = result->cached_prompt_tokens;
 
     bool length_after_budget = false;
@@ -241,7 +294,8 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
             r2.prompt.insert(r2.prompt.end(), observed.begin(), observed.end());
             r2.prompt.insert(r2.prompt.end(), spec.close_reasoning_tokens.begin(), spec.close_reasoning_tokens.end());
             r2.max_tokens = req.max_tokens - out.completion_tokens;
-            call(r2);
+            call(r2);  // r2 carries the same stop token and deadline
+            classify_engine_end();
         }
     }
 

@@ -41,7 +41,7 @@ if(TARGET halo_autotune)
   endif()
 endif()
 
-add_library(halo_cli STATIC cli.cpp args.cpp config.cpp model_io.cpp commands.cpp bench.cpp tune.cpp hashing.cpp)
+add_library(halo_cli STATIC cli.cpp args.cpp config.cpp model_io.cpp commands.cpp bench.cpp tune.cpp fsutil.cpp)
 target_include_directories(halo_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(halo_cli PUBLIC ${_halo_cli_deps} PRIVATE halo_warnings)
 target_compile_definitions(halo_cli PUBLIC HALO_CLI_HAVE_RUNTIME=${_have_runtime} HALO_CLI_HAVE_API=${_have_api}

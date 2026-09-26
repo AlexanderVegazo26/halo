@@ -19,6 +19,14 @@
 // the offending piece reaches the OutputParser, whose tool-argument JSON handling recurses
 // (S-9).
 //
+// Cancellation without tokens (review R-3 / S-15, engine.h GenerateRequest::cancel and
+// ::deadline): every engine call carries a std::stop_token and the request deadline. The
+// engine checks both each tick whether the request is queued, prefilling or decoding. A
+// watcher thread per generation polls (every 100 ms) the server's stopping flag and
+// EventSink::peer_connected(), and requests the stop when either says so, so a client that
+// disconnects during a long prefill, a shutdown, or the wall-clock limit ends the request
+// within about one engine tick instead of at its first token.
+//
 // Threading: the TokenCallback runs on whatever thread the Engine invokes it on, and the
 // EventSink (an SSE writer) may block in it for up to the server's write timeout when the
 // client reads slowly. That is harmless when the Engine calls each request's callback on the
@@ -49,6 +57,10 @@ public:
     virtual bool tool_call(std::size_t index, const chat::ToolCall& call) = 0;
     /// Polled once per token; false = client disconnected.
     virtual bool alive() = 0;
+    /// Probes only the client socket (no writer state), so it may be called from another
+    /// thread while generation runs: the disconnect watcher uses it before the first token,
+    /// when no callback runs (review R-3 / S-15). false = the client has gone.
+    virtual bool peer_connected() { return true; }
 };
 
 enum class StopCause {

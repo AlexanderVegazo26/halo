@@ -17,6 +17,7 @@
 // is never printed (the resolved-config dump shows "<redacted>").
 
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -74,7 +75,9 @@ public:
 [[nodiscard]] ResolvedConfig resolve_config(const ParsedArgs& args, const std::map<std::string, std::string>& env,
                                             const std::vector<std::string>& keys);
 
-[[nodiscard]] runtime::EngineConfig engine_config(const ResolvedConfig& c);
+/// `default_profile_db` is used when a power mode is set and no profile DB is given.
+[[nodiscard]] runtime::EngineConfig engine_config(const ResolvedConfig& c,
+                                                  const std::filesystem::path& default_profile_db = {});
 [[nodiscard]] api::ServerConfig server_config(const ResolvedConfig& c);
 
 /// Keys used by serve / run / bench model.

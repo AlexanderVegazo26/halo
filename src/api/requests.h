@@ -28,6 +28,7 @@ struct ChatJob {
     bool include_usage = false;
     bool add_generation_prompt = true;  // /apply-template only
     bool tokenize = false;              // /apply-template only
+    std::vector<std::string> warnings;  // request-level notes for the response
 };
 
 struct CompletionJob {

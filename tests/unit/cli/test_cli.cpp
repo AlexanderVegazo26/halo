@@ -18,7 +18,14 @@
 #include "config.h"
 #include "fake_engine.h"
 #include "halo/core/error.h"
-#include "hashing.h"
+#include "fsutil.h"
+#if HALO_CLI_HAVE_RUNTIME
+#include "halo/runtime/profile.h"
+#endif
+#if HALO_CLI_HAVE_AUTOTUNE
+#include "halo/autotune/lookup.h"
+#include "halo/model/model.h"
+#endif
 
 #if HALO_CLI_HAVE_API
 #include <httplib.h>
@@ -155,7 +162,7 @@ TEST(Cli, UsageAndExitCodes) {
     EXPECT_NE(r.err.find("needs a value"), std::string::npos);
     r = cli_run({"tune", "m.gguf"});
     EXPECT_EQ(r.rc, 2);
-    EXPECT_NE(r.err.find(HALO_CLI_HAVE_AUTOTUNE ? "no positional arguments" : "not part of this build"),
+    EXPECT_NE(r.err.find((HALO_CLI_HAVE_AUTOTUNE && HALO_CLI_HAVE_RUNTIME) ? "no positional arguments" : "not part of this build"),
               std::string::npos)
         << r.err;
     r = cli_run({"version"});
@@ -275,6 +282,16 @@ TEST(CliConfig, EngineAndServerConfigMapping) {
     ASSERT_EQ(r2.rc, 0) << r2.err;
     EXPECT_EQ(seen_concurrent, 2u);
     EXPECT_NE(r2.err.find("--max-concurrent 8 exceeds --parallel 2"), std::string::npos) << r2.err;
+    // TRD §64: with a power mode the engine applies tuned profiles from tune's default DB.
+    ff.configs->clear();
+    auto r3 = cli_run({"serve", "m.gguf", "--port", "0", "--power-mode", "performance"},
+                      CliOptions().with_env({{"HALO_PROFILE_DB", "/tmp/halo-profiles.db"}}).with_factory(ff.factory())
+                          .with_serving([](api::ApiServer&, std::function<void()> stop) { stop(); }));
+    ASSERT_EQ(r3.rc, 0) << r3.err;
+    EXPECT_EQ(ff.configs->at(0).platform_power_mode, "performance");
+    EXPECT_EQ(ff.configs->at(0).profile_db.value_or(""), "/tmp/halo-profiles.db");
+    r3 = cli_run({"serve", "m.gguf", "--profile-db", "/tmp/x.db"}, CliOptions().with_factory(ff.factory()));
+    EXPECT_EQ(r3.rc, 1) << "a profile DB without the power mode cannot form the key";
 #else
     EXPECT_EQ(r.rc, 2);
 #endif
@@ -554,7 +571,13 @@ TEST(CliServe, UnsafeBindRefusedBeforeLoadingTheModel) {
     EXPECT_NE(r.err.find("CONFIG_ERROR"), std::string::npos) << r.err;
     EXPECT_TRUE(ff.configs->empty()) << "the model must not be loaded for a refused configuration";
     bool served = false;
-    r = cli_run({"serve", "m.gguf", "--host", "0.0.0.0", "--port", "0"},
+    // D-017: a key alone is not enough; the explicit opt-in is required.
+    r = cli_run({"serve", "m.gguf", "--host", "0.0.0.0"},
+                CliOptions().with_env({{"HALO_API_KEY", "k"}}).with_factory(ff.factory()));
+    EXPECT_EQ(r.rc, 1);
+    EXPECT_NE(r.err.find("loopback-only (D-017)"), std::string::npos) << r.err;
+    EXPECT_TRUE(ff.configs->empty());
+    r = cli_run({"serve", "m.gguf", "--host", "0.0.0.0", "--port", "0", "--allow-remote"},
                 CliOptions().with_env({{"HALO_API_KEY", "k"}}).with_factory(ff.factory()).with_serving(
                     [&](api::ApiServer&, std::function<void()> stop) {
                         served = true;
@@ -563,7 +586,126 @@ TEST(CliServe, UnsafeBindRefusedBeforeLoadingTheModel) {
     EXPECT_EQ(r.rc, 0) << r.err;
     EXPECT_TRUE(served);
 }
+
+TEST(CliServe, EmptyApiKeyNeverDisablesAuthentication) {
+    // Security review S-18: `HALO_API_KEY=` (empty, e.g. passed through by a service unit)
+    // used to replace a key from the config file and run the server without auth.
+    FakeFactory ff;
+    const auto cfgfile = temp_file("key.json", R"({"server":{"api_key":"filekey-XYZ"}})");
+    auto r = cli_run({"serve", "m.gguf", "--config", cfgfile.string(), "--print-config"},
+                     CliOptions().with_env({{"HALO_API_KEY", ""}}));
+    ASSERT_EQ(r.rc, 0) << r.err;
+    json j = json::parse(r.out);
+    EXPECT_EQ(j.at("server.api_key").at("source"), "file:" + cfgfile.string());
+    EXPECT_EQ(j.at("server.api_key").at("value"), "<redacted>");
+    std::optional<std::string> key;
+    r = cli_run({"serve", "m.gguf", "--port", "0", "--config", cfgfile.string()},
+                CliOptions().with_env({{"HALO_API_KEY", ""}}).with_factory(ff.factory()).with_serving(
+                    [&](api::ApiServer& s, std::function<void()> stop) {
+                        key = s.config().api_key;
+                        stop();
+                    }));
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(key.value_or("<none>"), "filekey-XYZ");
+    // An explicitly empty key is an error, and --print-config says it is empty.
+    r = cli_run({"serve", "m.gguf", "--api-key", ""});
+    EXPECT_EQ(r.rc, 2) << r.err;
+    const auto emptyfile = temp_file("emptykey.json", R"({"server":{"api_key":""}})");
+    r = cli_run({"serve", "m.gguf", "--config", emptyfile.string(), "--print-config"});
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(json::parse(r.out).at("server.api_key").at("value"), "<empty>");
+    const std::size_t loads = ff.configs->size();
+    r = cli_run({"serve", "m.gguf", "--config", emptyfile.string()}, CliOptions().with_factory(ff.factory()));
+    EXPECT_EQ(r.rc, 1);
+    EXPECT_NE(r.err.find("api_key is empty"), std::string::npos) << r.err;
+    EXPECT_EQ(ff.configs->size(), loads) << "refused before loading the model";
+    fs::remove(cfgfile);
+    fs::remove(emptyfile);
+}
+
+TEST(CliServe, UnsafeBrowserAndRemoteConfigurationsAreRefused) {
+    FakeFactory ff;
+    // S-19: wildcard CORS without a key.
+    auto r = cli_run({"serve", "m.gguf", "--cors-origins", "*"}, CliOptions().with_factory(ff.factory()));
+    EXPECT_EQ(r.rc, 1);
+    EXPECT_NE(r.err.find("cors_origins '*' requires an api_key"), std::string::npos) << r.err;
+    // S-20: unauthenticated remote without a Host allowlist.
+    r = cli_run({"serve", "m.gguf", "--host", "0.0.0.0", "--allow-remote", "--allow-unauthenticated-remote"},
+                CliOptions().with_factory(ff.factory()));
+    EXPECT_EQ(r.rc, 1);
+    EXPECT_NE(r.err.find("allowed_hosts"), std::string::npos) << r.err;
+    EXPECT_TRUE(ff.configs->empty()) << "refused before loading the model";
+    // S-22: the /v1/completions special-token behaviour is configurable.
+    bool parse_special = true;
+    r = cli_run({"serve", "m.gguf", "--port", "0", "--no-completions-parse-special", "--header-timeout", "3",
+                 "--utility-concurrency", "3"},
+                CliOptions().with_factory(ff.factory()).with_serving([&](api::ApiServer& s, std::function<void()> stop) {
+                    parse_special = s.config().completions_parse_special;
+                    EXPECT_EQ(s.config().header_timeout, std::chrono::milliseconds(3000));
+                    EXPECT_EQ(s.config().utility_concurrency, 3u);
+                    stop();
+                }));
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_FALSE(parse_special);
+    r = cli_run({"serve", "m.gguf", "--print-config"}, CliOptions().with_env({{"HALO_COMPLETIONS_PARSE_SPECIAL", "false"}}));
+    EXPECT_EQ(json::parse(r.out).at("server.completions_parse_special").at("value"), false);
+    r = cli_run({"serve", "m.gguf", "--max-queue", "65536", "--print-config"});
+    EXPECT_EQ(r.rc, 2) << "the queue (and so the HTTP pool) is bounded";
+}
 #endif
+
+// ---- output files (S-21) -------------------------------------------------------------------
+
+TEST(CliOutput, OutputPathsNeverFollowSymlinksAndWriteFailuresAreErrors) {
+    const std::string tag = std::to_string(::getpid());
+    const fs::path target = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_victim.txt");
+    const fs::path link = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_link.json");
+    { std::ofstream(target) << "precious"; }
+    fs::remove(link);
+    fs::create_symlink(target, link);
+    cli::write_file_no_follow(fs::temp_directory_path() / ("halo_cli_test_" + tag + "_ok.json"), "{}");
+    EXPECT_THROW(cli::write_file_no_follow(link, "overwritten"), halo::Error);
+    EXPECT_THROW(cli::write_file_no_follow("/nonexistent-dir/x.json", "{}"), halo::Error);
+#if HALO_CLI_HAVE_PROFILING && HALO_CLI_HAVE_CPU
+    auto r = cli_run({"bench", "micro", "--filter", "RMS", "--host-label", "t", "--warmup", "1", "--iterations", "2",
+                      "--allow-nonconformant", "--root", fixture_root("no_gpu").string(), "--out", link.string()});
+    EXPECT_EQ(r.rc, 1);
+    EXPECT_NE(r.err.find("symbolic link"), std::string::npos) << r.err;
+#endif
+#if HALO_CLI_HAVE_AUTOTUNE_CPU && HALO_CLI_HAVE_RUNTIME
+    if (fs::exists(tiny_model())) {
+        const fs::path db = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_s21.db");
+        const std::vector<std::string> base = {"--model", tiny_model().string(), "--host-label", "t", "--power-mode", "p",
+                                               "--threads", "1", "--chunks", "16", "--max-cv", "1e9",
+                                               "--no-bandwidth", "--root", fixture_root("no_gpu").string()};
+        std::vector<std::string> tune = {"tune", "--db", db.string()};
+        tune.insert(tune.end(), base.begin(), base.end());
+        ASSERT_EQ(cli_run(tune).rc, 0);
+        // --list --report to an unwritable path used to exit 0.
+        std::vector<std::string> list = {"tune", "--list", "--db", db.string(), "--report", "/nonexistent-dir/r.json"};
+        list.insert(list.end(), base.begin(), base.end());
+        r = cli_run(list);
+        EXPECT_EQ(r.rc, 1) << r.out << r.err;
+        // A symlinked database is refused.
+        const fs::path dblink = fs::temp_directory_path() / ("halo_cli_test_" + tag + "_dblink.db");
+        fs::remove(dblink);
+        fs::create_symlink(db, dblink);
+        std::vector<std::string> viaLink = {"tune", "--db", dblink.string()};
+        viaLink.insert(viaLink.end(), base.begin(), base.end());
+        r = cli_run(viaLink);
+        EXPECT_EQ(r.rc, 1);
+        EXPECT_NE(r.err.find("symbolic link"), std::string::npos) << r.err;
+        for (const auto& p : {db, dblink, fs::path(db.string() + "-wal"), fs::path(db.string() + "-shm")}) fs::remove(p);
+    }
+#endif
+    std::ifstream in(target);
+    std::string s;
+    std::getline(in, s);
+    EXPECT_EQ(s, "precious") << "the symlink target was never written";
+    fs::remove(link);
+    fs::remove(target);
+    fs::remove(fs::temp_directory_path() / ("halo_cli_test_" + tag + "_ok.json"));
+}
 
 // ---- bench ---------------------------------------------------------------------------------
 
@@ -629,8 +771,27 @@ TEST(CliBench, ModelSuiteOverFakeEngine) {
     EXPECT_TRUE(modes.contains(std::string(profiling::to_string(profiling::ModelMode::Decode))));
     EXPECT_GE(ff.configs->size(), 2u) << "load_time creates fresh engines through the factory";
     EXPECT_FALSE(ff.engine->calls().empty());
+    // F-3: no mtp_decode mode requested -> the engine is created with MTP drafting off.
+    EXPECT_FALSE(ff.configs->at(0).mtp_enabled);
+    EXPECT_NE(r.err.find("MTP drafting off for this run"), std::string::npos) << r.err;
     r = cli_run({"bench", "model", "m.gguf", "--host-label", "fake", "--modes", "warp_speed"}, CliOptions().with_factory(ff.factory()));
     EXPECT_EQ(r.rc, 2);
+    // An explicit --mtp-draft is honoured; F-2: --concurrency-context reaches the suite.
+    ff.configs->clear();
+    r = cli_run({"bench", "model", "m.gguf", "--host-label", "fake", "--modes", "concurrency", "--concurrency", "1",
+                 "--concurrency-context", "96", "--decode-tokens", "4", "--warmup", "0", "--repetitions", "3", "--mtp-draft",
+                 "2", "--root", root},
+                CliOptions().with_factory(ff.factory()));
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_TRUE(ff.configs->at(0).mtp_enabled);
+    const json jc = json::parse(r.out);
+    bool saw = false;
+    for (const auto& rec : jc.at("records")) {
+        if (rec.at("mode") != "concurrency") continue;
+        saw = true;
+        EXPECT_EQ(rec.at("context"), 96) << rec.dump();
+    }
+    EXPECT_TRUE(saw) << jc.dump().substr(0, 400);
 }
 
 TEST(CliBench, SystemSuiteOverFakeEngine) {
@@ -662,25 +823,28 @@ TEST(CliBench, SystemSuiteOverFakeEngine) {
 
 // ---- tune ----------------------------------------------------------------------------------
 
+#if HALO_CLI_HAVE_RUNTIME
 TEST(CliHashing, Sha256KnownAnswers) {
-    // FIPS 180-4 / NIST CSRC example vectors.
-    EXPECT_EQ(cli::sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    EXPECT_EQ(cli::sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    EXPECT_EQ(cli::sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+    // The one SHA-256 the profile keys use (runtime/profile.h, shared by halo tune and the
+    // Engine). FIPS 180-4 / NIST CSRC example vectors.
+    EXPECT_EQ(runtime::sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    EXPECT_EQ(runtime::sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(runtime::sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-    EXPECT_EQ(cli::sha256_hex(std::string(1000000, 'a')),
+    EXPECT_EQ(runtime::sha256_hex(std::string(1000000, 'a')),
               "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
     // Streaming over a file larger than one 4 MiB read equals the one-shot digest.
     const std::string big(9u << 20, 'x');
     const auto p = temp_file("hash.bin", big);
-    EXPECT_EQ(cli::sha256_file_hex(p), cli::sha256_hex(big));
+    EXPECT_EQ(runtime::sha256_file_hex(p), runtime::sha256_hex(big));
     fs::remove(p);
-    EXPECT_THROW((void)cli::sha256_file_hex("/nonexistent/file"), halo::Error);
-    EXPECT_EQ(cli::pack_id("t", std::nullopt), cli::sha256_hex("halo.pack/1\ntrunk=t\nmtp=none\n"));
+    EXPECT_THROW((void)runtime::sha256_file_hex("/nonexistent/file"), halo::Error);
+    EXPECT_EQ(runtime::pack_id("t", std::nullopt), runtime::sha256_hex("halo.pack/1\ntrunk=t\nmtp=none\n"));
 }
+#endif
 
 
-#if HALO_CLI_HAVE_AUTOTUNE
+#if HALO_CLI_HAVE_AUTOTUNE && HALO_CLI_HAVE_RUNTIME
 TEST(CliTune, RequiredFlagsAndStrategyRules) {
     REQUIRE_FILE(tiny_model());
     const std::string m = tiny_model().string();
@@ -710,6 +874,11 @@ TEST(CliTune, RequiredFlagsAndStrategyRules) {
     EXPECT_NE(r.err.find("needs a cost-model calibration"), std::string::npos) << r.err;
     r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--strategy", "bayesian"});
     EXPECT_EQ(r.rc, 2);
+    r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--gdn-tokens", "64"});
+    EXPECT_EQ(r.rc, 2);
+    EXPECT_NE(r.err.find("looks the GDN tunable up at T=512"), std::string::npos) << r.err;
+    r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--chunks", "17"});
+    EXPECT_EQ(r.rc, 2) << "a chunk the engine cannot run could never apply";
     r = run({"--model", m, "--host-label", "t", "--power-mode", "p", "--ops", "CONV"});
     EXPECT_EQ(r.rc, 2) << r.err;
     EXPECT_NE(r.err.find("unknown operator 'CONV'"), std::string::npos) << r.err;
@@ -731,7 +900,7 @@ TEST(CliTune, TunesTinyModelThenListShowsTheLookup) {
     for (const auto& p : {db, report, listrep}) fs::remove(p);
     // The shapes are the tiny model's; the stability gate is relaxed because ctest -j loads
     // the host (instability rejection is covered in test_tuner.cpp with a ManualClock).
-    const std::vector<std::string> shape = {"--model", m, "--threads", "1,2", "--gdn-tokens", "64", "--chunks", "16,32",
+    const std::vector<std::string> shape = {"--model", m, "--threads", "1,2", "--chunks", "16,32",
                                             "--db", db.string(), "--root", root, "--host-label", "cli-test"};
     std::vector<std::string> args = {"tune", "--power-mode", "performance", "--max-cv", "1e9", "--no-bandwidth",
                                      "--report", report.string()};
@@ -753,6 +922,25 @@ TEST(CliTune, TunesTinyModelThenListShowsTheLookup) {
     }
     EXPECT_EQ(rep.at("host_label"), "cli-test");
     ASSERT_TRUE(fs::exists(db));
+
+    // The key contract (runtime/profile.h): the key and op keys the ENGINE builds find the
+    // winners exactly (TRD §56 step 1), so a tuned profile is applied on next launch.
+    {
+        runtime::EngineConfig ec;
+        ec.model_path = m;
+        ec.platform_power_mode = "performance";
+        const auto key = runtime::engine_profile_key(ec, root);
+        const auto nm = model::NormalizedModel::load(m, model::GgufMode::HeaderOnly);
+        const auto lookup = autotune::ProfileLookup::open(db);
+        const auto mm = autotune::select_kernel(lookup, key, runtime::matmul_op_key(nm.hparams()), "cpu",
+                                                runtime::matmul_candidates(), nullptr, {});
+        EXPECT_EQ(mm.source, autotune::SelectionSource::Exact);
+        EXPECT_EQ(mm.candidate.value().to_string(), winners.at("MATMUL"));
+        const auto gd = autotune::select_kernel(lookup, key, runtime::gdn_op_key(nm.hparams()), "cpu",
+                                                runtime::gdn_candidates(), nullptr, {});
+        EXPECT_EQ(gd.source, autotune::SelectionSource::Exact);
+        EXPECT_EQ(gd.candidate.value().to_string(), winners.at("GATED_DELTANET"));
+    }
 
     // --list: the same key finds both winners at §56 step 1 (exact).
     std::vector<std::string> list = {"tune", "--list", "--power-mode", "performance", "--report", listrep.string()};

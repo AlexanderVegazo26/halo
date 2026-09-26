@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "admission.h"
+#include "conn_guard.h"
 #include "generation.h"
 #include "halo/api/prompt.h"
 #include "halo/core/error.h"
@@ -143,6 +144,7 @@ public:
     bool content(std::string_view) override { return true; }
     bool tool_call(std::size_t, const chat::ToolCall&) override { return true; }
     bool alive() override { return !req_.is_connection_closed(); }
+    bool peer_connected() override { return !req_.is_connection_closed(); }
 
 private:
     const httplib::Request& req_;
@@ -161,6 +163,8 @@ public:
         return ok_;
     }
     bool alive() { return ok_ && ds_.is_writable(); }
+    /// Socket probe only (no writer state): safe from the disconnect watcher thread.
+    bool peer_connected() { return ds_.is_writable(); }
 
 private:
     httplib::DataSink& ds_;
@@ -179,6 +183,7 @@ public:
         return w_.data(chunk(Json{{"tool_calls", std::move(calls)}}));
     }
     bool alive() override { return w_.alive(); }
+    bool peer_connected() override { return w_.peer_connected(); }
 
     void finish(const GenerationOutcome& o) {
         Json last = chunk(Json::object(), openai_finish(o));
@@ -219,6 +224,7 @@ public:
     bool content(std::string_view t) override { return w_.data(chunk(std::string(t), std::nullopt)); }
     bool tool_call(std::size_t, const chat::ToolCall&) override { return true; }
     bool alive() override { return w_.alive(); }
+    bool peer_connected() override { return w_.peer_connected(); }
     void finish(const GenerationOutcome& o) {
         Json last = chunk("", openai_finish(o));
         if (const Json w = warnings_json(m_, o); !w.empty()) last["warnings"] = w;
@@ -281,6 +287,7 @@ public:
         return close();
     }
     bool alive() override { return w_.alive(); }
+    bool peer_connected() override { return w_.peer_connected(); }
 
     void finish(const GenerationOutcome& o) {
         if (!close()) return;
@@ -321,6 +328,26 @@ private:
 
 }  // namespace
 
+/// Keeps a streaming response's connection in the handler phase of the ConnectionGuard for
+/// as long as the SSE body is being written. httplib runs the chunked content provider
+/// after the logger has already reported the request done, so without this the read
+/// deadline clock would be running during a long stream (found by the integration tests
+/// under ASan, where a stream outlived header_timeout and was cut off).
+class StreamPhase {
+public:
+    StreamPhase(ConnectionGuard& g, std::string addr, int port) : g_(g), addr_(std::move(addr)), port_(port) {
+        g_.handler_started(addr_, port_);
+    }
+    ~StreamPhase() { g_.request_done(addr_, port_); }
+    StreamPhase(const StreamPhase&) = delete;
+    StreamPhase& operator=(const StreamPhase&) = delete;
+
+private:
+    ConnectionGuard& g_;
+    std::string addr_;
+    int port_;
+};
+
 // ---- Impl ----------------------------------------------------------------------------------
 
 struct ApiServer::Impl {
@@ -328,7 +355,9 @@ struct ApiServer::Impl {
         : engine(e),
           cfg(std::move(c)),
           specials(e.tokenizer()),
-          admission(cfg.max_concurrent, cfg.max_queue) {
+          admission(cfg.max_concurrent, cfg.max_queue),
+          utility(cfg.utility_concurrency, cfg.utility_queue),
+          guard(cfg.header_timeout, cfg.body_timeout) {
         model_name = cfg.served_model_name.empty() ? engine.model().id : cfg.served_model_name;
         if (model_name.empty()) model_name = "halo";
         close_reasoning = engine.tokenizer().encode("\n</think>\n\n", true);
@@ -351,6 +380,8 @@ struct ApiServer::Impl {
     std::string model_name;
     httplib::Server svr;
     Admission admission;
+    Admission utility;  // /tokenize and /apply-template (S-16)
+    ConnectionGuard guard;  // per-connection read deadlines (S-13)
     Metrics metrics;
     std::atomic<bool> stopping{false};
     std::thread thread;
@@ -370,6 +401,7 @@ struct ApiServer::Impl {
     httplib::Server::Handler guarded(F f) {
         return [this, f](const httplib::Request& req, httplib::Response& res) {
             const ApiFamily fam = family_of(req.path);
+            guard.handler_started(req.remote_addr, req.remote_port);  // body fully read
             try {
                 f(req, res);
             } catch (const std::exception& e) {
@@ -415,6 +447,22 @@ struct ApiServer::Impl {
             case Admission::Result::Timeout:
                 metrics.count_rejection("queue_timeout");
                 throw RequestError(ErrorKind::Overloaded, "timed out waiting for a generation slot");
+            case Admission::Result::Stopped: break;
+        }
+        throw RequestError(ErrorKind::Overloaded, "server is shutting down");
+    }
+
+    /// Admission for the utility routes: no waiting beyond utility_queue, no queue timeout
+    /// beyond the generation one.
+    AdmissionSlot admit_utility() {
+        switch (utility.acquire(cfg.queue_timeout)) {
+            case Admission::Result::Admitted: return AdmissionSlot(utility);
+            case Admission::Result::QueueFull:
+                metrics.count_rejection("utility_queue_full");
+                throw RequestError(ErrorKind::RateLimited, "too many concurrent /tokenize or /apply-template requests");
+            case Admission::Result::Timeout:
+                metrics.count_rejection("utility_queue_timeout");
+                throw RequestError(ErrorKind::Overloaded, "timed out waiting for a /tokenize or /apply-template slot");
             case Admission::Result::Stopped: break;
         }
         throw RequestError(ErrorKind::Overloaded, "server is shutting down");
@@ -514,17 +562,20 @@ struct ApiServer::Impl {
         const Json body = parse_request_body(req.body, cfg.max_json_depth);
         ChatJob job = fam == ApiFamily::OpenAI ? parse_openai_chat(body, cfg) : parse_anthropic_messages(body, cfg);
         job.render.add_generation_prompt = true;
+        // Admission first (security review S-16): rendering and tokenizing cost up to ~1 s for
+        // a large request, and a request that ends in 429 must not have paid it.
+        auto slot = admit();
         const ChatPrompt prompt = build_chat_prompt(engine.tokenizer(), specials, engine.chat_template(), job.messages,
                                                     job.tools, job.render);
         ResponseMeta m = fam == ApiFamily::OpenAI ? meta("chatcmpl-", "call_", job.include_usage)
                                                   : meta("msg_", "toolu_", true);
+        m.warnings = job.warnings;
         if (prompt.neutralized_literals > 0) {
             HALO_INFO(kLog, "neutralized {} special-token literal(s) in client strings", prompt.neutralized_literals);
         }
         auto spec = std::make_shared<GenerationSpec>(make_spec(prompt.tokens, prompt.starts_in_reasoning, job.tools,
                                                                job.sampling, job.max_tokens, job.reasoning_budget,
                                                                job.stop, true, m));
-        auto slot = admit();
 
         if (!job.stream) {
             CollectSink sink(req);
@@ -542,7 +593,9 @@ struct ApiServer::Impl {
         auto meta_ptr = std::make_shared<ResponseMeta>(std::move(m));
         set_sse_headers(res);
         res.set_chunked_content_provider(
-            "text/event-stream", [this, spec, slot, meta_ptr, fam](std::size_t, httplib::DataSink& ds) {
+            "text/event-stream", [this, spec, slot, meta_ptr, fam, addr = req.remote_addr,
+                                  rport = req.remote_port](std::size_t, httplib::DataSink& ds) {
+                const StreamPhase phase(guard, addr, rport);
                 SseWriter w(ds);
                 if (fam == ApiFamily::OpenAI) {
                     OpenAIChatStream s(w, *meta_ptr);
@@ -568,10 +621,10 @@ struct ApiServer::Impl {
         const Json body = parse_request_body(req.body, cfg.max_json_depth);
         const CompletionJob job = parse_openai_completion(body, cfg);
         ResponseMeta m = meta("cmpl-", "call_", job.include_usage);
+        auto slot = admit();  // before tokenizing (S-16)
         auto tokens = engine.tokenizer().encode(job.prompt, cfg.completions_parse_special);
         auto spec = std::make_shared<GenerationSpec>(
             make_spec(std::move(tokens), false, nullptr, job.sampling, job.max_tokens, std::nullopt, job.stop, false, m));
-        auto slot = admit();
         if (!job.stream) {
             CollectSink sink(req);
             const GenerationOutcome o = run(*spec, sink);
@@ -596,7 +649,9 @@ struct ApiServer::Impl {
         auto meta_ptr = std::make_shared<ResponseMeta>(std::move(m));
         set_sse_headers(res);
         res.set_chunked_content_provider("text/event-stream",
-                                         [this, spec, slot, meta_ptr](std::size_t, httplib::DataSink& ds) {
+                                         [this, spec, slot, meta_ptr, addr = req.remote_addr,
+                                          rport = req.remote_port](std::size_t, httplib::DataSink& ds) {
+                                             const StreamPhase phase(guard, addr, rport);
                                              SseWriter w(ds);
                                              CompletionStream s(w, *meta_ptr);
                                              const GenerationOutcome o = run(*spec, s);
@@ -666,11 +721,12 @@ struct ApiServer::Impl {
         return j;
     }
 
-    void tokenize(const httplib::Request& req, httplib::Response& res) const {
+    void tokenize(const httplib::Request& req, httplib::Response& res) {
         const Json body = parse_request_body(req.body, cfg.max_json_depth);
         const auto content = opt_string(body, "content", "content");
         if (!content) throw RequestError(ErrorKind::InvalidRequest, "is required", "content");
         check_content_bytes(content->size(), cfg, "content");
+        const AdmissionSlot slot = admit_utility();
         const bool parse_special = opt_bool(body, "parse_special", "parse_special").value_or(false);
         const bool with_pieces = opt_bool(body, "with_pieces", "with_pieces").value_or(false);
         const auto& tok = engine.tokenizer();
@@ -683,10 +739,11 @@ struct ApiServer::Impl {
         res.set_content(dump(Json{{"tokens", std::move(arr)}}), "application/json");
     }
 
-    void apply_template(const httplib::Request& req, httplib::Response& res) const {
+    void apply_template(const httplib::Request& req, httplib::Response& res) {
         const Json body = parse_request_body(req.body, cfg.max_json_depth);
         ChatJob job = parse_apply_template(body, cfg);
         job.render.add_generation_prompt = job.add_generation_prompt;
+        const AdmissionSlot slot = admit_utility();
         const ChatPrompt p = build_chat_prompt(engine.tokenizer(), specials, engine.chat_template(), job.messages,
                                                job.tools, job.render);
         Json j = {{"prompt", p.text}};
@@ -718,7 +775,9 @@ struct ApiServer::Impl {
     // -- wiring -----------------------------------------------------------------------------
 
     void setup() {
-        const std::size_t threads = cfg.http_threads != 0 ? cfg.http_threads : cfg.max_concurrent + cfg.max_queue + 4;
+        const std::size_t threads = cfg.http_threads != 0 ? cfg.http_threads
+                                                          : cfg.max_concurrent + cfg.max_queue + cfg.utility_concurrency +
+                                                                cfg.utility_queue + 4;
         // httplib takes ownership of the returned queue (library contract: raw pointer).
         svr.new_task_queue = [threads] { return new httplib::ThreadPool(threads, threads, 64); };
         svr.set_payload_max_length(cfg.max_body_bytes);
@@ -728,6 +787,7 @@ struct ApiServer::Impl {
         svr.set_keep_alive_timeout(cfg.keep_alive_timeout);
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            guard.headers_done(req.remote_addr, req.remote_port);  // S-13: header deadline met
             const ApiFamily fam = family_of(req.path);
             // 1. Host (DNS rebinding, A-6): a page on attacker.example that rebinds its name to
             //    127.0.0.1 still sends "Host: attacker.example".
@@ -833,6 +893,8 @@ struct ApiServer::Impl {
 
         svr.set_logger([this](const httplib::Request& req, const httplib::Response& res) {
             metrics.count_request(route_label(req.path), res.status);
+            // Streaming responses report "done" when their body is written (StreamPhase).
+            if (!res.has_header("X-Accel-Buffering")) guard.request_done(req.remote_addr, req.remote_port);
         });
 
         svr.Get("/health", guarded([this](const httplib::Request&, httplib::Response& res) {
@@ -845,8 +907,13 @@ struct ApiServer::Impl {
         }));
         svr.Get("/v1/models", guarded([this](const httplib::Request&, httplib::Response& res) { models(res); }));
         svr.Get("/metrics", guarded([this](const httplib::Request&, httplib::Response& res) {
-            res.set_content(metrics.render(engine.stats(), admission.queued(), admission.active()),
-                            "text/plain; version=0.0.4; charset=utf-8");
+            std::string text = metrics.render(engine.stats(), admission.queued(), admission.active());
+            text += std::format(
+                "# HELP halo_api_connection_deadline_closes_total Connections closed for exceeding the header/body "
+                "read deadline.\n# TYPE halo_api_connection_deadline_closes_total counter\n"
+                "halo_api_connection_deadline_closes_total {}\n",
+                guard.timeouts());
+            res.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
         }));
         svr.Post("/v1/chat/completions", guarded([this](const httplib::Request& q, httplib::Response& r) {
             chat(q, r, ApiFamily::OpenAI);
@@ -863,20 +930,41 @@ struct ApiServer::Impl {
 
 // ---- ApiServer -----------------------------------------------------------------------------
 
-namespace {
-ServerConfig validated(ServerConfig c) {
+void validate_server_config(const ServerConfig& c) {
     const bool no_key = !c.api_key || c.api_key->empty();
+    HALO_CHECK(is_loopback_host(c.host) || c.allow_remote, ErrorCode::Config,
+               "server.host {} is not a loopback address: v0.2 serving is loopback-only (D-017). To bind it anyway, "
+               "set allow_remote and put a reverse proxy with connection limits and header/body timeouts in front",
+               c.host);
     HALO_CHECK(is_loopback_host(c.host) || !no_key || c.allow_unauthenticated_remote, ErrorCode::Config,
                "server.host {} is not a loopback address: an api_key is required (or set "
                "allow_unauthenticated_remote explicitly)",
                c.host);
+    // S-20: an unauthenticated non-loopback server keeps the Host check (DNS rebinding).
+    HALO_CHECK(is_loopback_host(c.host) || !no_key || !c.allowed_hosts.empty(), ErrorCode::Config,
+               "server.host {} without an api_key: allowed_hosts must name the Host values clients use, so "
+               "the DNS-rebinding check stays on",
+               c.host);
+    // S-19: a wildcard CORS origin lets any web page drive the model; only with a key.
+    HALO_CHECK(!no_key || std::ranges::find(c.cors_origins, "*") == c.cors_origins.end(), ErrorCode::Config,
+               "server.cors_origins '*' requires an api_key (any web page could use the model otherwise)");
+    HALO_CHECK(!c.api_key || !c.api_key->empty(), ErrorCode::Config, "server.api_key must not be empty");
     HALO_CHECK(c.max_concurrent > 0, ErrorCode::Config, "server.max_concurrent must be > 0");
+    HALO_CHECK(c.utility_concurrency > 0, ErrorCode::Config, "server.utility_concurrency must be > 0");
+    // S-13: every queued request holds an HTTP thread; keep the pool a sane size.
+    HALO_CHECK(c.max_queue <= 4096 && c.utility_queue <= 4096, ErrorCode::Config,
+               "server.max_queue / utility_queue must be <= 4096");
     HALO_CHECK(c.max_body_bytes > 0, ErrorCode::Config, "server.max_body_bytes must be > 0");
     HALO_CHECK(c.max_tokens_cap > 0, ErrorCode::Config, "server.max_tokens_cap must be > 0");
     HALO_CHECK(c.default_max_tokens > 0, ErrorCode::Config, "server.default_max_tokens must be > 0");
     HALO_CHECK(c.max_json_depth >= 4, ErrorCode::Config, "server.max_json_depth must be >= 4");
     HALO_CHECK(c.port >= 0 && c.port <= 65535, ErrorCode::Config, "server.port must be 0-65535");
     HALO_CHECK(!c.host.empty(), ErrorCode::Config, "server.host must not be empty");
+}
+
+namespace {
+ServerConfig validated(ServerConfig c) {
+    validate_server_config(c);
     return c;
 }
 }  // namespace
@@ -903,6 +991,11 @@ bool is_loopback_host(std::string_view host) noexcept {
 
 ApiServer::ApiServer(runtime::Engine& engine, ServerConfig config)
     : impl_(std::make_unique<Impl>(engine, validated(std::move(config)))) {
+    if (!is_loopback_host(impl_->cfg.host)) {
+        HALO_WARN(kLog, "binding non-loopback {} (allow_remote): v0.2 requires a reverse proxy with connection limits "
+                        "and header/body timeouts in front of this server (D-017)",
+                  impl_->cfg.host);
+    }
     if (!is_loopback_host(impl_->cfg.host) && (!impl_->cfg.api_key || impl_->cfg.api_key->empty())) {
         HALO_WARN(kLog, "binding {} without an API key: anyone who can reach this address can use the model",
                   impl_->cfg.host);
@@ -922,6 +1015,7 @@ int ApiServer::bind() {
     }
     HALO_CHECK(impl_->port > 0, ErrorCode::Io, "cannot bind {}:{}", c.host, c.port);
     HALO_INFO(kLog, "listening on http://{}:{}", c.host, impl_->port);
+    impl_->guard.start(impl_->port);
     return impl_->port;
 }
 
@@ -944,8 +1038,10 @@ void ApiServer::stop() {
     impl_->stopped = true;
     impl_->stopping.store(true);
     impl_->admission.shutdown();
+    impl_->utility.shutdown();
     impl_->svr.stop();
     if (impl_->thread.joinable()) impl_->thread.join();
+    impl_->guard.stop();
 }
 
 int ApiServer::port() const noexcept { return impl_->port; }

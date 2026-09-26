@@ -302,6 +302,37 @@ TEST(ApiOpenAI, StructuredOutputPassthrough) {
     EXPECT_FALSE(calls.at(2).request.sampling.json_schema.has_value());
 }
 
+TEST(ApiOpenAI, StructuredOutputReturnsJsonAsContentWithThinkingOn) {
+    // F-1 (found by WS-G's integration test on the real engine): with the template's
+    // default thinking, a grammar-constrained answer ended up in reasoning_content and
+    // content was "". The prompt is now rendered with thinking off.
+    TestServer ts;
+    ts.engine->script = [](const auto&, int) { return sc("{\"color\":\"red\"}"); };
+    const Json schema = Json::parse(R"({"type":"object","properties":{"color":{"enum":["red","green"]}},"required":["color"]})");
+    for (const bool json_object : {false, true}) {
+        Json b = user_chat("pick");
+        if (json_object) {
+            b["response_format"] = {{"type", "json_object"}};
+        } else {
+            b["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "n"}, {"schema", schema}}}};
+        }
+        auto r = ts.post("/v1/chat/completions", b);
+        ASSERT_EQ(r->status, 200) << r->body;
+        const Json j = Json::parse(r->body);
+        EXPECT_EQ(j.at("choices").at(0).at("message").at("content"), "{\"color\":\"red\"}") << j.dump();
+        EXPECT_FALSE(j.at("choices").at(0).at("message").contains("reasoning_content"));
+        EXPECT_FALSE(j.contains("warnings")) << "thinking was not explicitly requested";
+        EXPECT_TRUE(ts.engine->prompt_text(ts.engine->calls().size() - 1).ends_with("<think>\n\n</think>\n\n"));
+    }
+    // An explicit thinking request is overridden, with a warning.
+    Json b = user_chat("pick");
+    b["reasoning_effort"] = "high";
+    b["response_format"] = {{"type", "json_object"}};
+    const Json j = Json::parse(ts.post("/v1/chat/completions", b)->body);
+    EXPECT_EQ(j.at("choices").at(0).at("message").at("content"), "{\"color\":\"red\"}");
+    EXPECT_NE(j.value("warnings", Json::array()).dump().find("disables thinking"), std::string::npos) << j.dump();
+}
+
 TEST(ApiOpenAI, StopSequencesTruncateContent) {
     TestServer ts;
     ts.engine->script = [](const auto&, int) { return sc("r</think>\n\nHello. World."); };
@@ -540,14 +571,27 @@ TEST(ApiAnthropic, ThinkingBudgetEffortAndStructuredOutput) {
     };
     Json b = user_messages("x", 64);
     b["thinking"] = {{"type", "enabled"}, {"budget_tokens", 8}};
-    const Json schema = Json::parse(R"({"type":"object"})");
-    b["output_config"] = {{"format", {{"type", "json_schema"}, {"schema", schema}}}};
     auto r = ts.post("/v1/messages", b);
     ASSERT_EQ(r->status, 200) << r->body;
     const Json j = Json::parse(r->body);
     EXPECT_EQ(j.at("content").at(0).at("thinking"), std::string(8, 't')) << "explicit budget_tokens is the reasoning budget";
     EXPECT_EQ(j.at("content").at(1).at("text"), "ok");
-    EXPECT_EQ(Json::parse(ts.engine->calls().at(0).request.sampling.json_schema.value()), schema);
+
+    // F-1: structured output renders with thinking off (the grammar would otherwise be
+    // stuck inside the think block), and says so when thinking had been requested.
+    const Json schema = Json::parse(R"({"type":"object"})");
+    b["output_config"] = {{"format", {{"type", "json_schema"}, {"schema", schema}}}};
+    ts.engine->script = [](const auto&, int) { return sc("{\"a\":1}"); };
+    r = ts.post("/v1/messages", b);
+    ASSERT_EQ(r->status, 200) << r->body;
+    const Json js = Json::parse(r->body);
+    ASSERT_EQ(js.at("content").size(), 1u) << js.dump();
+    EXPECT_EQ(js.at("content").at(0).at("type"), "text");
+    EXPECT_EQ(js.at("content").at(0).at("text"), "{\"a\":1}");
+    EXPECT_NE(js.value("warnings", Json::array()).dump().find("disables thinking"), std::string::npos) << js.dump();
+    const std::size_t last = ts.engine->calls().size() - 1;
+    EXPECT_EQ(Json::parse(ts.engine->calls().at(last).request.sampling.json_schema.value()), schema);
+    EXPECT_TRUE(ts.engine->prompt_text(last).ends_with("<think>\n\n</think>\n\n")) << ts.engine->prompt_text(last);
 
     b = user_messages("x");
     b["thinking"] = {{"type", "disabled"}};

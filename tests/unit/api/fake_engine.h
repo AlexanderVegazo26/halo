@@ -27,6 +27,9 @@ namespace halo::test {
 struct Script {
     std::string text;                        ///< emitted output (special tokens parsed)
     std::chrono::milliseconds delay{0};      ///< sleep before each token
+    /// Simulated queue wait + prefill before the first token; the engine's cancel token and
+    /// deadline are honoured during it (engine.h, checked every "tick" of 10 ms).
+    std::chrono::milliseconds prefill{0};
     bool eos = true;                         ///< end with an EOS event after `text`
     std::optional<std::string> throw_error;  ///< throw halo::Error(throw_code, ...) instead
     ErrorCode throw_code = ErrorCode::Backend;  ///< Api / Unsupported mimic an engine-side request rejection
@@ -38,6 +41,9 @@ struct RecordedCall {
     runtime::GenerateRequest request;
     bool cancelled = false;          ///< the callback returned false
     std::size_t tokens_emitted = 0;  ///< callback invocations
+    bool stop_token_cancelled = false;  ///< ended through GenerateRequest::cancel
+    bool deadline_expired = false;      ///< ended through GenerateRequest::deadline
+    std::chrono::milliseconds duration{0};
 };
 
 class FakeEngine final : public runtime::Engine {

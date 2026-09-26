@@ -6,7 +6,7 @@ if(NOT TARGET halo_httplib)
 endif()
 
 halo_module(api
-  SOURCES json_util.cpp prompt.cpp admission.cpp metrics.cpp generation.cpp requests.cpp server.cpp
+  SOURCES json_util.cpp prompt.cpp admission.cpp metrics.cpp generation.cpp requests.cpp conn_guard.cpp server.cpp
   DEPS halo_template halo_tokenizer halo_core nlohmann_json::nlohmann_json Threads::Threads)
 target_link_libraries(halo_api PRIVATE halo_httplib)
 # Structured-output schemas are compiled at request parse time when the sampler is built

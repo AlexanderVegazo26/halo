@@ -303,6 +303,7 @@ Json parse_openai_tools(const Json& body, const ServerConfig& cfg) {
     for (std::size_t i = 0; i < t->size(); ++i) {
         const std::string w = join_path("tools", i);
         const Json& tool = require_object((*t)[i], w);
+        check_schema_size(tool, cfg, w);  // the whole definition, description included (S-17)
         const auto type = opt_string(tool, "type", join_path(w, "type")).value_or("function");
         if (type != "function") unsupported(join_path(w, "type"), "only function tools are supported");
         const Json* fn = field(tool, "function");
@@ -502,6 +503,27 @@ void parse_anthropic_structured(const Json& body, SamplingParams& s, const Serve
     s.json_schema = checked_schema(*schema, cfg, join_path(where, "schema"));
 }
 
+/// F-1: structured output renders the prompt with thinking off. With thinking on, the
+/// Qwen generation prompt ends inside "<think>\n", the grammar constrains the output from
+/// its first token and never allows "</think>", so the JSON would land in reasoning_content
+/// and `content` would stay empty. Rendering with enable_thinking=false (the template's own
+/// non-thinking form, "<think>\n\n</think>\n\n") starts the grammar at the answer.
+void structured_output_disables_thinking(ChatJob& job) {
+    if (!job.sampling.json_schema && !job.sampling.json_object) return;
+    Json& x = job.render.extra_context;
+    const bool asked = !job.thinking_disabled &&
+                       ((x.contains("enable_thinking") && x["enable_thinking"] == true) || x.contains("reasoning_effort") ||
+                        job.reasoning_budget.has_value());
+    job.thinking_disabled = true;
+    job.reasoning_budget.reset();
+    x.erase("reasoning_effort");
+    x["enable_thinking"] = false;
+    if (asked) {
+        job.warnings.push_back("structured output (response format / output format) disables thinking; the "
+                               "requested reasoning settings were ignored");
+    }
+}
+
 }  // namespace
 
 void check_content_bytes(std::size_t n, const ServerConfig& cfg, const std::string& where) { check_bytes(n, cfg, where); }
@@ -520,11 +542,13 @@ ChatJob parse_openai_chat(const Json& body, const ServerConfig& cfg) {
     (void)opt_string(body, "model", "model");
     job.messages = parse_openai_messages(body, cfg);
     job.tools = parse_openai_tools(body, cfg);
+    check_bytes(string_bytes(job.messages) + string_bytes(job.tools), cfg, "messages");  // tools count (S-17)
     if (!parse_openai_tool_choice(body)) job.tools = nullptr;
     (void)opt_bool(body, "parallel_tool_calls", "parallel_tool_calls");  // accepted, not enforced (docs/api.md)
     parse_openai_thinking(body, job);
     parse_openai_sampling(body, job.sampling);
     parse_response_format(body, job.sampling, cfg);
+    structured_output_disables_thinking(job);
     job.max_tokens = parse_max_tokens(body, cfg, "max_completion_tokens", "max_tokens");
     job.stop = parse_stop(body, "stop", cfg, true);
     parse_stream(body, job.stream, job.include_usage);
@@ -535,6 +559,7 @@ ChatJob parse_apply_template(const Json& body, const ServerConfig& cfg) {
     ChatJob job;
     job.messages = parse_openai_messages(body, cfg);
     job.tools = parse_openai_tools(body, cfg);
+    check_bytes(string_bytes(job.messages) + string_bytes(job.tools), cfg, "messages");  // S-17
     parse_openai_thinking(body, job);
     job.add_generation_prompt = opt_bool(body, "add_generation_prompt", "add_generation_prompt").value_or(true);
     job.tokenize = opt_bool(body, "tokenize", "tokenize").value_or(false);
@@ -557,6 +582,11 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
         append_anthropic_message(require_object(msgs[i], w), w, job.messages);
     }
     check_bytes(string_bytes(job.messages), cfg, "messages");
+    // tool_result blocks expand into separate template messages (S-17).
+    if (job.messages.size() > cfg.max_messages) {
+        bad("messages", std::format("expands to {} template messages (tool_result blocks count); at most {} are allowed",
+                                    job.messages.size(), cfg.max_messages));
+    }
     if (msgs.back().is_object() && msgs.back().value("role", "") == "assistant") {
         unsupported("messages", "a final assistant message (response prefill) is not supported");
     }
@@ -582,6 +612,7 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
         for (std::size_t i = 0; i < t->size(); ++i) {
             const std::string w = join_path("tools", i);
             const Json& tool = require_object((*t)[i], w);
+            check_schema_size(tool, cfg, w);  // S-17
             if (auto type = opt_string(tool, "type", join_path(w, "type")); type && *type != "custom") {
                 unsupported(join_path(w, "type"), "server tools are not supported ('" + *type + "')");
             }
@@ -596,6 +627,7 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
             f["parameters"] = *schema;
             out.push_back(Json{{"type", "function"}, {"function", std::move(f)}});
         }
+        check_bytes(string_bytes(job.messages) + string_bytes(out), cfg, "messages");  // tools count (S-17)
         if (tools_enabled && !out.empty()) job.tools = std::move(out);
     }
 
@@ -635,6 +667,7 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
     if (auto v = opt_number(body, "top_p", "top_p", 0.0, 1.0)) job.sampling.top_p = static_cast<float>(*v);
     if (auto v = opt_int(body, "top_k", "top_k", 0, 1 << 20)) job.sampling.top_k = static_cast<int>(*v);
     parse_anthropic_structured(body, job.sampling, cfg);
+    structured_output_disables_thinking(job);
     job.stop = parse_stop(body, "stop_sequences", cfg, false);
     job.stream = opt_bool(body, "stream", "stream").value_or(false);
     job.include_usage = true;

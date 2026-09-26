@@ -3,6 +3,7 @@
 // UsageError / halo::Error, which run_cli turns into messages.
 
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -28,6 +29,11 @@ int cmd_tune(const std::vector<std::string>& args, Context& ctx);
 /// environment (Vulkan ICD variables); a fixture root uses none.
 [[nodiscard]] hardware::DiscoveryOptions discovery_options(const std::string& root,
                                                            const std::map<std::string, std::string>& env);
+
+/// The profile DB `halo tune` writes by default and the engine reads with --power-mode:
+/// $HALO_PROFILE_DB, else $XDG_CACHE_HOME/halo/profiles.db, else ~/.cache/halo/profiles.db;
+/// empty when none of those variables is set.
+[[nodiscard]] std::filesystem::path default_profile_db(const std::map<std::string, std::string>& env);
 
 /// Message printed (exit 2) when a command needs the runtime and this build has none.
 inline constexpr const char* kRuntimeNotBuilt =

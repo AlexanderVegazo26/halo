@@ -201,6 +201,41 @@ runtime::GenerateResult FakeEngine::generate(const runtime::GenerateRequest& req
 
     runtime::GenerateResult r;
     r.prompt_tokens = req.prompt.size();
+    const auto started = std::chrono::steady_clock::now();
+    const auto finish_call = [&] {
+        std::lock_guard lk(mu_);
+        calls_[slot].duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    };
+    // engine.h: cancel -> Cancelled, deadline -> Length + deadline_expired; checked per tick.
+    const auto engine_side_end = [&]() -> bool {
+        if (req.cancel.stop_requested()) {
+            r.finish = runtime::FinishReason::Cancelled;
+            {
+                std::lock_guard lk(mu_);
+                calls_[slot].stop_token_cancelled = true;
+                calls_[slot].cancelled = true;
+                cancellations_.fetch_add(1);
+            }
+            cv_.notify_all();
+            return true;
+        }
+        if (req.deadline && std::chrono::steady_clock::now() >= *req.deadline) {
+            r.finish = runtime::FinishReason::Length;
+            r.deadline_expired = true;
+            std::lock_guard lk(mu_);
+            calls_[slot].deadline_expired = true;
+            return true;
+        }
+        return false;
+    };
+    for (auto waited = std::chrono::milliseconds(0); waited < s.prefill; waited += std::chrono::milliseconds(10)) {
+        if (engine_side_end()) {
+            finish_call();
+            return r;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     const auto ids = tok_->encode(s.text, true);
     tokenizer::StreamDecoder dec(*tok_);
     bool cancelled = false;
@@ -228,6 +263,10 @@ runtime::GenerateResult FakeEngine::generate(const runtime::GenerateRequest& req
             break;
         }
         if (s.delay.count() > 0) std::this_thread::sleep_for(s.delay);
+        if (engine_side_end()) {
+            finish_call();
+            return r;
+        }
         r.tokens.push_back(id);
         generated_.fetch_add(1);
         runtime::TokenEvent ev{.token = id, .piece = dec.push(id), .is_eos = false};

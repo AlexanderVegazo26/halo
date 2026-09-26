@@ -57,12 +57,24 @@ Any other route returns 404 in the OpenAI error format. The error format is Anth
 
 ## Security defaults
 
-These implement PRD §12 and the security review of 2026-09-24 (`docs/reviews/`).
+These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
+(`docs/reviews/`).
 
-- **Bind address.** The default is `127.0.0.1`. Binding a non-loopback address without an
-  API key fails with `CONFIG_ERROR`, unless `allow_unauthenticated_remote` is set; the server
-  then logs a warning.
-- **API key.** When `api_key` is set, every route except `GET /health` and CORS preflight
+- **v0.2 serving is loopback-only (DECISIONS.md D-017).** The default bind is `127.0.0.1`.
+  - **Opt-in.** Binding any non-loopback address fails with `CONFIG_ERROR` unless
+    `allow_remote` is set (`halo serve --allow-remote`), and the server then logs a warning.
+  - **API key.** Without an API key, a non-loopback bind additionally needs
+    `allow_unauthenticated_remote`. It also needs a non-empty `allowed_hosts`, so that the
+    DNS-rebinding Host check stays on (review S-20).
+- **A reverse proxy is required for every non-loopback deployment** (D-017). It must enforce
+  per-client connection limits and header and body timeouts: in nginx terms, `limit_conn`,
+  `client_header_timeout` and `client_body_timeout`. It also terminates TLS.
+  - HALO's own read deadlines (below) keep the server reachable, but they do not cap
+    connections per peer.
+  - Without the proxy, one peer can open enough connections to use the whole HTTP pool.
+- **API key.** An empty key is a `CONFIG_ERROR`, never "no key". The CLI treats an empty
+  `HALO_API_KEY=` as unset (review S-18). When `api_key` is set, every route except
+  `GET /health` and CORS preflight
   requires `Authorization: Bearer <key>` or `x-api-key: <key>`. The `bearer` scheme is
   matched case-insensitively. The comparison runs in constant time: its duration depends only
   on the lengths. A missing or wrong key gets 401 plus `WWW-Authenticate: Bearer`.
@@ -72,15 +84,27 @@ These implement PRD §12 and the security review of 2026-09-24 (`docs/reviews/`)
   the Host is not checked, and the API key is then mandatory (see above).
 - **Origin (CSRF).** A request whose `Origin` header is not in `cors_origins` gets 403 on
   every route, before any handler runs. `cors_origins` holds exact origins or `"*"`. It is
-  empty by default, which means no browser origin is allowed. For an allowed origin the
+  empty by default, which means no browser origin is allowed. `"*"` requires an API key
+  (`CONFIG_ERROR` otherwise, review S-19), because it would let any web page use the model. For an allowed origin the
   server returns `Access-Control-Allow-Origin: <origin>` and `Vary: Origin`.
 - **Content type.** A POST body must be `application/json`, otherwise 415. This blocks
   HTML-form CSRF, which sends `text/plain` or `application/x-www-form-urlencoded` without a
   preflight.
-- **Compressed bodies.** The server is built without decompression, so a request body with a
-  known compression coding (`gzip`, `deflate`, `br` or `zstd`) also gets 415. httplib passes
-  an unrecognized `Content-Encoding` value through unchanged, and the body is then parsed as
-  JSON.
+- **Compressed bodies.** The server is built without decompression.
+  - A request whose `Content-Encoding` is exactly one known coding (`gzip`, `deflate`, `br`
+    or `zstd`) gets 415.
+  - Other values pass through undecoded and the body is parsed as JSON. That covers
+    unrecognized codings (`x-gzip`) and lists (`gzip, identity`). A body that really is
+    compressed then fails as malformed JSON (review S-25). Nothing is ever decompressed.
+- **Read deadlines (review S-13).** Each connection must deliver a complete header block
+  within `header_timeout` (default 10 s), counted from the connection opening or from the
+  previous response, and a complete body within `body_timeout` (default 60 s). A connection
+  that misses a deadline is closed, and counted in
+  `halo_api_connection_deadline_closes_total`.
+  - This stops slow-header clients, which need no API key because auth runs after the
+    headers are read, from holding every HTTP worker. `/health` stays reachable within about
+    `header_timeout`.
+  - Enforcement is Linux-only: a watchdog scans the server's sockets (`src/api/conn_guard.h`).
 - **Body size.** `max_body_bytes` (default 8 MiB) is enforced by httplib before the body is
   parsed. A larger body gets 413.
 - **Strict JSON.** The parser accepts RFC 8259 only: no comments, no trailing data, and valid
@@ -95,8 +119,12 @@ These implement PRD §12 and the security review of 2026-09-24 (`docs/reviews/`)
 - **Size caps:**
   - `max_messages` (4096);
   - `max_tools` (256);
-  - `max_tool_schema_bytes` per tool schema (64 KiB);
-  - `max_content_bytes`, the total bytes of every string in the conversation (4 MiB; 413);
+  - `max_tool_schema_bytes` for each whole tool definition, description included, and for
+    each structured-output schema (64 KiB);
+  - `max_content_bytes`, the total bytes of every string in the conversation **and the tool
+    definitions** (4 MiB; 413; review S-17);
+  - Anthropic `tool_result` blocks, each of which becomes a template message, count toward
+    `max_messages`;
   - `max_stop_sequences` (16, each at most 256 bytes);
   - `max_tokens_cap` (32768; a larger request is a 400).
 - **No file paths.** No request field names a file. The model is chosen by the operator at
@@ -110,6 +138,9 @@ These implement PRD §12 and the security review of 2026-09-24 (`docs/reviews/`)
   client-supplied strings cannot inject terminal escapes.
 - **Crash containment (RR-005).** Every handler converts exceptions into the native error
   body. httplib's exception handler never exposes `what()`.
+  - A stack overflow cannot be caught. The bounds that prevent one are the JSON depth caps and
+    the template limits in `src/template` (render depth, loop iterations, output size;
+    re-tested in the 2026-09-25 security review, S-14).
 
 ## Resource governance
 
@@ -123,13 +154,19 @@ These implement PRD §12 and the security review of 2026-09-24 (`docs/reviews/`)
 | `max_tokens_cap` | 32768 | A request asking for more gets 400. |
 | `reasoning_output_reserve` | 512 | Output headroom kept free of reasoning. See "Reasoning". |
 | `max_output_nesting` | 256 | Unmatched `[`/`{` allowed in model output (review S-9). |
-| `http_threads` | 0 (`max_concurrent + max_queue + 4`) | Size of the HTTP worker pool. |
+| `utility_concurrency` / `utility_queue` | 2 / 8 | Admission for `/tokenize` and `/apply-template`. Beyond it: 429 (review S-16). |
+| `header_timeout` / `body_timeout` | 10 s / 60 s | Per-connection read deadlines (review S-13). 0 = unlimited. |
+| `http_threads` | 0 (`max_concurrent + max_queue + utility_concurrency + utility_queue + 4`) | Size of the HTTP worker pool. `max_queue` and `utility_queue` are capped at 4096. |
 | `read_timeout` / `write_timeout` / `keep_alive_timeout` | 60 s / 60 s / 5 s | Socket timeouts. At most 100 requests per keep-alive connection. |
 
-The admission cap applies only to generation routes. `/tokenize`, `/apply-template`,
-`/metrics`, `/health` and `/v1/models` are not queued. They run on the HTTP pool, which
-bounds them. The prompt is rendered and tokenized **before** admission, on the HTTP worker
-thread (see "Known gaps").
+**Admission comes before the expensive work (review S-16).**
+- A chat or completion request is parsed and validated, which is cheap and size-capped, and
+  then admitted. Only an admitted request renders the template and tokenizes. So a request
+  refused with 429 has not paid for rendering, which can take about a second for a
+  multi-MiB request.
+- `/tokenize` and `/apply-template` pass their own small admission (`utility_concurrency`,
+  `utility_queue`).
+- `/metrics`, `/health` and `/v1/models` are not queued.
 
 **Cancellation.** The API can stop an engine request only from its token callback, which
 the engine calls once per generated token.
@@ -232,8 +269,10 @@ The other fields are as for chat: sampling, `max_tokens`, `stop`, `stream` and
 `stream_options`. `echo`, `suffix`, `best_of` > 1 and `logprobs` get 400. The output is raw
 text: no reasoning, tool or template parsing. By default the prompt is tokenized with special
 tokens parsed (`completions_parse_special = true`), because the client wrote the whole
-prompt. This is a deliberate exception to the chat routes' injection protection; set it to
-false to treat the prompt as plain text.
+prompt. This is a deliberate exception to the chat routes' injection protection. To treat
+the prompt as plain text, set it to false: `halo serve --no-completions-parse-special`,
+`HALO_COMPLETIONS_PARSE_SPECIAL=false`, or `server.completions_parse_special` in the config
+file (review S-22).
 
 ### `POST /tokenize` and `POST /apply-template`
 
@@ -299,6 +338,25 @@ Hardware and kernel metrics (PRD §13) are not exposed in v0.2.
 - **Empty content.** If generation ends at the length or time limit with no content and no
   tool calls, but reasoning tokens were produced, the response carries the warning "no
   content was produced: reasoning used N of the M max_tokens; …".
+
+### Structured output and thinking (finding F-1)
+
+A request with `response_format` `json_schema` or `json_object`, or with Anthropic
+`output_config.format`, is rendered with **thinking off** (`enable_thinking=false`, the
+template's non-thinking form, which ends with `<think>\n\n</think>\n\n`).
+- **The problem.** With thinking on, the generation prompt ends inside `<think>\n`. The
+  grammar constrains the output from its first token and does not allow `</think>`. So the
+  schema-valid JSON would be returned as `reasoning_content`, and `content` would be empty.
+- **Why not pre-fill `</think>` instead.** The alternative was to prefill
+  `\n</think>\n\n` before constrained decoding. It was not chosen:
+  - Thinking off uses the template's own documented mode, so the prompt equals HF
+    `apply_chat_template(..., enable_thinking=False)`, and the prefix cache sees the same
+    prefix as any other non-thinking request.
+  - A prefill would add a second, HALO-specific prompt shape and extra tokens outside the
+    template.
+- **Warnings.** An explicit thinking request that is overridden this way (`reasoning_effort`,
+  `enable_thinking: true`, or Anthropic `thinking.type: "enabled"`) gets the warning
+  "structured output … disables thinking".
 
 ## Special-token handling (review S-1, A-1)
 
@@ -370,10 +428,10 @@ Tests: `PromptFixture.*` and `PromptReal.*` (the real Qwen tokenizer and templat
 
 ## Known gaps (v0.2)
 
-- **Rendering is not isolated (A-5, partial).** Rendering and tokenizing run on the HTTP
-  worker thread before admission. They are bounded by the body and content caps but have no
-  separate stack-size or time budget. A hostile *model* template (review S-3) can still
-  crash or hang a worker. The fix belongs in `src/template`.
+- **Rendering has no separate pool (A-5, partial).** Rendering and tokenizing now run after
+  admission, on the admitted request's HTTP thread. The template's own step, depth and
+  output limits bound them (`src/template`, review S-14 re-test), but they run on no
+  dedicated pool with its own stack.
 - **Structured output.** Schemas are compiled at parse time (see the OpenAI and Anthropic
   tables), but the constrained decoding itself is done by the engine (WS-G/WS-H).
 - **Engine rejections.** When the engine rejects a request with a typed Api or Unsupported

@@ -364,7 +364,7 @@ TEST(ApiRequests, Limits) {
     cfg.max_messages = 2;
     cfg.max_tools = 1;
     cfg.max_content_bytes = 100;
-    cfg.max_tool_schema_bytes = 64;
+    cfg.max_tool_schema_bytes = 96;
     const auto kind = [&](const std::string& body) {
         try {
             (void)api::parse_openai_chat(Json::parse(body), cfg);
@@ -393,6 +393,48 @@ TEST(ApiRequests, Limits) {
     EXPECT_EQ(kind(R"({"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"a b"}}]})"),
               api::ErrorKind::InvalidRequest)
         << "tool names are restricted (they are rendered into markup)";
+}
+
+TEST(ApiRequests, ToolTextAndExpandedMessagesAreCapped) {
+    // Security review S-17: a tool *description* is capped (the whole tool object is), tool
+    // text counts toward max_content_bytes, and Anthropic tool_result blocks that expand into
+    // separate template messages count toward max_messages.
+    api::ServerConfig cfg;
+    cfg.max_content_bytes = 300;
+    cfg.max_tool_schema_bytes = 200;
+    cfg.max_messages = 3;
+    const auto kind = [&](const std::string& body, bool anthropic = false) {
+        try {
+            if (anthropic) {
+                (void)api::parse_anthropic_messages(Json::parse(body), cfg);
+            } else {
+                (void)api::parse_openai_chat(Json::parse(body), cfg);
+            }
+        } catch (const RequestError& e) {
+            return e.info().kind;
+        }
+        return api::ErrorKind::Server;
+    };
+    const std::string m1 = R"({"role":"user","content":"hi"})";
+    const auto tool = [](std::size_t desc) {
+        return R"({"type":"function","function":{"name":"f","description":")" + std::string(desc, 'd') + R"("}})";
+    };
+    EXPECT_EQ(kind(R"({"messages":[)" + m1 + R"(],"tools":[)" + tool(50) + "]}"), api::ErrorKind::Server);
+    EXPECT_EQ(kind(R"({"messages":[)" + m1 + R"(],"tools":[)" + tool(250) + "]}"), api::ErrorKind::InvalidRequest)
+        << "a description alone can exceed the per-tool cap";
+    EXPECT_EQ(kind(R"({"messages":[)" + m1 + R"(],"tools":[)" + tool(120) + "," + tool(120) + "," + tool(120) + "]}"),
+              api::ErrorKind::TooLarge)
+        << "tool text counts toward max_content_bytes";
+    const std::string atool = R"({"name":"f","description":")" + std::string(250, 'd') + R"(","input_schema":{"type":"object"}})";
+    EXPECT_EQ(kind(R"({"max_tokens":5,"messages":[)" + m1 + R"(],"tools":[)" + atool + "]}", true),
+              api::ErrorKind::InvalidRequest);
+    const std::string tr = R"({"type":"tool_result","tool_use_id":"t","content":"r"})";
+    EXPECT_EQ(kind(R"({"max_tokens":5,"messages":[{"role":"user","content":[)" + tr + "," + tr + "]}]}", true),
+              api::ErrorKind::Server);
+    EXPECT_EQ(kind(R"({"max_tokens":5,"messages":[{"role":"user","content":[)" + tr + "," + tr + "," + tr + "," + tr + "]}]}",
+                   true),
+              api::ErrorKind::InvalidRequest)
+        << "one message with 4 tool_result blocks expands to 4 template messages";
 }
 
 TEST(ApiRequests, ReasoningEffortMapping) {

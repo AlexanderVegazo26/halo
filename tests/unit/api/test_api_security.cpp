@@ -3,6 +3,11 @@
 // authentication, Host/Origin/Content-Type checks, admission control (429/503), client
 // disconnect cancellation, shutdown, and "one failing request never takes the process down".
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <thread>
 
 #include "api_test_util.h"
@@ -351,6 +356,11 @@ TEST(ApiAuth, ConfigValidation) {
     auto eng = FakeEngine::synthetic();
     api::ServerConfig remote;
     remote.host = "0.0.0.0";
+    // D-017: loopback-only unless explicitly opted in, even with a key.
+    remote.api_key = "k";
+    EXPECT_THROW({ api::ApiServer s(*eng, remote); }, halo::Error);
+    remote.api_key.reset();
+    remote.allow_remote = true;
     try {
         api::ApiServer s(*eng, remote);
         ADD_FAILURE() << "non-loopback bind without an API key was accepted";
@@ -361,7 +371,27 @@ TEST(ApiAuth, ConfigValidation) {
     EXPECT_NO_THROW({ api::ApiServer s(*eng, remote); });
     remote.api_key.reset();
     remote.allow_unauthenticated_remote = true;
+    // S-20: unauthenticated remote only with a Host allowlist (the DNS-rebinding check).
+    EXPECT_THROW({ api::ApiServer s(*eng, remote); }, halo::Error);
+    remote.allowed_hosts = {"halo.lan"};
     EXPECT_NO_THROW({ api::ApiServer s(*eng, remote); });
+    // S-19: wildcard CORS only with a key.
+    api::ServerConfig cors;
+    cors.cors_origins = {"*"};
+    EXPECT_THROW(api::validate_server_config(cors), halo::Error);
+    cors.api_key = "k";
+    EXPECT_NO_THROW(api::validate_server_config(cors));
+    cors.cors_origins = {"http://ok.example"};
+    cors.api_key.reset();
+    EXPECT_NO_THROW(api::validate_server_config(cors)) << "an explicit origin list needs no key";
+    // S-18: an empty key is never "no key".
+    api::ServerConfig empty_key;
+    empty_key.api_key = "";
+    EXPECT_THROW(api::validate_server_config(empty_key), halo::Error);
+    // S-13: the queue size bounds the HTTP pool.
+    api::ServerConfig huge;
+    huge.max_queue = 65536;
+    EXPECT_THROW(api::validate_server_config(huge), halo::Error);
     api::ServerConfig bad;
     bad.max_concurrent = 0;
     EXPECT_THROW({ api::ApiServer s(*eng, bad); }, halo::Error);
@@ -477,6 +507,257 @@ TEST(ApiAdmissionHttp, QueueFullIs429AndQueueTimeoutIs503) {
     EXPECT_EQ(ts.post("/v1/chat/completions", user_chat("d"))->status, 200);
 }
 
+TEST(ApiAdmissionHttp, AdmissionComesBeforeRenderingAndTokenizing) {
+    // Security review S-16: with every slot busy, a request is refused (429) *before* the
+    // server renders and tokenizes it. The probe request's prompt does not fit the 64-token
+    // context: rendering it first would answer 400 context_length_exceeded instead.
+    api::ServerConfig cfg;
+    cfg.max_concurrent = 1;
+    cfg.max_queue = 0;
+    TestServer ts(cfg, FakeEngine::synthetic(64));
+    std::atomic<bool> release{false};
+    ts.engine->script = [&](const auto&, int call) {
+        if (call == 0) {
+            while (!release.load()) std::this_thread::sleep_for(1ms);
+        }
+        return sc("</think>\n\nok");
+    };
+    std::thread holder([&] { EXPECT_EQ(ts.post("/v1/chat/completions", user_chat("a"))->status, 200); });
+    ASSERT_TRUE(ts.engine->wait_active(1, 5s));
+    const std::string too_long(200, 'x');
+    expect_openai_error(ts.post("/v1/chat/completions", user_chat(too_long)), 429, "rate_limit_error");
+    expect_openai_error(ts.post("/v1/completions", Json{{"prompt", too_long}}), 429, "rate_limit_error");
+    expect_anthropic_error(ts.post("/v1/messages", Json{{"max_tokens", 5},
+                                                         {"messages", Json::array({{{"role", "user"}, {"content", too_long}}})}}),
+                           429, "rate_limit_error");
+    release = true;
+    holder.join();
+    // With the slot free the same request reaches rendering and gets its real answer.
+    auto r = ts.post("/v1/chat/completions", user_chat(too_long));
+    expect_openai_error(r, 400, "invalid_request_error");
+    EXPECT_EQ(Json::parse(r->body).at("error").at("code"), "context_length_exceeded");
+}
+
+TEST(ApiAdmissionHttp, UtilityRoutesHaveTheirOwnAdmission) {
+    // S-16: /tokenize and /apply-template are admitted too (their own small semaphore).
+    api::ServerConfig cfg;
+    cfg.utility_concurrency = 1;
+    cfg.utility_queue = 0;
+    TestServer ts(cfg);
+    const Json big = Json{{"content", std::string(2u << 20, 'a')}};
+    std::atomic<int> ok{0}, limited{0}, other{0};
+    std::vector<std::thread> th;
+    for (int i = 0; i < 8; ++i) {
+        th.emplace_back([&] {
+            auto r = ts.post("/tokenize", big);
+            if (r && r->status == 200) {
+                ++ok;
+            } else if (r && r->status == 429 && Json::parse(r->body).at("error").at("type") == "rate_limit_error") {
+                ++limited;
+            } else {
+                ++other;
+            }
+        });
+    }
+    for (auto& t : th) t.join();
+    EXPECT_EQ(other.load(), 0);
+    EXPECT_GE(ok.load(), 1);
+    EXPECT_GE(limited.load(), 1) << "8 concurrent 2 MiB /tokenize calls against 1 slot and no queue";
+    EXPECT_NE(ts.get("/metrics")->body.find("halo_api_rejections_total{reason=\"utility_queue_full\"}"), std::string::npos);
+    // The utility slot is not the generation slot: chat still works.
+    EXPECT_EQ(ts.post("/v1/chat/completions", user_chat("x"))->status, 200);
+}
+
+// ---- slow clients (S-13) -------------------------------------------------------------------
+
+/// A raw TCP connection to the server that dribbles a request, `line` every `every`.
+class SlowClient {
+public:
+    SlowClient(int port, std::string head, std::string line, std::chrono::milliseconds every)
+        : fd_(::socket(AF_INET, SOCK_STREAM, 0)) {
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(static_cast<std::uint16_t>(port));
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        connected_ = fd_ >= 0 && ::connect(fd_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;  // NOLINT: sockets API
+        if (connected_) (void)::send(fd_, head.data(), head.size(), MSG_NOSIGNAL);
+        thread_ = std::thread([this, line, every] {
+            while (!stop_.load()) {
+                std::this_thread::sleep_for(every);
+                if (::send(fd_, line.data(), line.size(), MSG_NOSIGNAL) < 0) {
+                    closed_by_server_ = true;
+                    return;
+                }
+                char c = 0;
+                if (::recv(fd_, &c, 1, MSG_DONTWAIT) == 0) {  // orderly shutdown by the server
+                    closed_by_server_ = true;
+                    return;
+                }
+            }
+        });
+    }
+    ~SlowClient() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+        if (fd_ >= 0) ::close(fd_);
+    }
+    SlowClient(const SlowClient&) = delete;
+    SlowClient& operator=(const SlowClient&) = delete;
+    [[nodiscard]] bool connected() const { return connected_; }
+    [[nodiscard]] bool closed_by_server() const { return closed_by_server_.load(); }
+
+private:
+    int fd_;
+    bool connected_ = false;
+    std::atomic<bool> stop_{false}, closed_by_server_{false};
+    std::thread thread_;
+};
+
+TEST(ApiLimits, SlowHeaderConnectionsCannotStarveTheServer) {
+    // The reviewer's repro (S-13), scaled down: a pool of 8 threads and 8 connections that
+    // each send one header line every 300 ms and never finish. Without a total header
+    // deadline every worker is held and /health is unreachable; with it, the connections
+    // are closed after header_timeout and a legitimate request is served.
+    api::ServerConfig cfg;
+    cfg.http_threads = 8;
+    cfg.header_timeout = std::chrono::milliseconds(1500);
+    TestServer ts(cfg);
+    std::vector<std::unique_ptr<SlowClient>> slow;
+    for (int i = 0; i < 8; ++i) {
+        slow.push_back(std::make_unique<SlowClient>(ts.port, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n", "X-a: b\r\n",
+                                                    300ms));
+        ASSERT_TRUE(slow.back()->connected());
+    }
+    std::this_thread::sleep_for(300ms);  // let them occupy the workers
+    const auto t0 = std::chrono::steady_clock::now();
+    auto c = make_client(ts.port, std::chrono::seconds(15));
+    auto r = c->Get("/health");
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    ASSERT_TRUE(r) << "legitimate /health not served while slow connections are open: " << httplib::to_string(r.error());
+    EXPECT_EQ(r->status, 200);
+    EXPECT_LT(waited, 10s);
+    std::size_t closed = 0;
+    for (int i = 0; i < 50 && closed == 0; ++i) {  // the dribbling threads notice within one period
+        std::this_thread::sleep_for(100ms);
+        closed = 0;
+        for (const auto& s : slow) closed += s->closed_by_server() ? 1 : 0;
+    }
+    EXPECT_GE(closed, 1u) << "the slow connections were closed by the server";
+    EXPECT_EQ(ts.get("/metrics")->body.find("halo_api_connection_deadline_closes_total 0"), std::string::npos);
+}
+
+TEST(ApiLimits, SlowBodyIsCutOffAtTheBodyDeadline) {
+    api::ServerConfig cfg;
+    cfg.http_threads = 4;
+    cfg.body_timeout = std::chrono::milliseconds(1500);
+    TestServer ts(cfg);
+    std::vector<std::unique_ptr<SlowClient>> slow;
+    for (int i = 0; i < 4; ++i) {
+        slow.push_back(std::make_unique<SlowClient>(
+            ts.port,
+            "POST /tokenize HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{",
+            "a", 300ms));
+        ASSERT_TRUE(slow.back()->connected());
+    }
+    std::this_thread::sleep_for(300ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto c = make_client(ts.port, std::chrono::seconds(15));
+    auto r = c->Get("/health");
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    ASSERT_TRUE(r) << httplib::to_string(r.error());
+    EXPECT_EQ(r->status, 200);
+    // The body deadline (1.5 s), not the 10 s header deadline, freed the workers.
+    EXPECT_LT(waited, 6s);
+    // Well-behaved requests are unaffected by the deadlines.
+    EXPECT_EQ(ts.post("/v1/chat/completions", user_chat("x"))->status, 200);
+}
+
+TEST(ApiLimits, LongStreamsOutliveTheReadDeadlines) {
+    // The deadlines cover reading the request only. A stream that runs longer than both of
+    // them must finish (a stream cut off at header_timeout was found by WS-G's integration
+    // tests under ASan).
+    api::ServerConfig cfg;
+    cfg.header_timeout = std::chrono::milliseconds(800);
+    cfg.body_timeout = std::chrono::milliseconds(800);
+    TestServer ts(cfg);
+    ts.engine->script = [](const auto&, int) { return sc("</think>\n\n" + std::string(50, 'z'), 50ms); };
+    Json b = user_chat("x");
+    b["stream"] = true;
+    auto r = ts.client()->Post("/v1/chat/completions", b.dump(), "application/json");
+    ASSERT_TRUE(r) << httplib::to_string(r.error());
+    EXPECT_NE(r->body.find("data: [DONE]"), std::string::npos) << r->body.size() << " bytes";
+    auto rc = ts.client()->Post("/v1/completions", Json{{"prompt", "x"}, {"stream", true}}.dump(), "application/json");
+    ASSERT_TRUE(rc) << httplib::to_string(rc.error());
+    EXPECT_NE(rc->body.find("data: [DONE]"), std::string::npos);
+    // A slow non-streaming generation is fine too.
+    auto n = ts.post("/v1/chat/completions", user_chat("x"));
+    ASSERT_TRUE(n);
+    EXPECT_EQ(n->status, 200);
+    EXPECT_EQ(ts.get("/metrics")->body.find("halo_api_connection_deadline_closes_total 0") == std::string::npos, false)
+        << "no connection was closed";
+}
+
+TEST(ApiLimits, HeaderDeadlineRestartsAfterAStreamOnAKeepAliveConnection) {
+    // After a streamed response the same (keep-alive) connection is back to waiting for
+    // headers, so a slow second request on it is cut off like any other.
+    api::ServerConfig cfg;
+    cfg.header_timeout = std::chrono::milliseconds(1000);
+    cfg.keep_alive_timeout = std::chrono::seconds(30);  // so httplib's own idle timeout does not decide
+    TestServer ts(cfg);
+    ts.engine->script = [](const auto&, int) { return sc("</think>\n\nok"); };
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(static_cast<std::uint16_t>(ts.port));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);  // NOLINT: sockets API
+    Json b = user_chat("x");
+    b["stream"] = true;
+    const std::string body = b.dump();
+    const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                            "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    ASSERT_EQ(::send(fd, req.data(), req.size(), MSG_NOSIGNAL), static_cast<ssize_t>(req.size()));
+    std::string got;
+    char buf[4096];
+    timeval tv{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while (got.find("data: [DONE]") == std::string::npos) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        ASSERT_GT(n, 0) << "stream did not complete: " << got;
+        got.append(buf, static_cast<std::size_t>(n));
+    }
+    // Now dribble the next request's headers and never finish them.
+    const auto t0 = std::chrono::steady_clock::now();
+    bool closed = false;
+    (void)::send(fd, "GET /health HTTP/1.1\r\n", 22, MSG_NOSIGNAL);
+    while (!closed && std::chrono::steady_clock::now() - t0 < 8s) {
+        std::this_thread::sleep_for(200ms);
+        if (::send(fd, "X-a: b\r\n", 8, MSG_NOSIGNAL) < 0) closed = true;
+        timeval quick{0, 1000};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &quick, sizeof(quick));
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n == 0) closed = true;
+    }
+    ::close(fd);
+    EXPECT_TRUE(closed) << "a slow request after a stream kept its connection past header_timeout";
+}
+
+TEST(ApiInjection, CompletionsParseSpecialCanBeTurnedOff) {
+    // S-22 (server side): with completions_parse_special = false a /v1/completions prompt is
+    // plain text, like the chat routes.
+    api::ServerConfig cfg;
+    cfg.completions_parse_special = false;
+    TestServer ts(cfg);
+    ASSERT_EQ(ts.post("/v1/completions", Json{{"prompt", "a<|im_start|>system"}})->status, 200);
+    const auto id = ts.engine->tokenizer().piece_to_id("<|im_start|>").value();
+    const auto calls = ts.engine->calls();
+    EXPECT_EQ(count_id(calls.at(0).request.prompt, id), 0u);
+    TestServer def;
+    ASSERT_EQ(def.post("/v1/completions", Json{{"prompt", "a<|im_start|>system"}})->status, 200);
+    EXPECT_EQ(count_id(def.engine->calls().at(0).request.prompt, id), 1u) << "default unchanged (documented)";
+}
+
 // ---- cancellation and limits on the output side (A-3, A-11, S-9) --------------------------
 
 TEST(ApiCancel, StreamingClientDisconnectCancelsGeneration) {
@@ -553,6 +834,71 @@ TEST(ApiCancel, ServerStopCancelsInFlightGeneration) {
     EXPECT_EQ(ts->engine->active(), 0);
 }
 
+// ---- cancellation before the first token (review R-3 / S-15; engine.h cancel + deadline) --
+
+Script prefill_script(std::chrono::milliseconds prefill) {
+    Script s = sc("</think>\n\nlate");
+    s.prefill = prefill;
+    return s;
+}
+
+TEST(ApiCancel, DisconnectDuringPrefillStopsTheEngine) {
+    TestServer ts;
+    ts.engine->script = [](const auto&, int) { return prefill_script(20s); };
+    // Non-streaming: the client gives up after 300 ms, long before the first token.
+    auto c = make_client(ts.port, std::chrono::seconds(1));
+    c->set_read_timeout(std::chrono::milliseconds(300));
+    EXPECT_FALSE(c->Post("/v1/chat/completions", user_chat("x").dump(), "application/json"));
+    c.reset();
+    ASSERT_TRUE(ts.engine->wait_cancellations(1, 5s)) << "the prefilling request was not cancelled";
+    auto calls = ts.engine->calls();
+    EXPECT_TRUE(calls.at(0).stop_token_cancelled);
+    EXPECT_EQ(calls.at(0).tokens_emitted, 0u);
+    EXPECT_LT(calls.at(0).duration, 5s);
+    // Streaming: the client hangs up after the role chunk (sent before generation starts).
+    Json b = user_chat("x");
+    b["stream"] = true;
+    (void)ts.client()->Post("/v1/chat/completions", {}, b.dump(), "application/json",
+                            [](const char*, std::size_t) { return false; });
+    ASSERT_TRUE(ts.engine->wait_cancellations(2, 5s));
+    calls = ts.engine->calls();
+    EXPECT_TRUE(calls.at(1).stop_token_cancelled);
+    EXPECT_LT(calls.at(1).duration, 5s);
+    bool counted = false;
+    for (int i = 0; i < 200 && !counted; ++i) {
+        counted = ts.get("/metrics")->body.find("halo_api_cancelled_total 2") != std::string::npos;
+        if (!counted) std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_TRUE(counted) << "reported as client cancellations, not errors";
+}
+
+TEST(ApiCancel, RequestTimeoutCoversPrefill) {
+    api::ServerConfig cfg;
+    cfg.request_timeout = std::chrono::seconds(1);
+    TestServer ts(cfg);
+    ts.engine->script = [](const auto&, int) { return prefill_script(20s); };
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = ts.post("/v1/chat/completions", user_chat("x"));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s);
+    ASSERT_EQ(r->status, 200) << r->body;
+    const Json j = Json::parse(r->body);
+    EXPECT_EQ(j.at("choices").at(0).at("finish_reason"), "length");
+    EXPECT_NE(j.value("warnings", Json::array()).dump().find("time limit"), std::string::npos) << j.dump();
+    EXPECT_TRUE(ts.engine->calls().at(0).deadline_expired) << "the engine-side deadline ended it";
+}
+
+TEST(ApiCancel, StopDuringPrefillIsPrompt) {
+    auto ts = std::make_unique<TestServer>();
+    ts->engine->script = [](const auto&, int) { return prefill_script(30s); };
+    std::thread t([&] { (void)ts->post("/v1/chat/completions", user_chat("x")); });
+    ASSERT_TRUE(ts->engine->wait_active(1, 5s));
+    const auto t0 = std::chrono::steady_clock::now();
+    ts->server->stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s) << "stop() waited for the prefill";
+    t.join();
+    EXPECT_TRUE(ts->engine->calls().at(0).stop_token_cancelled);
+}
+
 TEST(ApiCancel, WallClockLimitEndsLikeMaxTokens) {
     api::ServerConfig cfg;
     cfg.request_timeout = std::chrono::seconds(1);
@@ -567,7 +913,10 @@ TEST(ApiCancel, WallClockLimitEndsLikeMaxTokens) {
     const Json j = Json::parse(r->body);
     EXPECT_EQ(j.at("choices").at(0).at("finish_reason"), "length");
     EXPECT_NE(j.value("warnings", Json::array()).dump().find("time limit"), std::string::npos);
-    EXPECT_TRUE(ts.engine->calls().at(0).cancelled);
+    // Either path may end it: the engine-side deadline (checked first each tick) or the
+    // callback's own wall-clock check. Both must yield the same response.
+    const auto call = ts.engine->calls().at(0);
+    EXPECT_TRUE(call.deadline_expired || call.cancelled);
 }
 
 TEST(ApiCancel, DeeplyNestedModelOutputStopsGeneration) {

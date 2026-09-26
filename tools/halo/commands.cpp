@@ -42,6 +42,17 @@ std::string human_bytes(std::uint64_t b) {
     return u == 0 ? std::format("{} B", b) : std::format("{:.2f} {}", v, units[u]);
 }
 
+std::filesystem::path default_profile_db(const std::map<std::string, std::string>& env) {
+    const auto get = [&](const char* k) -> std::string {
+        const auto it = env.find(k);
+        return it == env.end() ? std::string{} : it->second;
+    };
+    if (auto p = get("HALO_PROFILE_DB"); !p.empty()) return p;
+    if (auto x = get("XDG_CACHE_HOME"); !x.empty()) return std::filesystem::path(x) / "halo/profiles.db";
+    if (auto h = get("HOME"); !h.empty()) return std::filesystem::path(h) / ".cache/halo/profiles.db";
+    return {};
+}
+
 hardware::DiscoveryOptions discovery_options(const std::string& root, const std::map<std::string, std::string>& env) {
     hardware::DiscoveryOptions o;
     o.root = root;
@@ -423,7 +434,7 @@ int cmd_run(const std::vector<std::string>& args, Context& ctx) {
     }
     if (!a.has("prompt")) throw UsageError("--prompt/-p is required\n" + usage);
     const ResolvedConfig cfg = resolve_config(a, ctx.env, runtime_keys());
-    const runtime::EngineConfig ec = engine_config(cfg);
+    const runtime::EngineConfig ec = engine_config(cfg, default_profile_db(ctx.env));
     SamplingParams sp;
     sp.temperature = static_cast<float>(a.number("temperature", 0.0, 2.0).value_or(0.7));
     if (auto v = a.number("top-p", 0.0, 1.0)) sp.top_p = static_cast<float>(*v);
@@ -526,7 +537,7 @@ int cmd_serve(const std::vector<std::string>& args, Context& ctx) {
         return kExitOk;
     }
 #if HALO_CLI_HAVE_API
-    const runtime::EngineConfig ec = engine_config(cfg);
+    const runtime::EngineConfig ec = engine_config(cfg, default_profile_db(ctx.env));
     api::ServerConfig sc = server_config(cfg);
     // More API slots than engine sequences would park the extra requests inside the engine,
     // where queue_timeout, request_timeout, disconnect and stop() cannot reach them until
@@ -538,10 +549,8 @@ int cmd_serve(const std::vector<std::string>& args, Context& ctx) {
         sc.max_concurrent = ec.max_sequences;
     }
     // Fail before the (slow) model load on an unsafe bind (PRD §12, review A-6).
-    HALO_CHECK(api::is_loopback_host(sc.host) || sc.api_key || sc.allow_unauthenticated_remote, ErrorCode::Config,
-               "server.host {} is not a loopback address: set an API key (HALO_API_KEY) or "
-               "--allow-unauthenticated-remote",
-               sc.host);
+    // (also S-19 wildcard CORS without a key, S-20 unauthenticated remote without allowed_hosts)
+    api::validate_server_config(sc);
     if (!ctx.engine_factory) {
         *ctx.err << "halo: " << kRuntimeNotBuilt << "\n";
         return kExitUsage;
