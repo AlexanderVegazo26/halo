@@ -274,6 +274,13 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
             continue;
         }
         for (const auto& a : so.argmax) o.targets.push_back(a.index);
+        // H1: the backend now reports a NaN logit as a poisoned row (index == -1) instead of
+        // throwing from inside the forward, so pre-tick KV/GDN state stays intact (M1) and a
+        // future milestone can fail just this sequence. Until that per-sequence fault path
+        // exists, a poisoned row must not silently become token id -1: throw here, at the
+        // same granularity (the whole tick) as before this change.
+        HALO_CHECK(std::none_of(o.targets.begin(), o.targets.end(), [](std::int32_t t) { return t < 0; }),
+                   ErrorCode::Kernel, "trunk forward: NaN logit (poisoned argmax row)");
         if (!is_decode(r)) {
             o.tokens = o.targets;
             o.n_keep = s.fed.size();

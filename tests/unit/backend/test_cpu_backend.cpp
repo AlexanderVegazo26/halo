@@ -476,7 +476,7 @@ TEST_F(CpuBackendTest, KvWriteAndAttentionOverThePoolImageEqualCpuOps) {
     EXPECT_TRUE(bits_equal(o2, ref)) << "head-strided attention differs from dense";
 }
 
-TEST_F(CpuBackendTest, LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNIsKernelError) {
+TEST_F(CpuBackendTest, LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNPoisonsOnlyItsRow) {
     const std::size_t V = 8192 + 900, E = 16, n = 3;
     auto w = rnd(V * E, 28), x = rnd(n * E, 29);
     std::vector<float> logits(n * V), ref(n * V);
@@ -515,14 +515,26 @@ TEST_F(CpuBackendTest, LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNIsKernelError) {
             EXPECT_EQ(vals[i * 5 + j], tk[j].value);
         }
     }
-    // NaN: the same Error(Kernel) the qwen35 head raises.
-    w[8200 * E] = std::nanf("");
-    try {
-        be->lm_head(*st, b);
-        ADD_FAILURE() << "NaN logit not detected";
-    } catch (const halo::Error& e) {
-        EXPECT_EQ(e.code(), ErrorCode::Kernel);
-        EXPECT_NE(std::string(e.what()).find("NaN logit at vocab index 8200"), std::string::npos) << e.what();
+    // NaN (H1): poisons only its own row -- decode_argmax reports {-1, NaN} for that row and
+    // leaves the others (a different row of the batch here) untouched, instead of throwing for
+    // the whole batch. Poisoning x (not w) affects exactly one batch row's dot products.
+    auto x2 = x;
+    x2[1 * E] = std::nanf("");  // batch row 1's activation
+    std::vector<std::byte> res4(n * kArgmaxResultBytes);
+    LmHeadArgs c = a;
+    c.gemv.x = imp(x2);
+    c.gemv.y = {};
+    c.result = imp_bytes(res4);
+    be->lm_head(*st, c);
+    const auto best4 = decode_argmax(res4);
+    ASSERT_EQ(best4.size(), n);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i == 1) {
+            EXPECT_EQ(best4[i].index, -1);
+            EXPECT_TRUE(std::isnan(best4[i].value));
+        } else {
+            EXPECT_EQ(best4[i].index, best[i].index) << "row " << i << " must be unaffected by row 1's NaN";
+        }
     }
 }
 
@@ -559,11 +571,18 @@ TEST_F(CpuBackendTest, ValidationRejectsBadShapesAndLayouts) {
     EXPECT_EQ(TensorRef::of(*buf).shifted(40).bytes, 0u);  // unbounded stays unbounded
     expect_code(ErrorCode::Kernel, [&] { (void)bounded.shifted(16); }, "shift to the end of a bounded view");
 
-    // decode_argmax: the NaN word and the size.
+    // decode_argmax: the NaN word poisons only its own vector (H1), not the whole decode; the
+    // size check still throws.
     std::vector<std::byte> words(2 * kArgmaxResultBytes);
     const std::uint32_t nan = 1;
     std::memcpy(words.data() + kArgmaxResultBytes + 8, &nan, 4);
-    expect_code(ErrorCode::Kernel, [&] { (void)decode_argmax(words); }, "argmax NaN word");
+    {
+        const auto out = decode_argmax(words);
+        ASSERT_EQ(out.size(), 2u);
+        EXPECT_EQ(out[0].index, 0);  // untouched entry: zero-initialized words decode to id 0
+        EXPECT_TRUE(std::isnan(out[1].value));
+        EXPECT_EQ(out[1].index, -1);
+    }
     EXPECT_EQ(decode_argmax(std::span(words).first(kArgmaxResultBytes)).size(), 1u);
     expect_code(ErrorCode::Kernel, [&] { (void)decode_argmax(std::span(words).first(8)); }, "argmax words size");
 

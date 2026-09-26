@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <limits>
 
 #include "halo/core/error.h"
 
@@ -87,8 +88,12 @@ std::vector<ArgmaxResult> decode_argmax(std::span<const std::byte> words) {
     for (std::size_t i = 0; i < n; ++i) {
         std::array<std::uint32_t, 3> w{};
         std::memcpy(w.data(), words.data() + i * kArgmaxResultBytes, sizeof(w));
-        HALO_CHECK(w[2] == 0, ErrorCode::Kernel, "argmax: NaN logit in vector {}", i);
-        out[i] = {static_cast<std::int32_t>(w[0]), std::bit_cast<float>(w[1])};
+        // H1: a NaN word poisons only its own vector (ArgmaxResult{-1, NaN}), not the whole
+        // decode -- a batched LM-head call spans multiple sequences, and one bad row must not
+        // stop the caller from reading the others'. The caller decides what a poisoned row
+        // means for the sequence it belongs to.
+        out[i] = w[2] != 0 ? ArgmaxResult{-1, std::numeric_limits<float>::quiet_NaN()}
+                           : ArgmaxResult{static_cast<std::int32_t>(w[0]), std::bit_cast<float>(w[1])};
     }
     return out;
 }

@@ -19,37 +19,53 @@ notes. The README and `docs/` were also audited/rewritten for staleness; no code
 
 ## What's left, and why it needed to wait for you
 
-### H1 — full per-sequence isolation (HIGH, partially fixed)
-M1 (commit-after-head reorder in `qwen35.cpp`) is done and landed: a NaN logit or allocation
-failure in the LM head no longer leaves KV/GDN state partially advanced. What's still open:
-`CpuEngine::run()`'s tick-wide catch still calls `fail_all` on any exception from that
-section, so **one bad sequence still kills every concurrent sequence in the tick** — M1 just
-made that failure mode safe to recover from, it didn't remove it.
+### H1 — full per-sequence isolation (HIGH, foundation now landed, engine-side fix still open)
+M1 (commit-after-head reorder in `qwen35.cpp`) is done: a NaN logit or allocation failure in
+the LM head no longer leaves KV/GDN state partially advanced.
 
-The real fix requires the LM-head kernel to report a NaN as a **per-row** signal instead of a
-whole-batch exception, so the engine can fail just the offending sequence. The wire format
-already has an unused slot for this (`ArgmaxResult`'s third word, `backend.h:436-440`,
-D-016) — but `decode_argmax` currently throws the instant it sees that word set, for **all
-three backends** (`src/backend/backend.cpp`, `backends/vulkan/src/ops.cpp`, `backends/hip/src/ops.cpp`),
-and that throw-not-poison contract is asserted by name in tests in all three
-(`tests/unit/backend/test_cpu_backend.cpp:566`, `tests/unit/vulkan/test_vk_ops.cpp:905-908`,
-plus the HIP equivalent). Changing this on the dev host risked colliding with in-flight
-Vulkan/HIP work from other agents in the same tree; it no longer needs to be done blind once
-you're on the EVO-X2 with a settled tree and (per the plan below) a real device to test the
-Vulkan/HIP legs against.
+Beyond that, the **wire-format half of H1 is now also done**: `backend::decode_argmax`
+(`src/backend/backend.cpp`) and the CPU backend's `lm_head()` (`src/backend/cpu_backend.cpp`)
+no longer throw for the whole batch on a NaN logit — a NaN now poisons only its own row
+(`ArgmaxResult{-1, NaN}`), and the other rows in the same batched call decode normally. This
+was safe to do without a device: `qwen35.cpp`'s `head()` is backend-agnostic and only ever
+consumes the shared `backend::decode_argmax`, and Vulkan/HIP's own kernels already report a
+NaN per-row at the shader/kernel level (each GPU invocation only ever knows about its own row
+— they structurally couldn't throw for a whole batch). So neither `backends/vulkan/`,
+`backends/hip/`, nor their own `halo::vulkan::decode_argmax` / `halo::hip::decode_argmax`
+helpers needed to change; the two `throw`s that mattered were both in code shared across all
+three backends' adapter path, and both are now fixed. Verified: `test_backend` (12/12,
+including a new regression proving row 1's NaN doesn't disturb rows 0/2's results),
+`test_models` (25/25), `test_speculative` (18/18), `test_runtime` (32/32),
+`test_vulkan_backend` (10/10), `test_vulkan_forward` (8/8, 2 pre-existing unrelated skips).
 
-**Plan:**
-1. Change `decode_argmax` in all three backends to return a poisoned `ArgmaxResult{-1, NaN}`
-   per row instead of throwing for the whole batch.
-2. Update the three tests above to expect a poisoned entry, not an exception.
-3. In `qwen35.cpp`'s `head()`, surface a poisoned row through `SeqOutput` instead of letting
-   the exception propagate.
-4. In `engine.cpp`, fail only the poisoned sequence (`retire(..., FinishReason::Error, ...)`),
-   not `fail_all`.
+**What's still open, and why it stopped there:** `speculative.cpp`'s `verify()` currently
+converts a poisoned row back into a **thrown exception** at the point it would otherwise
+become token id `-1` (`HALO_CHECK(std::none_of(o.targets...))`), which still lets
+`CpuEngine::run()`'s tick-wide catch call `fail_all` — i.e. **the user-visible failure domain
+is unchanged from before this fix**: one bad sequence still fails every sequence in the tick.
+This was a deliberate, correctness-first stopping point: finishing per-sequence isolation
+needs `StepOutput`/`Tick::Seq` (`include/halo/speculative/speculative.h`) to carry a
+per-sequence error/poisoned flag through `verify()`/`commit()`, and `engine.cpp` to read it
+and call `retire(..., FinishReason::Error, ...)` for just that one `Active` instead of
+`fail_all` for the whole tick — a real, non-trivial change to the rollback/commit invariants
+this codebase is careful about, not a place to rush.
+
+**Remaining plan:**
+1. Add an error/poisoned signal to `StepOutput` (or a parallel per-sequence status the caller
+   already has access to after `verify()`).
+2. In `speculative.cpp::verify()`, replace the `HALO_CHECK(std::none_of(...))` guard with
+   setting that signal instead of throwing.
+3. In `engine.cpp`, after calling `verify()`, iterate sequences and call
+   `retire(a, FinishReason::Error, ...)` for any poisoned one, then continue committing the
+   rest of the tick normally instead of the tick-wide catch firing.
+4. Do the same for `bad_alloc` in the head-section allocations (M1's other named producer) —
+   that one isn't a per-row wire signal, so it needs its own handling (likely: catch it at the
+   same point, treat as a poisoned row for every sequence sharing that batched call, since a
+   host allocation failure isn't attributable to one row the way a NaN is).
 5. Add a fault hook that injects a NaN mid-forward (today's four hooks fire before-step/
-   output/retire, never inside the forward — this is why the test suite can't see H1 today).
-6. Re-run `test_models`, `test_runtime`, `test_speculative`, `test_vulkan*`, `test_hip*` after
-   each step.
+   output/retire, never inside the forward — this is why the test suite still can't exercise
+   any of this end-to-end).
+6. Re-run `test_models`, `test_runtime`, `test_speculative` after each step.
 
 ### M2 — fused-argmax vocab clamp (MEDIUM, partially fixed)
 The sampler-side clamp (unstructured sampling excludes padded LM-head rows) is done. The

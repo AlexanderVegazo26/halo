@@ -482,7 +482,9 @@ struct Qwen35::Impl {
     };
 
     /// LM head over the requested rows: one pass over the head matrix (the LM_HEAD op);
-    /// ties resolve to the lowest index; a NaN logit is Error(Kernel).
+    /// ties resolve to the lowest index. H1: a NaN logit poisons only its own row -- the
+    /// engine sees it as argmax.index == -1 (backend::decode_argmax's poisoned sentinel) and
+    /// must fail only that request, not every sequence in the tick.
     void head(Step& st, const Table& head_w, std::uint64_t bytes, TensorRef h, std::span<const HeadReq> reqs) const {
         if (reqs.empty()) return;
         const std::size_t n = reqs.size();

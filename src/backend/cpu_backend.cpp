@@ -637,6 +637,11 @@ public:
         const std::size_t slab = std::min(kSlab, n_vocab);
         std::vector<float> buf(n * slab);
         std::vector<cpu::TopKEntry> best(n);
+        // H1/M2: a NaN logit poisons only its own row (sequence), not the whole batched call.
+        // decode_argmax reports a poisoned row as ArgmaxResult{-1, NaN} instead of throwing, so
+        // the engine can fail just that one sequence instead of every sequence in the tick.
+        // (std::vector<bool> is not span-compatible, hence uint8_t here.)
+        std::vector<std::uint8_t> poisoned(n, 0);
         for (std::size_t n0 = 0; n0 < n_vocab; n0 += slab) {
             const std::size_t ns = std::min(slab, n_vocab - n0);
             const cpu::WeightMatrix sub = weight_matrix(g.wtype, w, n0, ns, E, rb);
@@ -644,13 +649,20 @@ public:
             for (std::size_t i = 0; i < n; ++i) {
                 const float* row = &buf[i * slab];
                 for (std::size_t c = 0; c < ns; ++c) {
-                    HALO_CHECK(!std::isnan(row[c]), ErrorCode::Kernel, "LM head: NaN logit at vocab index {}", n0 + c);
-                    if (best[i].index < 0 || row[c] > best[i].value) best[i] = {static_cast<std::int32_t>(n0 + c), row[c]};
+                    if (std::isnan(row[c])) {
+                        poisoned[i] = 1;
+                        continue;
+                    }
+                    if (!poisoned[i] && (best[i].index < 0 || row[c] > best[i].value))
+                        best[i] = {static_cast<std::int32_t>(n0 + c), row[c]};
                 }
                 if (want_logits) std::copy_n(row, ns, y.wf() + i * y.fstride() + n0);
             }
         }
-        write_results(res, best);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (poisoned[i] != 0) best[i] = {-1, std::numeric_limits<float>::quiet_NaN()};
+        }
+        write_results(res, best, std::span<const std::uint8_t>(poisoned));
     }
 
     void argmax(Stream& s, const ArgmaxArgs& a) override {
@@ -705,10 +717,12 @@ private:
         HALO_CHECK(cs != nullptr && cs->owner() == this, ErrorCode::Api, "{}: stream of another backend", op);
     }
 
-    static void write_results(const Operand& res, std::span<const cpu::TopKEntry> best) {
+    static void write_results(const Operand& res, std::span<const cpu::TopKEntry> best,
+                              std::span<const std::uint8_t> poisoned = {}) {
         for (std::size_t i = 0; i < best.size(); ++i) {
+            const bool p = i < poisoned.size() && poisoned[i] != 0;
             const std::array<std::uint32_t, 3> w{static_cast<std::uint32_t>(best[i].index), std::bit_cast<std::uint32_t>(best[i].value),
-                                                 0u};
+                                                 p ? 1u : 0u};
             std::memcpy(res.wbase + i * kArgmaxResultBytes, w.data(), sizeof(w));
         }
     }
