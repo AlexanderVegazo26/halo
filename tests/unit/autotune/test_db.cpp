@@ -314,3 +314,34 @@ TEST(ProfileDbMigration, AppliesInOrderAndFailedMigrationKeepsVersion) {
     test::expect_db_error(DbErrorKind::ForeignVersion, [&] { (void)ProfileDb::open(t.path()); });
     test::expect_db_error(DbErrorKind::ForeignVersion, [&] { (void)ProfileLookup::open(t.path()); });
 }
+
+TEST(ProfileDbErrors, SymlinkedDatabaseFileIsRefusedButASymlinkedDirectoryWorks) {
+    // S-46: the database file itself must not be a symbolic link (SQLITE_OPEN_NOFOLLOW; no
+    // lstat-then-open window), while a symlinked directory on the way (a symlinked $HOME,
+    // /tmp on some systems) keeps working.
+    namespace fs = std::filesystem;
+    TempDb target("s46_target");
+    TempDb link("s46_link");
+    fs::create_symlink(target.path(), link.path());
+    test::expect_db_error(DbErrorKind::Io, [&] { (void)ProfileDb::open(link.path()); });
+    EXPECT_FALSE(fs::exists(target.path())) << "a read-write open created the symlink's target";
+    { (void)ProfileDb::open(target.path()); }
+    test::expect_db_error(DbErrorKind::Io, [&] { (void)ProfileDb::open(link.path()); });
+    test::expect_db_error(DbErrorKind::Io, [&] { (void)ProfileLookup::open(link.path()); });
+
+    const std::string tag = std::to_string(::getpid());
+    const fs::path real = fs::temp_directory_path() / ("halo_s46_" + tag + "_realdir");
+    const fs::path dirlink = fs::temp_directory_path() / ("halo_s46_" + tag + "_dirlink");
+    fs::remove_all(real);
+    fs::remove(dirlink);
+    fs::create_directory(real);
+    fs::create_directory_symlink(real, dirlink);
+    {
+        ProfileDb db = ProfileDb::open(dirlink / "profiles.db");
+        EXPECT_EQ(db.schema_version(), 1);
+    }
+    EXPECT_TRUE(fs::is_regular_file(real / "profiles.db"));
+    EXPECT_EQ(ProfileLookup::open(dirlink / "profiles.db").size(), 0u);
+    fs::remove(dirlink);
+    fs::remove_all(real);
+}

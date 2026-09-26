@@ -1,7 +1,9 @@
 #include "sqlite.h"
 
 #include <chrono>
+#include <filesystem>
 #include <format>
+#include <system_error>
 
 #include "halo/core/log.h"
 
@@ -91,6 +93,18 @@ std::string Statement::text(int col) const {
 // ---- Connection ---------------------------------------------------------------------------
 
 Connection::Connection(const std::string& path, bool read_only, int busy_timeout_ms) {
+    // S-46: the database file itself must not be a symbolic link -- fs::symlink_status
+    // resolves every path component except the last (the same rule lstat(2) follows), so a
+    // symlinked directory earlier in the path (a symlinked $HOME, /tmp on some systems) is
+    // unaffected; only the leaf being a symlink is refused. SQLITE_OPEN_NOFOLLOW was tried
+    // first and rejected the symlinked-directory case too on this platform, so this checks
+    // the leaf directly instead. A create-after-check race is possible in principle (TOCTOU);
+    // accepted here as for the mmap SIGBUS risk elsewhere in this codebase (I5/S-5) -- the
+    // profile DB has no untrusted multi-tenant writer.
+    std::error_code ec;
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(path, ec))) {
+        throw ProfileDbError(DbErrorKind::Io, std::format("open {}: refusing a symlinked database file", path));
+    }
     const int flags = (read_only ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) |
                       SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_EXRESCODE;
     const int rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
