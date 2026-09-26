@@ -21,6 +21,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "halo/backend/backend.h"
 #include "halo/backends/cpu/traffic.h"
@@ -680,6 +681,20 @@ void check_tokens(std::span<const std::int32_t> tokens, std::size_t n_vocab, con
     }
 }
 
+// O(n log n) duplicate-pointer check, replacing the O(n^2) pairwise scan every batch step used to
+// do: a pair of steps is invalid if they share the *same* state pointer, so sorting once and
+// scanning for adjacent equal entries finds any violation without comparing every pair.
+template <typename T>
+void check_all_distinct(std::span<T* const> ptrs, const char* what, const char* field) {
+    std::vector<std::pair<T*, std::size_t>> by_ptr(ptrs.size());
+    for (std::size_t i = 0; i < ptrs.size(); ++i) by_ptr[i] = {ptrs[i], i};
+    std::sort(by_ptr.begin(), by_ptr.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (std::size_t i = 1; i < by_ptr.size(); ++i) {
+        HALO_CHECK(by_ptr[i].first != by_ptr[i - 1].first, ErrorCode::Api, "{}: steps {} and {} share a sequence's {}", what,
+                   by_ptr[i - 1].second, by_ptr[i].second, field);
+    }
+}
+
 }  // namespace
 
 void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const ForwardOptions& opts) const {
@@ -689,6 +704,8 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     // ---- validate everything before touching any state ---------------------------------
     std::vector<SeqRows> seqs(steps.size());
     std::vector<Impl::GdnSeq> gseqs(steps.size());
+    std::vector<kv_cache::SequenceKv*> kv_ptrs(steps.size());
+    std::vector<state::GdnState*> gdn_ptrs(steps.size());
     std::size_t R = 0;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const SeqStep& s = steps[si];
@@ -701,10 +718,8 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
                    ErrorCode::Api, "forward step {}: GDN state shape does not match the model", si);
         HALO_CHECK(s.n_state_slots <= s.gdn->max_slots(), ErrorCode::Api, "forward step {}: {} state slots, state has {}", si,
                    s.n_state_slots, s.gdn->max_slots());
-        for (std::size_t sj = 0; sj < si; ++sj) {
-            HALO_CHECK(steps[sj].kv != s.kv && steps[sj].gdn != s.gdn, ErrorCode::Api,
-                       "forward: steps {} and {} share a sequence's state", sj, si);
-        }
+        kv_ptrs[si] = s.kv;
+        gdn_ptrs[si] = s.gdn;
         const std::size_t len = s.kv->length();
         HALO_CHECK(len + s.tokens.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()), ErrorCode::Api,
                    "forward step {}: position overflow", si);
@@ -726,6 +741,8 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         gseqs[si] = {s.gdn, s.n_state_slots, chunked};
         R += s.tokens.size();
     }
+    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "forward", "KV cache");
+    check_all_distinct<state::GdnState>(gdn_ptrs, "forward", "GDN state");
     out.seqs.assign(steps.size(), {});
     out.cost = {};
     out.layer_inputs.clear();
@@ -813,6 +830,7 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     const kv_cache::KvLayout want_kv = mtp_kv_layout();
     const std::size_t E = I.E;
     std::vector<SeqRows> seqs(steps.size());
+    std::vector<kv_cache::SequenceKv*> kv_ptrs(steps.size());
     std::size_t R = 0;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const MtpStep& s = steps[si];
@@ -824,13 +842,12 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
                        static_cast<std::size_t>(s.first_position) + s.tokens.size() <=
                            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
                    ErrorCode::Api, "mtp_forward step {}: bad first position {}", si, s.first_position);
-        for (std::size_t sj = 0; sj < si; ++sj) {
-            HALO_CHECK(steps[sj].kv != s.kv, ErrorCode::Api, "mtp_forward: steps {} and {} share a KV cache", sj, si);
-        }
+        kv_ptrs[si] = s.kv;
         check_rows(s.logit_rows, s.tokens.size(), "mtp_forward", si);
         seqs[si] = {R, s.tokens.size(), s.kv, s.first_position, {}, {}};
         R += s.tokens.size();
     }
+    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "mtp_forward", "KV cache");
     out.seqs.assign(steps.size(), {});
     out.cost = {};
     out.layer_inputs.clear();
