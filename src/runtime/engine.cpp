@@ -381,18 +381,21 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     sc.gate.probe_interval = opts.gate_probe_interval;
     spec_ = std::make_unique<speculative::Speculator>(*model_, sc);
 
-    // D-013 budget. The planner puts checkpoints in the GPU pool only; the CPU reference has
-    // none on a host-only machine, so it budgets the requested count on the host.
-    // A Checkpoint also stores its token prefix and the carried hidden (state::Checkpoint::
-    // bytes), which the planner's per-copy state size does not include.
+    // D-013 budget. The planner counts only the requested spacing checkpoints per slot and
+    // its per-copy state size excludes the Checkpoint's token prefix and carried hidden
+    // (state::Checkpoint::bytes). The engine actually takes, per sequence: the spacing
+    // checkpoints + a prompt-end (tail) checkpoint + a retirement checkpoint. Budget what
+    // the engine stores, whichever tier the plan found (M10: the GPU-tier and host-only
+    // paths must agree, or cache behaviour changes with the hardware).
     const std::uint64_t extra = (static_cast<std::uint64_t>(hp.n_embd) + info_.context_length) * 4;
-    std::uint64_t ck = plan_.sizes.prefix_checkpoints;
-    if (ck > 0 && plan_.sizes.gdn_state_per_copy > 0) ck += ck / plan_.sizes.gdn_state_per_copy * extra;
-    if (cfg.prefix_cache && ck == 0) {
-        // Requested spacing checkpoints + prompt end + retirement, per sequence.
-        const std::uint64_t ck_per_seq = std::max<std::uint64_t>(plan_.prefix_checkpoints_requested, 1) + 2;
-        ck = ck_per_seq * cfg.max_sequences * (plan_.sizes.gdn_state_per_copy + extra);
-        HALO_INFO("runtime", "no GPU tier for prefix checkpoints: CPU reference budgets {} bytes on the host", ck);
+    std::uint64_t ck = 0;
+    if (cfg.prefix_cache) {
+        const bool planned = plan_.sizes.prefix_checkpoints > 0;
+        const std::uint64_t per_slot = planned ? plan_.sizes.prefix_checkpoints_per_slot
+                                               : std::max<std::uint64_t>(plan_.prefix_checkpoints_requested, 1);
+        ck = (per_slot + 2) * cfg.max_sequences * (plan_.sizes.gdn_state_per_copy + extra);
+        if (!planned)
+            HALO_INFO("runtime", "no GPU tier for prefix checkpoints: CPU reference budgets {} bytes on the host", ck);
     }
     if (opts.checkpoint_budget_bytes) ck = *opts.checkpoint_budget_bytes;
     ckpts_ = std::make_unique<state::CheckpointStore>(cfg.prefix_cache ? ck : 0);
