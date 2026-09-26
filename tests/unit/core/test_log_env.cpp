@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -191,6 +192,20 @@ TEST_F(LogEnv, SymlinkIsRefusedAndLoggingStaysOnStderr) {
     EXPECT_FALSE(fs::exists(target));
 }
 
+// A symlink to an EXISTING file of ours would pass every other check (regular, owned, one link):
+// only O_NOFOLLOW refuses it. The target must stay untouched.
+TEST_F(LogEnv, SymlinkToExistingFileIsRefusedAndTargetUntouched) {
+    const fs::path target = dir_ / "target";
+    const fs::path link = dir_ / "link";
+    std::ofstream(target) << "precious\n";
+    ::chmod(target.c_str(), 0600);
+    fs::create_symlink(target, link);
+    const Child c = run("emit", {"HALO_LOG_FILE=" + link.string()});
+    EXPECT_NE(c.err.find("cannot open HALO_LOG_FILE"), std::string::npos) << c.err;
+    EXPECT_TRUE(has_line(c.err, "[INFO] i: info-line")) << c.err;
+    EXPECT_EQ(slurp(target), "precious\n");
+}
+
 TEST_F(LogEnv, FifoDoesNotBlockAndFallsBackToStderr) {
     const fs::path fifo = dir_ / "fifo";
     ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
@@ -198,6 +213,58 @@ TEST_F(LogEnv, FifoDoesNotBlockAndFallsBackToStderr) {
     EXPECT_FALSE(c.timed_out);
     EXPECT_EQ(c.code, 0);
     EXPECT_TRUE(has_line(c.err, "[INFO] i: info-line")) << c.err;
+}
+
+// Review S-43: an existing non-regular path is refused BEFORE open(), so a driver never sees an
+// open. A FIFO shows this: a reader blocked in open(O_RDONLY) returns only once a writer opens.
+TEST_F(LogEnv, FifoWithReaderIsRefusedWithoutBeingOpened) {
+    const fs::path fifo = dir_ / "fifo";
+    ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+    std::atomic<bool> reader_open{false};
+    std::thread reader([&] {
+        const int fd = ::open(fifo.c_str(), O_RDONLY | O_CLOEXEC);  // blocks until a writer opens
+        reader_open.store(true);
+        if (fd >= 0) ::close(fd);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // let the reader block in open()
+    const Child c = run("emit", {"HALO_LOG_FILE=" + fifo.string()});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const bool opened_by_child = reader_open.load();
+    const int unblock = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);  // release the reader
+    reader.join();
+    if (unblock >= 0) ::close(unblock);
+    EXPECT_FALSE(opened_by_child) << "the child opened the FIFO before refusing it";
+    EXPECT_NE(c.err.find("not a regular file"), std::string::npos) << c.err;
+    EXPECT_TRUE(has_line(c.err, "[INFO] i: info-line")) << c.err;
+}
+
+// Review S-42: a file with a second hard link is refused and left untouched.
+TEST_F(LogEnv, HardLinkedFileIsRefusedAndLeftUntouched) {
+    const fs::path orig = dir_ / "orig";
+    const fs::path link = dir_ / "hl";
+    std::ofstream(orig) << "precious\n";
+    ::chmod(orig.c_str(), 0644);
+    fs::create_hard_link(orig, link);
+    const Child c = run("emit", {"HALO_LOG_FILE=" + link.string()});
+    EXPECT_NE(c.err.find("more than one hard link"), std::string::npos) << c.err;
+    EXPECT_TRUE(has_line(c.err, "[INFO] i: info-line")) << c.err;
+    EXPECT_EQ(slurp(orig), "precious\n");
+    EXPECT_EQ(mode_of(orig), 0644U);
+}
+
+// Review S-42: a file owned by another user is refused and left untouched (no chmod, no append),
+// which matters when the kit runs as root. Creating such a file needs root.
+TEST_F(LogEnv, ForeignOwnedFileIsRefusedAndLeftUntouched) {
+    if (::geteuid() != 0) GTEST_SKIP() << "needs root to create a file owned by another user (chown)";
+    const fs::path f = dir_ / "shared.txt";
+    std::ofstream(f) << "precious\n";
+    ::chmod(f.c_str(), 0644);
+    ASSERT_EQ(::chown(f.c_str(), 65534, 65534), 0);  // nobody
+    const Child c = run("emit", {"HALO_LOG_FILE=" + f.string()});
+    EXPECT_NE(c.err.find("not owned by this user"), std::string::npos) << c.err;
+    EXPECT_TRUE(has_line(c.err, "[INFO] i: info-line")) << c.err;
+    EXPECT_EQ(slurp(f), "precious\n");
+    EXPECT_EQ(mode_of(f), 0644U);
 }
 
 TEST_F(LogEnv, NonRegularFileIsRefused) {

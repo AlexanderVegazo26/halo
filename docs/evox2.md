@@ -171,7 +171,29 @@ scripts/evox2/collect.sh --model ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf \
 - `--llama-dir` is a llama.cpp build (the directory with `llama-bench`) for the same-file
   baseline; it is also passed to the baseline integration tests.
 - `--quick` skips the full bandwidth benchmark and the per-driver Vulkan passes.
-- `--anonymize` replaces the hostname, user name and home directory everywhere in the bundle.
+- **Redaction (always on).** Every file in the bundle, of any size and text or binary, is scrubbed
+  line by line before it is packed:
+  - the values of secret-looking variables (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSW*`, `*AUTH*`,
+    `*CREDENTIAL*`, `*COOKIE*`, `*DSN*`, `*PRIVATE*`, `*_PAT`, `SSH_CONNECTION`, `SSH_CLIENT`)
+    are replaced by `<redacted>`;
+  - `user:password@` inside any URL (for example `http_proxy`) becomes `<redacted>@`.
+- **`--anonymize`** also replaces:
+  - the home directory, as `/home/<user>`;
+  - the host name and FQDN, as `<host>`;
+  - the user name, as `<user>`, including the invoking user under `sudo` (`SUDO_USER` and its
+    home);
+  - the SSH client and server addresses, as `<ip>`.
+
+  It also drops `SSH_*`, `DISPLAY`, `XDG_SESSION_*`, `MAIL` and `SUDO_*` from the environment
+  dump.
+- **How names are matched.** Names are replaced only as whole tokens, so a user called `amd` does
+  not turn `amdgpu` into `<user>gpu`. A name shorter than 3 characters is replaced only where
+  names appear: after `=`, `(`, a quote, `/` or `@` (`USER=ab`, `uid=1000(ab)`, `/home/ab`), and
+  before `@`.
+- **Files that cannot be scrubbed.** A file with a line over 16 MiB, or a symlink, is left out of
+  the `.tar.gz`, listed in `SUMMARY.md` section 6 and `excluded-from-tarball.txt`, and kept only
+  in the bundle directory.
+- The tarball is created with `O_EXCL` (it never overwrites or follows an existing path).
 - `--help` lists the rest (`--mtp`, `--prompt`, `--max-tokens`, `--ctx`, `--bench-system`,
   `--skip`, `--timeout-scale`, ...).
 
@@ -196,7 +218,7 @@ HALO's logs are captured through three environment variables that `src/core/log.
 |---|---|
 | `HALO_LOG_LEVEL` | `trace`, `debug`, `info` (default), `warn`, `error`, `fatal`, `off` |
 | `HALO_LOG_FORMAT` | `text` (default) or `json`: one `{"ts_ms", "level", "component", "msg"}` object per line; `ts_ms` is Unix epoch milliseconds |
-| `HALO_LOG_FILE` | append to this file (created mode 0600, regular files only, never through a symlink) instead of stderr |
+| `HALO_LOG_FILE` | append to this file instead of stderr. A new file is created with mode 0600; an existing file must be a regular file owned by the running user with one hard link (a symlink, device, FIFO, foreign-owned or hard-linked file is refused, and logging stays on stderr) |
 
 The bundle has `SUMMARY.md` (section 1: every failure with its log path; section 2: the
 expected-vs-actual checklist; then what was not available, and every step) and `manifest.json`

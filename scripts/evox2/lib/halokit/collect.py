@@ -291,7 +291,7 @@ def system_steps(b: Bundle) -> None:
     b.step("id", ["id"], category="system", timeout=T)
 
     def env_fn(d: Path) -> str:
-        env = C.redacted_env() if b.a.redact else dict(sorted(os.environ.items()))
+        env = C.redacted_env(anonymize=b.a.anonymize) if b.a.redact else dict(sorted(os.environ.items()))
         (d / "env.txt").write_text("".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
         gpu = {k: v for k, v in env.items() if k.startswith(C.GPU_ENV_PREFIXES)}
         C.write_json(d / "gpu-env.json", gpu)
@@ -719,25 +719,116 @@ def write_summary(b: Bundle, manifest: dict[str, Any]) -> None:
     (b.root / "SUMMARY.md").write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
-def scrub(root: Path, replacements: list[tuple[str, str]]) -> int:
-    """Replaces every occurrence of each needle in every text file of the bundle."""
+MAX_SCRUB_LINE = 16 << 20  # a "line" longer than this cannot be scrubbed safely: the file is excluded
+_TOKEN = rb"A-Za-z0-9_"
+
+
+def _identity_patterns(name: str, rep: bytes) -> list[tuple[re.Pattern[bytes], bytes]]:
+    """Patterns that replace a user or host name only as a whole token (review S-41).
+
+    Names of 3+ characters are replaced wherever they stand alone (not inside `amdgpu` for a user
+    called `amd`). Shorter names would hit ordinary words, so they are replaced only in the
+    places a name appears: after = ( " ' / @ (USER=ab, uid=1000(ab), "user": "ab", /home/ab)
+    and before @ (ab@host).
+    """
+    n = re.escape(name.encode())
+    if len(name) >= 3:
+        return [(re.compile(rb"(?<![" + _TOKEN + rb"])" + n + rb"(?![" + _TOKEN + rb"])"), rep)]
+    return [(re.compile(rb"(?<=[=(\"'/@])" + n + rb"(?![" + _TOKEN + rb"])"), rep),
+            (re.compile(rb"(?<![" + _TOKEN + rb"])" + n + rb"(?=@)"), rep)]
+
+
+def scrub_patterns(a: argparse.Namespace, host: str, users: list[str], homes: list[str]) -> list[tuple[re.Pattern[bytes], bytes]]:
+    pats: list[tuple[re.Pattern[bytes], bytes]] = []
+    if a.redact:
+        for v in C.secret_values():
+            pats.append((re.compile(re.escape(v.encode())), b"<redacted>"))
+        pats.append((C.URL_CRED_BYTES_RE, rb"\1<redacted>@"))
+    if a.anonymize:
+        for h in sorted({x for x in homes if x and x != "/"}, key=len, reverse=True):
+            pats.append((re.compile(re.escape(h.encode()) + rb"(?![A-Za-z0-9_.-])"), b"/home/<user>"))
+        for ip in sorted(ssh_addresses(), key=len, reverse=True):
+            pats.append((re.compile(rb"(?<![0-9A-Fa-f.:])" + re.escape(ip.encode()) + rb"(?![0-9A-Fa-f.:])"), b"<ip>"))
+        for h in sorted({x for x in (socket.getfqdn(), host) if x and x != "localhost"}, key=len, reverse=True):
+            pats += _identity_patterns(h, b"<host>")
+        for u in sorted({x for x in users if x}, key=len, reverse=True):
+            pats += _identity_patterns(u, b"<user>")
+    return pats
+
+
+def ssh_addresses() -> set[str]:
+    """Client and server IP addresses from SSH_CONNECTION / SSH_CLIENT (review S-44)."""
+    out = set()
+    for k in ("SSH_CONNECTION", "SSH_CLIENT"):
+        for tok in os.environ.get(k, "").split():
+            if re.fullmatch(r"[0-9.]{7,15}|[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+", tok) and not tok.isdigit():
+                out.add(tok)
+    return out
+
+
+def scrub_file(p: Path, pats: list[tuple[re.Pattern[bytes], bytes]]) -> str:
+    """Scrubs one file as bytes, line by line (any size, binary or text). Returns 'changed',
+    'unchanged', or 'excluded: <why>' when a line is too long to scrub safely."""
+    tmp = p.with_name(p.name + ".scrub-tmp")
+    changed = False
+    try:
+        with open(p, "rb") as fi, open(tmp, "wb") as fo:
+            while True:
+                line = fi.readline(MAX_SCRUB_LINE + 1)
+                if not line:
+                    break
+                if len(line) > MAX_SCRUB_LINE:
+                    raise ValueError(f"a line longer than {MAX_SCRUB_LINE >> 20} MiB")
+                new = line
+                for rx, rep in pats:
+                    new = rx.sub(rep, new)
+                changed = changed or new != line
+                fo.write(new)
+    except (OSError, ValueError) as e:
+        tmp.unlink(missing_ok=True)
+        return f"excluded: {e}"
+    if changed:
+        os.chmod(tmp, p.stat().st_mode & 0o777)
+        os.replace(tmp, p)
+        return "changed"
+    tmp.unlink()
+    return "unchanged"
+
+
+def scrub(root: Path, pats: list[tuple[re.Pattern[bytes], bytes]]) -> tuple[int, list[tuple[str, str]]]:
+    """Scrubs every file of the bundle. Never skips silently (review S-41): a file that cannot be
+    scrubbed (or a symlink) is returned in the excluded list, and is kept out of the tarball."""
     changed = 0
-    if not replacements:
-        return 0
-    for p in root.rglob("*"):
-        if not p.is_file() or p.stat().st_size > 64 << 20:
+    excluded: list[tuple[str, str]] = []
+    if not pats:
+        return 0, excluded
+    for p in sorted(root.rglob("*")):
+        rel = str(p.relative_to(root))
+        if p.is_symlink():
+            excluded.append((rel, "symlink"))
             continue
-        data = p.read_bytes()
-        if b"\0" in data[:8192]:
+        if not p.is_file():
             continue
-        new = data
-        for needle, rep in replacements:
-            if needle:
-                new = new.replace(needle.encode(), rep.encode())
-        if new != data:
-            p.write_bytes(new)
+        r = scrub_file(p, pats)
+        if r == "changed":
             changed += 1
-    return changed
+        elif r.startswith("excluded"):
+            excluded.append((rel, r.split(": ", 1)[1]))
+    return changed, excluded
+
+
+def write_tarball(root: Path, name: str, excluded: set[str]) -> Path:
+    """<name>.tar.gz next to root, created with O_EXCL | O_NOFOLLOW, mode 0600 (review S-47)."""
+    tgz = root.with_name(name + ".tar.gz")
+    fd = os.open(tgz, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
+    def keep(ti: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        rel = ti.name[len(name) + 1:] if ti.name.startswith(name + "/") else ""
+        return None if rel in excluded or ti.issym() or ti.islnk() else ti
+
+    with os.fdopen(fd, "wb") as fo, tarfile.open(fileobj=fo, mode="w:gz") as tf:
+        tf.add(root, arcname=name, filter=keep)
+    return tgz
 
 
 def main(argv: list[str]) -> int:
@@ -789,6 +880,17 @@ def main(argv: list[str]) -> int:
     host = socket.gethostname()
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
     home = os.path.expanduser("~")
+    # Under sudo, USER/HOME are root's: the invoking user's name and home also identify them
+    # (paths in --kit/--model, manifest args, command.txt; review S-41).
+    users, homes = [user], [home]
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        users.append(sudo_user)
+        try:
+            import pwd
+            homes.append(pwd.getpwnam(sudo_user).pw_dir)
+        except (KeyError, ImportError):
+            homes.append(f"/home/{sudo_user}")
     host_tag = "anon" if a.anonymize else re.sub(r"[^A-Za-z0-9_.-]", "_", host)
     name = f"halo-diag-{host_tag}-{C.utc_stamp()}"
     root = Path(a.out).resolve() / name
@@ -873,32 +975,33 @@ def main(argv: list[str]) -> int:
             + f"\n```\n{tb}```\n", encoding="utf-8")
         verdict = "NEEDS ATTENTION"
 
-    reps: list[tuple[str, str]] = []
-    if a.redact:
-        reps += [(v, "<redacted>") for v in C.secret_values()]
-    if a.anonymize:
-        if home and home != "/":
-            reps.append((home, "/home/<user>"))
-        fq = socket.getfqdn()
-        for h in sorted({fq, host}, key=len, reverse=True):
-            if h and len(h) >= 3 and h not in ("localhost",):
-                reps.append((h, "<host>"))
-        if len(user) >= 3:
-            reps.append((user, "<user>"))
     try:
-        n = scrub(root, reps)
+        n, excluded = scrub(root, scrub_patterns(a, host, users, homes))
     except Exception as e:  # noqa: BLE001
         # Never package what may still hold a secret or a hostname: leave the directory only.
         print(f"collect: ERROR scrubbing the bundle ({type(e).__name__}: {e}); NOT writing the .tar.gz. "
               f"Inspect {root} before sharing it.", file=sys.stderr, flush=True)
         return 1
+    if excluded:
+        lines = [f"- `{rel}`: {why}" for rel, why in excluded]
+        (root / "excluded-from-tarball.txt").write_text("".join(f"{rel}\t{why}\n" for rel, why in excluded),
+                                                        encoding="utf-8")
+        with open(root / "SUMMARY.md", "a", encoding="utf-8") as f:
+            f.write("\n## 6. Excluded from the tarball (could not be scrubbed)\n\n"
+                    "These files stay in the bundle directory only; review them before sharing.\n\n"
+                    + "\n".join(lines) + "\n")
+        print(f"collect: WARNING {len(excluded)} file(s) could not be scrubbed and are NOT in the tarball "
+              f"(listed in SUMMARY.md section 6): {[r for r, _ in excluded][:5]}", file=sys.stderr, flush=True)
     print(f"collect: scrubbed {n} file(s) ({'redacted' if a.redact else 'NOT redacted'}"
           f"{', anonymized' if a.anonymize else ''})", flush=True)
     if not a.no_tar:
-        tgz = root.with_name(name + ".tar.gz")
-        with tarfile.open(tgz, "w:gz") as tf:
-            tf.add(root, arcname=name)
-        print(f"collect: wrote {tgz}")
+        try:
+            tgz = write_tarball(root, name, {r for r, _ in excluded})
+            print(f"collect: wrote {tgz}")
+        except OSError as e:
+            print(f"collect: ERROR cannot create the tarball ({e}); the bundle directory {root} is complete",
+                  file=sys.stderr, flush=True)
+            return 1
     print(f"collect: {verdict}: {len(bad_steps)} failed step(s), {len(test_failures)} failed test(s), "
           f"{len(exp_failures)} expectation failure(s), {len(collector_errors)} collector error(s); "
           f"read {root / 'SUMMARY.md'}")

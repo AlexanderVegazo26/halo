@@ -21,7 +21,16 @@ from typing import Any
 GNU_TIME = "/usr/bin/time"
 
 # Environment variable names whose values are never written anywhere (collect.sh, run-tests).
-SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSW|AUTH|CREDENTIAL|COOKIE", re.IGNORECASE)
+# PAT only as a whole word (GITHUB_PAT), so PATH is not caught. SSH_CONNECTION / SSH_CLIENT carry
+# the client and server IP addresses (review S-44).
+SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSW|AUTH|CREDENTIAL|COOKIE|DSN|PRIVATE|(?:^|_)PAT(?:_|$)|"
+                            r"^SSH_(?:CONNECTION|CLIENT)$", re.IGNORECASE)
+# Credentials inside a URL-valued variable of any name: http_proxy=http://user:pass@host:3128,
+# DATABASE_URL=postgres://u:p@db/x (review S-44). Group 1 keeps the scheme.
+URL_CRED_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+:[^@\s/]+@")
+URL_CRED_BYTES_RE = re.compile(URL_CRED_RE.pattern.encode())
+# Dropped from the environment dump under --anonymize (they identify the session or the network).
+ANON_DROP_RE = re.compile(r"^(?:SSH_\w*|DISPLAY|XDG_SESSION_\w*|MAIL|SUDO_\w*)$")
 # GPU runtime variables whose values are recorded (they change what the GPU stack does).
 GPU_ENV_PREFIXES = ("HSA_", "HIP_", "ROCR_", "ROCM_", "HCC_", "AMD_", "GPU_", "RADV_", "VK_", "MESA_",
                     "ACO_", "LLVM_", "HALO_", "GGML_", "OMP_", "LD_LIBRARY_PATH")
@@ -43,10 +52,20 @@ def is_secret_name(name: str) -> bool:
     return bool(SECRET_NAME_RE.search(name))
 
 
-def redacted_env(env: dict[str, str] | None = None) -> dict[str, str]:
-    """A copy of env with every secret-looking name's value replaced by <redacted>."""
+def redact_url_credentials(text: str) -> str:
+    return URL_CRED_RE.sub(r"\1<redacted>@", text)
+
+
+def redacted_env(env: dict[str, str] | None = None, anonymize: bool = False) -> dict[str, str]:
+    """A copy of env: secret-looking names' values -> <redacted>, URL credentials in any value
+    -> scheme://<redacted>@, and with anonymize the session/network variables dropped."""
     src = os.environ if env is None else env
-    return {k: ("<redacted>" if is_secret_name(k) else v) for k, v in sorted(src.items())}
+    out = {}
+    for k, v in sorted(src.items()):
+        if anonymize and ANON_DROP_RE.match(k):
+            continue
+        out[k] = "<redacted>" if is_secret_name(k) else redact_url_credentials(v)
+    return out
 
 
 def secret_values(env: dict[str, str] | None = None) -> list[str]:
@@ -327,17 +346,24 @@ def setup_anchor(kit: Path, anchor: str, ref: Path | None) -> list[str]:
     a = Path(anchor)
     if a.is_symlink():
         raise KitError(f"{a} is a symlink; the kit refuses to use it. Remove it (rm {a}) and re-run.")
-    if a.exists():
-        st = a.lstat()
-        import stat as _stat
-        if not _stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-            raise KitError(f"{a} exists and is not a directory owned by uid {os.getuid()}. Remove it "
-                           "(it may be left over from another user or from package.sh) and re-run.")
-        if (a / ".halo-kit-staging").exists():
-            raise KitError(f"{a} holds a package build (scripts/package.sh --keep-build). Remove it or "
-                           "run the tests from that build directory instead.")
-    else:
+    import stat as _stat
+    if not a.exists():
+        # No parents, no exist_ok: fails if another user creates it first (review S-40).
         a.mkdir(mode=0o700, parents=False)
+        os.chmod(a, 0o700, follow_symlinks=False)  # mkdir's mode is filtered by the umask
+    # Verify whatever is there now: a directory, not a symlink, owned by the effective user, mode
+    # 0700. A group- or world-writable anchor would let another user swap the build/ symlink that
+    # run-tests executes through.
+    st = a.lstat()
+    if not _stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise KitError(f"{a} exists and is not a directory owned by uid {os.geteuid()}. Remove it "
+                       "(it may be left over from another user or from package.sh) and re-run.")
+    if _stat.S_IMODE(st.st_mode) != 0o700:
+        raise KitError(f"{a} has mode {_stat.S_IMODE(st.st_mode):o}, not 700; refusing to run binaries through it. "
+                       f"Remove it (rm -r {a}) and re-run.")
+    if (a / ".halo-kit-staging").exists():
+        raise KitError(f"{a} holds a package build (scripts/package.sh --keep-build). Remove it or "
+                       "run the tests from that build directory instead.")
     for name, target in (("src", kit / "src"), ("build", kit / "build"), ("ref", ref)):
         link = a / name
         if link.is_symlink():

@@ -54,24 +54,51 @@ bool iequals(std::string_view a, std::string_view b) noexcept {
     return true;
 }
 
-// Opens HALO_LOG_FILE for appending: never follows a symlink, never blocks on a FIFO,
-// accepts only a regular file, and does not leak into child processes (review S-33/S-37).
+// Opens HALO_LOG_FILE for appending (review S-33/S-37/S-42/S-43):
+// - never follows a symlink (O_NOFOLLOW), never blocks on a FIFO (O_NONBLOCK until checked),
+//   never becomes a controlling terminal (O_NOCTTY), never leaks into children (O_CLOEXEC);
+// - an existing path is lstat()ed first, so a device node or FIFO is refused without being opened;
+// - accepts only a regular file owned by the effective user with exactly one link, so a mistyped
+//   path under root cannot append to (or chmod) a system file or a hard link to one;
+// - creates a new file 0600, and tightens an existing file of ours only if it is wider than 0600.
 std::FILE* open_log_file(const char* path) noexcept {
-    const int fd = ::open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    const auto refuse = [path](const char* why) -> std::FILE* {
+        std::fprintf(stderr, "[WARN] log: HALO_LOG_FILE '%s' %s; logging to stderr\n", path, why);
+        return nullptr;
+    };
+    constexpr int kFlags = O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK;
+    bool created = true;
+    int fd = ::open(path, kFlags | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        created = false;
+        struct stat pre{};
+        // A symlink is left to open() below, which refuses it with ELOOP (O_NOFOLLOW).
+        if (::lstat(path, &pre) == 0 && !S_ISREG(pre.st_mode) && !S_ISLNK(pre.st_mode)) {
+            return refuse("is not a regular file");
+        }
+        fd = ::open(path, kFlags);
+    }
     if (fd < 0) {
         std::fprintf(stderr, "[WARN] log: cannot open HALO_LOG_FILE '%s': %s; logging to stderr\n", path,
                      std::strerror(errno));
         return nullptr;
     }
     struct stat st{};
+    const char* why = nullptr;
     if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        std::fprintf(stderr, "[WARN] log: HALO_LOG_FILE '%s' is not a regular file; logging to stderr\n", path);
+        why = "is not a regular file";
+    } else if (st.st_uid != ::geteuid()) {
+        why = "is not owned by this user";
+    } else if (st.st_nlink != 1) {
+        why = "has more than one hard link";
+    }
+    if (why != nullptr) {
         ::close(fd);
-        return nullptr;
+        return refuse(why);
     }
     const int flags = ::fcntl(fd, F_GETFL);
     if (flags >= 0) (void)::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-    (void)::fchmod(fd, 0600);  // tighten a pre-existing file; fails harmlessly if not ours
+    if (!created && (st.st_mode & 077) != 0) (void)::fchmod(fd, 0600);  // ours (checked above)
     std::FILE* f = ::fdopen(fd, "a");
     if (f == nullptr) {
         std::fprintf(stderr, "[WARN] log: cannot use HALO_LOG_FILE '%s': %s; logging to stderr\n", path,

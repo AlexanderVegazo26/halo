@@ -128,7 +128,14 @@ if [[ -e "$ANCHOR" || -L "$ANCHOR" ]]; then
     rm -rf -- "$ANCHOR"
   fi
 fi
-mkdir -p -m 0700 "$ANCHOR"
+# The anchor is a predictable /tmp path (review S-40): create it with plain mkdir (no -p), which
+# fails if another user created it in the meantime, and then verify what we got before staging.
+if [[ ! -e "$ANCHOR" && ! -L "$ANCHOR" ]]; then
+  mkdir -m 0700 -- "$ANCHOR" 2>/dev/null \
+    || die "cannot create $ANCHOR (it appeared after the check: another user may own it); remove it and re-run"
+fi
+[[ -d "$ANCHOR" && ! -L "$ANCHOR" && -O "$ANCHOR" ]] || die "$ANCHOR is not a directory owned by $(id -un); refusing"
+[[ "$(stat -c %a -- "$ANCHOR")" == 700 ]] || die "$ANCHOR has mode $(stat -c %a -- "$ANCHOR"), not 700; refusing"
 touch "$ANCHOR/.halo-kit-staging"
 # Stage into src.new. Files get the extraction time as mtime (tar -m, cp without -a): git
 # archive would otherwise stamp every file with the commit time, older than existing objects.

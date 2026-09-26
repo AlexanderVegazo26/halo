@@ -8,10 +8,13 @@
 //                    default info)
 //   HALO_LOG_FORMAT  text | json (default text). json writes one object per line:
 //                    {"ts_ms": <Unix epoch milliseconds>, "level", "component", "msg"}
-//   HALO_LOG_FILE    append log lines to this file instead of stderr. The file is opened
-//                    with O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode 0600, and must be a
-//                    regular file; a symlink is refused. Every line is flushed. If it cannot
-//                    be opened, one warning goes to stderr and logging stays on stderr.
+//   HALO_LOG_FILE    append log lines to this file instead of stderr. A new file is created
+//                    with mode 0600; an existing one must be a regular file owned by the
+//                    effective user with exactly one hard link (a symlink, device, FIFO,
+//                    foreign-owned or hard-linked file is refused, without opening a device).
+//                    Opened O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY; an existing file of
+//                    ours wider than 0600 is tightened to 0600. Every line is flushed. If it
+//                    cannot be used, one warning goes to stderr and logging stays on stderr.
 // An empty value counts as unset. An unknown value prints one warning on stderr and keeps
 // the default; it never aborts the process.
 
