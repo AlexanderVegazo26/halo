@@ -11,8 +11,10 @@
 //  - host validation parity: every rejection of the CPU backend (ownership, read-only output,
 //    aliasing, range, alignment, foreign stream, unknown variant, status words) has the same
 //    ErrorCode here; the HIP limits raise Unsupported (never Kernel);
-//  - data errors (bad id, bad block, positive g, NaN) raise Error(Kernel) at the op call in
-//    emulation, as on the CPU backend;
+//  - data errors (bad id, bad block, positive g) raise Error(Kernel) at the op call in
+//    emulation, as on the CPU backend; a NaN logit in the fused LM head instead poisons only
+//    its own row ({-1, NaN} in the result words, H1) on both backends, while standalone
+//    argmax / top-k still raise Kernel on NaN;
 //  - registry: the (id -> name) table is pinned; every HIP registry variant has an id; ids
 //    select what they name; a wrong op/form id is Error(Config);
 //  - modes: Kind, describe(), device mode without a device, poisoned allocations.
@@ -889,15 +891,23 @@ TEST(HipBackendValidation, DataErrorsRaiseKernelAtTheOpInEmulation) {
         b.gated_delta_rule(s, a);
     }, "chunked GDN g > 0", "GATED_DELTANET");
     EXPECT_TRUE(same_bits(st.fh(), st.fc(), "state untouched by the failed chunked GDN (both sides)"));
-    // NaN logits: LM head, argmax, top-k.
+    // NaN logits: the LM head poisons only its own row (H1) -- both backends report
+    // {-1, NaN} in the result words instead of throwing for the batched call. Standalone
+    // argmax and top-k still raise Error(Kernel), as on the CPU backend.
     std::vector<float> wv = rnd(20 * E, 10);
     wv[7 * E + 3] = std::numeric_limits<float>::quiet_NaN();
     Dual& w = p.f32(wv);
     Dual& x = p.f32(rnd(E, 11));
     Dual& res = p.out(3);
-    both([&](Backend& b, Stream& s, int i) {
+    p.run([&](Backend& b, Stream& s, int i) {
         b.lm_head(s, LmHeadArgs{GemvArgs{DType::F32, S(w, i), S(x, i), {}, 20, E, 1, {}}, S(res, i), {}, {}});
-    }, "LM head NaN logit", "LM_HEAD");
+    });
+    for (const std::span<const std::byte>& side : {std::as_bytes(res.fc()), std::as_bytes(res.fh())}) {
+        const std::vector<ArgmaxResult> best = decode_argmax(side);
+        ASSERT_EQ(best.size(), 1);
+        EXPECT_EQ(best[0].index, -1);
+        EXPECT_TRUE(std::isnan(best[0].value));
+    }
     std::vector<float> lv = rnd(3000, 12);
     lv[2500] = std::numeric_limits<float>::quiet_NaN();
     Dual& lg = p.f32(lv);

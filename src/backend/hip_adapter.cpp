@@ -953,7 +953,10 @@ public:
         h.workspace = st.scratch(ops.lm_head_workspace_bytes(g.rows, g.n_vec));
         h.result = res.view();
         ops.lm_head_argmax(st.target(), h);
-        st.expect_argmax(r.op(), kBatchWide, h.result, g.n_vec);
+        // H1: no expect_argmax here -- a NaN logit poisons only its own row ({-1, NaN} in the
+        // result words), which is data the caller decodes per sequence, not a Kernel error.
+        // Throwing here would fail every sequence in the batched call (Vulkan already behaves
+        // this way; the standalone argmax op below keeps the check, matching the CPU backend).
         st.op_done();
     }
 

@@ -224,7 +224,10 @@ TEST(VkOps, MatvecQ6KBeyondWorkgroupCountLimitUses2DGrid) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t rows = 248320;
-    ASSERT_GT(rows, ctx->info().max_workgroup_count[0]) << "device X limit too large to exercise the 2-D grid";
+    // RADV exposes a 2^32-1 X limit, so no allocatable row count exceeds it there; the 2-D
+    // grid path is then only exercisable on devices with a smaller limit (e.g. lavapipe).
+    if (rows <= ctx->info().max_workgroup_count[0])
+        GTEST_SKIP() << "device X limit " << ctx->info().max_workgroup_count[0] << " too large to exercise the 2-D grid";
     const auto st = run_matvec(ctx, ops, ref::WType::Q6_K, rows, 256, 5, 14, /*print_timing=*/true);
     report("matvec_q6_k 248320x256 (2-D grid)", st);
     EXPECT_LE(st.max_ratio, 1.0);
