@@ -15,6 +15,12 @@ option(HALO_BUILD_HIP        "Build the HIP backend (needs ROCm)"    OFF)
 option(HALO_ENABLE_LTO       "Enable link-time optimization"         OFF)
 option(HALO_ENABLE_ASAN      "Enable AddressSanitizer + UBSan"       OFF)
 option(HALO_NATIVE           "Tune for the build machine CPU"        OFF)
+# CPU target passed as -march=<value> to every HALO target (C, C++ and the host side of HIP).
+# Empty (the default) passes no -march, i.e. the compiler's baseline x86-64; HALO_NATIVE=ON
+# is the same as HALO_MARCH=native. Portable packages use a psABI level such as x86-64-v3
+# (scripts/package.sh; docs/evox2.md explains the choice).
+set(HALO_MARCH "" CACHE STRING "CPU target for -march (empty = compiler default; e.g. x86-64-v3, native)")
+option(HALO_WERROR           "Treat compiler warnings as errors"    ON)
 # Semicolon list of module / backend / test-dir names to build (empty = everything).
 # Lets parallel workstreams build only their own code in a shared tree, e.g.
 #   -DHALO_ONLY="tensor;model"
@@ -34,6 +40,12 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(HaloWarnings)
+if(NOT HALO_WERROR)
+  # For building on a newer compiler whose new warnings would otherwise stop the build
+  # (scripts/evox2/build-native.sh). The warnings are still printed.
+  target_compile_options(halo_warnings INTERFACE -Wno-error)
+  message(STATUS "HALO_WERROR=OFF: warnings are not errors")
+endif()
 include(HaloDeps)
 
 if(HALO_ENABLE_ASAN)
@@ -43,8 +55,18 @@ endif()
 if(HALO_ENABLE_LTO)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
-if(HALO_NATIVE)
+if(NOT HALO_MARCH STREQUAL "")
+  if(NOT HALO_MARCH MATCHES "^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
+    message(FATAL_ERROR "HALO_MARCH='${HALO_MARCH}' is not a CPU target name (e.g. x86-64-v3, znver5, native)")
+  endif()
+  if(HALO_NATIVE AND NOT HALO_MARCH STREQUAL "native")
+    message(FATAL_ERROR "HALO_NATIVE=ON conflicts with HALO_MARCH='${HALO_MARCH}': set only one")
+  endif()
+  add_compile_options(-march=${HALO_MARCH})
+  message(STATUS "CPU target: -march=${HALO_MARCH}")
+elseif(HALO_NATIVE)
   add_compile_options(-march=native)
+  message(STATUS "CPU target: -march=native (HALO_NATIVE)")
 endif()
 
 # Symbol visibility: only the public API (HALO_API) is exported (TRD §35).
@@ -54,6 +76,7 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_subdirectory(src)
 add_subdirectory(backends)
 add_subdirectory(tools)
+include(HaloInstall)
 
 if(HALO_BUILD_TESTS)
   enable_testing()

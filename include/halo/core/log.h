@@ -1,6 +1,19 @@
 #pragma once
 // Minimal leveled logger (TRD §46). Text by default; JSON lines in benchmark mode.
-// Thread-safe; output goes to stderr.
+// Thread-safe; output goes to stderr unless HALO_LOG_FILE names a file.
+//
+// Environment (read once, at the first log call or level() query; an explicit set_level()
+// or set_json() call always wins over it, whenever it happens):
+//   HALO_LOG_LEVEL   trace | debug | info | warn | error | fatal | off (case-insensitive;
+//                    default info)
+//   HALO_LOG_FORMAT  text | json (default text). json writes one object per line:
+//                    {"ts_ms": <Unix epoch milliseconds>, "level", "component", "msg"}
+//   HALO_LOG_FILE    append log lines to this file instead of stderr. The file is opened
+//                    with O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode 0600, and must be a
+//                    regular file; a symlink is refused. Every line is flushed. If it cannot
+//                    be opened, one warning goes to stderr and logging stays on stderr.
+// An empty value counts as unset. An unknown value prints one warning on stderr and keeps
+// the default; it never aborts the process.
 
 #include <format>
 #include <string>
