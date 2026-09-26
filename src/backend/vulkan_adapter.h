@@ -28,7 +28,8 @@
 /// synchronously. In that case wait() does NOT write back imports (the host keeps its
 /// pre-step state). Per-sequence StatusRef owners (ADR §5.5) need the step status array of
 /// WS-BI-2: a non-empty StatusRef is Error(Unsupported), as on the CPU backend. A NaN logit in
-/// LM_HEAD / ARGMAX is reported through the result's NaN word (backend::decode_argmax raises).
+/// LM_HEAD / ARGMAX is reported through the result's NaN word (backend::decode_argmax maps it
+/// to the poisoned-row sentinel {-1, NaN}; only that row is affected, H1).
 ///
 /// Not implemented: the GDN / conv state ring (ADR §5.3, WS-BI-2; state is in place, as on the
 /// CPU backend), KernelChoice variants other than 0, Grouped GDN head mapping, weight types

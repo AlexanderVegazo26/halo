@@ -266,6 +266,54 @@ TEST(VkHead, LmHeadNanRaisesLikeCpu) {
     }
 }
 
+TEST(VkHead, LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogits) {
+    // M2: rows at/after valid_rows (GGUF LM-head padding) never win the argmax, but their raw
+    // values still land in the logits; mirrors the CPU backend test of the same name.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    const std::uint32_t rows = 20, cols = 4, valid_rows = 15;
+    std::mt19937 rng(7);
+    std::vector<float> w = ref::random_vec(std::size_t{rows} * cols, rng);
+    for (std::uint32_t r = 0; r < rows; ++r) w[std::size_t{r} * cols] = 0.0f;
+    w[10 * cols] = 1.0f;    // best real row (< valid_rows)
+    w[17 * cols] = 100.0f;  // padded row (>= valid_rows): an unclamped argmax would pick it
+    std::vector<float> x(cols, 0.0f);
+    x[0] = 1.0f;  // one-hot: every weight row's dot product is its w[row][0]
+    hv::Buffer bw = upload(ctx, std::span<const float>(w));
+    hv::Buffer bx = upload(ctx, std::span<const float>(x));
+    hv::Buffer by = hv::Buffer::create(ctx, std::uint64_t{rows} * 4, hv::MemoryUsage::HostCached);
+    const std::uint64_t ws_bytes = ops.lm_head_workspace_bytes(rows, 1, false);
+    hv::Buffer bws = hv::Buffer::create(ctx, ws_bytes, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer bres = hv::Buffer::create(ctx, hv::k_argmax_result_bytes, hv::MemoryUsage::HostCached);
+    hv::LmHeadArgs a;
+    a.gemv = hv::GemvArgs{halo::DType::F32, bw, bx, by, rows, cols, 1};
+    a.workspace = bws;
+    a.result = bres;
+    a.valid_rows = valid_rows;
+    hv::Stream s(ctx);
+    ops.lm_head(s, a);
+    s.submit_and_wait();
+    const hv::ArgmaxResult r = hv::read_argmax(bres);
+    EXPECT_EQ(r.index, 10u) << "the padded row (17) must never win, even though its raw logit is larger";
+    EXPECT_EQ(r.value, 1.0f);
+    const auto logits = download<float>(by, rows);
+    EXPECT_EQ(logits[17], 100.0f) << "the padded row's raw logit is still reported";
+    // valid_rows == 0 is "no clamp": the larger (padded) logit wins as before.
+    a.valid_rows = 0;
+    ops.lm_head(s, a);
+    s.submit_and_wait();
+    EXPECT_EQ(hv::read_argmax(bres).index, 17u);
+    // The clamp does not hide poison: a NaN in a padded row still fails the vector.
+    std::vector<float> wn = w;
+    wn[18 * cols] = std::numeric_limits<float>::quiet_NaN();
+    hv::Buffer bwn = upload(ctx, std::span<const float>(wn));
+    a.valid_rows = valid_rows;
+    a.gemv.w = bwn;
+    ops.lm_head(s, a);
+    s.submit_and_wait();
+    EXPECT_THROW((void)hv::read_argmax(bres), halo::Error) << "a NaN in a padded row must still poison the vector";
+}
+
 TEST(VkHead, LmHeadValidation) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);

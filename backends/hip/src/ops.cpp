@@ -588,6 +588,7 @@ void Ops::lm_head_argmax(const Target& target, const LmHeadArgs& a) const {
     check_disjoint(res, "result", {{&g.x, "x"}, {&g.y, "y"}, {&wr, "w"}}, kOp);
     g.p.part = reinterpret_cast<kern::ArgPart*>(ws.ptr);
     g.p.n_parts = n_parts;
+    g.p.valid_rows = a.valid_rows;
     run_gemv(target, g, gemv_generic_, kOp);
     kern::ArgmaxParams r;
     r.part = g.p.part;

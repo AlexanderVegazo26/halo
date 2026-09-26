@@ -197,10 +197,15 @@ struct ArgmaxResult {
 /// and stay on the device either way (TRD §19).
 ///  - workspace: >= Ops::lm_head_workspace_bytes(rows, n_vec).
 ///  - result: n_vec * k_argmax_result_bytes.
+///  - valid_rows: rows at/after this index are excluded from the argmax (GGUF LM-head padding
+///    past the real vocabulary). 0 = no clamp (argmax over all gemv.rows). The logits
+///    (gemv.y, when set) are unaffected; a NaN in any row -- padded or not -- still sets the
+///    vector's NaN word.
 struct LmHeadArgs {
     GemvArgs gemv{};  ///< gemv.y may be empty (argmax only)
     BufferView workspace{};
     BufferView result{};
+    std::uint32_t valid_rows = 0;
 };
 
 /// [ARGMAX_FUSED building block] argmax of each of n_vec logits vectors of length n (cpu::argmax).

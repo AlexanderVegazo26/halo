@@ -36,6 +36,8 @@
 #include "halo/runtime/engine.h"
 #include "halo/speculative/speculative.h"
 
+namespace halo::backend { class Backend; }
+
 namespace halo::runtime {
 
 /// One scheduler tick, reported on the worker thread (tests / profiling).
@@ -100,9 +102,15 @@ struct CpuEngineOptions {
     /// Called on the worker thread after every tick. Must not block or call the engine.
     std::function<void(const TickInfo&)> on_tick;
     FaultInjection faults;  ///< tests only
+    /// Test seam (BI-6): overrides GPU backend construction when cfg.backend is
+    /// "vulkan"/"hip" (e.g. HIP emulation, a Vulkan context with test options).
+    /// Null = the real factories. Ignored for "cpu"/"auto".
+    std::function<std::unique_ptr<backend::Backend>()> backend_factory;
 };
 
-/// Throws Error(Unsupported) for a backend other than cpu/auto, Error(Model/Io) for model
+/// Throws Error(Unsupported) for an unknown backend name or one whose adapter is not
+/// compiled in (BI-6: "vulkan"/"hip" construct a GPU backend when available; HIP device
+/// mode constructs but cannot run a forward until WS-BI-2), Error(Model/Io) for model
 /// files, Error(Memory) if the memory plan does not fit.
 [[nodiscard]] std::unique_ptr<Engine> create_cpu_engine(const EngineConfig& cfg, const CpuEngineOptions& opts = {});
 

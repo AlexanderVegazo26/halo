@@ -4,7 +4,8 @@
 // Order: larger value wins; equal values -> lower index; -inf is ordinary. A NaN never
 // wins but sets the nan word (1 if any element of the range is NaN), so the host can
 // raise Error(Kernel) like cpu::argmax (DECISIONS D-016, code review S-3). An empty or
-// all-NaN range yields index 0xFFFFFFFF.
+// all-NaN range yields index 0xFFFFFFFF. valid != 0 (the LM head's valid_rows clamp, M2)
+// excludes indices >= valid from the ranking; the NaN scan still covers the whole range.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
@@ -19,6 +20,7 @@ layout(push_constant) uniform Push {
     uint groups;
     uint x_off;  // element remainder of the logits view (code review S-1)
     uint p_off;  // word remainder of the scratch view
+    uint valid;  // 0 = no clamp; else indices >= valid never win (NaN scan unaffected)
 } pc;
 
 const uint NONE = 0xFFFFFFFFu;
@@ -50,6 +52,7 @@ void main() {
             nan_seen = 1u;
             continue;
         }
+        if (pc.valid != 0u && i >= pc.valid) continue;
         if (better(v, i, bv, bi)) {
             bv = v;
             bi = i;

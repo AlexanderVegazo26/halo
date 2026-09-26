@@ -21,6 +21,10 @@
 #include "halo/template/chat_template.h"
 #include "halo/tokenizer/tokenizer.h"
 
+#if defined(HALO_TEST_HIP)
+#include "halo/backend/hip_backend.h"
+#endif
+
 using halo::runtime::CpuEngineOptions;
 using halo::runtime::Engine;
 using halo::runtime::EngineConfig;
@@ -105,6 +109,17 @@ protected:
 TEST_F(EngineTest, CreationErrorsAreTyped) {
     EngineConfig c = base_cfg();
     c.backend = "vulkan";
+    // BI-6: "vulkan" is a real backend -- the engine constructs when a Vulkan device is
+    // available (RADV on the EVO-X2, lavapipe on the dev host). Any failure must still be a
+    // typed halo::Error (Device when no ICD/device, Unsupported when the adapter is not
+    // compiled in), never an untyped exception.
+    try {
+        (void)make({}, c);
+    } catch (const halo::Error& e) {
+        EXPECT_TRUE(e.code() == halo::ErrorCode::Device || e.code() == halo::ErrorCode::Unsupported) << e.what();
+    }
+    c = base_cfg();
+    c.backend = "not-a-backend";
     try {
         (void)make({}, c);
         ADD_FAILURE() << "expected Unsupported";
@@ -182,6 +197,53 @@ TEST_F(EngineTest, GreedyWithMtpDisabledIsIdentical) {
     for (const TickInfo& t : ticks) {
         EXPECT_EQ(t.weight_passes, t.trunk_passes) << "MTP disabled: no MTP weight pass (catch-up or draft) may run";
     }
+}
+
+// ---- GPU backends (BI-6) --------------------------------------------------------------
+// The engine over a GPU backend (Vulkan device; HIP host emulation with the bitwise
+// profile) must produce the same greedy tokens as the CPU engine / transformers golden.
+// KV/GDN state is still host memory imported per forward call (WS-BI-2), so this exercises
+// dispatch and correctness, not performance.
+
+TEST_F(EngineTest, VulkanBackendProducesTheSameGreedyOutput) {
+#if defined(HALO_TEST_VULKAN)
+    EngineConfig c = base_cfg();
+    c.backend = "vulkan";
+    c.mtp_enabled = false;  // dispatch + correctness only; MTP over GPU is exercised later
+    std::unique_ptr<Engine> e;
+    try {
+        e = make({}, c);
+    } catch (const halo::Error& x) {
+        GTEST_SKIP() << "no Vulkan device in this environment: " << x.what();
+    }
+    const GenerateResult r = run(*e, greedy(prompt("p0"), 8));
+    EXPECT_EQ(r.finish, FinishReason::Length);
+    EXPECT_EQ(r.tokens, prefix(gold("p0"), 8));
+    EXPECT_EQ(e->stats().threads, 0u) << "no thread pool on a GPU backend";
+#else
+    GTEST_SKIP() << "built without the Vulkan backend";
+#endif
+}
+
+TEST_F(EngineTest, HipEmulationBackendProducesTheSameGreedyOutput) {
+#if defined(HALO_TEST_HIP)
+    CpuEngineOptions o;
+    o.backend_factory = [] {
+        halo::backend::HipBackendOptions ho;
+        ho.mode = halo::backend::HipMode::Emulation;
+        ho.defaults = halo::backend::hip_bitwise_defaults();  // bit-identical to halo::cpu
+        return halo::backend::make_hip_backend(ho);
+    };
+    EngineConfig c = base_cfg();
+    c.backend = "hip";
+    c.mtp_enabled = false;
+    auto e = make(o, c);
+    const GenerateResult r = run(*e, greedy(prompt("p0"), 8));
+    EXPECT_EQ(r.finish, FinishReason::Length);
+    EXPECT_EQ(r.tokens, prefix(gold("p0"), 8));  // bitwise emulation: exact golden match
+#else
+    GTEST_SKIP() << "built without the HIP backend";
+#endif
 }
 
 // ---- threading ---------------------------------------------------------------------------

@@ -81,7 +81,8 @@ void Ops::lm_head(Stream& stream, const LmHeadArgs& a) {
         argmax(stream, BufferView(*logits.buffer, logits.offset + t * l_stride, logit_row),
                g.rows, BufferView(*a.workspace.buffer, scratch_base + t * scratch_one, scratch_one),
                BufferView(*a.result.buffer, a.result.offset + std::uint64_t{t} * k_argmax_result_bytes,
-                          k_argmax_result_bytes));
+                          k_argmax_result_bytes),
+               a.valid_rows);
     }
 }
 

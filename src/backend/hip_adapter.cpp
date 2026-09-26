@@ -952,6 +952,7 @@ public:
         h.gemv = hip::GemvArgs{g.wtype, w.view(), x.view(), y.view(), g.rows, g.cols, g.n_vec};
         h.workspace = st.scratch(ops.lm_head_workspace_bytes(g.rows, g.n_vec));
         h.result = res.view();
+        h.valid_rows = a.valid_rows;
         ops.lm_head_argmax(st.target(), h);
         // H1: no expect_argmax here -- a NaN logit poisons only its own row ({-1, NaN} in the
         // result words), which is data the caller decodes per sequence, not a Kernel error.

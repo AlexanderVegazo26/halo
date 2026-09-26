@@ -416,10 +416,14 @@ struct GemvArgs {
 ///  - workspace: >= Ops::lm_head_workspace_bytes(rows, n_vec, gemv.y empty).
 ///  - result: n_vec * k_argmax_result_bytes; vector t at byte t * k_argmax_result_bytes
 ///    (read_argmax(result_buffer, result.offset + t * 12)).
+///  - valid_rows: rows at/after this index are excluded from the argmax (GGUF LM-head padding
+///    past the real vocabulary). 0 = no clamp (argmax over all gemv.rows). The logits are
+///    unaffected; a NaN in any row -- padded or not -- still sets the vector's NaN word.
 struct LmHeadArgs {
     GemvArgs gemv{};
     BufferView workspace{};
     BufferView result{};
+    std::uint32_t valid_rows = 0;
 };
 
 /// [TOP_K] (cpu::top_k, per vector): the k largest logits, value descending, ties by lower
@@ -473,9 +477,10 @@ public:
     /// workgroup reduces them into `result` (k_argmax_result_bytes, see read_argmax). Ties
     /// resolve to the lowest index; -inf is an ordinary value; any NaN sets the result's
     /// NaN flag (read_argmax then throws). Every dispatch rewrites the flag, so a result
-    /// buffer can be reused.
+    /// buffer can be reused. `valid` > 0 excludes indices >= valid from the ranking (the LM
+    /// head's valid_rows clamp); the NaN scan still covers all n elements.
     void argmax(Stream& stream, const BufferView& logits, std::uint32_t n, const BufferView& scratch,
-                const BufferView& result);
+                const BufferView& result, std::uint32_t valid = 0);
     [[nodiscard]] std::uint64_t argmax_scratch_bytes(std::uint32_t n) const;
     [[nodiscard]] std::uint32_t argmax_partials(std::uint32_t n) const;
 

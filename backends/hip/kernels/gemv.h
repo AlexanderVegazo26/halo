@@ -277,6 +277,7 @@ struct GemvParams {
     unsigned n_vec = 1;          // T
     ArgPart* part = nullptr;     // LM head: per-workgroup argmax partials, [n_vec][n_parts]
     unsigned n_parts = 0;        // = grid.x
+    unsigned valid_rows = 0;     // LM head: rows >= valid_rows never win the argmax (0 = no clamp)
 };
 
 struct GemvNoRegs {
@@ -284,7 +285,9 @@ struct GemvNoRegs {
 };
 
 /// ARGMAX_FUSED epilogue: thread 0 ranks this workgroup's rows (rows n >= p.rows excluded)
-/// into one partial; NaN rows only set the flag. Stage 2 is argmax_reduce_body.
+/// into one partial; NaN rows only set the flag. Stage 2 is argmax_reduce_body. M2: when
+/// p.valid_rows != 0, rows n >= p.valid_rows (GGUF LM-head padding) are never ranked, but a
+/// NaN in one still sets the flag (the CPU backend's lm_head poisons the same way).
 template <class Exec>
 HALO_HD void gemv_argmax_epilogue(Exec& ex, const float* rowv, const GemvParams& p, unsigned rpb, unsigned bx,
                                   unsigned by) {
@@ -301,6 +304,7 @@ HALO_HD void gemv_argmax_epilogue(Exec& ex, const float* rowv, const GemvParams&
                 nan = 1;
                 continue;
             }
+            if (p.valid_rows != 0u && n >= p.valid_rows) continue;
             if (ranks_before(v, n, bv, bi)) {
                 bv = v;
                 bi = n;

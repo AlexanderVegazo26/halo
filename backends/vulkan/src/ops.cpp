@@ -352,7 +352,7 @@ std::uint64_t Ops::argmax_scratch_bytes(std::uint32_t n) const {
 }
 
 void Ops::argmax(Stream& stream, const BufferView& logits, std::uint32_t n, const BufferView& scratch,
-                 const BufferView& result) {
+                 const BufferView& result, std::uint32_t valid) {
     constexpr std::string_view op = "argmax";
     const std::uint32_t groups = argmax_partials(n);
     const std::uint64_t align = ctx_->info().min_storage_buffer_offset_alignment;
@@ -364,8 +364,8 @@ void Ops::argmax(Stream& stream, const BufferView& logits, std::uint32_t n, cons
 
     const std::uint32_t wg = options_.reduce_workgroup;
     struct Push1 {
-        std::uint32_t n, chunk, groups, x_off, p_off;
-    } p1{n, wg * k_argmax_per_thread, groups, ol.off, os.off};
+        std::uint32_t n, chunk, groups, x_off, p_off, valid;
+    } p1{n, wg * k_argmax_per_thread, groups, ol.off, os.off, valid};
     struct Push2 {
         std::uint32_t count, p_off, r_off;
     } p2{groups, os.off, orr.off};

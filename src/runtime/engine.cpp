@@ -1,6 +1,11 @@
-// CPU reference Engine: one worker thread, one batched tick per step, per-request token
+// Reference Engine: one worker thread, one batched tick per step, per-request token
 // queues drained on the caller's thread, prefix cache (KV sharing + GDN checkpoints),
 // MTP speculative decoding with a k = 0 fallback on MTP-KV exhaustion.
+// BI-6: the forward runs on the backend named by EngineConfig::backend (cpu | vulkan |
+// hip; "auto" = cpu until a measured GPU default policy exists, WS-BI-4). KV/GDN state is
+// host memory imported per forward call on every backend today (WS-BI-2 moves it onto
+// backend buffers); a GPU engine is therefore correct but slow, and HIP device mode
+// cannot run a forward at all yet (hip_adapter's import_host raises Unsupported).
 
 #include <algorithm>
 #include <atomic>
@@ -19,6 +24,7 @@
 #include <utility>
 
 #include "halo/autotune/lookup.h"
+#include "halo/backend/backend.h"
 #include "halo/backends/cpu/thread_pool.h"
 #include "halo/core/error.h"
 #include "halo/core/log.h"
@@ -35,6 +41,14 @@
 #include "halo/template/chat_template.h"
 #include "halo/tokenizer/tokenizer.h"
 
+#if defined(HALO_RUNTIME_VULKAN)
+#include "backend/vulkan_adapter.h"
+#include "halo/backends/vulkan/context.h"
+#endif
+#if defined(HALO_RUNTIME_HIP)
+#include "halo/backend/hip_backend.h"
+#endif
+
 namespace halo::runtime {
 
 namespace {
@@ -47,6 +61,31 @@ double ms_between(Clock::time_point a, Clock::time_point b) {
 }
 
 std::size_t ceil_div(std::size_t a, std::size_t b) { return (a + b - 1) / b; }
+
+// ---- backend selection (BI-6) ----------------------------------------------------------
+
+#if defined(HALO_RUNTIME_VULKAN) || defined(HALO_RUNTIME_HIP)
+/// Constructs the GPU backend named by EngineConfig::backend. "auto" never selects one:
+/// there is no measured default policy yet (WS-BI-4), so a GPU backend is explicit opt-in.
+/// Throws Error(Device) when the device/driver is missing.
+std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
+#if defined(HALO_RUNTIME_VULKAN)
+    if (name == "vulkan") return backend::make_vulkan_backend(vulkan::Context::create({}));
+#endif
+#if defined(HALO_RUNTIME_HIP)
+    if (name == "hip") {
+        // Device mode. Construction succeeds (weights are read-only imports, copied into
+        // VRAM), but the forward needs WS-BI-2 state placement: the first step raises
+        // Error(Unsupported) from the adapter's import_host until KV/GDN state lives on
+        // backend buffers.
+        backend::HipBackendOptions o;
+        o.mode = backend::HipMode::Device;
+        return backend::make_hip_backend(o);
+    }
+#endif
+    throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", name);
+}
+#endif
 
 // ---- memory plan inputs --------------------------------------------------------------
 
@@ -192,7 +231,8 @@ private:
     EngineConfig cfg_;
     CpuEngineOptions opts_;
     std::unique_ptr<model::NormalizedModel> nm_;
-    std::unique_ptr<cpu::ThreadPool> pool_;
+    std::unique_ptr<cpu::ThreadPool> pool_;       // CPU backend only
+    std::unique_ptr<backend::Backend> backend_;   // GPU backends only (BI-6); before model_
     std::unique_ptr<models::Qwen35> model_;
     std::unique_ptr<tokenizer::Tokenizer> tok_;
     std::unique_ptr<chat::ChatTemplate> tmpl_;
@@ -239,8 +279,17 @@ private:
 // ---------------------------------------------------------------------------------------
 
 CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cfg_(cfg), opts_(opts) {
-    HALO_CHECK(cfg.backend == "cpu" || cfg.backend == "auto", ErrorCode::Unsupported,
-               "backend '{}' is not available in this build (cpu reference only)", cfg.backend);
+    const bool cpu_path = cfg.backend == "cpu" || cfg.backend == "auto";
+    HALO_CHECK(cpu_path || cfg.backend == "vulkan" || cfg.backend == "hip", ErrorCode::Unsupported,
+               "unknown backend '{}' (cpu | vulkan | hip | auto)", cfg.backend);
+    if (!cpu_path && !opts.backend_factory) {
+#if !defined(HALO_RUNTIME_VULKAN)
+        HALO_CHECK(cfg.backend != "vulkan", ErrorCode::Unsupported, "backend 'vulkan' is not available in this build");
+#endif
+#if !defined(HALO_RUNTIME_HIP)
+        HALO_CHECK(cfg.backend != "hip", ErrorCode::Unsupported, "backend 'hip' is not available in this build");
+#endif
+    }
     HALO_CHECK(cfg.max_sequences >= 1 && cfg.max_context >= 2, ErrorCode::Config,
                "max_sequences {} / max_context {} out of range", cfg.max_sequences, cfg.max_context);
     HALO_CHECK(cfg.mtp_max_draft >= 0 && cfg.mtp_max_draft <= 8, ErrorCode::Config, "mtp_max_draft {} outside [0, 8]",
@@ -251,7 +300,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     nm_ = std::make_unique<model::NormalizedModel>(model::NormalizedModel::load(cfg.model_path));
     if (cfg.mtp_path) nm_->attach_mtp(*cfg.mtp_path);
     apply_profile();
-    pool_ = std::make_unique<cpu::ThreadPool>(threads_);
+    if (cpu_path) pool_ = std::make_unique<cpu::ThreadPool>(threads_);
     // Built before the model (M2): the model needs the tokenizer's real vocab size to clamp
     // the fused greedy argmax away from GGUF LM-head padding rows, and the tokenizer itself
     // only depends on GGUF metadata, not on the model.
@@ -262,7 +311,21 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     models::Qwen35Options mo;
     mo.gdn_chunk = gdn_chunk_;
     mo.valid_vocab = tok_->vocab_size();
-    model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
+    if (cpu_path) {
+        model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
+    } else {
+        if (opts_.backend_factory) {
+            backend_ = opts_.backend_factory();
+        } else {
+#if defined(HALO_RUNTIME_VULKAN) || defined(HALO_RUNTIME_HIP)
+            backend_ = make_gpu_backend(cfg.backend);
+#else
+            throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", cfg.backend);
+#endif
+        }
+        HALO_INFO("runtime", "backend '{}' selected; KV/GDN state stays host-resident until WS-BI-2", cfg.backend);
+        model_ = std::make_unique<models::Qwen35>(*nm_, *backend_, mo);
+    }
     const auto piece = [&](std::optional<std::int32_t> id) { return id ? tok_->token_to_piece(*id) : std::string(); };
     tmpl_ = std::make_unique<chat::ChatTemplate>(std::string(*meta.chat_template), piece(tok_->bos()), piece(tok_->eos()));
     eos_ = opts.eos_token ? opts.eos_token : tok_->eos();
@@ -362,7 +425,7 @@ EngineStats CpuEngine::stats() const {
     EngineStats s = stats_;
     s.queued_requests = pending_.size();
     // What is actually in effect (not what was requested): the live pool and model.
-    s.threads = static_cast<std::uint32_t>(pool_->size());
+    s.threads = static_cast<std::uint32_t>(pool_ != nullptr ? pool_->size() : 0);
     s.gdn_chunk = static_cast<std::uint32_t>(model_->gdn_chunk());
     s.tuning = tuning_;
     return s;
@@ -372,6 +435,14 @@ EngineStats CpuEngine::stats() const {
 void CpuEngine::apply_profile() {
     threads_ = cfg_.threads > 0 ? static_cast<std::size_t>(cfg_.threads) : cpu::ThreadPool::default_threads();
     gdn_chunk_ = 64;
+    if (cfg_.backend != "cpu" && cfg_.backend != "auto") {
+        // GPU backends: kernel-variant selection is WS-BI-4's KernelPlan; the profile DB's
+        // cpu tunables (threads, GDN chunk) do not apply.
+        tuning_ = "n/a (gpu backend)";
+        if (cfg_.profile_db)
+            HALO_WARN("runtime", "profile_db is ignored on the '{}' backend (cpu tunables only)", cfg_.backend);
+        return;
+    }
     if (!cfg_.profile_db) {
         tuning_ = "off";
         return;

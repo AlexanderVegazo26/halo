@@ -22,10 +22,12 @@
 ///  - Operand limits (Limits) raise Error(Unsupported) before any HIP code runs: GDN d_k <= 128,
 ///    chunk <= 64, head_dim <= 256, conv kernel <= 8, top-k <= 1024, rope dims <= 128.
 ///  - Data errors (GET_ROWS id out of range, KV/attention block id outside the pool, positive
-///    g in chunked GDN, NaN in LM head / ARGMAX / TOP_K) raise Error(Kernel) naming the op:
+///    g in chunked GDN, NaN in standalone ARGMAX / TOP_K) raise Error(Kernel) naming the op:
 ///    in emulation right after the op (the CPU backend's timing), on a device at the next
-///    Stream::wait() (ADR §5.5). Status words (StatusRef) must be empty, as on the CPU
-///    backend (WS-BI-1 contract); per-sequence status arrives with WS-BI-2's interface change.
+///    Stream::wait() (ADR §5.5). A NaN logit in the fused LM head instead poisons only its
+///    own row ({-1, NaN} in the result words, H1) -- the caller decodes it per sequence.
+///    Status words (StatusRef) must be empty, as on the CPU backend (WS-BI-1 contract);
+///    per-sequence status arrives with WS-BI-2's interface change.
 ///  - Device mode: import_host_readonly COPIES the bytes into a read-only VRAM buffer (D-017:
 ///    weights are copied at load until owner question Q3 is answered); import_host raises
 ///    Error(Unsupported), because a copy would break the caller's expectation that writes are

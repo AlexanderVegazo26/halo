@@ -233,6 +233,71 @@ TEST(HipHeadDevice, LmHeadArgmaxVsCpuMatmulArgmax) {
     }
 }
 
+// M2: rows at/after valid_rows (GGUF LM-head padding) never win the fused argmax, but their
+// raw values still land in the logits; mirrors the CPU backend test of the same name.
+void check_valid_rows(const std::string& variant, Runner& r) {
+    SCOPED_TRACE(r.name() + " " + variant);
+    constexpr std::uint32_t kRows = 20, kCols = 4, kValid = 15;
+    std::mt19937 rng(911);
+    std::vector<float> w = uniform(rng, kRows * kCols, -1.0f, 1.0f);
+    std::vector<float> x(kCols, 0.0f);
+    x[0] = 1.0f;             // one-hot: every weight row's dot product is its w[row][0]
+    w[10 * kCols] = 1.0f;    // best real row (< kValid)
+    w[17 * kCols] = 100.0f;  // padded row (>= kValid): an unclamped argmax would pick it
+    std::vector<float> logits(kRows, 999.0f);
+    OpsOptions o;
+    o.gemv = variant;
+    const Ops ops(o);
+    std::vector<float> ws(ops.lm_head_workspace_bytes(kRows, 1) / 4, 0.0f);
+    std::vector<std::uint32_t> res = words_zero(3);
+    const Buffer bw = r.make(w), bx = r.make(x), by = r.make(logits), bws = r.make(ws), bres = r.make_words(res);
+    LmHeadArgs a;
+    a.gemv.wtype = DType::F32;
+    a.gemv.w = BufferView(bw, 0, kRows * kCols * sizeof(float));
+    a.gemv.x = bx;
+    a.gemv.y = by;
+    a.gemv.rows = kRows;
+    a.gemv.cols = kCols;
+    a.gemv.n_vec = 1;
+    a.workspace = bws;
+    a.result = bres;
+    a.valid_rows = kValid;
+    ops.lm_head_argmax(r.target(), a);
+    r.finish();
+    const std::vector<ArgmaxResult> got = Ops::read_argmax(r.target(), bres, 1);
+    EXPECT_EQ(got[0].index, 10u) << "the padded row (17) must never win, even though its raw logit is larger";
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(got[0].value), std::bit_cast<std::uint32_t>(1.0f));
+    r.fetch(by, logits);
+    EXPECT_EQ(logits[17], 100.0f) << "the padded row's raw logit is still reported";
+    // valid_rows == 0 is "no clamp": the larger (padded) logit wins as before.
+    a.valid_rows = 0;
+    ops.lm_head_argmax(r.target(), a);
+    r.finish();
+    const std::vector<ArgmaxResult> unclamped = Ops::read_argmax(r.target(), bres, 1);
+    EXPECT_EQ(unclamped[0].index, 17u);
+    // The clamp does not hide poison: a NaN in a padded row still fails the vector.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::memcpy(&w[18 * kCols], &nan, 4);
+    const Buffer bn = r.make(w);
+    a.valid_rows = kValid;
+    a.gemv.w = BufferView(bn, 0, kRows * kCols * sizeof(float));
+    ops.lm_head_argmax(r.target(), a);
+    r.finish();
+    expect_kernel_error([&] { static_cast<void>(Ops::read_argmax(r.target(), bres, 1)); }, "NaN logit");
+}
+
+TEST(HipHeadEmu, LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogits) {
+    for (const std::string& v : kGemvVariants) {
+        for (auto& r : emulation_runners()) check_valid_rows(v, *r);
+    }
+}
+
+TEST(HipHeadDevice, LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogits) {
+    HALO_REQUIRE_HIP_DEVICE();
+    DeviceRunner r;
+    for (const std::string& v : kGemvVariants) check_valid_rows(v, r);
+}
+
 // ---------------------------------------------------------------------------------------
 // ARGMAX and TOP_K over logits vectors
 // ---------------------------------------------------------------------------------------

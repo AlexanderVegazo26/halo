@@ -658,6 +658,7 @@ public:
         l.gemv = hg;
         l.workspace = st.scratch(ops_.lm_head_workspace_bytes(g.rows, g.n_vec, g.y.empty()));
         l.result = res.view;
+        l.valid_rows = a.valid_rows;
         ops_.lm_head(st.s(), l);
     }
 
