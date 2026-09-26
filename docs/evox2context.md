@@ -71,8 +71,14 @@ not a full engine-level "two real sequences, one goes NaN, watch the other survi
    first retires as `FinishReason::Error`.
 3. Re-run `test_models`, `test_runtime`, `test_speculative` after each step.
 
-### M2 — fused-argmax vocab clamp (MEDIUM, now fully fixed on CPU)
-Both halves are done. The sampler-side clamp (unstructured sampling excludes padded LM-head
+### M2 — fused-argmax vocab clamp (MEDIUM, now fully fixed on CPU and GPU)
+**Update (commit `8ab9c38`, verified on the EVO-X2):** the GPU follow-up described below is
+done. The Vulkan and HIP adapters now read `valid_rows` and their kernels honour it (Vulkan
+argmax-partial push constant, HIP GEMV argmax epilogue): padded rows never win, their raw
+logits are still reported, and a NaN in a padded row still poisons its vector. New regressions
+in `test_vk_head.cpp` / `test_hip_head.cpp` (both pass on RADV / the 8060S device).
+
+Both halves were done on CPU first. The sampler-side clamp (unstructured sampling excludes padded LM-head
 rows) landed earlier. `LmHeadArgs` (`include/halo/backend/backend.h`) now has a `valid_rows`
 field (0 = no clamp, the pre-M2 default); the CPU backend's `lm_head()` excludes rows at/after
 it from the argmax while still reporting every row's raw value in the full logits output;
@@ -128,9 +134,14 @@ standing rule.
 **Reconciliation (still open)**: on a host-only machine, the planner reports prefix
 checkpoints as disabled (`src/memory/planner.cpp:352-361`) while the engine silently budgets
 them on the host anyway (`src/runtime/engine.cpp:302-316`), so `halo inspect`'s memory report
-understates the real footprint. On the EVO-X2 a GPU tier will actually be discovered, which
-may make this whole code path moot (checkpoints would then genuinely live in the GPU pool,
-matching D-013) — re-check whether this finding still applies before fixing it.
+understates the real footprint. **This is now reproducible as a test failure on the EVO-X2:**
+with a real GPU tier the engine uses the planner's derived budget — `max_context / 8192 + 1`
+per slot, i.e. exactly 1 checkpoint for the tiny model's 512-token context — instead of the
+host fallback's `requested + 2` per sequence, so the retirement checkpoint evicts the hint
+checkpoint and `EngineTest.CheckpointHintsAreTakenAndReused` fails (`cached_prompt_tokens` 0,
+expected 100). It fails identically at `844ec11` (HEAD before BI-6), so it is not a BI-6
+regression; it is this finding turning into a red test on hardware. The fix should reconcile
+the two budget paths (e.g. apply the same `+ 2` headroom when a GPU tier supplies the budget).
 
 ### M11 — real hardware validation
 Everything in `docs/evox2.md` that hasn't run yet: the smoke harness beyond 3×32-token
@@ -152,16 +163,19 @@ breaks.
   Vulkan suites against the real RADV driver.
 - **GPU autotune profiles** — `halo tune` only searches CPU tunables today; bridge the GPU
   variant search once there's a real device to search against.
-- **BI-6** — wire `CpuEngine` (or a generalized successor) to actually construct `Qwen35`
-  over a `vulkan`/`hip` `Backend&` instead of hard-rejecting anything but `cpu`/`auto`
-  (`engine.cpp:227-228`). Nothing above matters for real serving until this lands.
+- **BI-6** — DONE (commit `8ab9c38`, on the EVO-X2): `CpuEngine` constructs `Qwen35` over a
+  `vulkan`/`hip` `Backend&` (runtime links the adapters; "auto" stays cpu; `backend_factory`
+  is the test seam). The engine golden tests pass on both the Vulkan device (RADV) and HIP
+  bitwise emulation. KV/GDN state is still host memory imported per forward (WS-BI-2), so a
+  GPU engine is correct but slow; HIP **device** mode constructs but raises Unsupported at the
+  first forward until state placement lands. `valid_vocab` (M2) is wired through all three
+  backends.
 
 ## Suggested order
 
-1. BI-6 engine wiring first — nothing else is real until the engine can actually dispatch to
-   a GPU backend. While you're in there: have it also set `valid_vocab` (M2) and check
-   whether Vulkan's/HIP's adapters need `valid_rows` wired through to their own kernels for
-   parity with the CPU path (see M2 above — it's a small, already-proven-safe addition now).
+1. ~~BI-6 engine wiring~~ — done (`8ab9c38`). Next in this area: WS-BI-2 state placement on
+   backend buffers (removes the per-forward host import and unblocks HIP device mode), then
+   WS-BI-4 GPU autotune bridging.
 2. TRD §68 Phase 0 roofline measurement — everything performance-related is guesswork until
    this exists.
 3. H1's remaining `bad_alloc` producer, plus a real mid-forward fault hook so this whole area
@@ -169,8 +183,16 @@ breaks.
    H1 above for exactly what's left).
 4. Real Vulkan (RADV) and HIP (ROCm) validation passes.
 5. M11's serving-surface validation at scale.
-6. M5 (offline transformers run) and M10 (message-boundary hints / planner reconciliation) as
-   time allows — both are real but neither blocks the others.
+6. M5 (offline transformers run) and M10 (planner/engine checkpoint-budget reconciliation —
+   now a red test on hardware, see above) as time allows.
+
+**Fixture note (EVO-X2):** `~/halo-ref` now exists on this host — tokenizer files fetched with
+`python/tools/fetch_hf_files.py`, tiny model + goldens regenerated with
+`python/tools/make_tiny_model.py` (needed `llama-quantize`, built in `~/llama.cpp/build` via
+`cmake --build . --target llama-quantize`), so the ~110 fixture-gated tests actually run here.
+Still skipped: the SplitMtp engine tests (need `python/tools/split_mtp_gguf.py` output) and
+`ModelsAdapters.VocabSpecFromGgufReproducesTokenizerGolden` (needs
+`python/tools/make_tokenizer_golden.py` output).
 
 ## How to verify anything you fix
 
