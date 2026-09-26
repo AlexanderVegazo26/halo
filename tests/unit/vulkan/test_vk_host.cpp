@@ -50,7 +50,8 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
                                          "get_rows_q6_k",  "get_rows_iq4_xs", "kv_write",
                                          "attention",      "matvec_iq4_nl",  "matvec_q3_k",
                                          "matvec_iq3_s",   "get_rows_iq4_nl", "get_rows_q3_k",
-                                         "get_rows_iq3_s", "topk"};
+                                         "get_rows_iq3_s", "topk",          "gated_delta_rule_chunked",
+                                         "gdn_gcheck"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
         ASSERT_NE(s, nullptr);

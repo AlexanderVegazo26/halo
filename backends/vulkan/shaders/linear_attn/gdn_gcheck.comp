@@ -1,0 +1,30 @@
+#version 450
+// Pre-pass of the chunked GATED_DELTANET: sets status bit 1 (k_status_positive_g) when some
+// g is not <= 0 (NaN included), the check cpu::gated_delta_rule_chunked makes. The main
+// kernel reads the word first and then writes nothing, so a rejected call leaves out, state
+// and slots as they were. The host zeroed the word.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+const uint STATUS_POSITIVE_G = 1u;
+
+layout(std430, binding = 0) readonly buffer G { float g[]; };
+layout(std430, binding = 1) buffer St { uint st[]; };
+
+layout(push_constant) uniform Push {
+    uint n_tokens;
+    uint n_v;
+    uint g_off, g_stride, st_off;
+} pc;
+
+void main() {
+    const uint t = halo_group_id();
+    if (t >= pc.n_tokens) return;
+    bool bad = false;
+    for (uint j = gl_LocalInvocationID.x; j < pc.n_v; j += WG) {
+        if (!(g[pc.g_off + t * pc.g_stride + j] <= 0.0)) bad = true;
+    }
+    if (bad) atomicOr(st[pc.st_off], STATUS_POSITIVE_G);
+}

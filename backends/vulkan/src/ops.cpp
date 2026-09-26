@@ -33,6 +33,8 @@ constexpr std::uint32_t k_argmax_per_thread = 16;
 constexpr std::uint32_t k_argmax_words = 3;
 // Vectors per gemv dispatch (matvec_quant_main.glsl MAX_VEC).
 constexpr std::uint32_t k_gemv_max_vec = 8;
+// Largest chunk of the chunked GDN (the HIP backend's cap too; qwen35 prefill uses 64).
+constexpr std::uint32_t k_gdn_max_chunk = 64;
 
 }  // namespace
 
@@ -188,8 +190,8 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
     }
 }
 
-void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) {
-    constexpr std::string_view op = "gated_delta_rule_decode";
+void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs* chunked) {
+    const std::string_view op = chunked == nullptr ? "gated_delta_rule_decode" : "gated_delta_rule_chunked";
     HALO_CHECK(a.n_v > 0 && a.n_k > 0 && a.d_k > 0 && a.d_v > 0 && a.n_tokens > 0, ErrorCode::Kernel,
                "{}: empty dims n_v={} n_k={} d_k={} d_v={} T={}", op, a.n_v, a.n_k, a.d_k, a.d_v, a.n_tokens);
     HALO_CHECK(a.n_v % a.n_k == 0, ErrorCode::Kernel, "{}: n_v={} is not a multiple of n_k={}", op, a.n_v, a.n_k);
@@ -238,27 +240,87 @@ void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) {
         require_disjoint(*osl, "state_slots", {{&oin, "state"}, {&osout, "state_out"}}, op);
     }
 
+    const DeviceInfo& info = ctx_->info();
     const std::uint32_t wg = options_.gdn_workgroup;
+    const GroupCount groups = grid_1d(a.n_v, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+    if (chunked == nullptr) {
+        struct Push {
+            std::uint32_t n_v, n_k, d_k, d_v, n_tokens, n_slots, in_off, out_off, slots_off, qk_l2norm;
+            float q_scale;
+            std::uint32_t q_off, q_stride, k_off, k_stride, v_off, v_stride, g_off, g_stride, b_off, b_stride, o_off,
+                o_stride;
+        } push{a.n_v,      a.n_k,      a.d_k,          a.d_v,
+               a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, osout.off,
+               osl ? osl->off : 0u, a.qk_l2norm ? 1u : 0u, q_scale,  oq.off,
+               oq.stride,  ok.off,     ok.stride,      ov.off,
+               ov.stride,  og.off,     og.stride,      ob.off,
+               ob.stride,  oo.off,     oo.stride};
+        static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128-byte minimum");
+        const Kernel& k = kernel("gated_delta_rule_decode", 9, sizeof(Push), {{0, wg}, {1, options_.gdn_max_dk}},
+                                 {wg, 1, 1});
+        // Without slots, binding 8 aliases `out` as a placeholder; the shader never writes it.
+        const std::array bindings{oq.binding, ok.binding,    ov.binding, og.binding,
+                                  ob.binding, oin.binding,   osout.binding, oo.binding,
+                                  osl ? osl->binding : oo.binding};
+        stream.dispatch(k, bindings, push, groups);
+        return;
+    }
+
+    // Chunked form: workspace and status, then the g pre-pass and the main kernel.
+    const std::uint32_t cs = chunked->chunk_size;
+    HALO_CHECK(cs >= 1 && cs <= k_gdn_max_chunk, ErrorCode::Kernel, "{}: chunk_size {} not in [1, {}]", op, cs,
+               k_gdn_max_chunk);
+    const std::uint64_t ws_bytes = gdn_chunked_workspace_bytes(a, cs);
+    const Operand ows = operand(chunked->workspace, 1, ws_bytes, Access::Floats, align, op, "workspace");
+    const Operand ost = operand(chunked->status, 1, k_status_bytes, Access::Floats, align, op, "status");
+    const std::initializer_list<std::pair<const Operand*, std::string_view>> all{
+        {&oq, "q"},     {&ok, "k"},           {&ov, "v"},   {&og, "g"}, {&ob, "beta"}, {&oin, "state"},
+        {&osout, "state_out"}, {&oo, "out"}, {osl ? &*osl : nullptr, "state_slots"}};
+    require_disjoint(ows, "workspace", all, op);
+    require_disjoint(ost, "status", all, op);
+    require_disjoint(ost, "status", {{&ows, "workspace"}}, op);
     struct Push {
         std::uint32_t n_v, n_k, d_k, d_v, n_tokens, n_slots, in_off, out_off, slots_off, qk_l2norm;
         float q_scale;
         std::uint32_t q_off, q_stride, k_off, k_stride, v_off, v_stride, g_off, g_stride, b_off, b_stride, o_off,
-            o_stride;
+            o_stride, cs, ws_off, st_off;
     } push{a.n_v,      a.n_k,      a.d_k,          a.d_v,
            a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, osout.off,
            osl ? osl->off : 0u, a.qk_l2norm ? 1u : 0u, q_scale,  oq.off,
            oq.stride,  ok.off,     ok.stride,      ov.off,
            ov.stride,  og.off,     og.stride,      ob.off,
-           ob.stride,  oo.off,     oo.stride};
+           ob.stride,  oo.off,     oo.stride,      cs,
+           ows.off,    ost.off};
     static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128-byte minimum");
-    const Kernel& k = kernel("gated_delta_rule_decode", 9, sizeof(Push), {{0, wg}, {1, options_.gdn_max_dk}},
+    struct CheckPush {
+        std::uint32_t n_tokens, n_v, g_off, g_stride, st_off;
+    } check{a.n_tokens, a.n_v, og.off, og.stride, ost.off};
+    constexpr std::uint32_t check_wg = 64;
+    const Kernel& kc = kernel("gdn_gcheck", 2, sizeof(CheckPush), {{0, check_wg}}, {check_wg, 1, 1});
+    const Kernel& k = kernel("gated_delta_rule_chunked", 11, sizeof(Push), {{0, wg}, {1, options_.gdn_max_dk}},
                              {wg, 1, 1});
-    // Without slots, binding 8 aliases `out` as a placeholder; the shader never writes it.
-    const std::array bindings{oq.binding, ok.binding,    ov.binding, og.binding,
-                              ob.binding, oin.binding,   osout.binding, oo.binding,
-                              osl ? osl->binding : oo.binding};
-    const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(a.n_v, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    const GroupCount check_groups = grid_1d(a.n_tokens, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+    const std::array check_bindings{og.binding, ost.binding};
+    const std::array bindings{oq.binding,  ok.binding,  ov.binding, og.binding,
+                              ob.binding,  oin.binding, osout.binding, oo.binding,
+                              osl ? osl->binding : oo.binding, ows.binding, ost.binding};
+    stream.fill(*chunked->status.buffer, chunked->status.offset, k_status_bytes, 0u);
+    stream.dispatch(kc, check_bindings, check, check_groups);
+    stream.dispatch(k, bindings, push, groups);
+}
+
+void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) { gdn_impl(stream, a, nullptr); }
+
+void Ops::gated_delta_rule_chunked(Stream& stream, const GdnChunkedArgs& a) { gdn_impl(stream, a.gdn, &a); }
+
+std::uint64_t gdn_chunked_workspace_bytes(const GdnDecodeArgs& g, std::uint32_t chunk_size) {
+    constexpr std::string_view op = "gated_delta_rule_chunked";
+    const std::uint64_t cs = chunk_size;
+    // gated_delta_rule_chunked.comp head_floats(): q, k, kb, kcd [cs x d_k]; vb, nv, v_new
+    // [cs x d_v]; ut, attn [cs x cs]; gc [cs].
+    const std::uint64_t per_head = checked_add(
+        checked_add(checked_mul(4 * cs, g.d_k, op), checked_mul(3 * cs, g.d_v, op), op), 2 * cs * cs + cs, op);
+    return checked_mul(checked_mul(per_head, g.n_v, op), k_f32, op);
 }
 
 std::uint32_t Ops::argmax_partials(std::uint32_t n) const {

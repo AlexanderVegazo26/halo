@@ -1,0 +1,260 @@
+#version 450
+// GATED_DELTANET, chunked form (cpu::gated_delta_rule_chunked; transformers
+// torch_chunk_gated_delta_rule). One workgroup per value head j (key head j % n_k, tiled);
+// the chunks of `cs` tokens run in order. Per chunk (names as in the CPU op; per-head scratch
+// lives in the workspace buffer):
+//   1. q, k per D-016 (in-kernel L2 when qk_l2norm, then q *= q_scale); kb = k*beta,
+//      vb = v*beta, gc = cumulative g inside the chunk (sequential, as the CPU).
+//   2. ut[a][b] = (kb_a . k_b) exp(gc_a - gc_b) for b < a; attn[a][b] = (q_a . k_b)
+//      exp(gc_a - gc_b) for b <= a (the CPU's 8-lane dot order).
+//   3. Forward substitution of (I + ut): new_values nv (from vb) and k_cumdecay kcd (from
+//      kb * exp(gc)), row by row with b ascending; each thread owns columns c / indices i.
+//   4. v_new_a = nv_a - kcd_a @ S.
+//   5. out_a = (q_a exp(gc_a)) @ S + sum_{b<=a} attn[a][b] v_new_b.
+//   6. Rollback slots and the chunk-end state S_a = S exp(gc_a) + sum_{b<=a}
+//      (k_b exp(gc_a - gc_b))^T v_new_b, element by element in the CPU's order.
+// Steps 4-6 touch only state column c per thread, so in place is safe: each element is read
+// before the same invocation writes it. The first chunk reads the input state region and
+// later chunks read the output region. Every arithmetic step follows the CPU op's order;
+// only exp, the L2 norm's reduction order and (if `precise` is ignored) contraction differ,
+// which the tests bound. If the pre-pass (gdn_gcheck) flagged a positive g, nothing is written.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint MAX_DK = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Q { float qin[]; };
+layout(std430, binding = 1) readonly buffer K { float kin[]; };
+layout(std430, binding = 2) readonly buffer V { float vin[]; };
+layout(std430, binding = 3) readonly buffer G { float g[]; };
+layout(std430, binding = 4) readonly buffer Beta { float beta[]; };
+layout(std430, binding = 5) readonly buffer StateIn { float state_in[]; };
+layout(std430, binding = 6) buffer StateOut { float state_out[]; };
+layout(std430, binding = 7) writeonly buffer Out { float o[]; };
+layout(std430, binding = 8) writeonly buffer Slots { float slots[]; };
+layout(std430, binding = 9) coherent buffer Ws { float ws[]; };
+layout(std430, binding = 10) readonly buffer St { uint st[]; };
+
+layout(push_constant) uniform Push {
+    uint n_v;
+    uint n_k;
+    uint d_k;
+    uint d_v;
+    uint n_tokens;
+    uint n_slots;
+    uint in_off, out_off, slots_off;
+    uint qk_l2norm;
+    float q_scale;
+    uint q_off, q_stride, k_off, k_stride, v_off, v_stride;
+    uint g_off, g_stride, b_off, b_stride, o_off, o_stride;
+    uint cs;      // chunk size
+    uint ws_off;  // element offset of head 0's scratch
+    uint st_off;
+} pc;
+
+shared float sq[MAX_DK];
+shared float sk[MAX_DK];
+shared float red_q[WG];
+shared float red_k[WG];
+
+// Per-head scratch layout (elements, relative to the head base); host: gdn_chunked_workspace_bytes.
+uint oQ() { return 0u; }
+uint oK() { return pc.cs * pc.d_k; }
+uint oKB() { return 2u * pc.cs * pc.d_k; }
+uint oKCD() { return 3u * pc.cs * pc.d_k; }
+uint oVB() { return 4u * pc.cs * pc.d_k; }
+uint oNV() { return oVB() + pc.cs * pc.d_v; }
+uint oVN() { return oNV() + pc.cs * pc.d_v; }
+uint oUT() { return oVN() + pc.cs * pc.d_v; }
+uint oAT() { return oUT() + pc.cs * pc.cs; }
+uint oGC() { return oAT() + pc.cs * pc.cs; }
+uint head_floats() { return oGC() + pc.cs; }
+
+// Workspace (buffer) and shared writes of one invocation visible to the whole workgroup.
+void sync() {
+    memoryBarrierBuffer();
+    memoryBarrierShared();
+    barrier();
+}
+
+// cpu::detail::dot over two workspace rows.
+float dot8(uint a, uint b, uint n) {
+    precise float acc[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    uint i = 0u;
+    for (; i + 8u <= n; i += 8u) {
+        for (uint l = 0u; l < 8u; ++l) {
+            precise float p = ws[a + i + l] * ws[b + i + l];
+            acc[l] = acc[l] + p;
+        }
+    }
+    precise float tail = 0.0;
+    for (; i < n; ++i) {
+        precise float p = ws[a + i] * ws[b + i];
+        tail = tail + p;
+    }
+    precise float s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    precise float r = s + tail;
+    return r;
+}
+
+float state_at(bool first, uint e) { return first ? state_in[pc.in_off + e] : state_out[pc.out_off + e]; }
+
+void main() {
+    const uint j = halo_group_id();
+    if (j >= pc.n_v) return;
+    if (st[pc.st_off] != 0u) return;  // a positive g somewhere: write nothing (uniform)
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kh = j % pc.n_k;
+    const uint dk = pc.d_k;
+    const uint dv = pc.d_v;
+    const uint cs = pc.cs;
+    const uint head = j * dk * dv;
+    const uint state_elems = pc.n_v * dk * dv;
+    const uint W = pc.ws_off + j * head_floats();
+    const bool l2 = pc.qk_l2norm != 0u;
+    uint p2 = 1u;
+    while (p2 < WG) p2 <<= 1;
+
+    for (uint t0 = 0u; t0 < pc.n_tokens; t0 += cs) {
+        const uint len = min(cs, pc.n_tokens - t0);
+        const bool first = t0 == 0u;
+        // 1. per-row inputs
+        precise float cum = 0.0;
+        for (uint a = 0u; a < len; ++a) {
+            sync();
+            const uint t = t0 + a;
+            const uint q_row = pc.q_off + t * pc.q_stride + kh * dk;
+            const uint k_row = pc.k_off + t * pc.k_stride + kh * dk;
+            float pq = 0.0;
+            float pk = 0.0;
+            for (uint i = tid; i < dk; i += WG) {
+                const float qa = qin[q_row + i];
+                const float ka = kin[k_row + i];
+                sq[i] = qa;
+                sk[i] = ka;
+                pq += qa * qa;
+                pk += ka * ka;
+            }
+            red_q[tid] = pq;
+            red_k[tid] = pk;
+            sync();
+            for (uint s = p2 / 2u; s > 0u; s >>= 1) {
+                if (tid < s && tid + s < WG) {
+                    red_q[tid] += red_q[tid + s];
+                    red_k[tid] += red_k[tid + s];
+                }
+                sync();
+            }
+            const float inv_q = l2 ? 1.0 / sqrt(red_q[0] + 1e-6) : 1.0;
+            const float inv_k = l2 ? 1.0 / sqrt(red_k[0] + 1e-6) : 1.0;
+            const float bt = beta[pc.b_off + t * pc.b_stride + j];
+            for (uint i = tid; i < dk; i += WG) {
+                precise float qn = (l2 ? sq[i] * inv_q : sq[i]) * pc.q_scale;
+                precise float kn = l2 ? sk[i] * inv_k : sk[i];
+                precise float kb = kn * bt;
+                ws[W + oQ() + a * dk + i] = qn;
+                ws[W + oK() + a * dk + i] = kn;
+                ws[W + oKB() + a * dk + i] = kb;
+            }
+            const uint vrow = pc.v_off + t * pc.v_stride + j * dv;
+            for (uint c = tid; c < dv; c += WG) {
+                precise float vb = vin[vrow + c] * bt;
+                ws[W + oVB() + a * dv + c] = vb;
+            }
+            if (tid == 0u) {
+                cum = cum + g[pc.g_off + t * pc.g_stride + j];
+                ws[W + oGC() + a] = cum;
+            }
+        }
+        sync();
+        // 2. ut (b < a) and attn (b <= a)
+        for (uint idx = tid; idx < len * len; idx += WG) {
+            const uint a = idx / len;
+            const uint b = idx % len;
+            if (b > a) continue;
+            precise float dg = ws[W + oGC() + a] - ws[W + oGC() + b];
+            const float dec = exp(dg);
+            if (b < a) {
+                precise float u = dot8(W + oKB() + a * dk, W + oK() + b * dk, dk) * dec;
+                ws[W + oUT() + a * cs + b] = u;
+            }
+            precise float at = dot8(W + oQ() + a * dk, W + oK() + b * dk, dk) * dec;
+            ws[W + oAT() + a * cs + b] = at;
+        }
+        sync();
+        // 3. forward substitution (thread-owned columns c and indices i)
+        for (uint a = 0u; a < len; ++a) {
+            const float ea = exp(ws[W + oGC() + a]);
+            for (uint c = tid; c < dv; c += WG) {
+                precise float nv = ws[W + oVB() + a * dv + c];
+                for (uint b = 0u; b < a; ++b) {
+                    precise float p = ws[W + oUT() + a * cs + b] * ws[W + oNV() + b * dv + c];
+                    nv = nv - p;
+                }
+                ws[W + oNV() + a * dv + c] = nv;
+            }
+            for (uint i = tid; i < dk; i += WG) {
+                precise float kc = ws[W + oKB() + a * dk + i] * ea;
+                for (uint b = 0u; b < a; ++b) {
+                    precise float p = ws[W + oUT() + a * cs + b] * ws[W + oKCD() + b * dk + i];
+                    kc = kc - p;
+                }
+                ws[W + oKCD() + a * dk + i] = kc;
+            }
+        }
+        sync();
+        // 4-6, per owned state column c
+        for (uint c = tid; c < dv; c += WG) {
+            for (uint a = 0u; a < len; ++a) {  // 4. v_new
+                precise float tmp = 0.0;
+                for (uint i = 0u; i < dk; ++i) {
+                    precise float p = ws[W + oKCD() + a * dk + i] * state_at(first, head + i * dv + c);
+                    tmp = tmp + p;
+                }
+                precise float vn = ws[W + oNV() + a * dv + c] - tmp;
+                ws[W + oVN() + a * dv + c] = vn;
+            }
+            for (uint a = 0u; a < len; ++a) {  // 5. out
+                const float ea = exp(ws[W + oGC() + a]);
+                precise float acc = 0.0;
+                for (uint i = 0u; i < dk; ++i) {
+                    precise float qi = ws[W + oQ() + a * dk + i] * ea;
+                    precise float p = qi * state_at(first, head + i * dv + c);
+                    acc = acc + p;
+                }
+                precise float tmp = 0.0;
+                for (uint b = 0u; b <= a; ++b) {
+                    precise float p = ws[W + oAT() + a * cs + b] * ws[W + oVN() + b * dv + c];
+                    tmp = tmp + p;
+                }
+                precise float r = acc + tmp;
+                o[pc.o_off + (t0 + a) * pc.o_stride + j * dv + c] = r;
+            }
+            // 6. slots of this chunk's rows (before the state is overwritten), then the chunk end
+            for (uint a = 0u; a < len; ++a) {
+                const uint slot = pc.n_tokens - 1u - (t0 + a);
+                const bool last = a + 1u == len;
+                if (slot >= pc.n_slots && !last) continue;
+                const float ga = ws[W + oGC() + a];
+                const float decay = exp(ga);
+                for (uint i = 0u; i < dk; ++i) {
+                    precise float upd = 0.0;
+                    for (uint b = 0u; b <= a; ++b) {
+                        precise float dg = ga - ws[W + oGC() + b];
+                        const float w = exp(dg);
+                        precise float ki = ws[W + oK() + b * dk + i] * w;
+                        precise float p = ki * ws[W + oVN() + b * dv + c];
+                        upd = upd + p;
+                    }
+                    const uint e = head + i * dv + c;
+                    precise float sd = state_at(first, e) * decay;
+                    precise float r = sd + upd;
+                    if (slot < pc.n_slots) slots[pc.slots_off + slot * state_elems + e] = r;
+                    if (last) state_out[pc.out_off + e] = r;
+                }
+            }
+        }
+        sync();
+    }
+}

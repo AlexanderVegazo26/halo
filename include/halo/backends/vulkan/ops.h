@@ -351,6 +351,35 @@ struct AttentionArgs {
     BufferView status{};
 };
 
+// ---------------------------------------------------------------- chunked GATED_DELTANET (WS-F2 V4)
+
+/// Status bit: the chunked GDN saw a g that is not <= 0 (NaN included) and wrote nothing
+/// (= hip::kStatusPositiveG; check_status raises Error(Kernel) exactly where
+/// cpu::gated_delta_rule_chunked throws).
+inline constexpr std::uint32_t k_status_positive_g = 1u;
+
+/// GATED_DELTANET, chunked form (cpu::gated_delta_rule_chunked; transformers
+/// torch_chunk_gated_delta_rule), for prefill: the same function and operands as
+/// gated_delta_rule_decode (GdnDecodeArgs: D-016 q/k contract, tiled heads, state layout,
+/// state_out / in place, rollback slots evaluated with the chunk's closed form exactly as the
+/// CPU op), evaluated chunk_size tokens at a time. Every arithmetic step follows the CPU
+/// op's order; exp, the L2-norm reduction order and contraction differ, so the result is
+/// bounded against the CPU op, not bitwise (test_vk_chunked.cpp).
+///  - chunk_size: 1..64 (qwen35 prefill uses 64).
+///  - workspace: >= gdn_chunked_workspace_bytes(gdn, chunk_size) (per-head scratch).
+///  - status: zeroed by the op; a g that is not <= 0 sets k_status_positive_g and then out,
+///    state and slots are left untouched (the op writes nothing).
+/// Parallel over value heads only (one workgroup per head, chunks in order): correct, but
+/// not a tuned GPU prefill.
+struct GdnChunkedArgs {
+    GdnDecodeArgs gdn{};
+    std::uint32_t chunk_size = 64;
+    BufferView workspace{};
+    BufferView status{};
+};
+
+[[nodiscard]] std::uint64_t gdn_chunked_workspace_bytes(const GdnDecodeArgs& gdn, std::uint32_t chunk_size);
+
 // ---------------------------------------------------------------- GEMV, LM head, TOP_K (WS-F2 V3)
 
 /// Status bit: TOP_K saw a NaN logit (= hip::kStatusNaN; check_status raises Error(Kernel),
@@ -468,6 +497,9 @@ public:
     /// [ATTENTION] see AttentionArgs; then check_status(read_status(...)).
     void attention(Stream& stream, const AttentionArgs& args);
 
+    /// [GATED_DELTANET] chunked form; see GdnChunkedArgs; then check_status(read_status(...)).
+    void gated_delta_rule_chunked(Stream& stream, const GdnChunkedArgs& args);
+
     /// [QUANT_GEMV / MATMUL] batched; see GemvArgs. matvec() is gemv with n_vec = 1.
     void gemv(Stream& stream, const GemvArgs& args);
     /// [LOGITS_MATMUL + ARGMAX] see LmHeadArgs.
@@ -480,6 +512,7 @@ public:
 private:
     void eltwise(Stream& stream, const EltwiseArgs& args, std::uint32_t op_code, std::string_view name);
     void gemv_impl(Stream& stream, const GemvArgs& args, std::string_view op);
+    void gdn_impl(Stream& stream, const GdnDecodeArgs& args, const GdnChunkedArgs* chunked);
     const Kernel& kernel(const std::string& shader, std::uint32_t num_buffers,
                          std::uint32_t push_bytes, std::vector<SpecConstant> spec,
                          std::array<std::uint32_t, 3> local);

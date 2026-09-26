@@ -1,6 +1,6 @@
 # HALO Vulkan backend (WS-F / WS-F2)
 
-Status: a **correctness-first building-block set**, verified on lavapipe only (D-001). It covers RMS_NORM (incl. per-head q/k norm), the GEMV (decode and batched T > 1) for every UD weight type, the GATED_DELTANET recurrent decode (MTP-verify rows, rollback slots), ARGMAX and (V1, 2026-09-25) CONV1D+SiLU, GATED_NORM, PARTIAL_ROPE with head_stride, SWIGLU, MUL_SIGMOID, ADD, ADD+RMS_NORM, the fused GDN gates and (V2, 2026-09-26) GET_ROWS, KV write and paged GQA ATTENTION, and (V3) the batched GEMV, IQ4_NL / Q3_K / IQ3_S, the LM head (logits + argmax) and TOP_K. It is **not yet a qwen35 forward**; "What the full forward still needs" below lists the missing operators.
+Status: a **correctness-first building-block set**, verified on lavapipe only (D-001). It covers RMS_NORM (incl. per-head q/k norm), the GEMV (decode and batched T > 1) for every UD weight type, the GATED_DELTANET recurrent decode (MTP-verify rows, rollback slots), ARGMAX and (V1, 2026-09-25) CONV1D+SiLU, GATED_NORM, PARTIAL_ROPE with head_stride, SWIGLU, MUL_SIGMOID, ADD, ADD+RMS_NORM, the fused GDN gates and (V2, 2026-09-26) GET_ROWS, KV write and paged GQA ATTENTION, and (V3) the batched GEMV, IQ4_NL / Q3_K / IQ3_S, the LM head (logits + argmax) and TOP_K, and (V4) the chunked GATED_DELTANET: the MVP op set of ADR-001 BI-5. It is **not yet a qwen35 forward**; "What the full forward still needs" below lists the missing operators.
 
 Code: `backends/vulkan/`, `include/halo/backends/vulkan/`, tests in `tests/unit/vulkan/`.
 
@@ -68,6 +68,17 @@ offsets and bitonic direction. Two mutations were not run:
 - **Dropping the 8-vector cap.** The kernel would index past its per-thread array, which is
   undefined behaviour on the device.
 
+For the V4 chunked GATED_DELTANET, every targeted mutation went red. These cover:
+- the head mapping, the cumulative gc, the forward substitution, the `exp(gc)` in k_cumdecay,
+  the intra-chunk output term and its diagonal, and the state decay;
+- the slot index, later chunks reading the input state, q_scale and k's L2 norm;
+- the g pre-pass and the main kernel honouring it, an undersized per-head workspace, and the
+  chunk-size limit.
+
+Measured detection floor: a per-chunk bias of 1e-4 or 1e-3 in the state decay is caught by
+the shape and slot tests. The fast-decay T = 4096 prefill does not catch it, because the decay
+forgets the bias. The bound is loose: observed differences are at most 4.6e-3 of it.
+
 **Caveat — the bounds are loose.** Observed |vk − cpu| is typically 1e-4 to 4e-2 of the
 bound. The long-trajectory GDN test therefore adds a second, random-walk check at 2× CPU
 Model G (see S-5 below). A small systematic drift passes the worst-case bound and fails
@@ -80,6 +91,7 @@ that check. The random-walk check is a model, not a proof.
 | RMS_NORM | `Ops::rms_norm` | `norm/rms_norm` | `(x · rsqrt(mean x² + eps)) · w`, plain x̂·w (**D-004**). Same operation order as `cpu::rms_norm`. No in-place | `VkOps.RmsNormMatchesCpu`, `VkViews.RmsNormStridedViewsMatchCpuAndDense` |
 | MATMUL / QUANT_GEMV (decode and batched, V3) | `Ops::matvec`, `Ops::gemv` (`GemvArgs`, n_vec rows) | `matmul/matvec_{f32,q8_0,q4_k,q5_k,q6_k,iq4_xs,iq4_nl,q3_k,iq3_s}` (body `common/matvec_quant_main.glsl`, dequantization `common/dequant_<type>.glsl`) | ggml block layouts, dequantization as `tensor::dequantize_row`, every type of the UD-Q4_K_XL pack (**D-007**, **D-014**). One workgroup per W row dequantizes each element once and applies it to up to 8 x vectors per dispatch (n_vec > 8 is split); a vector's result is bitwise the same as its own n_vec = 1 matvec | `VkMatvec.*` (9 types × shapes / workgroups / realistic scales), `VkHead.GemvBatched*` (9 types × n_vec 1, 3, 8, 11, 17, strided x / y), 2-D grid past 65 535 rows, `VkViews.Arena*` |
 | GATED_DELTANET (recurrent; T = 1 decode, T > 1 MTP verify) | `Ops::gated_delta_rule_decode` | `linear_attn/gated_delta_rule_decode` | **D-004** item 6. Tiled head mapping `j % n_k`. q/k contract **D-016**: raw q/k, in-kernel per-head L2 (eps 1e-6) when `qk_l2norm`, then `q *= q_scale`. Rollback slots **D-012**. In place or disjoint state_out | `VkDiffGdn.*`, `VkGdn.*` |
+| GATED_DELTANET chunked (prefill, V4) | `Ops::gated_delta_rule_chunked` (`GdnChunkedArgs`, `gdn_chunked_workspace_bytes`) | `linear_attn/gated_delta_rule_chunked`, `linear_attn/gdn_gcheck` | `cpu::gated_delta_rule_chunked` (HF torch_chunk_gated_delta_rule): same operands and D-016 / D-012 contract as the decode op, chunk_size 1..64, the CPU op's operation order step by step (UT forward substitution, intra-chunk attention, one state update per chunk; slots by the chunk's closed form). One workgroup per value head, chunks in order, per-head scratch in `workspace`. A g that is not <= 0 (NaN included) sets `k_status_positive_g` in a pre-pass and the op writes nothing. Bounded vs CPU (2 x Model G random-walk model), observed 9e-6 to 4.6e-3 of it | `VkChunkedGdn.*` |
 | ARGMAX (building block of ARGMAX_FUSED) | `Ops::argmax` + `read_argmax` | `reduce/argmax_{partial,final}` | Lowest index on ties, -inf ordinary. **NaN → Error(Kernel)** through a NaN word in the 12-byte result (**D-016**, review S-3) | `VkArgmax.*`, `VkViews.ArgmaxOnSubViews*` |
 | LM head (V3) | `Ops::lm_head` (`LmHeadArgs`) | gemv + `reduce/argmax_*` | `cpu::matmul` then `cpu::argmax` per vector (= `cpu::matmul_argmax`), composed on the device (no host round trip; not a fused kernel). Logits optional (`gemv.y`, else workspace). NaN → the vector's NaN word | `VkHead.LmHead*` |
 | TOP_K (V3) | `Ops::top_k` (`TopKArgs`, `topk_workspace_bytes`) | `sample/topk` | `cpu::top_k` per vector: value descending, ties by lower index. Chunked bitonic selection (2048-entry chunks in 16 KiB shared memory, best k kept, repeated until one chunk per vector) → **bit-identical** ids and values. k ≤ 1024. NaN sets `k_status_nan` | `VkHead.TopK*` |
@@ -111,7 +123,7 @@ Common to all ops:
 
 ### GATED_DELTANET specifics
 - **State layout** is `[n_v, d_k, d_v]` fp32, d_v fastest (HF layout, the same as the CPU op; ggml stores the transpose).
-- **No chunked form.** A T-row call runs the recurrence serially per head, so prefill of 4096 tokens is one dispatch of 4096 sequential rows. It is correct (tested at T = 4096 + 64), but a GPU prefill needs a chunked kernel (see below).
+- **Chunked form (V4).** `Ops::gated_delta_rule_chunked` evaluates prefill 64 tokens at a time (T = 4096 tested against `cpu::gated_delta_rule_chunked`, both decay bands). It parallelises over value heads only, like the CPU op, so it is correct but not a tuned GPU prefill. The decode op still accepts T > 1 (MTP verify) and runs it serially.
 - **Limits:** `d_k ≤ gdn_max_dk` (default 256; shared memory). `gdn_workgroup` can be any size (32, 96 and 100 tested).
 - **S-5 evidence (lavapipe):**
   - **Long trajectory.** Heads (1 key / 2 value) at d_k = d_v = 128. One 4096-row dispatch, then 64 single-row dispatches in place, compared with CPU chunked prefill plus 64 recurrent steps.
@@ -140,7 +152,7 @@ Per D-004, the layer ops, the existing Vulkan pieces and what is missing:
 | **beta = sigmoid(b), g = ssm_a · softplus(a + dt_bias)** | GDN gates | **Done (V1)**, fused | `cpu::sigmoid`, `cpu::softplus` (qwen35.cpp sequence) |
 | Residual adds, ADD + RMS_NORM | every layer | **Done (V1)** (h ≡ a in place) | `cpu::add`, `cpu::rms_norm` |
 | **Batched / prefill matmul** (T > 1 rows) | prefill, MTP verify | **Done (V3)**: `Ops::gemv` reads W once per 8 rows (correctness-first; not a tiled GEMM) | `cpu::matmul` |
-| **Chunked GATED_DELTANET** | prefill | **Missing.** The recurrent kernel is correct but serial in T | `cpu::gated_delta_rule_chunked` |
+| **Chunked GATED_DELTANET** | prefill | **Done (V4)**: `Ops::gated_delta_rule_chunked` | `cpu::gated_delta_rule_chunked` |
 | **IQ4_NL, Q3_K, IQ3_S matvec** | remaining UD types (D-014 priority list) | **Done (V3)**, GEMV and GET_ROWS | `tensor::dequantize_row` |
 | **LM head: matvec + argmax, TOP_K** | head | **Done (V3)**: `Ops::lm_head` (gemv + argmax on the device), `Ops::top_k` | `cpu::matmul_argmax`, `cpu::top_k` |
 | Token embedding lookup (`token_embd`, quantized rows) | input | **Done (V2)**: `Ops::get_rows` | `tensor::dequantize_row` |

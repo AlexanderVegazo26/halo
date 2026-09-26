@@ -562,3 +562,309 @@ TEST(VkDiffGdn, NonFiniteQScaleIsRejectedLikeCpu) {
         EXPECT_THROW((void)run_vk(ctx, ops, d, true, bad), halo::Error);
     }
 }
+
+// ---------------------------------------------------------------- chunked GATED_DELTANET (V4)
+//
+// Vulkan chunked vs cpu::gated_delta_rule_chunked on the same host arrays with the same
+// chunk_size. The kernel follows the CPU op's operation order step by step; exp, the L2 norm's
+// reduction order and possible contraction differ. Bound: random-walk model, each side within
+// Model G of exact (the CPU side is established by the CPU tests), so
+//   |vk - cpu| <= 2 x Model G (tolerance.h) per head, for out, state and slots (state scale).
+// This is a model, not a proof (the file header's worst-case linear bound is derived for the
+// recurrent kernel's per-token structure); observed ratios are printed.
+
+namespace {
+
+struct ChunkRun {
+    GdnOut r;
+    std::vector<float> slots;
+    std::vector<float> state_in_after;  // the input region after the call (out-of-place runs)
+    std::uint32_t status = 0;
+};
+
+struct ChunkOpts {
+    std::uint32_t chunk = 64;
+    std::uint32_t n_slots = 0;
+    bool out_of_place = false;
+    bool l2 = true;
+    std::optional<float> q_scale{};
+    hv::OpsOptions ops{};
+};
+
+ChunkRun run_vk_chunked(const std::shared_ptr<hv::Context>& ctx, const GdnData& d, const ChunkOpts& o) {
+    hv::Ops ops(ctx, o.ops);
+    const GdnCase& c = d.c;
+    const std::size_t S = c.state_n();
+    hv::Buffer q = upload(ctx, std::span<const float>(d.q));
+    hv::Buffer k = upload(ctx, std::span<const float>(d.k));
+    hv::Buffer v = upload(ctx, std::span<const float>(d.v));
+    hv::Buffer g = upload(ctx, std::span<const float>(d.g));
+    hv::Buffer beta = upload(ctx, std::span<const float>(d.beta));
+    // State at an odd element offset of an arena; state_out (if any) right after it.
+    const std::size_t s_off = 3;
+    std::vector<float> arena(s_off + 2 * S + 5, -3.0f);
+    std::copy(d.s0.begin(), d.s0.end(), arena.begin() + static_cast<std::ptrdiff_t>(s_off));
+    hv::Buffer barena = upload(ctx, std::span<const float>(arena), hv::MemoryUsage::HostCached);
+    const std::vector<float> out_init(d.T * c.v_cols(), 777.0f);
+    hv::Buffer out = upload(ctx, std::span<const float>(out_init), hv::MemoryUsage::HostCached);
+    const std::vector<float> sl_init(std::max<std::size_t>(1, std::size_t{o.n_slots} * S), 555.0f);
+    hv::Buffer slots = upload(ctx, std::span<const float>(sl_init), hv::MemoryUsage::HostCached);
+    hv::GdnDecodeArgs a;
+    a.q = q;
+    a.k = k;
+    a.v = v;
+    a.g = g;
+    a.beta = beta;
+    a.state = hv::BufferView(barena, s_off * 4, S * 4);
+    if (o.out_of_place) a.state_out = hv::BufferView(barena, (s_off + S) * 4, S * 4);
+    if (o.n_slots > 0) a.state_slots = slots;
+    a.out = out;
+    a.n_v = c.n_v;
+    a.n_k = c.n_k;
+    a.d_k = c.d_k;
+    a.d_v = c.d_v;
+    a.n_tokens = static_cast<std::uint32_t>(d.T);
+    a.n_slots = o.n_slots;
+    a.qk_l2norm = o.l2;
+    a.q_scale = o.q_scale;
+    const std::uint64_t ws_bytes = hv::gdn_chunked_workspace_bytes(a, o.chunk);
+    hv::Buffer ws = hv::Buffer::create(ctx, ws_bytes + 12, hv::MemoryUsage::DeviceLocal);
+    const std::vector<std::uint32_t> st{0xDEADBEEFu, 0xDEADBEEFu};
+    hv::Buffer bst = upload(ctx, std::span<const std::uint32_t>(st), hv::MemoryUsage::HostCached);
+    hv::GdnChunkedArgs ca;
+    ca.gdn = a;
+    ca.chunk_size = o.chunk;
+    ca.workspace = hv::BufferView(ws, 12, ws_bytes);  // an offset off the device alignment
+    ca.status = hv::BufferView(bst, 4, 4);
+    hv::Stream s(ctx);
+    ops.gated_delta_rule_chunked(s, ca);
+    s.submit_and_wait();
+    const auto arena_after = download<float>(barena, arena.size());
+    ChunkRun r;
+    r.r.out = download<float>(out, out_init.size());
+    const std::size_t so = o.out_of_place ? s_off + S : s_off;
+    r.r.state.assign(arena_after.begin() + static_cast<std::ptrdiff_t>(so),
+                     arena_after.begin() + static_cast<std::ptrdiff_t>(so + S));
+    r.state_in_after.assign(arena_after.begin() + static_cast<std::ptrdiff_t>(s_off),
+                            arena_after.begin() + static_cast<std::ptrdiff_t>(s_off + S));
+    r.slots = download<float>(slots, sl_init.size());
+    r.status = hv::read_status(bst, 4);
+    for (std::size_t i = 0; i < arena.size(); ++i) {
+        const bool in_state = i >= s_off && i < s_off + S;
+        const bool in_out = o.out_of_place && i >= s_off + S && i < s_off + 2 * S;
+        if (!in_state && !in_out) EXPECT_EQ(arena_after[i], -3.0f) << "arena guard " << i;
+    }
+    return r;
+}
+
+struct CpuChunk {
+    GdnOut r;
+    std::vector<float> slots;
+};
+
+CpuChunk run_cpu_chunked(const GdnData& d, const ChunkOpts& o) {
+    const GdnCase& c = d.c;
+    CpuChunk r{GdnOut{std::vector<float>(d.T * c.v_cols()), d.s0},
+               std::vector<float>(std::max<std::size_t>(1, std::size_t{o.n_slots} * c.state_n()), 555.0f)};
+    const std::size_t qc = c.qk_cols(), vc = c.v_cols(), nv = c.n_v;
+    const hc::GdnInputs in{hc::ConstRows(d.q.data(), d.T, qc, qc), hc::ConstRows(d.k.data(), d.T, qc, qc),
+                           hc::ConstRows(d.v.data(), d.T, vc, vc), hc::ConstRows(d.g.data(), d.T, nv, nv),
+                           hc::ConstRows(d.beta.data(), d.T, nv, nv)};
+    hc::gated_delta_rule_chunked(c.cpu(), in, r.r.state, hc::Rows(r.r.out.data(), d.T, vc, vc),
+                                 hc::GdnQkParams{.qk_l2norm = o.l2, .q_scale = o.q_scale}, o.chunk, nullptr,
+                                 o.n_slots > 0 ? std::span<float>(r.slots) : std::span<float>());
+    return r;
+}
+
+/// 2 x Model G per head for out, state and every written slot; returns the worst ratio.
+double check_chunked(const GdnData& d, const ChunkRun& vk, const CpuChunk& cpu, const ChunkOpts& o,
+                     const std::string& what) {
+    const GdnCase& c = d.c;
+    const GdnScales sc =
+        gdn_scales(d, o.l2, hc::gdn_q_scale(hc::GdnQkParams{.qk_l2norm = o.l2, .q_scale = o.q_scale}, c.d_k));
+    const std::size_t sh = std::size_t{c.d_k} * c.d_v, S = c.state_n();
+    const std::size_t used = std::min<std::size_t>(d.T, o.n_slots);
+    auto err = [](float a, float b) {
+        return std::isfinite(double(a)) ? std::abs(double(a) - double(b)) : std::numeric_limits<double>::infinity();
+    };
+    double worst = 0;
+    for (std::size_t j = 0; j < c.n_v; ++j) {
+        const double to = 2.0 * ct::tol_gdn(d.T, c.d_k, sc.out[j]) + ct::kDenormFloor;
+        const double ts = 2.0 * ct::tol_gdn(d.T, c.d_k, sc.state[j]) + ct::kDenormFloor;
+        double eo = 0, es = 0, esl = 0;
+        for (std::size_t t = 0; t < d.T; ++t)
+            for (std::size_t b = 0; b < c.d_v; ++b) {
+                const std::size_t i = t * c.v_cols() + j * c.d_v + b;
+                eo = std::max(eo, err(vk.r.out[i], cpu.r.out[i]));
+            }
+        for (std::size_t e = 0; e < sh; ++e) es = std::max(es, err(vk.r.state[j * sh + e], cpu.r.state[j * sh + e]));
+        for (std::size_t s = 0; s < used; ++s)
+            for (std::size_t e = 0; e < sh; ++e) {
+                const std::size_t i = s * S + j * sh + e;
+                esl = std::max(esl, err(vk.slots[i], cpu.slots[i]));
+            }
+        EXPECT_LE(eo, to) << what << " head " << j << " out";
+        EXPECT_LE(es, ts) << what << " head " << j << " state";
+        EXPECT_LE(esl, ts) << what << " head " << j << " slots";
+        worst = std::max({worst, eo / to, es / ts, esl / ts});
+    }
+    // Slots >= T are untouched (both sides start at 555).
+    for (std::size_t i = used * S; i < std::size_t{o.n_slots} * S; ++i) {
+        EXPECT_EQ(vk.slots[i], 555.0f) << what << ": slot element " << i << " (slot >= T) written";
+        if (vk.slots[i] != 555.0f) break;
+    }
+    std::cout << "[vk-chunked] " << what << ": worst |vk-cpu| / (2 x Model G) = " << worst << "\n";
+    return worst;
+}
+
+void chunked_case(const std::shared_ptr<hv::Context>& ctx, const GdnCase& c, std::size_t T, const ChunkOpts& o,
+                  std::uint64_t seed, const std::string& what, bool slow = false, QkInput in = QkInput::Raw) {
+    SCOPED_TRACE(what);
+    const GdnData d = make_gdn(c, T, in, seed, slow);
+    const ChunkRun vk = run_vk_chunked(ctx, d, o);
+    EXPECT_EQ(vk.status, 0u) << what;
+    check_chunked(d, vk, run_cpu_chunked(d, o), o, what);
+}
+
+}  // namespace
+
+TEST(VkChunkedGdn, MatchesCpuChunkedAcrossShapesAndChunkSizes) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    // qwen35 dims, chunk 64: one full chunk + a partial one, and a single token.
+    chunked_case(ctx, k_real, 70, {}, 101, "real dims T=70 cs=64");
+    chunked_case(ctx, k_real, 1, {}, 102, "real dims T=1 cs=64");
+    // Small dims (tiled heads discriminated), several chunk sizes incl. 1 and a partial tail.
+    chunked_case(ctx, k_small, 23, {.chunk = 4}, 103, "small T=23 cs=4");
+    chunked_case(ctx, k_small, 23, {.chunk = 1}, 104, "small T=23 cs=1");
+    chunked_case(ctx, k_small, 23, {.chunk = 64}, 105, "small T=23 cs=64 (one partial chunk)");
+    chunked_case(ctx, k_small, 130, {.chunk = 64}, 106, "small T=130 cs=64 slow decay", true);
+    // D-016 variants: no L2 with an explicit q_scale (prenormalized inputs), explicit scale.
+    chunked_case(ctx, k_small, 40, {.chunk = 16, .l2 = false, .q_scale = 0.5f}, 107, "small T=40 cs=16 no-l2 qs=0.5",
+                 false, QkInput::Prenormalized);
+    chunked_case(ctx, k_small, 40, {.chunk = 16, .q_scale = 0.3f}, 108, "small T=40 cs=16 l2 qs=0.3");
+}
+
+TEST(VkChunkedGdn, WorkgroupSizes) {
+    // Columns c / indices i are thread-owned with a stride of WG; the L2 tree handles a
+    // non-power-of-two WG. d_v = d_k = 128 against WG 32 (4 columns per thread) and 100.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    for (const std::uint32_t wg : {32u, 100u}) {
+        ChunkOpts o;
+        o.ops.gdn_workgroup = wg;
+        chunked_case(ctx, k_real, 66, o, 110 + wg, "real dims T=66 cs=64 wg=" + std::to_string(wg));
+    }
+}
+
+TEST(VkChunkedGdn, RollbackSlotsAcrossChunksAndOutOfPlaceState) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    // Slots for rows 65, 64 (second chunk) and 63, 62 (first chunk); state in place.
+    chunked_case(ctx, k_real, 66, {.chunk = 64, .n_slots = 4}, 121, "real dims T=66 slots=4 (across chunks)");
+    // More slots than rows: slots >= T untouched.
+    chunked_case(ctx, k_small, 5, {.chunk = 4, .n_slots = 7}, 122, "small T=5 cs=4 slots=7");
+    // Out of place over several chunks: the input region is untouched, and the result equals
+    // the in-place run bitwise.
+    const GdnData d = make_gdn(k_small, 23, QkInput::Raw, 123);
+    const ChunkOpts ip{.chunk = 4, .n_slots = 3};
+    ChunkOpts oop = ip;
+    oop.out_of_place = true;
+    const ChunkRun a = run_vk_chunked(ctx, d, ip);
+    const ChunkRun b = run_vk_chunked(ctx, d, oop);
+    EXPECT_TRUE(std::equal(b.state_in_after.begin(), b.state_in_after.end(), d.s0.begin()))
+        << "out-of-place run modified the input state region";
+    EXPECT_EQ(std::memcmp(a.r.out.data(), b.r.out.data(), a.r.out.size() * 4), 0);
+    EXPECT_EQ(std::memcmp(a.r.state.data(), b.r.state.data(), a.r.state.size() * 4), 0);
+    EXPECT_EQ(std::memcmp(a.slots.data(), b.slots.data(), a.slots.size() * 4), 0);
+    check_chunked(d, b, run_cpu_chunked(d, oop), oop, "small T=23 cs=4 slots=3 out of place");
+}
+
+TEST(VkChunkedGdn, PositiveOrNanGWritesNothingAndSetsStatusLikeCpuThrows) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    for (const float bad : {0.25f, std::numeric_limits<float>::quiet_NaN()}) {
+        GdnData d = make_gdn(k_small, 23, QkInput::Raw, 131);
+        d.g[17 * k_small.n_v + 4] = bad;  // one element, in the second-to-last chunk of 4
+        const ChunkOpts o{.chunk = 4, .n_slots = 2};
+        EXPECT_THROW((void)run_cpu_chunked(d, o), halo::Error);
+        const ChunkRun vk = run_vk_chunked(ctx, d, o);
+        EXPECT_EQ(vk.status, hv::k_status_positive_g);
+        EXPECT_THROW(hv::check_status(vk.status, "gated_delta_rule_chunked"), halo::Error);
+        EXPECT_TRUE(std::equal(vk.r.state.begin(), vk.r.state.end(), d.s0.begin())) << "state written";
+        EXPECT_TRUE(std::all_of(vk.r.out.begin(), vk.r.out.end(), [](float x) { return x == 777.0f; }))
+            << "out written";
+        EXPECT_TRUE(std::all_of(vk.slots.begin(), vk.slots.end(), [](float x) { return x == 555.0f; }))
+            << "slots written";
+    }
+}
+
+TEST(VkChunkedGdn, LongPrefillMatchesCpuChunked) {
+    // T = 4096 in one chunked dispatch (the qwen35 prefill form), reduced heads at the real
+    // head size, both decay bands, vs cpu::gated_delta_rule_chunked with the same chunks.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const GdnCase c{2, 1, 128, 128};
+    for (const bool slow : {false, true}) {
+        chunked_case(ctx, c, 4096, {}, slow ? 141 : 142,
+                     std::string("long prefill T=4096 cs=64 ") + (slow ? "slow decay" : "fast decay"), slow);
+    }
+}
+
+TEST(VkChunkedGdn, Validation) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    const GdnCase c = k_small;
+    const std::uint32_t T = 5;
+    hv::Buffer q = hv::Buffer::create(ctx, T * c.qk_cols() * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer k = hv::Buffer::create(ctx, T * c.qk_cols() * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer v = hv::Buffer::create(ctx, T * c.v_cols() * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer gb = hv::Buffer::create(ctx, 2 * T * c.n_v * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer st = hv::Buffer::create(ctx, c.state_n() * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer out = hv::Buffer::create(ctx, T * c.v_cols() * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer word = hv::Buffer::create(ctx, 4, hv::MemoryUsage::DeviceLocal);
+    auto base = [&] {
+        hv::GdnChunkedArgs a;
+        a.gdn.q = q;
+        a.gdn.k = k;
+        a.gdn.v = v;
+        a.gdn.g = hv::BufferView(gb, 0, T * c.n_v * 4);
+        a.gdn.beta = hv::BufferView(gb, T * c.n_v * 4, T * c.n_v * 4);
+        a.gdn.state = st;
+        a.gdn.out = out;
+        a.gdn.n_v = c.n_v;
+        a.gdn.n_k = c.n_k;
+        a.gdn.d_k = c.d_k;
+        a.gdn.d_v = c.d_v;
+        a.gdn.n_tokens = T;
+        a.chunk_size = 4;
+        a.status = word;
+        return a;
+    };
+    const std::uint64_t ws_bytes = hv::gdn_chunked_workspace_bytes(base().gdn, 4);
+    hv::Buffer ws = hv::Buffer::create(ctx, ws_bytes, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx);
+    auto a = base();
+    a.workspace = ws;
+    EXPECT_NO_THROW(ops.gated_delta_rule_chunked(s, a));
+    const std::uint32_t before = s.dispatch_count();
+    // A workspace large enough for chunk 65, so only the chunk-size limit can reject it.
+    hv::Buffer ws65 = hv::Buffer::create(ctx, hv::gdn_chunked_workspace_bytes(base().gdn, 65), hv::MemoryUsage::DeviceLocal);
+    for (const std::uint32_t cs : {0u, 65u}) {
+        a = base();
+        a.workspace = ws65;
+        a.chunk_size = cs;
+        EXPECT_THROW(ops.gated_delta_rule_chunked(s, a), halo::Error) << "chunk_size " << cs;
+    }
+    a = base();
+    a.workspace = hv::BufferView(ws, 0, ws_bytes - 4);
+    EXPECT_THROW(ops.gated_delta_rule_chunked(s, a), halo::Error) << "workspace too small";
+    a = base();
+    a.workspace = ws;
+    a.status = hv::BufferView(ws, 0, 4);
+    EXPECT_THROW(ops.gated_delta_rule_chunked(s, a), halo::Error) << "status inside the workspace";
+    a = base();
+    a.workspace = out;
+    EXPECT_THROW(ops.gated_delta_rule_chunked(s, a), halo::Error) << "workspace is out";
+    a = base();
+    a.workspace = ws;
+    a.status = hv::BufferView();
+    EXPECT_THROW(ops.gated_delta_rule_chunked(s, a), halo::Error) << "no status";
+    EXPECT_EQ(s.dispatch_count(), before) << "a rejected call recorded work";
+    s.submit_and_wait();
+}

@@ -32,6 +32,8 @@ set(HALO_VK_SHADERS
   matmul/matvec_q3_k
   matmul/matvec_iq3_s
   linear_attn/gated_delta_rule_decode
+  linear_attn/gated_delta_rule_chunked
+  linear_attn/gdn_gcheck
   linear_attn/conv1d_silu
   norm/gated_rms_norm
   norm/add_rms_norm
