@@ -49,3 +49,5 @@ S-13 design: Linux connection watchdog (scan /proc/self/fd sockets on our port, 
 - M5 mutations running detached in WSL: /root/halo-logs/wsi-mut7.log (i_mut_m5.json, 28). Check ALL_DONE + TREE_RESTORED_OK_AFTER.
 - M5 mutations: 28 + 3 reruns (F1c2,S16a2,S13d w/ timing) all red; TREE_RESTORED_OK. Running final release+ASan.
 - ASan found my S-13 watchdog cutting long SSE streams (httplib logger fires before chunked provider). Fix i_ed24.py (StreamPhase) + test ApiLimits.LongStreamsOutliveTheReadDeadlines. Also D-017: loopback-only, need explicit opt-in flag for any non-loopback bind.
+- i_sync.sh fixed: rsync without -t (changed files get a fresh mtime; git-archive commit times made ninja miss rebuilds -> stale test_profiling link errors).
+- StreamPhase+logger skip: LongStreams test red before fix (observed), keep-alive test catches SP1b; SP3 alone survives (redundant with StreamPhase ctor). D-017 done (allow_remote). Release 568/567/0/1 @fb9173c. Running final ASan + release.

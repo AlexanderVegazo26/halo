@@ -26,4 +26,6 @@
   delivery); GenerateResult::deadline_expired; queued test polls. E12 red, E13 green alone (two independent paths), E13b red.
   D-017 / ADR-001 read: NaN-in-head isolation needs commit-after-status (WS-BI-2 forward, WS-BI-6 engine) -> noted, not forced.
   OWNERSHIP: src/models, include/halo/models, tests/unit/models now belong to WS-BI-1 (M5 did not touch them; verified clean).
-  Release final: 556 tests, 554 pass, 0 fail, 2 skip. Final ASan running -> g_asan_m5b.out / .sum. Then REPORT + STOP.
+  Release final: 556 tests, 554 pass, 0 fail, 2 skip. Final ASan (pre-patch): EXIT=0, 0 reports; profile tests too slow (2446 s) -> moved to tiny-q4_0 via
+  scratchpad/g_m5_integration.patch (NOT applied to the shared file: WS-I edits it); ASan 97 s / 56 s. Final release 556: 554 pass, 2 skip.
+  M5 DONE and reported.

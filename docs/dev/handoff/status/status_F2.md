@@ -58,3 +58,12 @@ Proposed commit: "backends/vulkan: argmax NaN flag raises Error(Kernel) on the h
   docs/vulkan.md written. Mutations f2_mut_s5.sh/.out + floor probes f2_mut_s5b.sh/.out.
   Detection floor: vk decay bias 1e-5/token NOT caught, 1e-4 caught (ratio 1.002); cpu chunked 1e-4/chunk NOT caught, 1e-3 caught.
 - WS-F2 workstream complete after this commit (N-1 was the last listed item).
+
+# NEW WORK (2026-09-25): MVP Vulkan op set per ADR-001 (D-017). Milestones V1..V4 (coordinator's grouping).
+## V1 — IN PROGRESS (last commit 3064931 was my previous final milestone)
+- New: backends/vulkan/src/ops_internal.h (operand helpers moved out of ops.cpp + require_disjoint_or_exact),
+  src/ops_layer.cpp, shaders common/halo_math.glsl, linear_attn/conv1d_silu, norm/gated_rms_norm, norm/add_rms_norm,
+  eltwise/eltwise (ADD/SWIGLU/MUL_SIGMOID via spec const), eltwise/gdn_gates, rope/rope_neox (host cos/sin table),
+  tests/unit/vulkan/test_vk_layer.cpp (10 tests). ops.h: Conv1dArgs, GatedNormArgs, RopeArgs, EltwiseArgs,
+  AddRmsNormArgs, GdnGateArgs, rope_cos_sin_table.
+- Build 144/144 green. Mutations: f2_mut_v1.sh -> f2_mut_v1.out (running). Then ASan, docs/vulkan.md update, report.

@@ -3,7 +3,7 @@
 Resume the MVP build from this file. It is updated at every milestone commit; the
 **Last updated** line and **In flight** section say how fresh it is.
 
-**Last updated:** 2026-09-25, at commit `7d447d6` (branch `halo-v0.2`).
+**Last updated:** 2026-09-26, at commit `fea9181` (branch `halo-v0.2`). Session 324d2710: agents relaunched from `docs/dev/handoff/prompts/s3_*.txt` (map: `docs/dev/handoff/agents_s3.md`; live status in that session's scratchpad).
 
 ## 1. What HALO is and what "done" means
 - **What it is:** a C++23 inference runtime for Qwen3.8-27B on AMD Strix Halo (GMKtec EVO-X2, Radeon 8060S, gfx1151).
@@ -94,17 +94,17 @@ Report the status as "code-complete on dev host, hardware verification pending",
    - efficiency NFR measurements;
    - ADR-001 open questions Q3 and Q5.
 
-## 5. In flight at this checkpoint
-Agent ids are in `scratchpad/agents.md`.
+## 5. In flight at this checkpoint (session 324d2710)
+Committed this session: 89252eb BI-1 M1, e6ce83e WS-I M5 (WS-I finished), fea9181 F2 V1.
+The real 27B pack is downloaded and SHA-verified: WSL `/root/models/Qwen3.8-27B-UD-Q4_K_XL.gguf`.
 
 | Workstream | Doing | Owns |
 |---|---|---|
-| WS-G M6 | (M5 engine review fixes committed as 1f4d826.) D-006 separate-MTP-file path at engine level (split tiny fixture + tests); R-5(b) draft-chain golden (depth 2/3) or a documented llama.cpp cross-check | src/runtime, src/speculative, src/state, src/kv_cache and their tests, tests/unit/integration |
-| WS-I M5 | F-1 (structured output with thinking on); `halo tune` key contract via `runtime::engine_profile_key`; one SHA-256 (TD-12/13); bench F-2/F-3; security S-13 (header deadlines), S-16/A-5, S-17..S-22; then wire the API to G's cancel path | src/api, tools/halo, tests/unit/{api,cli}, docs/{api,cli}.md |
-| WS-BI-1 | Backend interface + CPU adapter; the qwen35 forward over `Backend&`, bit-identical to today | src/models, include/halo/models, tests/unit/models, the new backend module |
-| WS-F2 (V1–V4) | Vulkan op fill per ADR-001 BI-5 / docs/vulkan.md: conv, norms, RoPE with head stride, SwiGLU, gates, add/norm, get_rows, KV write, paged attention, chunked GDN, GEMM, more matvec types, LM head + top-k | backends/vulkan, include/halo/backends/vulkan, tests/unit/vulkan, docs/vulkan.md |
-| WS-S27 | Real 27B CPU smoke run: download UD-Q4_K_XL into WSL /root/models, integrity-check it, `halo inspect`/`run`, compare with llama.cpp CPU. Writes findings only | docs/dev/smoke-27b.md only |
-| WS-X | EVO-X2 field kit: portable build (HALO_MARCH), `scripts/package.sh` → dist/halo-evox2-<sha>.tar.gz, `scripts/evox2/collect.sh` (full log/evidence bundle for this agent), `build-native.sh`, docs/evox2.md | scripts/evox2, scripts/package.sh, root CMakeLists (options/install), core log (additive), docs/evox2.md, .gitignore |
+| WS-BI | BI-1 M2 (Qwen35 forward over Backend&, bitwise gate), then BI-2 | include/halo/backend, src/backend, src/models, include/halo/models, tests/unit/{backend,models} |
+| WS-F2 | Vulkan V2 (get_rows, KV write, paged attention), then V3, V4 | backends/vulkan, include/halo/backends/vulkan, tests/unit/vulkan, docs/vulkan.md |
+| WS-G M6 | D-006 separate-MTP-file at engine level; R-5(b) draft-chain cross-check with llama.cpp | src/runtime, src/speculative, src/state, src/kv_cache, tests, tests/unit/integration, python/tools/split_mtp_gguf.py |
+| WS-X | EVO-X2 field kit M1-M3 (package.sh, collect.sh, docs/evox2.md) | scripts/evox2, scripts/package.sh, root CMakeLists (options/install), cmake/HaloInstall.cmake, core log (additive), .gitignore |
+| WS-S27 | Not relaunched yet: 27B CPU smoke, run when RAM is free | docs/dev/smoke-27b.md |
 
 Finished workstreams: WS-A..F (phase 1), F2 (Vulkan review fixes), H (sampling), J (bench + autotune + security fixes), K (HIP ops), L (parser hardening).
 
