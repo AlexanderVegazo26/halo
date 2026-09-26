@@ -138,6 +138,7 @@ struct Qwen35::Impl {
     std::size_t n_k = 0, n_v = 0, d_k = 0, d_v = 0;
     std::size_t conv_k = 0, conv_c = 0, key_dim = 0, value_dim = 0;
     std::size_t gdn_chunk = 64;
+    std::size_t valid_vocab = 0;  // M2: 0 = no clamp
 
     std::vector<LayerW> layers;
     Vec output_norm;
@@ -500,6 +501,7 @@ struct Qwen35::Impl {
         be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{w.type(), TensorRef::of(*head_w.buf), xs, logits, u32(n_vocab),
                                                                  u32(E), u32(n), {}},
                                                res,
+                                               u32(valid_vocab),
                                                {},
                                                {}});
         std::vector<std::byte> words(n * backend::kArgmaxResultBytes);
@@ -556,6 +558,9 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     I.hp = &hp;
     I.E = hp.n_embd;
     I.n_vocab = static_cast<std::size_t>(hp.n_vocab);
+    HALO_CHECK(options.valid_vocab <= I.n_vocab, ErrorCode::Config, "qwen35: valid_vocab {} exceeds the head's {} rows",
+               options.valid_vocab, I.n_vocab);
+    I.valid_vocab = options.valid_vocab;
     I.eps = hp.rms_eps;
     HALO_CHECK(hp.key_length == hp.value_length, ErrorCode::Unsupported, "qwen35: key_length {} != value_length {}",
                hp.key_length, hp.value_length);

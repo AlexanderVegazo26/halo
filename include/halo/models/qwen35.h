@@ -162,6 +162,10 @@ struct Qwen35Options {
     /// Chunk length of the chunked GDN prefill (transformers uses 64). Any value >= 1 is the
     /// same function within fp32 tolerance; results are bitwise reproducible per value.
     std::size_t gdn_chunk = 64;
+    /// M2: the tokenizer's real vocabulary size, when smaller than the (possibly padded)
+    /// GGUF LM-head row count. 0 = no clamp (the head's full row count is the vocabulary).
+    /// Excludes padded rows from the fused greedy argmax; never affects full logits output.
+    std::size_t valid_vocab = 0;
 };
 
 class Qwen35 {

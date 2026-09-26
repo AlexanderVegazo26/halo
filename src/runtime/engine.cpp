@@ -252,13 +252,17 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     if (cfg.mtp_path) nm_->attach_mtp(*cfg.mtp_path);
     apply_profile();
     pool_ = std::make_unique<cpu::ThreadPool>(threads_);
-    models::Qwen35Options mo;
-    mo.gdn_chunk = gdn_chunk_;
-    model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
+    // Built before the model (M2): the model needs the tokenizer's real vocab size to clamp
+    // the fused greedy argmax away from GGUF LM-head padding rows, and the tokenizer itself
+    // only depends on GGUF metadata, not on the model.
     const model::TokenizerMetadata meta = nm_->tokenizer();
     tok_ = std::make_unique<tokenizer::Tokenizer>(tokenizer::Tokenizer::from_spec(models::vocab_spec(meta)));
     HALO_CHECK(meta.chat_template.has_value() && !meta.chat_template->empty(), ErrorCode::Model,
                "GGUF has no tokenizer.chat_template");
+    models::Qwen35Options mo;
+    mo.gdn_chunk = gdn_chunk_;
+    mo.valid_vocab = tok_->vocab_size();
+    model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
     const auto piece = [&](std::optional<std::int32_t> id) { return id ? tok_->token_to_piece(*id) : std::string(); };
     tmpl_ = std::make_unique<chat::ChatTemplate>(std::string(*meta.chat_template), piece(tok_->bos()), piece(tok_->eos()));
     eos_ = opts.eos_token ? opts.eos_token : tok_->eos();

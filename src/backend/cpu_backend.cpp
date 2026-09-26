@@ -630,6 +630,10 @@ public:
         r.no_overlap(res, y);
         const std::size_t n = g.n_vec, E = g.cols, n_vocab = g.rows;
         if (n == 0) return;
+        // M2: rows at/after valid_rows (GGUF LM-head padding past the tokenizer's real
+        // vocabulary) are excluded from the argmax. The full logits row (gemv.y), if
+        // requested, is unaffected -- every row still gets its raw value.
+        const std::size_t vocab_limit = a.valid_rows > 0 ? std::min<std::size_t>(a.valid_rows, n_vocab) : n_vocab;
         // Exactly Impl::head: one pass over the head matrix in slabs; the argmax is taken over
         // exactly the values matmul produces (ties: lowest index); NaN is an error.
         const cpu::ConstRows xs = crows(x, n, E);
@@ -653,7 +657,7 @@ public:
                         poisoned[i] = 1;
                         continue;
                     }
-                    if (!poisoned[i] && (best[i].index < 0 || row[c] > best[i].value))
+                    if (!poisoned[i] && n0 + c < vocab_limit && (best[i].index < 0 || row[c] > best[i].value))
                         best[i] = {static_cast<std::int32_t>(n0 + c), row[c]};
                 }
                 if (want_logits) std::copy_n(row, ns, y.wf() + i * y.fstride() + n0);

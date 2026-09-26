@@ -538,6 +538,39 @@ TEST_F(CpuBackendTest, LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNPoisonsOnlyItsRo
     }
 }
 
+TEST_F(CpuBackendTest, LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogits) {
+    // M2: rows at/after valid_rows are GGUF LM-head padding; argmax must never pick one, but
+    // the full logits row (when requested) must still report every row's raw value.
+    const std::size_t V = 20, E = 4, n = 2;
+    auto w = rnd(V * E, 41);
+    std::vector<float> x(n * E, 0.0f);
+    // Row 0's activation is a one-hot selecting w[.., 0], so each weight row's dot product is
+    // exactly that row's w[.., 0] value. Make the best real (< valid_rows) row smaller than a
+    // padded (>= valid_rows) row, so an unclamped argmax would pick the padded one.
+    const std::size_t valid_rows = 15;
+    w[10 * E] = 1.0f;    // real row 10: dot = 1
+    w[17 * E] = 100.0f;  // padded row 17: dot = 100
+    x[0] = 1.0f;
+    std::vector<float> logits(n * V);
+    std::vector<std::byte> res(n * kArgmaxResultBytes);
+    LmHeadArgs a{};
+    a.gemv = {DType::F32, imp(w), imp(x), imp(logits), V, E, n, {}};
+    a.valid_rows = static_cast<std::uint32_t>(valid_rows);
+    a.result = imp_bytes(res);
+    be->lm_head(*st, a);
+    const auto best = decode_argmax(res);
+    ASSERT_EQ(best.size(), n);
+    EXPECT_EQ(best[0].index, 10) << "the padded row (17) must never win, even though its raw logit is larger";
+    EXPECT_EQ(logits[0 * V + 17], 100.0f) << "the padded row's raw logit is still reported";
+    // valid_rows == 0 is "no clamp": unaffected by this change.
+    LmHeadArgs b = a;
+    b.valid_rows = 0;
+    std::vector<std::byte> res2(n * kArgmaxResultBytes);
+    b.result = imp_bytes(res2);
+    be->lm_head(*st, b);
+    EXPECT_EQ(decode_argmax(res2)[0].index, 17) << "with no clamp, the larger (padded) logit wins as before";
+}
+
 TEST_F(CpuBackendTest, GetRowsAndCopyEqualDequantizeRow) {
     const std::size_t rows = 10, cols = 32;
     auto t = rnd(rows * cols, 30);

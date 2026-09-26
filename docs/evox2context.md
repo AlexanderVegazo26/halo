@@ -71,13 +71,23 @@ not a full engine-level "two real sequences, one goes NaN, watch the other survi
    first retires as `FinishReason::Error`.
 3. Re-run `test_models`, `test_runtime`, `test_speculative` after each step.
 
-### M2 — fused-argmax vocab clamp (MEDIUM, partially fixed)
-The sampler-side clamp (unstructured sampling excludes padded LM-head rows) is done. The
-fused-greedy-argmax path (`qwen35.cpp:head()` calling `be->lm_head`) still computes argmax
-over the full padded vocab in the backend kernel itself, which needs the same kind of
-Backend-interface change as H1 (a vocab-limit parameter threaded through `GemvArgs`/
-`LmHeadArgs` and all three kernels) — bundle it with the H1 work above since it touches the
-same call sites.
+### M2 — fused-argmax vocab clamp (MEDIUM, now fully fixed on CPU)
+Both halves are done. The sampler-side clamp (unstructured sampling excludes padded LM-head
+rows) landed earlier. `LmHeadArgs` (`include/halo/backend/backend.h`) now has a `valid_rows`
+field (0 = no clamp, the pre-M2 default); the CPU backend's `lm_head()` excludes rows at/after
+it from the argmax while still reporting every row's raw value in the full logits output;
+`Qwen35Options::valid_vocab` threads the tokenizer's real vocab size in from `engine.cpp`
+(built before the model now, since the model needs this value and the tokenizer only depends
+on GGUF metadata, not the model). Turned out this needed none of the cross-backend risk H1's
+plan originally worried about — `GemvArgs`/`LmHeadArgs` in `include/halo/backend/backend.h`
+are a *different type* from Vulkan's and HIP's own internal `GemvArgs`/`LmHeadArgs` (their
+adapters translate between them), so adding a field with a zero-default only had to be
+threaded through the CPU implementation to take effect; Vulkan/HIP's adapters simply don't
+set it yet, meaning they're unaffected and still unclamped on GPU (their own follow-up, not
+blocked on anything -- the same `valid_rows` field is already there for them to use whenever
+their adapters are updated to read it). Verified: `test_backend` 13/13 (new regression:
+a deliberately larger padded-row logit never wins argmax, and is still visible in the full
+logits row), `test_models` 25/25, `test_speculative` 18/18, `test_runtime` 32/32.
 
 ### M5 — un-circularize the quantized-forward differential (MEDIUM)
 Needs one offline run: dequantize the canonical pack with `gguf-py`, feed the f32 result
@@ -129,11 +139,14 @@ breaks.
 ## Suggested order
 
 1. BI-6 engine wiring first — nothing else is real until the engine can actually dispatch to
-   a GPU backend.
+   a GPU backend. While you're in there: have it also set `valid_vocab` (M2) and check
+   whether Vulkan's/HIP's adapters need `valid_rows` wired through to their own kernels for
+   parity with the CPU path (see M2 above — it's a small, already-proven-safe addition now).
 2. TRD §68 Phase 0 roofline measurement — everything performance-related is guesswork until
    this exists.
-3. H1 + M2 together (same call sites, same three-backend contract change) — do this once,
-   with the real Vulkan/HIP devices available to test against, not blind.
+3. H1's remaining `bad_alloc` producer, plus a real mid-forward fault hook so this whole area
+   has an actual end-to-end regression test instead of the current layered verification (see
+   H1 above for exactly what's left).
 4. Real Vulkan (RADV) and HIP (ROCm) validation passes.
 5. M11's serving-surface validation at scale.
 6. M5 (offline transformers run) and M10 (message-boundary hints / planner reconciliation) as

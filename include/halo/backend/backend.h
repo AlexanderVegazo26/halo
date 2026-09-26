@@ -322,6 +322,11 @@ inline constexpr std::uint32_t kArgmaxResultBytes = 12;
 struct LmHeadArgs {
     GemvArgs gemv{};
     TensorRef result{};
+    /// M2: rows at/after this index are excluded from the argmax (GGUF LM-head padding past
+    /// the tokenizer's real vocabulary). 0 = no clamp (argmax over all gemv.rows), the
+    /// pre-M2 behavior; gemv.y (the full logits row, when requested) is unaffected either
+    /// way -- the caller still gets every row's raw value, only the *argmax* is clamped.
+    std::uint32_t valid_rows = 0;
     KernelChoice kernel{};
     StatusRef status{};
 };
