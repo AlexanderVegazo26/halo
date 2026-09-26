@@ -1,0 +1,44 @@
+#version 450
+// Element-wise binary ops over rows x cols views (spec constant OP):
+//   OP 0 [ADD]         out = a + b                 (cpu::add; bit-identical, IEEE add)
+//   OP 1 [SWIGLU]      out = silu(a) * b           (cpu::swiglu; a = gate, b = up)
+//   OP 2 [MUL_SIGMOID] out = a * sigmoid(b)        (cpu::mul_sigmoid; b = gate)
+// out may alias a or b exactly (each invocation reads its element before writing it).
+// One workgroup per row (2-D grid), threads stride the columns.
+#include "halo_common.glsl"
+#include "halo_math.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint OP = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint a_off, a_stride, b_off, b_stride, o_off, o_stride;
+} pc;
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint ab = pc.a_off + row * pc.a_stride;
+    const uint bb = pc.b_off + row * pc.b_stride;
+    const uint ob = pc.o_off + row * pc.o_stride;
+    for (uint i = gl_LocalInvocationID.x; i < pc.cols; i += WG) {
+        const float x = a[ab + i];
+        const float y = b[bb + i];
+        precise float r;
+        if (OP == 0u) {
+            r = x + y;
+        } else if (OP == 1u) {
+            r = halo_silu(x) * y;
+        } else {
+            r = x * halo_sigmoid(y);
+        }
+        o[ob + i] = r;
+    }
+}

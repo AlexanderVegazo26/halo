@@ -1,0 +1,61 @@
+#version 450
+// [CONV1D_SHORT] (cpu::causal_conv1d_silu): causal depthwise conv1d (no bias) + SiLU.
+// One invocation per channel c; time runs sequentially. The K-1 previous inputs live in
+// registers, oldest first:
+//   acc = 0; acc += w[c][j] * hist[j] for j = 0..K-2 (oldest first); acc += w[c][K-1] * x[t][c]
+//   out[t][c] = silu(acc)
+// — the CPU op's order, uncontracted (precise), so acc is bit-identical to halo::cpu.
+// out may alias x exactly (x[t][c] is read before out[t][c] is written by the same
+// invocation). Slot s (s < min(T, n_slots)) receives the conv state after row T-1-s.
+#include "halo_common.glsl"
+#include "halo_math.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+const uint MAX_K = 8u;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Wt { float w[]; };
+layout(std430, binding = 2) buffer St { float st[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+layout(std430, binding = 4) writeonly buffer Sl { float slots[]; };
+
+layout(push_constant) uniform Push {
+    uint n_tokens;
+    uint channels;
+    uint kernel;
+    uint n_slots;   // slots actually written: min(T, n_slots)
+    uint x_off, x_stride, w_off, w_stride, st_off, st_stride, o_off, o_stride, sl_off;
+} pc;
+
+void main() {
+    const uint c = halo_group_id() * WG + gl_LocalInvocationID.x;
+    if (c >= pc.channels) return;
+    const uint hist = pc.kernel - 1u;
+    float wt[MAX_K];
+    float h[MAX_K];
+    for (uint j = 0u; j < pc.kernel; ++j) wt[j] = w[pc.w_off + c * pc.w_stride + j];
+    for (uint j = 0u; j < hist; ++j) h[j] = st[pc.st_off + j * pc.st_stride + c];
+    const uint slot_n = hist * pc.channels;
+    for (uint t = 0u; t < pc.n_tokens; ++t) {
+        const float xv = x[pc.x_off + t * pc.x_stride + c];
+        precise float acc = 0.0;
+        for (uint j = 0u; j < hist; ++j) {
+            precise float p = wt[j] * h[j];
+            acc = acc + p;
+        }
+        precise float pl = wt[hist] * xv;
+        acc = acc + pl;
+        if (hist > 0u) {
+            for (uint j = 0u; j + 1u < hist; ++j) h[j] = h[j + 1u];
+            h[hist - 1u] = xv;
+        }
+        o[pc.o_off + t * pc.o_stride + c] = halo_silu(acc);
+        const uint slot = pc.n_tokens - 1u - t;
+        if (slot < pc.n_slots) {
+            for (uint j = 0u; j < hist; ++j) slots[pc.sl_off + slot * slot_n + j * pc.channels + c] = h[j];
+        }
+    }
+    for (uint j = 0u; j < hist; ++j) st[pc.st_off + j * pc.st_stride + c] = h[j];
+}

@@ -29,6 +29,12 @@ set(HALO_VK_SHADERS
   matmul/matvec_q6_k
   matmul/matvec_iq4_xs
   linear_attn/gated_delta_rule_decode
+  linear_attn/conv1d_silu
+  norm/gated_rms_norm
+  norm/add_rms_norm
+  eltwise/eltwise
+  eltwise/gdn_gates
+  rope/rope_neox
   reduce/argmax_partial
   reduce/argmax_final
 )
@@ -95,6 +101,7 @@ add_library(halo_backend_vulkan STATIC
   src/kernel.cpp
   src/stream.cpp
   src/ops.cpp
+  src/ops_layer.cpp
   src/shaders.cpp
   src/sha256.cpp
   src/vk_util.cpp

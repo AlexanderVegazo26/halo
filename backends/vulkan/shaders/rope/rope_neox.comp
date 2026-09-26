@@ -1,0 +1,49 @@
+#version 450
+// [PARTIAL_ROPE] (cpu::partial_rope_neox), NeoX rotate-half, in place. One workgroup per
+// token; invocations cover (head, i) pairs, i < rot/2:
+//   x1 = x[h][i], x2 = x[h][i + rot/2]
+//   x[h][i]         = x1 * cos_i + (-x2) * sin_i
+//   x[h][i + rot/2] = x2 * cos_i + x1 * sin_i
+// with cos_i / sin_i from the host table (RopeArgs::cos_sin: the CPU op's values). Two
+// products and one add, uncontracted: bit-identical to halo::cpu. Head h starts at
+// h * head_stride within the row (TD-9); nothing outside the rotated dims is touched.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Cs { float cs[]; };
+
+layout(push_constant) uniform Push {
+    uint n_tokens;
+    uint n_heads;
+    uint head_stride;
+    uint rot;
+    uint x_off, x_stride, cs_off, cs_stride;
+} pc;
+
+void main() {
+    const uint t = halo_group_id();
+    if (t >= pc.n_tokens) return;
+    const uint half_rot = pc.rot / 2u;
+    const uint xb = pc.x_off + t * pc.x_stride;
+    const uint cb = pc.cs_off + t * pc.cs_stride;
+    for (uint p = gl_LocalInvocationID.x; p < pc.n_heads * half_rot; p += WG) {
+        const uint hd = p / half_rot;
+        const uint i = p % half_rot;
+        const uint e = xb + hd * pc.head_stride + i;
+        const float c = cs[cb + i];
+        const float s = cs[cb + half_rot + i];
+        const float x1 = x[e];
+        const float x2 = x[e + half_rot];
+        precise float a1 = x1 * c;
+        precise float a2 = (-x2) * s;
+        precise float b1 = x2 * c;
+        precise float b2 = x1 * s;
+        precise float r1 = a1 + a2;
+        precise float r2 = b1 + b2;
+        x[e] = r1;
+        x[e + half_rot] = r2;
+    }
+}

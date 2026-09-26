@@ -42,7 +42,9 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
     const std::set<std::string> expected{"rms_norm",        "matvec_f32",           "matvec_q8_0",
                                          "matvec_q4_k",     "matvec_q5_k",          "matvec_q6_k",
                                          "matvec_iq4_xs",   "gated_delta_rule_decode",
-                                         "argmax_partial", "argmax_final"};
+                                         "argmax_partial", "argmax_final",   "conv1d_silu",
+                                         "gated_rms_norm", "add_rms_norm",   "eltwise",
+                                         "gdn_gates",      "rope_neox"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
         ASSERT_NE(s, nullptr);

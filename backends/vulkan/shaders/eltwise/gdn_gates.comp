@@ -1,0 +1,36 @@
+#version 450
+// [GDN gates] qwen35 (src/models/qwen35.cpp), fused, same order as the CPU forward:
+//   beta = sigmoid(b);  s = a + dt_bias;  g = ssm_a * softplus(s)
+// b, a, beta, g: rows x [n_v] views; dt_bias, ssm_a: [n_v]. beta may alias b and g may
+// alias a exactly.
+#include "halo_common.glsl"
+#include "halo_math.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Bb { float bin[]; };
+layout(std430, binding = 1) readonly buffer Aa { float ain[]; };
+layout(std430, binding = 2) readonly buffer Dt { float dt[]; };
+layout(std430, binding = 3) readonly buffer Sa { float sa[]; };
+layout(std430, binding = 4) writeonly buffer Beta { float beta[]; };
+layout(std430, binding = 5) writeonly buffer G { float g[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint n_v;
+    uint b_off, b_stride, a_off, a_stride, dt_off, sa_off, beta_off, beta_stride, g_off, g_stride;
+} pc;
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    for (uint j = gl_LocalInvocationID.x; j < pc.n_v; j += WG) {
+        const float bv = bin[pc.b_off + row * pc.b_stride + j];
+        const float av = ain[pc.a_off + row * pc.a_stride + j];
+        precise float s = av + dt[pc.dt_off + j];
+        precise float gv = sa[pc.sa_off + j] * halo_softplus(s);
+        beta[pc.beta_off + row * pc.beta_stride + j] = halo_sigmoid(bv);
+        g[pc.g_off + row * pc.g_stride + j] = gv;
+    }
+}

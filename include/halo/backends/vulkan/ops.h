@@ -38,6 +38,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "halo/backends/vulkan/buffer.h"
@@ -157,6 +158,95 @@ struct ArgmaxResult {
 /// has been waited on) and decodes them.
 [[nodiscard]] ArgmaxResult read_argmax(const Buffer& result, std::uint64_t offset = 0);
 
+// ---------------------------------------------------------------- layer ops (WS-F2 V1)
+// Argument structs mirror halo::hip (include/halo/backends/hip/ops.h) over vulkan::BufferView.
+// Each op's semantics are those of the named halo::cpu op; "may alias exactly" means the
+// output may name exactly the same elements (same buffer, first byte, stride and extent) as
+// that input, and must be disjoint from every other operand.
+
+/// [CONV1D_SHORT] (cpu::causal_conv1d_silu): causal depthwise conv1d (no bias) + SiLU.
+///  - x: n_tokens rows of [channels]; weight: channels rows of [kernel] (tap kernel-1 = the
+///    current input); kernel in 1..8.
+///  - conv_state: kernel-1 rows of [channels], in/out (oldest first); empty when kernel = 1.
+///  - out: n_tokens rows of [channels]; may alias x exactly.
+///  - state_slots (D-012; empty = none): n_slots dense [kernel-1, channels] states; slot s =
+///    conv state after row T-1-s for s < min(T, n_slots); slots s >= T are left untouched.
+/// The accumulation order is the CPU op's (taps oldest first, then the current input), and
+/// no multiply-add is contracted, so the pre-activation is bit-identical to halo::cpu; the
+/// SiLU uses the device exp. conv_state and the slots are bit-identical copies of inputs.
+struct Conv1dArgs {
+    BufferView x{}, weight{}, conv_state{}, out{};
+    BufferView state_slots{};
+    std::uint32_t n_tokens = 0;
+    std::uint32_t channels = 0;
+    std::uint32_t kernel = 4;
+    std::uint32_t n_slots = 0;
+};
+
+/// [GATED_NORM] (cpu::gated_rms_norm): out[r] = (w * (x[r] * rsqrt(mean(x[r]^2) + eps))) *
+/// silu(z[r]), per row (a row = one value head). x, z, out: rows rows of [cols]; w: [cols].
+/// out may alias x or z exactly.
+struct GatedNormArgs {
+    BufferView x{}, z{}, w{}, out{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+    float eps = 1e-6f;
+};
+
+/// [PARTIAL_ROPE] (cpu::partial_rope_neox), in place on x: n_tokens rows, each n_heads heads
+/// of head_dim elements, head h starting at h * head_stride (TD-9; 0 = head_dim, dense). Only
+/// the first rot_dims of each head rotate (NeoX rotate-half); the rest (and anything between
+/// heads, e.g. the gate halves of qwen35's interleaved [Q | gate] attn_q row, head_dim 256,
+/// head_stride 512) are never touched.
+///  - cos_sin: n_tokens rows of [rot_dims] fp32 = rope_cos_sin_table(positions, rot_dims,
+///    theta): per token rot_dims/2 cosines then rot_dims/2 sines of the CPU op's fp32 angles,
+///    evaluated in double and rounded (Vulkan has no double sin/cos, and its float sin/cos
+///    is only accurate to 2^-11 absolute, so the table is built on the host). With the table
+///    the kernel is the CPU op's two products and one add per element, uncontracted:
+///    bit-identical to halo::cpu.
+///  - x's row_stride should be explicit when head_stride > head_dim.
+struct RopeArgs {
+    BufferView x{};
+    BufferView cos_sin{};
+    std::uint32_t n_tokens = 0;
+    std::uint32_t n_heads = 0;
+    std::uint32_t head_dim = 0;
+    std::uint32_t rot_dims = 0;
+    std::uint32_t head_stride = 0;  ///< TD-9; 0 = head_dim
+};
+
+/// The RopeArgs::cos_sin table for `positions` (exactly the CPU op's angles; see RopeArgs).
+[[nodiscard]] std::vector<float> rope_cos_sin_table(std::span<const std::int32_t> positions, std::uint32_t rot_dims,
+                                                    float theta);
+
+/// [SWIGLU] out = silu(a) * b (a = gate, b = up); [MUL_SIGMOID] out = a * sigmoid(b) (a =
+/// attention output, b = gate); [ADD] out = a + b. rows x cols; out may alias a or b exactly.
+struct EltwiseArgs {
+    BufferView a{}, b{}, out{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+};
+
+/// [ADD + RMS_NORM fused] h = a + b, then y = rms_norm(h) * w — h bit-identical to cpu::add,
+/// y equal to Ops::rms_norm(h) bit for bit (same reduction order). h may alias a or b
+/// exactly (the in-place residual accumulate, ADR-001 §5.2); y must not overlap a, b, h, w.
+struct AddRmsNormArgs {
+    BufferView a{}, b{}, h{}, w{}, y{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+    float eps = 1e-6f;
+};
+
+/// [GDN gates] qwen35's per-head gate inputs, fused, in the CPU forward's exact order
+/// (src/models/qwen35.cpp): beta = sigmoid(b); g = ssm_a * softplus(a + dt_bias), softplus
+/// with torch's threshold 20 and an accurate log1p. b, a: rows x [n_v]; dt_bias, ssm_a:
+/// [n_v]. beta may alias b exactly, g may alias a exactly.
+struct GdnGateArgs {
+    BufferView b{}, a{}, dt_bias{}, ssm_a{}, beta{}, g{};
+    std::uint32_t rows = 0;
+    std::uint32_t n_v = 0;
+};
+
 class Ops {
 public:
     explicit Ops(std::shared_ptr<Context> ctx, OpsOptions options = {});
@@ -192,7 +282,23 @@ public:
     [[nodiscard]] std::uint64_t argmax_scratch_bytes(std::uint32_t n) const;
     [[nodiscard]] std::uint32_t argmax_partials(std::uint32_t n) const;
 
+    /// [CONV1D_SHORT] see Conv1dArgs.
+    void causal_conv1d_silu(Stream& stream, const Conv1dArgs& args);
+    /// [GATED_NORM] see GatedNormArgs.
+    void gated_rms_norm(Stream& stream, const GatedNormArgs& args);
+    /// [PARTIAL_ROPE] in place; see RopeArgs.
+    void partial_rope_neox(Stream& stream, const RopeArgs& args);
+    /// [SWIGLU] / [MUL_SIGMOID] / [ADD]; see EltwiseArgs.
+    void swiglu(Stream& stream, const EltwiseArgs& args);
+    void mul_sigmoid(Stream& stream, const EltwiseArgs& args);
+    void add(Stream& stream, const EltwiseArgs& args);
+    /// [ADD + RMS_NORM] see AddRmsNormArgs.
+    void add_rms_norm(Stream& stream, const AddRmsNormArgs& args);
+    /// [GDN gates] see GdnGateArgs.
+    void gdn_gates(Stream& stream, const GdnGateArgs& args);
+
 private:
+    void eltwise(Stream& stream, const EltwiseArgs& args, std::uint32_t op_code, std::string_view name);
     const Kernel& kernel(const std::string& shader, std::uint32_t num_buffers,
                          std::uint32_t push_bytes, std::vector<SpecConstant> spec,
                          std::array<std::uint32_t, 3> local);

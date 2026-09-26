@@ -1,0 +1,50 @@
+#version 450
+// [GATED_NORM] (cpu::gated_rms_norm): out[r,i] = (w[i] * (x[r,i] * inv)) * silu(z[r,i]),
+// inv = 1 / sqrt(mean(x[r,:]^2) + eps) — HF order. One workgroup per row; the sum of squares
+// is the rms_norm kernel's (strided partials + fixed-order tree). out may alias x or z
+// exactly: every x element is read in the reduction before the barrier, and each output
+// element is written by the invocation that read it.
+#include "halo_common.glsl"
+#include "halo_math.glsl"
+
+layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Z { float z[]; };
+layout(std430, binding = 2) readonly buffer Wt { float w[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    float eps;
+    uint x_off, x_stride, z_off, z_stride, w_off, y_off, y_stride;
+} pc;
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint xb = pc.x_off + row * pc.x_stride;
+    const uint zb = pc.z_off + row * pc.z_stride;
+    const uint yb = pc.y_off + row * pc.y_stride;
+    float acc = 0.0;
+    for (uint i = tid; i < pc.cols; i += WG) {
+        const float v = x[xb + i];
+        acc += v * v;
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    precise float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
+    for (uint i = tid; i < pc.cols; i += WG) {
+        precise float r = (w[pc.w_off + i] * (x[xb + i] * inv)) * halo_silu(z[zb + i]);
+        y[yb + i] = r;
+    }
+}

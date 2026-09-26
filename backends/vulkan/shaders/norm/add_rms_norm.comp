@@ -1,0 +1,50 @@
+#version 450
+// [ADD + RMS_NORM] h = a + b (IEEE add, = cpu::add), then y = (h * inv) * w with inv from
+// the rms_norm kernel's reduction over h (same order, so y == Ops::rms_norm(h) bitwise).
+// h may alias a or b exactly: each invocation reads a[i], b[i] and then writes h[i]; the
+// normalisation re-reads only h values this invocation wrote.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) buffer H { float h[]; };
+layout(std430, binding = 3) readonly buffer Wt { float w[]; };
+layout(std430, binding = 4) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    float eps;
+    uint a_off, a_stride, b_off, b_stride, h_off, h_stride, w_off, y_off, y_stride;
+} pc;
+
+shared float red[WG];
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint ab = pc.a_off + row * pc.a_stride;
+    const uint bb = pc.b_off + row * pc.b_stride;
+    const uint hb = pc.h_off + row * pc.h_stride;
+    const uint yb = pc.y_off + row * pc.y_stride;
+    float acc = 0.0;
+    for (uint i = tid; i < pc.cols; i += WG) {
+        precise float v = a[ab + i] + b[bb + i];
+        h[hb + i] = v;
+        acc += v * v;
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
+    for (uint i = tid; i < pc.cols; i += WG) {
+        y[yb + i] = (h[hb + i] * inv) * w[pc.w_off + i];
+    }
+}
