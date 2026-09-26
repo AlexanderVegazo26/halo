@@ -90,6 +90,9 @@ const char* name_of(ref::WType t) {
         case ref::WType::Q5_K: return "q5_k";
         case ref::WType::Q6_K: return "q6_k";
         case ref::WType::IQ4_XS: return "iq4_xs";
+        case ref::WType::IQ4_NL: return "iq4_nl";
+        case ref::WType::Q3_K: return "q3_k";
+        case ref::WType::IQ3_S: return "iq3_s";
     }
     return "?";
 }
@@ -212,7 +215,8 @@ TEST_P(VkMatvec, RealisticScalesMatchWithSmallRelativeError) {
 
 INSTANTIATE_TEST_SUITE_P(Types, VkMatvec,
                          ::testing::Values(ref::WType::F32, ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q5_K,
-                                           ref::WType::Q6_K, ref::WType::IQ4_XS),
+                                           ref::WType::Q6_K, ref::WType::IQ4_XS, ref::WType::IQ4_NL,
+                                           ref::WType::Q3_K, ref::WType::IQ3_S),
                          [](const auto& info) { return std::string(name_of(info.param)); });
 
 TEST(VkOps, MatvecQ6KBeyondWorkgroupCountLimitUses2DGrid) {

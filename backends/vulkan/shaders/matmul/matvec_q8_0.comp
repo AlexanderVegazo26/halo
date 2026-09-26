@@ -1,5 +1,5 @@
 #version 450
-// QUANT_GEMV, ggml Q8_0 weights: y[r] = sum_c W[r,c] * x[c]. Dequantization:
+// QUANT_GEMV / MATMUL, ggml Q8_0 weights: y[t][r] = sum_c W[r,c] * x[t][c]. Dequantization:
 // common/dequant_q8_0.glsl (shared with get_rows_q8_0); body: common/matvec_quant_main.glsl.
 #include "halo_common.glsl"
 

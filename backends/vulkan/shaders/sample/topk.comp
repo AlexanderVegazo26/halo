@@ -1,0 +1,90 @@
+#version 450
+// [TOP_K] one pass of a chunked selection (cpu::top_k: the k largest, value descending, ties
+// by lower index; exact — only comparisons, so ids and values are bit-identical to the CPU).
+// Each workgroup takes CHUNK consecutive entries of one vector (pass 0: the logits with their
+// indices; later passes: candidates (value, index) of the previous pass), sorts them in shared
+// memory with a bitonic network under the order
+//   a before b  <=>  a.v > b.v || (a.v == b.v && a.i < b.i)
+// and writes its first k (k <= CHUNK / 2). Missing entries are padded with (-inf, 0xFFFFFFFF),
+// which every real entry (even -inf, whose index is smaller) precedes, so pads never reach the
+// final k (k <= n). The host repeats passes until one chunk per vector remains. Pass 0 sets
+// status bit 2 (k_status_nan; the host zeroed the word) when an input is NaN.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;  // power of two
+layout(constant_id = 1) const uint FIRST = 1; // 1: read logits (index = position)
+layout(local_size_x_id = 0) in;
+
+const uint CHUNK = 2048u;
+const uint PAD_ID = 0xFFFFFFFFu;
+const uint STATUS_NAN = 2u;
+
+layout(std430, binding = 0) readonly buffer SV { float sv[]; };
+layout(std430, binding = 1) readonly buffer SI { uint si[]; };
+layout(std430, binding = 2) writeonly buffer DV { float dv[]; };
+layout(std430, binding = 3) writeonly buffer DI { uint di[]; };
+layout(std430, binding = 4) buffer St { uint st[]; };
+
+layout(push_constant) uniform Push {
+    uint count;     // entries per vector in this pass
+    uint n_chunks;  // chunks per vector in this pass
+    uint k;
+    uint n_vec;
+    uint sv_off, sv_stride, si_off, si_stride;  // source values / indices (elements; per vector)
+    uint dv_off, dv_stride, di_off, di_stride;  // destination: vector v, chunk c at v*stride + c*k
+    uint st_off;
+} pc;
+
+shared float kv[CHUNK];
+shared uint ki[CHUNK];
+
+bool before(float av, uint ai, float bv, uint bi) { return av > bv || (av == bv && ai < bi); }
+
+void main() {
+    const uint g = halo_group_id();
+    if (g >= pc.n_chunks * pc.n_vec) return;
+    const uint vec = g / pc.n_chunks;
+    const uint ch = g % pc.n_chunks;
+    const uint tid = gl_LocalInvocationID.x;
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+    const uint base = ch * CHUNK;
+    bool nan_seen = false;
+    for (uint i = tid; i < CHUNK; i += WG) {
+        const uint e = base + i;
+        float v = NEG_INF;
+        uint id = PAD_ID;
+        if (e < pc.count) {
+            v = sv[pc.sv_off + vec * pc.sv_stride + e];
+            id = FIRST == 1u ? e : si[pc.si_off + vec * pc.si_stride + e];
+            if (FIRST == 1u && isnan(v)) nan_seen = true;
+        }
+        kv[i] = v;
+        ki[i] = id;
+    }
+    if (nan_seen) atomicOr(st[pc.st_off], STATUS_NAN);
+    barrier();
+    for (uint size = 2u; size <= CHUNK; size <<= 1) {
+        for (uint stride = size >> 1; stride > 0u; stride >>= 1) {
+            for (uint i = tid; i < CHUNK; i += WG) {
+                const uint j = i ^ stride;
+                if (j > i) {
+                    const bool up = (i & size) == 0u;  // this sub-sequence ends best-first
+                    const float vi = kv[i], vj = kv[j];
+                    const uint ii = ki[i], ij = ki[j];
+                    const bool swap = up ? before(vj, ij, vi, ii) : before(vi, ii, vj, ij);
+                    if (swap) {
+                        kv[i] = vj;
+                        kv[j] = vi;
+                        ki[i] = ij;
+                        ki[j] = ii;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    for (uint i = tid; i < pc.k; i += WG) {
+        dv[pc.dv_off + vec * pc.dv_stride + ch * pc.k + i] = kv[i];
+        di[pc.di_off + vec * pc.di_stride + ch * pc.k + i] = ki[i];
+    }
+}

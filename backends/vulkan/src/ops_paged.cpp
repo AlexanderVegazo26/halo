@@ -105,18 +105,7 @@ void Ops::get_rows(Stream& stream, const GetRowsArgs& a) {
     constexpr std::string_view op = "get_rows";
     HALO_CHECK(a.n_rows > 0 && a.cols > 0 && a.n_ids > 0, ErrorCode::Kernel, "{}: empty shape rows={} cols={} ids={}",
                op, a.n_rows, a.cols, a.n_ids);
-    std::string shader;
-    switch (a.wtype) {
-        case DType::F32: shader = "get_rows_f32"; break;
-        case DType::Q8_0: shader = "get_rows_q8_0"; break;
-        case DType::Q4_K: shader = "get_rows_q4_k"; break;
-        case DType::Q5_K: shader = "get_rows_q5_k"; break;
-        case DType::Q6_K: shader = "get_rows_q6_k"; break;
-        case DType::IQ4_XS: shader = "get_rows_iq4_xs"; break;
-        default:
-            throw_error(ErrorCode::Unsupported, "{}: weight type id {} is not supported", op,
-                        static_cast<std::uint32_t>(a.wtype));
-    }
+    const std::string shader = detail::weight_shader("get_rows", a.wtype);
     const std::uint64_t row_bytes = matvec_row_bytes(a.wtype, a.cols);
     const std::uint64_t align = ctx_->info().min_storage_buffer_offset_alignment;
     const Operand ow = operand(a.w, a.n_rows, row_bytes, a.wtype == DType::F32 ? Access::Floats : Access::Words, align,

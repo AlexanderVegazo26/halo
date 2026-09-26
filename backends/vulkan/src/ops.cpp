@@ -31,6 +31,8 @@ using detail::k_f32;
 constexpr std::uint32_t k_argmax_per_thread = 16;
 // Words per argmax partial / result: {index, value bits, nan flag}.
 constexpr std::uint32_t k_argmax_words = 3;
+// Vectors per gemv dispatch (matvec_quant_main.glsl MAX_VEC).
+constexpr std::uint32_t k_gemv_max_vec = 8;
 
 }  // namespace
 
@@ -47,9 +49,13 @@ std::uint64_t matvec_row_bytes(DType t, std::uint32_t cols) {
         case DType::Q5_K: return blocks(256, 176);
         case DType::Q6_K: return blocks(256, 210);
         case DType::IQ4_XS: return blocks(256, 136);
+        case DType::IQ4_NL: return blocks(32, 18);
+        case DType::Q3_K: return blocks(256, 110);
+        case DType::IQ3_S: return blocks(256, 110);
         default:
             throw_error(ErrorCode::Unsupported,
-                        "Vulkan matvec: weight type id {} not supported (F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS)",
+                        "Vulkan matvec: weight type id {} not supported (F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, "
+                        "IQ4_NL, Q3_K, IQ3_S)",
                         static_cast<std::uint32_t>(t));
     }
 }
@@ -139,34 +145,47 @@ void Ops::rms_norm(Stream& stream, const BufferView& x, const BufferView& w, con
 
 void Ops::matvec(Stream& stream, DType wtype, const BufferView& w, const BufferView& x, const BufferView& y,
                  std::uint32_t rows, std::uint32_t cols) {
-    constexpr std::string_view op = "matvec";
-    HALO_CHECK(rows > 0 && cols > 0, ErrorCode::Kernel, "matvec: empty shape {}x{}", rows, cols);
-    const std::uint64_t row_bytes = matvec_row_bytes(wtype, cols);
-    std::string shader;
-    switch (wtype) {
-        case DType::F32: shader = "matvec_f32"; break;
-        case DType::Q8_0: shader = "matvec_q8_0"; break;
-        case DType::Q4_K: shader = "matvec_q4_k"; break;
-        case DType::Q5_K: shader = "matvec_q5_k"; break;
-        case DType::Q6_K: shader = "matvec_q6_k"; break;
-        case DType::IQ4_XS: shader = "matvec_iq4_xs"; break;
-        default: throw_error(ErrorCode::Unsupported, "Vulkan matvec: unsupported weight type");
-    }
+    gemv_impl(stream, GemvArgs{wtype, w, x, y, rows, cols, 1}, "matvec");
+}
+
+void Ops::gemv(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "gemv"); }
+
+void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
+    HALO_CHECK(a.rows > 0 && a.cols > 0 && a.n_vec > 0, ErrorCode::Kernel, "{}: empty shape {}x{} n_vec={}", op,
+               a.rows, a.cols, a.n_vec);
+    const std::uint64_t row_bytes = matvec_row_bytes(a.wtype, a.cols);
+    const std::string shader = detail::weight_shader("matvec", a.wtype);
     const std::uint64_t align = ctx_->info().min_storage_buffer_offset_alignment;
     // F32 weights are indexed by element, quantized ones by byte (read as 32-bit words).
-    const Operand ow = operand(w, rows, row_bytes, wtype == DType::F32 ? Access::Floats : Access::Words, align, op, "W");
-    const Operand ox = operand(x, 1, std::uint64_t{cols} * k_f32, Access::Floats, align, op, "x");
-    const Operand oy = operand(y, 1, std::uint64_t{rows} * k_f32, Access::Floats, align, op, "y");
+    const Operand ow =
+        operand(a.w, a.rows, row_bytes, a.wtype == DType::F32 ? Access::Floats : Access::Words, align, op, "W");
+    const Operand ox = operand(a.x, a.n_vec, std::uint64_t{a.cols} * k_f32, Access::Floats, align, op, "x");
+    const Operand oy = operand(a.y, a.n_vec, std::uint64_t{a.rows} * k_f32, Access::Floats, align, op, "y");
     require_disjoint(oy, "y", {{&ow, "W"}, {&ox, "x"}}, op);
 
     const std::uint32_t wg = options_.reduce_workgroup;
     struct Push {
-        std::uint32_t rows, cols, w_off, w_stride, x_off, y_off;
-    } push{rows, cols, ow.off, ow.stride, ox.off, oy.off};
+        std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
+    };
     const Kernel& k = kernel(shader, 3, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     const std::array bindings{ow.binding, ox.binding, oy.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(rows, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    const GroupCount groups = grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+    // Up to k_gemv_max_vec vectors per dispatch (matvec_quant_main.glsl MAX_VEC). Offsets of
+    // later chunks stay inside the index range operand() checked for the whole extent.
+    for (std::uint32_t t0 = 0; t0 < a.n_vec; t0 += k_gemv_max_vec) {
+        const std::uint32_t n = std::min(k_gemv_max_vec, a.n_vec - t0);
+        const Push push{a.rows,
+                        a.cols,
+                        n,
+                        ow.off,
+                        ow.stride,
+                        ox.off + t0 * ox.stride,
+                        ox.stride,
+                        oy.off + t0 * oy.stride,
+                        oy.stride};
+        stream.dispatch(k, bindings, push, groups);
+    }
 }
 
 void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) {

@@ -44,8 +44,11 @@ inline constexpr std::size_t k_q4_k_bytes = 144;  // fp16 d, dmin; u8 scales[12]
 inline constexpr std::size_t k_q6_k_bytes = 210;  // u8 ql[128]; u8 qh[64]; i8 scales[16]; fp16 d
 inline constexpr std::size_t k_q5_k_bytes = 176;  // fp16 d, dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]
 inline constexpr std::size_t k_iq4_xs_bytes = 136;  // fp16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]
+inline constexpr std::size_t k_iq4_nl_bytes = 18;   // fp16 d; u8 qs[16]
+inline constexpr std::size_t k_q3_k_bytes = 110;    // u8 hmask[32]; u8 qs[64]; u8 scales[12]; fp16 d
+inline constexpr std::size_t k_iq3_s_bytes = 110;   // fp16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4]
 
-enum class WType { F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS };
+enum class WType { F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q3_K, IQ3_S };
 
 [[nodiscard]] inline halo::DType dtype(WType t) {
     switch (t) {
@@ -55,11 +58,16 @@ enum class WType { F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS };
         case WType::Q5_K: return halo::DType::Q5_K;
         case WType::Q6_K: return halo::DType::Q6_K;
         case WType::IQ4_XS: return halo::DType::IQ4_XS;
+        case WType::IQ4_NL: return halo::DType::IQ4_NL;
+        case WType::Q3_K: return halo::DType::Q3_K;
+        case WType::IQ3_S: return halo::DType::IQ3_S;
     }
     return halo::DType::F32;
 }
 
-inline std::size_t block_elems(WType t) { return t == WType::Q8_0 ? 32 : (t == WType::F32 ? 1 : 256); }
+inline std::size_t block_elems(WType t) {
+    return (t == WType::Q8_0 || t == WType::IQ4_NL) ? 32 : (t == WType::F32 ? 1 : 256);
+}
 inline std::size_t block_bytes(WType t) {
     switch (t) {
         case WType::F32: return 4;
@@ -68,6 +76,9 @@ inline std::size_t block_bytes(WType t) {
         case WType::Q5_K: return k_q5_k_bytes;
         case WType::Q6_K: return k_q6_k_bytes;
         case WType::IQ4_XS: return k_iq4_xs_bytes;
+        case WType::IQ4_NL: return k_iq4_nl_bytes;
+        case WType::Q3_K: return k_q3_k_bytes;
+        case WType::IQ3_S: return k_iq3_s_bytes;
     }
     return 0;
 }
@@ -125,6 +136,9 @@ inline Weights random_weights(WType t, std::uint32_t rows, std::uint32_t cols, s
                 break;
             case WType::Q6_K: store_u16(blk + 208, random_normal_fp16(rng, 1, max_exp)); break;
             case WType::IQ4_XS: store_u16(blk, random_normal_fp16(rng, 1, max_exp)); break;
+            case WType::IQ4_NL: store_u16(blk, random_normal_fp16(rng, 1, max_exp)); break;
+            case WType::Q3_K: store_u16(blk + 108, random_normal_fp16(rng, 1, max_exp)); break;
+            case WType::IQ3_S: store_u16(blk, random_normal_fp16(rng, 1, max_exp)); break;
             case WType::F32: break;
         }
     }

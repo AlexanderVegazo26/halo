@@ -1,5 +1,5 @@
 #version 450
-// QUANT_GEMV, ggml IQ4_XS weights: y[r] = sum_c W[r,c] * x[c]. Dequantization:
+// QUANT_GEMV / MATMUL, ggml IQ4_XS weights: y[t][r] = sum_c W[r,c] * x[t][c]. Dequantization:
 // common/dequant_iq4_xs.glsl (shared with get_rows_iq4_xs); body: common/matvec_quant_main.glsl.
 #include "halo_common.glsl"
 

@@ -88,8 +88,9 @@ struct OpsOptions {
 };
 
 /// Byte size of one row of `cols` elements of weight type `t` (F32, Q8_0, Q4_K, Q5_K,
-/// Q6_K, IQ4_XS). Throws Error(Unsupported) for other types, Error(Kernel) if cols is not a
-/// multiple of the block size.
+/// Q6_K, IQ4_XS, IQ4_NL, Q3_K, IQ3_S: every type of the UD-Q4_K_XL pack, D-007 / D-014).
+/// Throws Error(Unsupported) for other types, Error(Kernel) if cols is not a multiple of the
+/// block size.
 [[nodiscard]] std::uint64_t matvec_row_bytes(DType t, std::uint32_t cols);
 
 /// Inputs of a recurrent Gated DeltaNet decode over T = n_tokens rows (DECISIONS D-004
@@ -267,7 +268,7 @@ inline constexpr std::uint64_t k_status_bytes = 4;
 void check_status(std::uint32_t word, std::string_view op);
 
 /// [GET_ROWS] embedding lookup: out[t] = tensor::dequantize_row(W[ids[t]]) for every GEMV
-/// weight type (F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS; the pack's token_embd is Q4_K).
+/// weight type (every type of matvec_row_bytes; the pack's token_embd is Q4_K).
 /// Bit-identical to tensor::dequantize_row: the kernels evaluate its expressions uncontracted
 /// (verified on lavapipe; fp16 scales are converted by unpackHalf2x16, which may flush fp16
 /// denormals on some devices).
@@ -350,6 +351,66 @@ struct AttentionArgs {
     BufferView status{};
 };
 
+// ---------------------------------------------------------------- GEMV, LM head, TOP_K (WS-F2 V3)
+
+/// Status bit: TOP_K saw a NaN logit (= hip::kStatusNaN; check_status raises Error(Kernel),
+/// as cpu::top_k does).
+inline constexpr std::uint32_t k_status_nan = 2u;
+
+/// [QUANT_GEMV / MATMUL] (cpu::matmul with a tensor::dequantize_row WeightMatrix):
+///   y[t][n] = sum_i x[t][i] * W[n][i],  t < n_vec, n < rows, i < cols.
+///  - wtype: every type of matvec_row_bytes. W: rows rows of matvec_row_bytes(wtype, cols)
+///    (row_stride 0 = dense). Quantized rows may start at any byte; F32 rows need 4-byte
+///    alignment.
+///  - x: n_vec rows of [cols] fp32; y: n_vec rows of [rows] fp32; y must not overlap x or W.
+/// n_vec > 1 is the batched form (prefill chunks, MTP verify): each workgroup dequantizes its
+/// W row once and applies it to up to 8 vectors per dispatch (larger n_vec is split into
+/// dispatches of 8). The per-vector arithmetic is exactly the n_vec = 1 matvec's, so a
+/// vector's result does not depend on the batch it is in (tested bitwise).
+struct GemvArgs {
+    DType wtype = DType::F32;
+    BufferView w{}, x{}, y{};
+    std::uint32_t rows = 0;
+    std::uint32_t cols = 0;
+    std::uint32_t n_vec = 1;
+};
+
+/// [LOGITS_MATMUL + ARGMAX] (cpu::matmul then cpu::argmax per vector; = cpu::matmul_argmax):
+/// argmax_n of y[t][n], ties to the lowest n, NaN -> the vector's NaN word is set (read_argmax
+/// then throws, D-016). Composed on the device from gemv and the two-pass argmax (no host
+/// round trip; not a fused kernel, no performance claim).
+///  - gemv.y: the logits (kept on the device); may be empty, then they go to the workspace.
+///  - workspace: >= Ops::lm_head_workspace_bytes(rows, n_vec, gemv.y empty).
+///  - result: n_vec * k_argmax_result_bytes; vector t at byte t * k_argmax_result_bytes
+///    (read_argmax(result_buffer, result.offset + t * 12)).
+struct LmHeadArgs {
+    GemvArgs gemv{};
+    BufferView workspace{};
+    BufferView result{};
+};
+
+/// [TOP_K] (cpu::top_k, per vector): the k largest logits, value descending, ties by lower
+/// index first; 1 <= k <= min(n, 1024). Exact (comparisons only): ids and values are
+/// bit-identical to the CPU.
+///  - logits: n_vec rows of [n] (row_stride = distance between vectors).
+///  - ids: n_vec rows of [k] int32; values: n_vec rows of [k] fp32.
+///  - workspace: >= topk_workspace_bytes(n, k, n_vec) (0 when n <= 2048).
+///  - status: a NaN logit sets k_status_nan (outputs then undefined), as cpu::top_k throws.
+/// Chunked bitonic selection: chunks of 2048 are sorted in shared memory (16 KiB) and reduced
+/// to their best k until one chunk per vector remains (ceil(log_{2048/k}(n/k)) + 1 passes).
+struct TopKArgs {
+    BufferView logits{};
+    std::uint32_t n = 0;
+    std::uint32_t k = 0;
+    std::uint32_t n_vec = 1;
+    BufferView workspace{};
+    BufferView ids{};
+    BufferView values{};
+    BufferView status{};
+};
+
+[[nodiscard]] std::uint64_t topk_workspace_bytes(std::uint32_t n, std::uint32_t k, std::uint32_t n_vec);
+
 class Ops {
 public:
     explicit Ops(std::shared_ptr<Context> ctx, OpsOptions options = {});
@@ -407,8 +468,18 @@ public:
     /// [ATTENTION] see AttentionArgs; then check_status(read_status(...)).
     void attention(Stream& stream, const AttentionArgs& args);
 
+    /// [QUANT_GEMV / MATMUL] batched; see GemvArgs. matvec() is gemv with n_vec = 1.
+    void gemv(Stream& stream, const GemvArgs& args);
+    /// [LOGITS_MATMUL + ARGMAX] see LmHeadArgs.
+    void lm_head(Stream& stream, const LmHeadArgs& args);
+    [[nodiscard]] std::uint64_t lm_head_workspace_bytes(std::uint32_t rows, std::uint32_t n_vec,
+                                                        bool logits_in_workspace) const;
+    /// [TOP_K] see TopKArgs; then check_status(read_status(...)).
+    void top_k(Stream& stream, const TopKArgs& args);
+
 private:
     void eltwise(Stream& stream, const EltwiseArgs& args, std::uint32_t op_code, std::string_view name);
+    void gemv_impl(Stream& stream, const GemvArgs& args, std::string_view op);
     const Kernel& kernel(const std::string& shader, std::uint32_t num_buffers,
                          std::uint32_t push_bytes, std::vector<SpecConstant> spec,
                          std::array<std::uint32_t, 3> local);

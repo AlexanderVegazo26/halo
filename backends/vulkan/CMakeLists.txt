@@ -28,6 +28,9 @@ set(HALO_VK_SHADERS
   matmul/matvec_q5_k
   matmul/matvec_q6_k
   matmul/matvec_iq4_xs
+  matmul/matvec_iq4_nl
+  matmul/matvec_q3_k
+  matmul/matvec_iq3_s
   linear_attn/gated_delta_rule_decode
   linear_attn/conv1d_silu
   norm/gated_rms_norm
@@ -41,6 +44,10 @@ set(HALO_VK_SHADERS
   get_rows/get_rows_q5_k
   get_rows/get_rows_q6_k
   get_rows/get_rows_iq4_xs
+  get_rows/get_rows_iq4_nl
+  get_rows/get_rows_q3_k
+  get_rows/get_rows_iq3_s
+  sample/topk
   attention/kv_write
   attention/attention
   reduce/argmax_partial
@@ -111,6 +118,7 @@ add_library(halo_backend_vulkan STATIC
   src/ops.cpp
   src/ops_layer.cpp
   src/ops_paged.cpp
+  src/ops_head.cpp
   src/shaders.cpp
   src/sha256.cpp
   src/vk_util.cpp

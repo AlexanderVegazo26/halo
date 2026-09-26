@@ -8,7 +8,7 @@ if(TARGET halo_backend_vulkan)
     endif()
   endforeach()
   halo_add_test(test_vulkan
-    SOURCES test_vk_host.cpp test_vk_device.cpp test_vk_ops.cpp test_vk_differential.cpp test_vk_views.cpp test_vk_layer.cpp test_vk_rows.cpp
+    SOURCES test_vk_host.cpp test_vk_device.cpp test_vk_ops.cpp test_vk_differential.cpp test_vk_views.cpp test_vk_layer.cpp test_vk_rows.cpp test_vk_head.cpp
     LIBS halo_backend_vulkan halo_backend_cpu halo_tensor)
   # Shared fp64 reference + tolerance models of the CPU kernel tests (error-bound scaling).
   target_include_directories(test_vulkan PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)

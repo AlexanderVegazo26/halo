@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <format>
 #include <initializer_list>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -105,6 +106,26 @@ inline void require_disjoint_or_exact(const Operand& out, std::string_view out_n
     HALO_CHECK(!overlaps(out, in) || same_range(out, in), ErrorCode::Kernel,
                "{}: output '{}' bytes [{}, {}) partially overlap '{}' bytes [{}, {}) (only an exact alias is allowed)",
                op, out_name, out.begin, out.end, in_name, in.begin, in.end);
+}
+
+/// "<prefix>_<type>" kernel name for a weight type of matvec_row_bytes (matvec_*, get_rows_*).
+inline std::string weight_shader(std::string_view prefix, DType t) {
+    std::string_view suffix;
+    switch (t) {
+        case DType::F32: suffix = "f32"; break;
+        case DType::Q8_0: suffix = "q8_0"; break;
+        case DType::Q4_K: suffix = "q4_k"; break;
+        case DType::Q5_K: suffix = "q5_k"; break;
+        case DType::Q6_K: suffix = "q6_k"; break;
+        case DType::IQ4_XS: suffix = "iq4_xs"; break;
+        case DType::IQ4_NL: suffix = "iq4_nl"; break;
+        case DType::Q3_K: suffix = "q3_k"; break;
+        case DType::IQ3_S: suffix = "iq3_s"; break;
+        default:
+            throw_error(ErrorCode::Unsupported, "Vulkan {}: weight type id {} is not supported", prefix,
+                        static_cast<std::uint32_t>(t));
+    }
+    return std::string(prefix) + "_" + std::string(suffix);
 }
 
 }  // namespace halo::vulkan::detail

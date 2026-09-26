@@ -1,0 +1,13 @@
+#version 450
+// [GET_ROWS] embedding lookup over Q3_K weights: out[t] = dequantize_row(W[ids[t]]).
+// Dequantization: common/dequant_q3_k.glsl; body: common/get_rows_main.glsl.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+
+HALO_DEFINE_BYTE_READERS(wq)
+#include "dequant_q3_k.glsl"
+#include "get_rows_main.glsl"

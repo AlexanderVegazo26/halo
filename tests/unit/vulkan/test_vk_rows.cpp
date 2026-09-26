@@ -35,6 +35,9 @@ const char* type_name(ref::WType t) {
         case ref::WType::Q5_K: return "Q5_K";
         case ref::WType::Q6_K: return "Q6_K";
         case ref::WType::IQ4_XS: return "IQ4_XS";
+        case ref::WType::IQ4_NL: return "IQ4_NL";
+        case ref::WType::Q3_K: return "Q3_K";
+        case ref::WType::IQ3_S: return "IQ3_S";
     }
     return "?";
 }
@@ -105,7 +108,8 @@ TEST(VkRows, GetRowsIsBitIdenticalToDequantizeRowForEveryType) {
         std::uint64_t lead;
     };
     const Case cases[] = {{ref::WType::F32, 77, 12},    {ref::WType::Q8_0, 160, 5},  {ref::WType::Q4_K, 512, 7},
-                          {ref::WType::Q5_K, 512, 3},   {ref::WType::Q6_K, 768, 1},  {ref::WType::IQ4_XS, 512, 9}};
+                          {ref::WType::Q5_K, 512, 3},   {ref::WType::Q6_K, 768, 1},  {ref::WType::IQ4_XS, 512, 9},
+                          {ref::WType::IQ4_NL, 96, 6},  {ref::WType::Q3_K, 512, 11}, {ref::WType::IQ3_S, 768, 2}};
     const std::uint32_t rows = 37;
     const std::vector<std::int32_t> ids{0, 36, 5, 5, 17, 36, 1, 2, 30};
     for (const Case& c : cases) {

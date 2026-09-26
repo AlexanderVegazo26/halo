@@ -14,6 +14,7 @@
 #include "halo/backends/vulkan/ops.h"
 #include "halo/backends/vulkan/shaders.h"
 #include "halo/core/error.h"
+#include "halo/tensor/quant.h"
 
 namespace hv = halo::vulkan;
 
@@ -47,7 +48,9 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
                                          "gdn_gates",      "rope_neox",      "get_rows_f32",
                                          "get_rows_q8_0",  "get_rows_q4_k",  "get_rows_q5_k",
                                          "get_rows_q6_k",  "get_rows_iq4_xs", "kv_write",
-                                         "attention"};
+                                         "attention",      "matvec_iq4_nl",  "matvec_q3_k",
+                                         "matvec_iq3_s",   "get_rows_iq4_nl", "get_rows_q3_k",
+                                         "get_rows_iq3_s", "topk"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
         ASSERT_NE(s, nullptr);
@@ -265,10 +268,18 @@ TEST(VkShapes, MatvecRowBytesFollowGgmlBlockSizes) {
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q5_K, 5120), 5120u / 256 * 176);
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q6_K, 5120), 5120u / 256 * 210);
     EXPECT_EQ(hv::matvec_row_bytes(halo::DType::IQ4_XS, 5120), 5120u / 256 * 136);
+    EXPECT_EQ(hv::matvec_row_bytes(halo::DType::IQ4_NL, 5120), 5120u / 32 * 18);
+    EXPECT_EQ(hv::matvec_row_bytes(halo::DType::Q3_K, 5120), 5120u / 256 * 110);
+    EXPECT_EQ(hv::matvec_row_bytes(halo::DType::IQ3_S, 5120), 5120u / 256 * 110);
+    for (const halo::DType t : {halo::DType::F32, halo::DType::Q8_0, halo::DType::Q4_K, halo::DType::Q5_K,
+                                halo::DType::Q6_K, halo::DType::IQ4_XS, halo::DType::IQ4_NL, halo::DType::Q3_K,
+                                halo::DType::IQ3_S}) {
+        EXPECT_EQ(hv::matvec_row_bytes(t, 5120), halo::tensor::row_bytes(t, 5120)) << static_cast<int>(t);
+    }
     EXPECT_THROW((void)hv::matvec_row_bytes(halo::DType::Q8_0, 33), halo::Error);
     EXPECT_THROW((void)hv::matvec_row_bytes(halo::DType::Q4_K, 128), halo::Error);
     try {
-        (void)hv::matvec_row_bytes(halo::DType::Q3_K, 256);
+        (void)hv::matvec_row_bytes(halo::DType::Q4_0, 256);
         FAIL() << "expected throw";
     } catch (const halo::Error& e) {
         EXPECT_EQ(e.code(), halo::ErrorCode::Unsupported);
