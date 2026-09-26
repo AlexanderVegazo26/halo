@@ -911,6 +911,16 @@ struct ApiServer::Impl {
             send_error(res, family_of(req.path), {ErrorKind::Server, "internal error", std::nullopt, std::nullopt});
         });
 
+        // I1: process_request() wraps only routing() in a try/catch; content providers (our
+        // SSE/chunked stream lambda), post-routing/logging handlers and expect-100 handling
+        // all run outside it. An exception there previously vanished silently into httplib's
+        // connection-level catch(...) -- no 500 is possible by then (headers are already on
+        // the wire), but the drop should at least leave a trace instead of none.
+        svr.set_error_logger([](const httplib::Error& err, const httplib::Request* req) {
+            HALO_ERROR(kLog, "httplib: {}{}", httplib::to_string(err),
+                       req != nullptr ? std::format(" on {} {}", req->method, sanitize_for_log(req->path, 256)) : "");
+        });
+
         svr.set_logger([this](const httplib::Request& req, const httplib::Response& res) {
             metrics.count_request(route_label(req.path), res.status);
             // Streaming responses report "done" when their body is written (StreamPhase).
