@@ -1,9 +1,14 @@
 #pragma once
-// Qwen3.8 ("qwen35") CPU reference forward pass (DECISIONS.md D-004, D-005, D-012, D-016).
+// Qwen3.8 ("qwen35") forward pass (DECISIONS.md D-004, D-005, D-012, D-016, D-017).
 //
-// Built from a NormalizedModel: every projection is a cpu::WeightMatrix whose rows are
-// dequantized on demand from the GGUF bytes (F32 tensors are viewed in place), norms and
-// other small vectors are dequantized once. The forward is composed from halo::cpu ops.
+// One forward for every backend (ADR-001 §4): the forward is composed from the ops of a
+// halo::backend::Backend. The GGUF tensor bytes are imported into the backend read-only
+// (on the CPU backend zero-copy; F32 matrices are then viewed in place and other types
+// dequantize rows on demand, exactly as models::weight_matrix does); norms and other small
+// vectors are dequantized once and uploaded. On the CPU backend every op is the halo::cpu
+// function the pre-backend forward called, on the same values: results are bit-identical
+// (tests/unit/models/test_backend_gate.cpp). The pool constructors build an internal CPU
+// backend, so existing callers are unchanged.
 //
 // Batch-shaped entry point (ARCHITECTURE "Backend::forward", review H-1/H-2): one call
 // runs S sequences, each with its own token rows, KV cache and GDN state; every matmul
@@ -20,11 +25,13 @@
 // state is modified, so a thrown Error (bad token, KV pool exhausted) leaves every
 // sequence's KV and GDN state as they were.
 //
-// Not implemented here (see the WS-G report): the generic Backend virtual interface with
-// variants()/run_op() and the "forward == composed run_op" differential test.
+// Not implemented yet (ADR-001 §9): the GDN state ring and commit-after-status ordering
+// (WS-BI-2; today KV is committed before the LM head, TD-2), the KernelPlan (WS-BI-4); the
+// state still lives in host memory (KvPool / GdnState, imported per call).
 //
-// Thread-safety: a Qwen35 is immutable after construction; forward() may be called from
-// several threads only with disjoint sequences (it shares the ThreadPool, which serializes).
+// Thread-safety: a Qwen35 is immutable after construction. On the CPU backend, forward()
+// may be called from several threads with disjoint sequences (it shares the ThreadPool,
+// which serializes). On a GPU backend the model and its backend are driven by one thread.
 
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +47,10 @@
 #include "halo/model/model.h"
 #include "halo/state/gdn_state.h"
 #include "halo/tokenizer/tokenizer.h"
+
+namespace halo::backend {
+class Backend;
+}
 
 namespace halo::models {
 
@@ -158,8 +169,14 @@ public:
     /// `model` and `pool` must outlive this object. pool may be null (single-threaded).
     /// Throws Error(Unsupported) for weight types without dequantization.
     Qwen35(const model::NormalizedModel& model, cpu::ThreadPool* pool);
-    /// As above with explicit kernel options. Error(Config) for gdn_chunk outside [1, 4096].
+    /// As above with explicit kernel options. Error(Config) for gdn_chunk outside [1, 4096];
+    /// Error(Unsupported) for a gdn_chunk above the backend's limit (the CPU backend's chunked
+    /// GDN accepts at most 1024; before ADR-001 such a chunk failed at the first chunked
+    /// forward with Error(Kernel) instead).
     Qwen35(const model::NormalizedModel& model, cpu::ThreadPool* pool, const Qwen35Options& options);
+    /// Over any backend (ADR-001 §6.1); `backend` must outlive this object. Error(Unsupported)
+    /// when a model dimension or gdn_chunk exceeds the backend's Limits.
+    Qwen35(const model::NormalizedModel& model, backend::Backend& backend, const Qwen35Options& options = {});
     ~Qwen35();
     Qwen35(const Qwen35&) = delete;
     Qwen35& operator=(const Qwen35&) = delete;
@@ -170,6 +187,8 @@ public:
     [[nodiscard]] std::size_t n_vocab() const noexcept;
     [[nodiscard]] std::size_t n_embd() const noexcept;
     [[nodiscard]] std::size_t gdn_chunk() const noexcept;
+    /// The backend the forward runs on (the internal CPU backend for the pool constructors).
+    [[nodiscard]] backend::Backend& backend() const noexcept;
 
     [[nodiscard]] kv_cache::KvLayout kv_layout(std::size_t block_tokens = 16) const;
     [[nodiscard]] kv_cache::KvLayout mtp_kv_layout(std::size_t block_tokens = 16) const;
@@ -192,6 +211,9 @@ public:
     struct Impl;
 
 private:
+    Qwen35(const model::NormalizedModel& model, std::unique_ptr<backend::Backend> owned, const Qwen35Options& options,
+           backend::Backend* borrowed = nullptr);
+
     const model::NormalizedModel* model_;
     std::unique_ptr<Impl> impl_;
 };
