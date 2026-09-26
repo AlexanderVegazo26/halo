@@ -11,6 +11,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 
 #include "../models/tiny_golden.h"
@@ -136,6 +140,33 @@ Toks oracle(const Toks& g, std::size_t m, std::size_t k, std::size_t wrong, std:
     Toks d(g.begin() + static_cast<std::ptrdiff_t>(m + 1), g.begin() + static_cast<std::ptrdiff_t>(m + 1 + k));
     if (wrong < k) d[wrong] = static_cast<std::int32_t>((static_cast<std::size_t>(d[wrong]) + 1) % n_vocab);
     return d;
+}
+
+/// The D-005 draft chain as direct mtp_forward calls, one depth at a time: depth 1 embeds the
+/// pending token x with the carried trunk hidden h_{L-1} at position L; depth i >= 2 embeds
+/// draft i-1 with the MTP's own post-shared_head_norm hidden of depth i-1 at position L+i-1.
+/// The MTP KV must already hold the catch-up rows (positions < L). Shared by the Speculator
+/// equivalence test and the llama.cpp cross-check, so both check the same convention.
+Toks direct_chain(const halo::models::Qwen35& m, halo::kv_cache::SequenceKv& mtp_kv, std::int32_t x,
+                  std::vector<float> h, std::size_t L, std::size_t k) {
+    Toks out;
+    std::int32_t tok = x;
+    for (std::size_t i = 0; i < k; ++i) {
+        halo::models::MtpStep s;
+        s.tokens = std::span(&tok, 1);
+        s.hidden = h;
+        s.kv = &mtp_kv;
+        s.first_position = static_cast<std::int32_t>(L + i);
+        const std::size_t row0 = 0;
+        s.logit_rows = std::span(&row0, 1);
+        s.want_hidden = true;
+        halo::models::StepResult r;
+        m.mtp_forward(std::span(&s, 1), r);
+        out.push_back(r.seqs[0].argmax.at(0).index);
+        tok = out.back();
+        h = std::move(r.seqs[0].hidden);
+    }
+    return out;
 }
 
 }  // namespace
@@ -384,6 +415,8 @@ TEST_F(Spec, KvExhaustionDuringVerifyLeavesEverySequenceAtItsPreTickState) {
 
 // ---- the draft chain (D-005 amendment) ---------------------------------------------------
 
+// The Speculator's chain == direct_chain(), bit for bit; DraftChainMatchesLlamaCpp checks
+// direct_chain() itself against llama.cpp.
 TEST_F(Spec, DraftChainEqualsDirectMtpCallsFedTheirOwnHidden) {
     const Toks pr = prompt("p0");
     auto sp = spec(GateMode::Always);
@@ -401,27 +434,117 @@ TEST_F(Spec, DraftChainEqualsDirectMtpCallsFedTheirOwnHidden) {
     sp.flush_mtp(tw);
     const std::size_t L = twin->length();
     ASSERT_EQ(twin->mtp_kv->length(), L - 1);
-    std::int32_t tok = first[0];
-    std::vector<float> h = twin->last_hidden;
-    Toks direct;
-    for (std::size_t i = 0; i < 3; ++i) {
-        halo::models::MtpStep m;
-        m.tokens = std::span(&tok, 1);
-        m.hidden = h;
-        m.kv = &*twin->mtp_kv;
-        m.first_position = static_cast<std::int32_t>(L + i);
-        const std::size_t row0 = 0;
-        m.logit_rows = std::span(&row0, 1);
-        m.want_hidden = true;
-        halo::models::StepResult r;
-        model().mtp_forward(std::span(&m, 1), r);
-        direct.push_back(r.seqs[0].argmax[0].index);
-        tok = direct.back();
-        h = r.seqs[0].hidden;
-    }
+    const Toks direct = direct_chain(model(), *twin->mtp_kv, first[0], twin->last_hidden, L, 3);
     EXPECT_EQ(t.out[0].drafts, direct);
     EXPECT_EQ(dump_kv(*s->mtp_kv), dump_kv(*twin->mtp_kv)) << "chain rows written at the same MTP positions";
     sp.abort_draft(std::span(&q, 1), t);
+}
+
+// Review R-5(b): the draft chain against llama.cpp, the only executable MTP reference (D-005).
+// llamacpp_draft_chain.json holds llama-server's (bd4f514db, --spec-type draft-mtp, 3 drafts,
+// greedy, one fresh server per prompt) top-3 draft candidates of every draft call and depth on
+// the golden prompts, captured by capture_llamacpp_drafts.py next to it.
+//
+// For every recorded draft call this rebuilds llama.cpp's MTP state with direct model calls and
+// runs direct_chain() — the same helper DraftChainEqualsDirectMtpCallsFedTheirOwnHidden proves
+// the Speculator bit-identical to. Every draft must equal llama.cpp's top candidate wherever
+// llama.cpp's top-1 lead is clear. Feeding the trunk hidden at depth >= 2 (the defect R-5(b)
+// names) fails 27 of 27 compared rows at depths 2 and 3.
+//
+// One difference from HALO's production MTP state is reproduced here on purpose: llama.cpp's
+// catch-up also writes an MTP row at position 0, pairing the first prompt token with its
+// carried-over hidden, which a fresh slot zero-initialises (common/speculative.cpp
+// draft_mtp::process, pending_h; it is not reset between requests on the same slot). HALO's
+// pairing (h_p, x_{p+1}) starts at position 1 and has no such row. Without it the drafts
+// differ from llama.cpp on some clear-lead rows (tiny model: 3 / 9 / 14 of 27 at depth 1/2/3);
+// with it they match on all of them. Whether production should mimic the row is an open
+// D-005 question (WS-G M6 report), not something this test decides.
+TEST_F(Spec, DraftChainMatchesLlamaCpp) {
+    // llama.cpp's probabilities come from its top-k=10 draft sampler and are printed with
+    // 3 decimals; below this lead the two fp32 implementations may legitimately disagree.
+    constexpr double kMinLead = 0.05;
+    constexpr std::size_t kDepth = 3;
+    const std::filesystem::path data = std::filesystem::path(HALO_SOURCE_DIR) / "tests/unit/speculative/llamacpp_draft_chain.json";
+    std::ifstream f(data);
+    ASSERT_TRUE(f) << data << " is committed test data; it must exist";
+    const nlohmann::json j = nlohmann::json::parse(f);
+    ASSERT_EQ(j.at("model").get<std::string>(), "tiny-f32.gguf");
+    ASSERT_EQ(j.at("n_draft").get<std::size_t>(), kDepth);
+    const std::size_t E = model().n_embd();
+
+    std::array<std::size_t, kDepth> compared{}, skipped{};
+    for (const auto& [name, rec] : j.at("prompts").items()) {
+        SCOPED_TRACE(name);
+        const Toks pr = prompt(name.c_str());
+        ASSERT_EQ(rec.at("prompt_len").get<std::size_t>(), pr.size());
+        ASSERT_EQ(rec.at("server_prompt_tokens").get<std::size_t>(), pr.size()) << "llama.cpp must not add a BOS";
+        const Toks gen = rec.at("tokens").get<Toks>();
+        // The recorded run is the same model: llama.cpp's greedy decode is the golden one.
+        EXPECT_EQ(gen, golden_->i32(name + ".decode_tokens"));
+        const auto& calls = rec.at("draft_calls");
+        const auto accepted = rec.at("accepted").get<std::vector<std::size_t>>();
+        ASSERT_FALSE(calls.empty());
+        ASSERT_EQ(accepted.size(), calls.size());
+
+        std::size_t emitted = 1;  // the prefill's token
+        for (std::size_t c = 0; c < calls.size(); ++c) {
+            SCOPED_TRACE(testing::Message() << "draft call " << c << " after " << emitted << " tokens");
+            ASSERT_LE(emitted, gen.size());
+            const auto& call = calls[c];
+            ASSERT_GE(call.size(), 1u);
+            ASSERT_LE(call.size(), kDepth);
+            // llama.cpp's state at this call: rows prompt + gen[0, emitted-1) in the target,
+            // pending token x = gen[emitted-1].
+            Toks ctx = pr;
+            ctx.insert(ctx.end(), gen.begin(), gen.begin() + static_cast<std::ptrdiff_t>(emitted - 1));
+            const std::size_t L = ctx.size();
+            auto s = seq(kDepth + 1);
+            halo::models::SeqStep st;
+            st.tokens = ctx;
+            st.kv = &s->kv;
+            st.gdn = &s->gdn;
+            st.logits = halo::models::LogitsMode::None;
+            st.want_hidden = true;
+            halo::models::StepResult tr;
+            model().forward(std::span(&st, 1), tr);
+            const std::vector<float>& h = tr.seqs[0].hidden;  // L x E, final output-normed
+            // MTP catch-up: llama.cpp's position-0 row (x_0, zero hidden), then the D-005
+            // pairs (x_i, h_{i-1}) at positions 1..L-1.
+            std::vector<float> hid(E, 0.0f);
+            hid.insert(hid.end(), h.begin(), h.end() - static_cast<std::ptrdiff_t>(E));
+            halo::models::MtpStep cu;
+            cu.tokens = ctx;
+            cu.hidden = hid;
+            cu.kv = &*s->mtp_kv;
+            cu.first_position = 0;
+            cu.logits = halo::models::LogitsMode::None;
+            halo::models::StepResult cr;
+            model().mtp_forward(std::span(&cu, 1), cr);
+            const Toks d = direct_chain(model(), *s->mtp_kv, gen[emitted - 1],
+                                        std::vector<float>(h.end() - static_cast<std::ptrdiff_t>(E), h.end()), L, call.size());
+            for (std::size_t i = 0; i < call.size(); ++i) {
+                const auto& cand = call[i];
+                ASSERT_GE(cand.size(), 2u);
+                const std::int32_t top = cand[0][0].get<std::int32_t>();
+                const double lead = cand[0][1].get<double>() - cand[1][1].get<double>();
+                if (lead < kMinLead) {
+                    ++skipped[i];
+                    continue;
+                }
+                ++compared[i];
+                EXPECT_EQ(d[i], top) << "depth " << i + 1 << " (llama.cpp p = " << cand[0][1] << ", lead " << lead << ")";
+            }
+            // Drafts llama.cpp's target accepted are the next tokens; the following call
+            // starts after them and the target's own token.
+            emitted += accepted[c] + 1;
+        }
+    }
+    std::printf("[llama.cpp draft chain] compared per depth: %zu / %zu / %zu, skipped (lead < %.2f): %zu / %zu / %zu\n",
+                compared[0], compared[1], compared[2], kMinLead, skipped[0], skipped[1], skipped[2]);
+    // Not vacuous: depths 2 and 3 are the point of this test.
+    EXPECT_GE(compared[0], 20u);
+    EXPECT_GE(compared[1], 20u);
+    EXPECT_GE(compared[2], 20u);
 }
 
 // ---- MTP pairing anchored to the golden-validated convention ----------------------------------

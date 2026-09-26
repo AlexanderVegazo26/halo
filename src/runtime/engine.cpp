@@ -894,6 +894,7 @@ void CpuEngine::tick() {
             info.decode_rows += 1 + o.drafts.size();
             info.max_draft = std::max(info.max_draft, o.drafts.size());
             info.drafted += o.drafts.size();
+            info.drafts.insert(info.drafts.end(), o.drafts.begin(), o.drafts.end());
             info.accepted += o.accepted;
             a.drafted += o.drafts.size();
             a.accepted += o.accepted;

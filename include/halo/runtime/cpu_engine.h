@@ -46,6 +46,9 @@ struct TickInfo {
     std::size_t max_draft = 0;           ///< deepest draft chain in the tick
     std::size_t drafted = 0;
     std::size_t accepted = 0;
+    /// Additive (WS-G M6): the draft tokens of every decode sequence, in tick order
+    /// (drafted == drafts.size()). Lets tests compare what two MTP sources proposed.
+    std::vector<std::int32_t> drafts;
     /// Pass counters count forward / mtp_forward *calls* (review N-4). Each call is one
     /// weight pass by construction (every matmul runs once over all rows of the call), so a
     /// count of 1 proves one batched forward, not a measured byte count; the byte figure is
