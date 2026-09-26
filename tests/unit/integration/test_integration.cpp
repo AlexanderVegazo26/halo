@@ -492,12 +492,29 @@ halo::autotune::TuneOptions tune_options() {
     return o;
 }
 
+// TRD §49: a GPU profile key requires a pinned GPU power state, and key formation refuses
+// (ErrorCode::Config) when it is unknown. On a host whose driver does not expose a pinnable
+// state (amdgpu here: power_dpm_force_performance_level=auto, no pp_power_profile_mode) the
+// tune->persist->apply chain is untestable until the operator pins the mode -- skip, don't
+// fail: the refusal is the designed behavior. Returns the skip reason (GTEST_SKIP must run
+// in the test body itself; inside a helper it would only return from the helper).
+std::optional<std::string> gpu_power_state_unknown_reason() {
+    halo::hardware::DiscoveryOptions dopt;
+    dopt.root = "/";
+    const auto hw = halo::profiling::capture_hardware_state(dopt, "probe");
+    if (hw.gpu_arch && !halo::profiling::power_mode_known(hw.power_mode))
+        return std::format("GPU power state unknown ('{}'); pin the GPU power mode (TRD §49) to run this test",
+                           hw.power_mode);
+    return std::nullopt;
+}
+
 }  // namespace
 
 TEST_F(Fx, ProfileDbWinnerIsAppliedOnTheNextLaunch) {
     TempDir d("profile");
     const auto db_path = d.path / "profiles.db";
     if (!fs::exists(tiny_q4())) GTEST_SKIP() << "tiny-q4_0.gguf missing under " << halo::test::tiny_dir();
+    if (const auto why = gpu_power_state_unknown_reason()) GTEST_SKIP() << *why;
     EngineConfig cfg = tiny_cfg();
     cfg.model_path = tiny_q4().string();
     cfg.max_sequences = 1;
@@ -574,6 +591,7 @@ TEST_F(Fx, ProfileMismatchesAndOverridesKeepDefaultsVisibly) {
     TempDir d("profile2");
     const auto db_path = d.path / "profiles.db";
     if (!fs::exists(tiny_q4())) GTEST_SKIP() << "tiny-q4_0.gguf missing under " << halo::test::tiny_dir();
+    if (const auto why = gpu_power_state_unknown_reason()) GTEST_SKIP() << *why;
     EngineConfig cfg = tiny_cfg();
     cfg.model_path = tiny_q4().string();
     cfg.max_sequences = 1;
