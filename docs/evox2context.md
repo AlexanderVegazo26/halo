@@ -131,20 +131,33 @@ happens again with some other historical handoff note: check what a constraint a
 and whether its context has since resolved, rather than treating a quoted fragment as a
 standing rule.
 
-**Reconciliation (still open)**: on a host-only machine, the planner reports prefix
-checkpoints as disabled (`src/memory/planner.cpp:352-361`) while the engine silently budgets
-them on the host anyway (`src/runtime/engine.cpp:302-316`), so `halo inspect`'s memory report
-understates the real footprint. **This is now reproducible as a test failure on the EVO-X2:**
-with a real GPU tier the engine uses the planner's derived budget — `max_context / 8192 + 1`
-per slot, i.e. exactly 1 checkpoint for the tiny model's 512-token context — instead of the
-host fallback's `requested + 2` per sequence, so the retirement checkpoint evicts the hint
-checkpoint and `EngineTest.CheckpointHintsAreTakenAndReused` fails (`cached_prompt_tokens` 0,
-expected 100). It fails identically at `844ec11` (HEAD before BI-6), so it is not a BI-6
-regression; it is this finding turning into a red test on hardware. The fix should reconcile
-the two budget paths (e.g. apply the same `+ 2` headroom when a GPU tier supplies the budget).
+**Reconciliation (FIXED, commit `8d04472`)**: the engine now budgets the same thing on both
+paths — (per-slot count + 2) x sequences x (state copy + token/hidden bytes) — whether the
+planner found a GPU tier or the host fallback applied. `EngineTest.CheckpointHintsAreTakenAnd
+Reused` passes on the EVO-X2. (`halo inspect`'s memory report still shows only the planner's
+derived line, which no longer matches the engine's real budget by the +2 headroom; cosmetic,
+worth aligning when the planner next changes.)
 
 ### M11 — real hardware validation
-Everything in `docs/evox2.md` that hasn't run yet: the smoke harness beyond 3×32-token
+**First results (2026-09-26, commit `0d69e13`):** the canonical 27B pack
+(`~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf`) loaded and generated for the first time.
+`halo inspect --ctx 4096 --parallel 1`: fits, 18.65 GiB planned against the 96 GiB carveout.
+Greedy 32-token runs (`-p "The capital of France is" --raw --temperature 0`) on the **CPU
+backend** (1.89 tok/s) and the **Vulkan backend on real RADV** (1.90 tok/s; Mesa 26.0.8,
+device `RADV STRIX_HALO`) produced **token-identical, coherent output**. `--backend hip`
+constructs in device mode and fails cleanly at the first forward with a typed
+`UNSUPPORTED_ERROR` (import_host / ADR-001 §5.2) and exit code 1 — exactly the expected
+pre-WS-BI-2 behaviour. Note the Vulkan tok/s parity with CPU is not suspicious: KV/GDN state
+is host-imported every forward, so decode is dispatch/import-bound, not compute-bound.
+
+Full ctest on this host: **937/937 pass** (16 labelled skips: opt-in bandwidth, RADV-limit
+2-D grid, device-absent negatives, gguf-py geometry, llama.cpp baseline adapters needing the
+reference server, and the two Fx profile-DB chain tests, which now skip by design because
+this host's GPU power state is unpinned — amdgpu reports `auto` and exposes no
+`pp_power_profile_mode`; TRD §49 correctly refuses to form a GPU profile key until the
+operator pins the mode. Do that as part of Phase 0 below.)
+
+Still open from the original list: the smoke harness beyond 3×32-token
 prompts, chunked-prefill at scale, KV paging under real pressure, prefix cache at scale,
 non-greedy sampling, structured output, concurrent sequences, and the full API surface, all
 at 27B. This is the actual point of you having the hardware — just run it and see what
@@ -183,8 +196,7 @@ breaks.
    H1 above for exactly what's left).
 4. Real Vulkan (RADV) and HIP (ROCm) validation passes.
 5. M11's serving-surface validation at scale.
-6. M5 (offline transformers run) and M10 (planner/engine checkpoint-budget reconciliation —
-   now a red test on hardware, see above) as time allows.
+6. ~~M10~~ (done, `8d04472`) and M5 (offline transformers run) as time allows.
 
 **Fixture note (EVO-X2):** `~/halo-ref` now exists on this host — tokenizer files fetched with
 `python/tools/fetch_hf_files.py`, tiny model + goldens regenerated with
