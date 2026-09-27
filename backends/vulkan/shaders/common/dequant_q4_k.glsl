@@ -8,18 +8,24 @@
 #ifndef HALO_DEQUANT_GLSL
 #define HALO_DEQUANT_GLSL
 
+#define HALO_DQ_QK 256
 const uint DQ_QK = 256u;
 const uint DQ_BLOCK_BYTES = 144u;
 
 // get_scale_min_k4(j, q, &d, &m) with q = block scales at byte offset `so`.
+// Branchless: j = 2*chunk+hi differs between lanes of the wave, so the original j < 4
+// branch executed both sides under exec-masking. One extra byte load, no divergence.
 void scale_min_k4(uint j, uint so, out uint sc, out uint m) {
-    if (j < 4u) {
-        sc = read_u8(so + j) & 63u;
-        m = read_u8(so + j + 4u) & 63u;
-    } else {
-        sc = (read_u8(so + j + 4u) & 0xFu) | ((read_u8(so + j - 4u) >> 6) << 4);
-        m = (read_u8(so + j + 4u) >> 4) | ((read_u8(so + j) >> 6) << 4);
-    }
+    const uint sj = read_u8(so + j);        // s[j]
+    const uint sj4 = read_u8(so + j + 4u);  // s[j+4]
+    const uint sjm4 = read_u8(so + max(j, 4u) - 4u);  // s[j-4] for j >= 4 (s[j] otherwise: unused)
+    const uint sc_lo = sj & 63u;
+    const uint m_lo = sj4 & 63u;
+    const uint sc_hi = (sj4 & 0xFu) | ((sjm4 >> 6) << 4);
+    const uint m_hi = (sj4 >> 4) | ((sj >> 6) << 4);
+    const bool hi = j >= 4u;
+    sc = hi ? sc_hi : sc_lo;
+    m = hi ? m_hi : m_lo;
 }
 
 float halo_dequant(uint row_off, uint c) {

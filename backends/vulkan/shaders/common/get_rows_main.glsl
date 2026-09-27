@@ -25,7 +25,13 @@ layout(push_constant) uniform Push {
     uint row_base, slab_rows, flag_bad;
 } pc;
 
+// Per-type one-time workgroup setup (e.g. the IQ3_S shared grid); empty for most types.
+#ifndef HALO_DEQUANT_SETUP
+#define HALO_DEQUANT_SETUP
+#endif
+
 void main() {
+    HALO_DEQUANT_SETUP;
     const uint t = halo_group_id();
     if (t >= pc.n_ids) return;
     const int id = ids[pc.ids_off + t];

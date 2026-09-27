@@ -7,6 +7,7 @@
 #ifndef HALO_DEQUANT_GLSL
 #define HALO_DEQUANT_GLSL
 
+#define HALO_DQ_QK 256
 const uint DQ_QK = 256u;
 const uint DQ_BLOCK_BYTES = 110u;
 
@@ -78,6 +79,18 @@ const uint IQ3S_GRID[512] = uint[512](
     0x0f090307u, 0x0f090501u, 0x0f090b01u, 0x0f0b0505u, 0x0f0b0905u, 0x0f0d0105u, 0x0f0d0703u, 0x0f0f0101u
 );
 
+// A const array indexed dynamically is lowered to scratch (local) memory by the GLSL/SPIR-V
+// toolchain, which made this lookup ~100x slower than the rest of the kernel combined. Stage
+// the grid in workgroup-shared memory instead (filled once per workgroup by HALO_DEQUANT_SETUP,
+// which the including main must invoke before any halo_dequant call).
+shared uint iq3s_grid_sh[512];
+
+void halo_iq3s_setup() {
+    for (uint i = gl_LocalInvocationID.x; i < 512u; i += gl_WorkGroupSize.x) iq3s_grid_sh[i] = IQ3S_GRID[i];
+    barrier();
+}
+#define HALO_DEQUANT_SETUP halo_iq3s_setup()
+
 float halo_dequant(uint row_off, uint c) {
     const uint bo = row_off + (c / DQ_QK) * DQ_BLOCK_BYTES;
     const uint i = c % DQ_QK;
@@ -101,7 +114,7 @@ float halo_dequant(uint row_off, uint c) {
         g = read_u8(qso + 2u * l + 1u) | ((h << (7u - 2u * l)) & 256u);
         byte_j = jj - 4u;
     }
-    const float gb = float((IQ3S_GRID[g] >> (8u * byte_j)) & 0xFFu);
+    const float gb = float((iq3s_grid_sh[g] >> (8u * byte_j)) & 0xFFu);
     const uint sb = read_u8(bo + 74u + 4u * grp + l);
     const float sign = ((sb >> jj) & 1u) != 0u ? -1.0 : 1.0;
     precise float db = d * float(1u + 2u * s);

@@ -77,6 +77,9 @@ struct OpsOptions {
     /// Workgroup size (power of two, 32..1024) of the reduction kernels (rms_norm,
     /// matvec_*, argmax). Passed as specialization constant 0.
     std::uint32_t reduce_workgroup = 256;
+    /// Workgroup size of the gemv/matvec kernels; 0 = reduce_workgroup. Small workgroups
+    /// (32: one wave, no cross-subgroup step) schedule more rows concurrently.
+    std::uint32_t gemv_workgroup = 0;
     /// Workgroup size of gated_delta_rule_decode (threads map to d_v columns; need not be a
     /// power of two).
     std::uint32_t gdn_workgroup = 128;

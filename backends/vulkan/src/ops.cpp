@@ -183,11 +183,14 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
         return;
     }
 
-    const std::uint32_t wg = options_.reduce_workgroup;
+    const std::uint32_t wg = options_.gemv_workgroup != 0 ? options_.gemv_workgroup : options_.reduce_workgroup;
     struct Push {
         std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
     };
-    const Kernel& k = kernel(shader, 3, sizeof(Push), {{0, wg}}, {wg, 1, 1});
+    // Specialization constant 1 (BATCHED): decode dispatches get a pipeline compiled without
+    // the batched accumulator body (matvec_quant_main.glsl).
+    const Kernel& k =
+        kernel(shader, 3, sizeof(Push), {{0, wg}, {1, a.n_vec == 1 ? 0u : 1u}}, {wg, 1, 1});
     const std::array bindings{ow.binding, ox.binding, oy.binding};
     const DeviceInfo& info = ctx_->info();
     const GroupCount groups = grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]);

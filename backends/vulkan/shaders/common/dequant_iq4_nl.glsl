@@ -5,6 +5,7 @@
 #ifndef HALO_DEQUANT_GLSL
 #define HALO_DEQUANT_GLSL
 
+#define HALO_DQ_QK 32
 const uint DQ_QK = 32u;
 const uint DQ_BLOCK_BYTES = 18u;
 
