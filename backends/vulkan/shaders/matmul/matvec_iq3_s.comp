@@ -1,13 +1,80 @@
 #version 450
-// QUANT_GEMV / MATMUL, IQ3_S weights: y[t][r] = sum_c W[r,c] * x[t][c]. Dequantization:
-// common/dequant_iq3_s.glsl (shared with get_rows_iq3_s); body: common/matvec_quant_main.glsl.
+// QUANT_GEMV / MATMUL, ggml IQ3_S weights: y[t][r] = sum_c W[r,c] * x[t][c]. Per-type
+// main: common/matvec_iq3_s_main.glsl (llama.cpp mul_mat_vec_iq3_s port: 8 threads/block,
+// SWAR dequant, d*(1+2*scale) hoisted per 32-element group; shared with neither the other
+// matvec types nor get_rows_iq3_s, which keep common/dequant_iq3_k.glsl). The grid table
+// and workgroup setup come from common/dequant_iq3_s.glsl (shared with get_rows). The
+// body is instantiated twice: FAST reads the weight words through a 2-aligned funnel
+// (110-byte blocks are 2-mod-4 on odd blocks); SLOW handles arbitrary byte offsets
+// (VkViews arena gate) via HALO_DEFINE_BYTE_READERS with identical integer content, so
+// both produce bitwise-identical results.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint n_vec;     // 1..MAX_VEC
+    uint w_off;     // sub-alignment remainder of the W view (bytes)
+    uint w_stride;  // row stride of W (bytes)
+    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+} pc;
+
+// Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
+layout(constant_id = 1) const uint BATCHED = 1;
+const uint MAX_VEC = 8u;
+
+shared float red[WG];
 
 HALO_DEFINE_BYTE_READERS(wq)
+// IQ3S_GRID + shared iq3s_grid_sh[512] + halo_iq3s_setup() (also defines halo_dequant,
+// unused here; get_rows_iq3_s keeps using it).
 #include "dequant_iq3_s.glsl"
-#include "matvec_quant_main.glsl"
+
+struct QI3SBlock {
+    uvec2 qsw;     // the group's 8 packed qs bytes (4 x 9-bit grid indices with qh)
+    uint signs;    // 4 sign bytes (one per 8-element l-group)
+    uint qh;       // the group's qh byte
+    float dscale;  // d * (1 + 2*scale), hoisted per 32-element group
+};
+
+// 110-byte blocks: odd blocks are 2-mod-4 even in an aligned row, so the fast path reads
+// every word through a branchless funnel shift (read_f16's pattern; bo is always even).
+uint ld32e(const uint bo) {
+    const uint i = bo >> 2;
+    const uint sh = (bo & 3u) << 3;
+    const uint w0 = wq[i];
+    return (w0 >> sh) | (sh != 0u ? wq[min(i + 1u, uint(wq.length()) - 1u)] << (32u - sh) : 0u);
+}
+
+#define LD32(bo) ld32e(bo)
+#define IQ3S_FN fast
+#include "matvec_iq3_s_main.glsl"
+#undef LD32
+#undef IQ3S_FN
+
+#define LD32(bo) \
+    (read_u8(bo) | (read_u8((bo) + 1u) << 8) | (read_u8((bo) + 2u) << 16) | (read_u8((bo) + 3u) << 24))
+#define IQ3S_FN slow
+#include "matvec_iq3_s_main.glsl"
+#undef LD32
+#undef IQ3S_FN
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    halo_iq3s_setup();  // fill iq3s_grid_sh (uniform; ends with a barrier)
+    const uint row_off = pc.w_off + row * pc.w_stride;
+    // Uniform branch: 110-byte blocks keep every field u16-aligned when the row starts
+    // even; odd row starts (VkViews arena gate) take the byte-reader path.
+    if ((row_off & 1u) == 0u)
+        iq3s_fast(row, row_off);
+    else
+        iq3s_slow(row, row_off);
+}

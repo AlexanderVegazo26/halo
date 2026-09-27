@@ -1,13 +1,81 @@
 #version 450
-// QUANT_GEMV / MATMUL, IQ4_NL weights: y[t][r] = sum_c W[r,c] * x[t][c]. Dequantization:
-// common/dequant_iq4_nl.glsl (shared with get_rows_iq4_nl); body: common/matvec_quant_main.glsl.
+// QUANT_GEMV / MATMUL, ggml IQ4_NL weights: y[t][r] = sum_c W[r,c] * x[t][c]. Per-type
+// main: common/matvec_iq4_nl_main.glsl (follows the iq4_xs port: 8 threads per 256-value
+// superblock, SWAR nibble extract, d hoisted per 32-element block; shared with neither
+// the other matvec types nor get_rows_iq4_nl, which keep common/dequant_iq4_nl.glsl). The
+// body is instantiated twice: FAST reads the weight words through a 2-aligned funnel
+// (18-byte blocks are 2-mod-4 on odd blocks); SLOW handles arbitrary byte offsets (VkViews
+// arena gate) via HALO_DEFINE_BYTE_READERS with identical integer content, so both
+// produce bitwise-identical results.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint n_vec;     // 1..MAX_VEC
+    uint w_off;     // sub-alignment remainder of the W view (bytes)
+    uint w_stride;  // row stride of W (bytes)
+    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+} pc;
+
+// Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
+layout(constant_id = 1) const uint BATCHED = 1;
+const uint MAX_VEC = 8u;
+
+shared float red[WG];
+
+// kvalues_iq4nl staged in shared memory (see matvec_iq4_xs.comp).
+shared int sh_kv[16];
 
 HALO_DEFINE_BYTE_READERS(wq)
-#include "dequant_iq4_nl.glsl"
-#include "matvec_quant_main.glsl"
+
+// ggml kvalues_iq4nl (ggml-common.h, MIT)
+const int KVALUES[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+struct QI4NLBlock {
+    uvec4 qsw;  // the block's 4 packed qs words (32 nibbles)
+    float d;
+};
+
+// 18-byte blocks: odd blocks are 2-mod-4 even in an aligned row, so the fast path reads
+// every word through a branchless funnel shift (read_f16's pattern; bo is always even).
+uint ld32e(const uint bo) {
+    const uint i = bo >> 2;
+    const uint sh = (bo & 3u) << 3;
+    const uint w0 = wq[i];
+    return (w0 >> sh) | (sh != 0u ? wq[min(i + 1u, uint(wq.length()) - 1u)] << (32u - sh) : 0u);
+}
+
+#define LD32(bo) ld32e(bo)
+#define IQ4NL_FN fast
+#include "matvec_iq4_nl_main.glsl"
+#undef LD32
+#undef IQ4NL_FN
+
+#define LD32(bo) \
+    (read_u8(bo) | (read_u8((bo) + 1u) << 8) | (read_u8((bo) + 2u) << 16) | (read_u8((bo) + 3u) << 24))
+#define IQ4NL_FN slow
+#include "matvec_iq4_nl_main.glsl"
+#undef LD32
+#undef IQ4NL_FN
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    if (gl_LocalInvocationID.x < 16u) sh_kv[gl_LocalInvocationID.x] = KVALUES[gl_LocalInvocationID.x];
+    barrier();
+    const uint row_off = pc.w_off + row * pc.w_stride;
+    // Uniform branch: 18-byte blocks keep every field u16-aligned when the row starts
+    // even; odd row starts (VkViews arena gate) take the byte-reader path.
+    if ((row_off & 1u) == 0u)
+        iq4nl_fast(row, row_off);
+    else
+        iq4nl_slow(row, row_off);
+}

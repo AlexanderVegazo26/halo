@@ -191,13 +191,15 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
         return;
     }
 
-    // Workgroup size. Types with a llama-style SWAR matvec main (q4_k/q5_k/q6_k/iq4_xs; see
-    // shaders/common/matvec_<type>_main.glsl) run fastest at one wave (64): 16 threads per
-    // block -> 4 blocks per iteration, and both ffn shapes (20/68 blocks) divide by 4.
+    // Workgroup size. Types with a llama-style SWAR matvec main (q4_k/q5_k/q6_k/q3_k/
+    // iq4_xs/iq4_nl/iq3_s; see shaders/common/matvec_<type>_main.glsl) run fastest at one
+    // wave (64): 16 (8 for iq*) threads per block -> 4 (8) blocks per iteration, and both
+    // ffn shapes (20/68 blocks) divide by 4.
     // Types on the shared matvec_quant_main.glsl keep reduce_workgroup (256 measured best
     // there). gemv_workgroup (HALO_VK_GEMV_WG) overrides for tuning.
     const bool swar_main = a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K ||
-                           a.wtype == DType::IQ4_XS;
+                           a.wtype == DType::IQ4_XS || a.wtype == DType::IQ4_NL || a.wtype == DType::Q3_K ||
+                           a.wtype == DType::IQ3_S;
     const std::uint32_t wg = options_.gemv_workgroup != 0 ? options_.gemv_workgroup
                              : swar_main                ? 64
                                                         : options_.reduce_workgroup;
