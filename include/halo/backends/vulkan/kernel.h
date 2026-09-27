@@ -169,6 +169,11 @@ private:
     // as "<kernel> <ns>" lines (diagnostics; off by default, one branch per dispatch).
     bool op_timings_ = false;
     std::string op_timings_path_;
+    // HALO_VK_SYNC_EVERY=N: log each dispatch's kernel name to stderr and submit+wait every
+    // N dispatches (1 = sync each). Diagnostics for device-lost hangs: the last logged
+    // batch brackets the faulting kernel. Drastically slows execution; 0 (default) = off.
+    std::uint32_t sync_every_ = 0;
+    std::uint32_t sync_logged_ = 0;  // monotonic; dispatches_ resets per command buffer
     struct OpMark {
         std::string name;
         std::uint32_t begin, end;

@@ -16,6 +16,8 @@ namespace halo::vulkan {
 namespace {
 constexpr std::uint32_t k_sets_per_pool = 256;
 constexpr std::uint32_t k_descriptors_per_pool = 256 * 16;
+// See Stream::dispatch: command buffers are capped at this many dispatches.
+constexpr std::uint32_t kMaxDispatchesPerSubmit = 512;
 }  // namespace
 
 Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx_(std::move(ctx)) {
@@ -25,6 +27,8 @@ Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx
         op_timings_path_ = p;
         max_timestamps = std::max(max_timestamps, 8192u);
     }
+    if (const char* p = std::getenv("HALO_VK_SYNC_EVERY"); p != nullptr && *p != '\0')
+        sync_every_ = static_cast<std::uint32_t>(std::max(1, std::atoi(p)));
     const VkDevice dev = ctx_->device();
     try {
         VkCommandPoolCreateInfo cpi{};
@@ -147,6 +151,16 @@ VkDescriptorSet Stream::allocate_set(VkDescriptorSetLayout layout, std::uint32_t
 
 void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffers,
                       std::span<const std::byte> push, GroupCount groups) {
+    // Very long single command buffers (thousands of compute dispatches, e.g. a large
+    // prefill) wedge the compute ring on this platform (gfx1151 / RADV, observed as
+    // VK_ERROR_DEVICE_LOST at prompts >= 24 tokens). Bound a command buffer to
+    // kMaxDispatchesPerSubmit dispatches: submit and re-open (the next ensure_recording
+    // waits the fence before descriptor pools are reused, so this is a cheap periodic
+    // fence: ~1 per 1.5 tokens at kMaxDispatchesPerSubmit = 512).
+    if (dispatches_ >= kMaxDispatchesPerSubmit && state_ == State::Recording) {
+        submit();
+        wait();
+    }
     const KernelDesc& d = kernel.desc();
     const DeviceInfo& info = ctx_->info();
     const std::string_view name = kernel.name();
@@ -204,8 +218,27 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
     }
     vkCmdDispatch(cmd_, groups[0], groups[1], groups[2]);
     if (op_timings_) {
-        if (const std::optional<std::uint32_t> t1 = timestamp(); t0.has_value() && t1.has_value())
-            op_marks_.push_back({std::string(name), *t0, *t1});
+        if (const std::optional<std::uint32_t> t1 = timestamp(); t0.has_value() && t1.has_value()) {
+            // TEMP DIAG: append grid and first push words to identify shapes.
+            std::string tag = std::string(name) + " g" + std::to_string(groups[0]) + "x" +
+                              std::to_string(groups[1]);
+            if (push.size() >= 12) {
+                const auto* w = reinterpret_cast<const std::uint32_t*>(push.data());
+                tag += " p" + std::to_string(w[0]) + "_" + std::to_string(w[1]) + "_" +
+                       std::to_string(w[2]);
+            }
+            op_marks_.push_back({std::move(tag), *t0, *t1});
+        }
+    }
+    if (sync_every_ != 0) {
+        std::fprintf(stderr, "[vk-sync] dispatch %u: %.*s\n", sync_logged_, static_cast<int>(name.size()),
+                     name.data());
+        std::fflush(stderr);
+        if (sync_logged_ % sync_every_ == 0) {
+            submit();
+            wait();
+        }
+        ++sync_logged_;
     }
     needs_barrier_ = true;
     ++dispatches_;
