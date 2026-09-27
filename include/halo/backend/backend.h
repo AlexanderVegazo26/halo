@@ -176,6 +176,9 @@ struct Limits {
     std::uint32_t max_top_k = 0;
     std::uint32_t max_rope_dims = 0;
     bool gdn_chunked = false;  ///< the chunked GATED_DELTANET form exists
+    /// Largest single host import the backend accepts (one Buffer::create per imported
+    /// span); 0 = unlimited. The engine clamps the context so a KV pool import fits.
+    std::uint64_t max_import_bytes = 0;
 };
 
 // ---------------------------------------------------------------------------------------

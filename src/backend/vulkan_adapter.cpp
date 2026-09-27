@@ -310,6 +310,7 @@ public:
         l.max_top_k = kMaxTopK;
         l.max_rope_dims = std::numeric_limits<std::uint32_t>::max();  // host cos/sin table; rot <= head_dim
         l.gdn_chunked = true;
+        l.max_import_bytes = ctx_->info().max_memory_allocation_size;  // RADV: 4 GiB
         return l;
     }
 

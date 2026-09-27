@@ -361,8 +361,36 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     // Prefill chunks stay a multiple of the GDN chunk (chunk boundaries line up).
     prefill_chunk_ = std::max(gdn_chunk_, opts.prefill_chunk / gdn_chunk_ * gdn_chunk_);
     const std::size_t bt = opts.kv_block_tokens;
-    const std::size_t per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;  // +1: one COW copy
+    std::size_t per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;  // +1: one COW copy
     cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
+    // The KV pool is imported as ONE span per forward; a backend with a single-allocation
+    // cap (RADV: maxMemoryAllocationSize = 4 GiB) fails the whole run when the pool is
+    // larger. Drop the prefix-cache slots first, then halve the context until it fits.
+    if (const std::uint64_t imp_cap = backend_->limits().max_import_bytes; imp_cap != 0 && !opts.kv_blocks) {
+        const std::uint64_t trunk_blk = model_->kv_layout(bt).block_bytes();
+        const std::uint64_t mtp_blk = mtp ? model_->mtp_kv_layout(bt).block_bytes() : 0;
+        const auto fits = [&](std::size_t seq_blocks, std::size_t cache) {
+            const std::uint64_t n = seq_blocks * (cfg.max_sequences + cache);
+            return n * trunk_blk < imp_cap && (mtp_blk == 0 || n * mtp_blk < imp_cap);
+        };
+        if (!fits(per_seq, cache_cap_)) {
+            if (cache_cap_ != 0) {
+                HALO_WARN("runtime", "KV pool exceeds the backend's {}-byte single-allocation cap; disabling prefix-cache slots",
+                          imp_cap);
+                cache_cap_ = 0;
+            }
+            while (!fits(per_seq, cache_cap_) && info_.context_length > 1024) {
+                info_.context_length = std::max<std::size_t>(1024, info_.context_length / 2);
+                per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;
+            }
+            HALO_CHECK(fits(per_seq, cache_cap_), ErrorCode::Memory,
+                       "KV pool import exceeds the backend's {}-byte single-allocation cap even at context {}: lower --ctx "
+                       "or --parallel",
+                       imp_cap, info_.context_length);
+            HALO_WARN("runtime", "context clamped to {} tokens so the KV pool import fits the backend's {}-byte cap",
+                      info_.context_length, imp_cap);
+        }
+    }
     const std::size_t blocks = opts.kv_blocks.value_or(per_seq * (cfg.max_sequences + cache_cap_));
     kv_pool_ = std::make_unique<kv_cache::KvPool>(model_->kv_layout(bt), blocks);
     if (mtp) {
