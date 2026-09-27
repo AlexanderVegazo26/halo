@@ -1,13 +1,64 @@
 #version 450
-// QUANT_GEMV / MATMUL, ggml Q5_K weights: y[t][r] = sum_c W[r,c] * x[t][c]. Dequantization:
-// common/dequant_q5_k.glsl (shared with get_rows_q5_k); body: common/matvec_quant_main.glsl.
+// QUANT_GEMV / MATMUL, ggml Q5_K weights: y[t][r] = sum_c W[r,c] * x[t][c]. Per-type main:
+// common/matvec_q5_k_main.glsl (llama.cpp mul_mat_vec_q5_k port: 16 threads/block, SWAR
+// dequant, sub-block scale application; shared with neither the other matvec types nor
+// get_rows_q5_k, which keep common/dequant_q5_k.glsl). The body is instantiated twice:
+// FAST reads the (4-aligned) weight words directly; SLOW handles arbitrary byte offsets
+// (VkViews arena gate) via HALO_DEFINE_BYTE_READERS with identical integer content, so
+// both produce bitwise-identical results.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint n_vec;     // 1..MAX_VEC
+    uint w_off;     // sub-alignment remainder of the W view (bytes)
+    uint w_stride;  // row stride of W (bytes)
+    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+} pc;
+
+// Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
+layout(constant_id = 1) const uint BATCHED = 1;
+const uint MAX_VEC = 8u;
+
+shared float red[WG];
 
 HALO_DEFINE_BYTE_READERS(wq)
-#include "dequant_q5_k.glsl"
-#include "matvec_quant_main.glsl"
+
+struct Q5KBlock {
+    vec4 qA, qB, qC, qD;  // q values + 5th bit: elements y_off+{0,1,16,17}, +32, and +128/+160
+    vec2 dm;              // (d, dmin)
+    vec4 sc_lo;           // sc0, sc1, m0, m1 (sub-blocks 2*v_im, 2*v_im+1)
+    vec4 sc_hi;           // sc4, sc5, m4, m5 (sub-blocks 2*v_im+4, 2*v_im+5)
+};
+
+#define LD32(bo) (wq[(bo) >> 2])
+#define Q5K_FN fast
+#include "matvec_q5_k_main.glsl"
+#undef LD32
+#undef Q5K_FN
+
+#define LD32(bo) \
+    (read_u8(bo) | (read_u8((bo) + 1u) << 8) | (read_u8((bo) + 2u) << 16) | (read_u8((bo) + 3u) << 24))
+#define Q5K_FN slow
+#include "matvec_q5_k_main.glsl"
+#undef LD32
+#undef Q5K_FN
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    const uint row_off = pc.w_off + row * pc.w_stride;
+    // Uniform branch: 176-byte blocks keep every row at the same alignment as w_off.
+    if ((row_off & 3u) == 0u)
+        q5k_fast(row, row_off);
+    else
+        q5k_slow(row, row_off);
+}

@@ -93,6 +93,14 @@ Ops::Ops(std::shared_ptr<Context> ctx, OpsOptions options) : ctx_(std::move(ctx)
     // argmax: three WG-wide shared arrays (value, index, NaN flag); rms_norm/matvec use one.
     HALO_CHECK(std::uint64_t{rw} * 12 <= info.max_shared_memory, ErrorCode::Kernel,
                "Ops: reduce_workgroup={} exceeds shared memory", rw);
+    // Tuning knob for the gemv/matvec workgroup size (specialization constant 0).
+    if (const char* env = std::getenv("HALO_VK_GEMV_WG"); env != nullptr && *env != '\0')
+        options_.gemv_workgroup = static_cast<std::uint32_t>(std::stoul(env));
+    if (options_.gemv_workgroup != 0)
+        HALO_CHECK(std::has_single_bit(options_.gemv_workgroup) && options_.gemv_workgroup >= 32 &&
+                       options_.gemv_workgroup <= info.max_workgroup_size[0],
+                   ErrorCode::Kernel, "Ops: gemv_workgroup={} must be a power of two >= 32",
+                   options_.gemv_workgroup);
     const std::uint32_t aw = options_.attention_workgroup;
     HALO_CHECK(std::has_single_bit(aw) && aw >= 32 && aw <= 1024 && aw <= info.max_workgroup_size[0] &&
                    aw <= info.max_workgroup_invocations,
@@ -183,7 +191,15 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
         return;
     }
 
-    const std::uint32_t wg = options_.gemv_workgroup != 0 ? options_.gemv_workgroup : options_.reduce_workgroup;
+    // Workgroup size. Types with a llama-style SWAR matvec main (q5_k pilot; see
+    // shaders/common/matvec_q5_k_main.glsl) run fastest at one wave (64): 16 threads per
+    // block -> 4 blocks per iteration, and both ffn shapes (20/68 blocks) divide by 4.
+    // Types on the shared matvec_quant_main.glsl keep reduce_workgroup (256 measured best
+    // there). gemv_workgroup (HALO_VK_GEMV_WG) overrides for tuning.
+    const bool swar_main = a.wtype == DType::Q5_K;
+    const std::uint32_t wg = options_.gemv_workgroup != 0 ? options_.gemv_workgroup
+                             : swar_main                ? 64
+                                                        : options_.reduce_workgroup;
     struct Push {
         std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
     };

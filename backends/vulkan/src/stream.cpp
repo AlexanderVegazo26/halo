@@ -218,17 +218,8 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
     }
     vkCmdDispatch(cmd_, groups[0], groups[1], groups[2]);
     if (op_timings_) {
-        if (const std::optional<std::uint32_t> t1 = timestamp(); t0.has_value() && t1.has_value()) {
-            // TEMP DIAG: append grid and first push words to identify shapes.
-            std::string tag = std::string(name) + " g" + std::to_string(groups[0]) + "x" +
-                              std::to_string(groups[1]);
-            if (push.size() >= 12) {
-                const auto* w = reinterpret_cast<const std::uint32_t*>(push.data());
-                tag += " p" + std::to_string(w[0]) + "_" + std::to_string(w[1]) + "_" +
-                       std::to_string(w[2]);
-            }
-            op_marks_.push_back({std::move(tag), *t0, *t1});
-        }
+        if (const std::optional<std::uint32_t> t1 = timestamp(); t0.has_value() && t1.has_value())
+            op_marks_.push_back({std::string(name), *t0, *t1});
     }
     if (sync_every_ != 0) {
         std::fprintf(stderr, "[vk-sync] dispatch %u: %.*s\n", sync_logged_, static_cast<int>(name.size()),
