@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -18,6 +20,11 @@ constexpr std::uint32_t k_descriptors_per_pool = 256 * 16;
 
 Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx_(std::move(ctx)) {
     HALO_CHECK(ctx_ != nullptr, ErrorCode::Backend, "Stream: null context");
+    if (const char* p = std::getenv("HALO_VK_OP_TIMINGS"); p != nullptr && *p != '\0') {
+        op_timings_ = true;
+        op_timings_path_ = p;
+        max_timestamps = std::max(max_timestamps, 8192u);
+    }
     const VkDevice dev = ctx_->device();
     try {
         VkCommandPoolCreateInfo cpi{};
@@ -87,6 +94,7 @@ void Stream::ensure_recording() {
     detail::vk_check(vkBeginCommandBuffer(cmd_, &bi), "vkBeginCommandBuffer");
     if (queries_ != VK_NULL_HANDLE) vkCmdResetQueryPool(cmd_, queries_, 0, max_timestamps_);
     used_timestamps_ = 0;
+    op_marks_.clear();
     dispatches_ = 0;
     needs_barrier_ = false;
     state_ = State::Recording;
@@ -187,6 +195,7 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
                            nullptr);
 
     barrier_if_needed();
+    const std::optional<std::uint32_t> t0 = op_timings_ ? timestamp() : std::nullopt;
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline());
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.layout(), 0, 1, &set, 0, nullptr);
     if (!push.empty()) {
@@ -194,6 +203,10 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
                            static_cast<std::uint32_t>(push.size()), push.data());
     }
     vkCmdDispatch(cmd_, groups[0], groups[1], groups[2]);
+    if (op_timings_) {
+        if (const std::optional<std::uint32_t> t1 = timestamp(); t0.has_value() && t1.has_value())
+            op_marks_.push_back({std::string(name), *t0, *t1});
+    }
     needs_barrier_ = true;
     ++dispatches_;
 }
@@ -275,6 +288,14 @@ void Stream::wait(std::uint64_t timeout_ns) {
                                                timestamp_values_.data(), sizeof(std::uint64_t),
                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
                          "vkGetQueryPoolResults");
+    }
+    if (op_timings_ && !op_marks_.empty()) {
+        if (std::FILE* f = std::fopen(op_timings_path_.c_str(), "a")) {
+            for (const OpMark& m : op_marks_)
+                if (const std::optional<double> ns = elapsed_ns(m.begin, m.end); ns.has_value())
+                    std::fprintf(f, "%s %.0f\n", m.name.c_str(), *ns);
+            std::fclose(f);
+        }
     }
 }
 

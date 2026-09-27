@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <utility>
 
 #include "halo/backends/vulkan/context.h"
@@ -21,6 +22,7 @@ Buffer Buffer::create(std::shared_ptr<Context> ctx, VkDeviceSize size, MemoryUsa
     Buffer b;
     b.ctx_ = std::move(ctx);
     b.size_ = size;
+    b.buffer_size_ = size;
     b.usage_ = usage;
     const VkDevice dev = b.ctx_->device();
 
@@ -42,6 +44,22 @@ Buffer Buffer::create(std::shared_ptr<Context> ctx, VkDeviceSize size, MemoryUsa
     b.memory_flags_ = info.memory_types[*type].flags;
     b.tier_ = info.memory_types[*type].tier;
 
+    // Recycling cache: adopt a retired allocation of the same memory type when one fits.
+    // The query buffer above (never bound, userspace-only on Mesa) is replaced by the
+    // cached VkBuffer, which keeps its existing binding and persistent mapping — no
+    // vkAllocateMemory / vkBindBufferMemory / vkMapMemory on this path.
+    if (std::optional<Context::RecycledBuffer> cached =
+            b.ctx_->recycle_take(b.memory_type_, size, req.size)) {
+        vkDestroyBuffer(dev, b.buffer_, nullptr);
+        b.buffer_ = cached->buffer;
+        b.memory_ = cached->memory;
+        b.mapped_ = cached->mapped;
+        b.alloc_size_ = cached->alloc_size;
+        b.buffer_size_ = cached->buffer_size;
+        b.complete_ = true;
+        return b;
+    }
+
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
@@ -55,6 +73,7 @@ Buffer Buffer::create(std::shared_ptr<Context> ctx, VkDeviceSize size, MemoryUsa
         detail::vk_check(vkMapMemory(dev, b.memory_, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory");
         b.mapped_ = static_cast<std::byte*>(p);
     }
+    b.complete_ = true;
     return b;  // on any throw above, ~Buffer releases what was created
 }
 
@@ -66,11 +85,13 @@ Buffer::Buffer(Buffer&& o) noexcept
       memory_(std::exchange(o.memory_, VK_NULL_HANDLE)),
       size_(std::exchange(o.size_, 0)),
       alloc_size_(std::exchange(o.alloc_size_, 0)),
+      buffer_size_(std::exchange(o.buffer_size_, 0)),
       usage_(o.usage_),
       memory_type_(o.memory_type_),
       memory_flags_(o.memory_flags_),
       tier_(o.tier_),
-      mapped_(std::exchange(o.mapped_, nullptr)) {}
+      mapped_(std::exchange(o.mapped_, nullptr)),
+      complete_(std::exchange(o.complete_, false)) {}
 
 Buffer& Buffer::operator=(Buffer&& o) noexcept {
     if (this != &o) {
@@ -80,11 +101,13 @@ Buffer& Buffer::operator=(Buffer&& o) noexcept {
         memory_ = std::exchange(o.memory_, VK_NULL_HANDLE);
         size_ = std::exchange(o.size_, 0);
         alloc_size_ = std::exchange(o.alloc_size_, 0);
+        buffer_size_ = std::exchange(o.buffer_size_, 0);
         usage_ = o.usage_;
         memory_type_ = o.memory_type_;
         memory_flags_ = o.memory_flags_;
         tier_ = o.tier_;
         mapped_ = std::exchange(o.mapped_, nullptr);
+        complete_ = std::exchange(o.complete_, false);
     }
     return *this;
 }
@@ -92,9 +115,17 @@ Buffer& Buffer::operator=(Buffer&& o) noexcept {
 void Buffer::release() noexcept {
     if (!ctx_) return;
     const VkDevice dev = ctx_->device();
-    if (mapped_ != nullptr) vkUnmapMemory(dev, memory_);
-    if (buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(dev, buffer_, nullptr);
-    if (memory_ != VK_NULL_HANDLE) vkFreeMemory(dev, memory_, nullptr);
+    if (complete_) {
+        // Fully constructed: retire to the context's recycling cache (which destroys the
+        // handles itself when over its cap or on any failure) instead of destroying here.
+        ctx_->recycle_put({buffer_, memory_, mapped_, alloc_size_, buffer_size_, memory_type_});
+    } else {
+        // Partially constructed (a create() throw): never cached, destroy what exists.
+        if (mapped_ != nullptr) vkUnmapMemory(dev, memory_);
+        if (buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(dev, buffer_, nullptr);
+        if (memory_ != VK_NULL_HANDLE) vkFreeMemory(dev, memory_, nullptr);
+    }
+    complete_ = false;
     mapped_ = nullptr;
     buffer_ = VK_NULL_HANDLE;
     memory_ = VK_NULL_HANDLE;

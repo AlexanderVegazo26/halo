@@ -246,6 +246,9 @@ Context::~Context() {
     if (staging_mapped_ != nullptr) vkUnmapMemory(device_, staging_memory_);
     if (staging_buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(device_, staging_buffer_, nullptr);
     if (staging_memory_ != VK_NULL_HANDLE) vkFreeMemory(device_, staging_memory_, nullptr);
+    for (RecycledBuffer& rb : recycle_) recycle_destroy(rb);
+    recycle_.clear();
+    recycle_bytes_ = 0;
     if (transfer_fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, transfer_fence_, nullptr);
     if (transfer_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, transfer_pool_, nullptr);
     if (pipeline_cache_ != VK_NULL_HANDLE) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
@@ -370,6 +373,65 @@ void Context::staged_download(VkBuffer src, VkDeviceSize src_offset, std::span<s
 Context::StagingStats Context::staging_stats() const {
     const std::scoped_lock lock(transfer_mutex_);
     return {staging_buffer_ != VK_NULL_HANDLE ? staging_capacity_ : 0, staging_allocations_, staging_chunks_};
+}
+
+// ---------------------------------------------------------------- Buffer recycling
+
+namespace {
+
+/// Total bytes the recycling cache may hold; beyond it the oldest entries are destroyed.
+/// Sized to the per-decode-step footprint (KV pool + GDN state imports + op scratch, which
+/// reappear with identical sizes every step): 2 GiB was measured to still evict ~15 entries
+/// per step on a 27B model (steady-state thrash); 4 GiB gives zero post-warmup misses.
+constexpr VkDeviceSize k_max_recycle_bytes = 4ull << 30;
+
+}  // namespace
+
+void Context::recycle_destroy(RecycledBuffer& rb) noexcept {
+    if (rb.mapped != nullptr) vkUnmapMemory(device_, rb.memory);
+    if (rb.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device_, rb.buffer, nullptr);
+    if (rb.memory != VK_NULL_HANDLE) vkFreeMemory(device_, rb.memory, nullptr);
+    rb = {};
+}
+
+std::optional<Context::RecycledBuffer> Context::recycle_take(std::uint32_t memory_type,
+                                                             VkDeviceSize size,
+                                                             VkDeviceSize req_size) noexcept {
+    try {
+        const std::scoped_lock lock(recycle_mutex_);
+        const VkDeviceSize ceiling = std::max(req_size * 4, req_size + (VkDeviceSize{64} << 20));
+        // Newest first: the buffer retired a moment ago is the one this size most likely
+        // reappears as (identically-sized buffers are re-created every decode step).
+        for (auto it = recycle_.rbegin(); it != recycle_.rend(); ++it) {
+            if (it->memory_type != memory_type || it->buffer_size < size ||
+                it->alloc_size < req_size || it->alloc_size > ceiling)
+                continue;
+            RecycledBuffer rb = *it;
+            recycle_bytes_ -= rb.alloc_size;
+            recycle_.erase(std::next(it).base());
+            return rb;
+        }
+    } catch (...) {
+        // Bookkeeping failure: fall through to the allocating path.
+    }
+    return std::nullopt;
+}
+
+void Context::recycle_put(RecycledBuffer rb) noexcept {
+    try {
+        const std::scoped_lock lock(recycle_mutex_);
+        recycle_.push_back(rb);
+        recycle_bytes_ += rb.alloc_size;
+        rb = {};
+        while (recycle_bytes_ > k_max_recycle_bytes && !recycle_.empty()) {
+            recycle_bytes_ -= recycle_.front().alloc_size;
+            recycle_destroy(recycle_.front());
+            recycle_.pop_front();
+        }
+    } catch (...) {
+        // Never throw out of Buffer::release: destroy the allocation instead.
+    }
+    recycle_destroy(rb);
 }
 
 void Context::copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, VkDeviceSize dst_offset,

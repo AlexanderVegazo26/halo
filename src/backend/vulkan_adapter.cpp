@@ -14,6 +14,7 @@
 #include <format>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "halo/backends/vulkan/buffer.h"
@@ -52,7 +53,8 @@ class VulkanBackend;
 class VkBuf final : public Buffer {
 public:
     VkBuf(VulkanBackend* owner, hv::Buffer dev, std::uint64_t bytes, Tier tier, bool writable, const std::byte* ro_host,
-          std::span<std::byte> rw_host);
+          std::span<std::byte> rw_host,
+          std::uint64_t wb_limit = std::numeric_limits<std::uint64_t>::max());
     ~VkBuf() override;
     VkBuf(const VkBuf&) = delete;
     VkBuf& operator=(const VkBuf&) = delete;
@@ -71,6 +73,37 @@ public:
     /// The caller's memory a writable import mirrors, else empty.
     [[nodiscard]] std::span<std::byte> rw_host() const noexcept { return rw_host_; }
 
+    /// Records a device-written byte range of a writable import (merged, sorted). Only the
+    /// union of these ranges, clamped to `wb_limit_`, is written back at Stream::wait().
+    void dirty_add(std::uint64_t lo, std::uint64_t hi) const {
+        if (rw_host_.empty()) return;
+        hi = std::min({hi, bytes_, wb_limit_});
+        if (hi <= lo) return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+        merged.reserve(dirty_.size() + 1);
+        bool placed = false;
+        for (const auto& [a, b] : dirty_) {
+            if (b < lo) {
+                merged.emplace_back(a, b);
+            } else if (hi < a) {
+                if (!placed) {
+                    merged.emplace_back(lo, hi);
+                    placed = true;
+                }
+                merged.emplace_back(a, b);
+            } else {  // overlaps or touches: absorb
+                lo = std::min(lo, a);
+                hi = std::max(hi, b);
+            }
+        }
+        if (!placed) merged.emplace_back(lo, hi);
+        dirty_ = std::move(merged);
+    }
+    /// The merged dirty ranges, resetting the tracker for the next wait interval.
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> dirty_take() const {
+        return std::exchange(dirty_, {});
+    }
+
 private:
     VulkanBackend* owner_;
     hv::Buffer dev_;
@@ -79,6 +112,9 @@ private:
     bool writable_;
     const std::byte* ro_host_;
     std::span<std::byte> rw_host_;
+    /// Write-back ceiling for write-only imports (the untouched suffix stays caller-owned).
+    std::uint64_t wb_limit_ = std::numeric_limits<std::uint64_t>::max();
+    mutable std::vector<std::pair<std::uint64_t, std::uint64_t>> dirty_;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -169,7 +205,7 @@ public:
     Resolver(const Backend* self, const char* op) : self_(self), op_(op) {}
 
     Ref get(const TensorRef& ref, std::uint64_t rows, std::uint64_t row_bytes, std::uint64_t align, Access access,
-            const char* name) const {
+            const char* name, bool track = true) const {
         Ref o;
         o.name = name;
         o.stride = ref.row_stride != 0 ? ref.row_stride : row_bytes;
@@ -195,11 +231,14 @@ public:
         o.buf = b;
         o.begin = ref.offset;
         o.view = hv::BufferView(b->dev(), ref.offset, limit, rows > 1 ? o.stride : 0);
+        // Writable imports are mirrored to the caller's memory at wait(): track what ops write.
+        if (track && access == Access::Write) b->dirty_add(o.begin, o.extent);
         return o;
     }
 
-    Ref f32(const TensorRef& ref, std::uint64_t rows, std::uint64_t cols, Access access, const char* name) const {
-        return get(ref, rows, mul_u64(cols, kF32, op_, name), kF32, access, name);
+    Ref f32(const TensorRef& ref, std::uint64_t rows, std::uint64_t cols, Access access, const char* name,
+            bool track = true) const {
+        return get(ref, rows, mul_u64(cols, kF32, op_, name), kF32, access, name, track);
     }
 
     /// Rejects any overlap of `out` with `other`; identical views only if `allow_identical`.
@@ -295,8 +334,24 @@ public:
             HALO_CHECK(bytes.empty() || b->rw_host().empty() || lo + bytes.size() <= blo || blo + b->rw_host().size() <= lo,
                        ErrorCode::Kernel, "vulkan import_host: [{:#x}, +{}) overlaps a live writable import", lo, bytes.size());
         }
-        hv::Buffer d = device_copy(bytes);
+        // Host-cached, not device-local: a writable import is uploaded at import and mirrored
+        // back at every Stream::wait(). As a mapped buffer both directions are plain memcpys
+        // and the kernels read/write the state over the unified fabric; as a device-local
+        // buffer each direction is a staged GPU transfer with a fence round-trip per 16 MiB
+        // chunk, which dominated decode time (~500 blocking round-trips per token).
+        hv::Buffer d = hv::Buffer::create(ctx_, std::max<std::uint64_t>(round_up4(bytes.size()), 4),
+                                          hv::MemoryUsage::HostCached);
+        if (!bytes.empty()) d.upload(bytes);
         return std::make_unique<VkBuf>(this, std::move(d), bytes.size(), Tier::Vram, true, nullptr, bytes);
+    }
+    std::unique_ptr<Buffer> import_host_writeonly(std::span<std::byte> bytes, std::uint64_t writeback_bytes) override {
+        // Same host-cached placement as import_host, but no upload: the device only writes the
+        // buffer (rollback-slot snapshots), and the write-back is clamped to the prefix the op
+        // actually writes — the untouched suffix stays caller-owned (backend.h).
+        hv::Buffer d = hv::Buffer::create(ctx_, std::max<std::uint64_t>(round_up4(bytes.size()), 4),
+                                          hv::MemoryUsage::HostCached);
+        return std::make_unique<VkBuf>(this, std::move(d), bytes.size(), Tier::Vram, true, nullptr, bytes,
+                                       writeback_bytes);
     }
     std::unique_ptr<Buffer> import_host_readonly(std::span<const std::byte> bytes) override {
         hv::Buffer d = device_copy(bytes);
@@ -573,6 +628,29 @@ public:
         r.no_overlap(p.pool, k);
         r.no_overlap(p.pool, v);
         if (a.n_tokens == 0) return;
+        // The kernel writes only the blocks of rows [start, +n_tokens): mark exactly those
+        // block ranges of the pool import dirty for the wait() write-back (pool_refs resolved
+        // the whole-pool operand untracked). The block table is a read-only host import, so
+        // its entries are readable here; anything unexpected falls back to the whole image.
+        if (p.pool.extent > 0 && p.pool.buf != nullptr) {
+            const std::uint64_t layer_floats = 2ULL * a.block_tokens * a.kv_dim;
+            const std::uint64_t block_bytes = std::uint64_t{a.n_layers} * layer_floats * kF32;
+            bool precise = p.table.buf != nullptr && p.table.buf->ro_host() != nullptr;
+            if (precise) {
+                const auto* tab = reinterpret_cast<const std::uint32_t*>(p.table.buf->ro_host() + p.table.begin);
+                const std::uint64_t t0 = a.start / a.block_tokens, t1 = (end - 1) / a.block_tokens;
+                for (std::uint64_t t = t0; t <= t1 && precise; ++t) {
+                    if (tab[t] >= a.n_pool_blocks) {
+                        precise = false;  // out of range: the kernel raises bad-block; mirror everything
+                    } else {
+                        const std::uint64_t lo =
+                            p.pool.begin + tab[t] * block_bytes + std::uint64_t{a.layer} * layer_floats * kF32;
+                        p.pool.buf->dirty_add(lo, lo + layer_floats * kF32);
+                    }
+                }
+            }
+            if (!precise) p.pool.buf->dirty_add(p.pool.begin, p.pool.begin + p.pool.extent);
+        }
         hv::KvWriteArgs w;
         w.kv_pool = p.pool.view;
         w.n_pool_blocks = a.n_pool_blocks;
@@ -721,10 +799,13 @@ public:
 
     void register_import(VkBuf* b) { imports_.push_back(b); }
     void unregister_import(const VkBuf* b) noexcept { std::erase(imports_, b); }
-    /// After a successful wait: every live writable import's device copy -> the caller's memory.
+    /// After a successful wait: the device-written (dirty) ranges of every live writable
+    /// import -> the caller's memory. Ranges are tracked per write operand resolution, so a
+    /// wait with no intervening import writes mirrors nothing.
     void write_back_imports() const {
         for (const VkBuf* b : imports_) {
-            if (!b->rw_host().empty()) b->dev().download(b->rw_host());
+            if (b->rw_host().empty()) continue;
+            for (const auto& [lo, hi] : b->dirty_take()) b->dev().download(b->rw_host().subspan(lo, hi - lo), lo);
         }
     }
 
@@ -762,7 +843,9 @@ private:
         PoolRefs p;
         const std::uint64_t block_floats =
             mul_u64(mul_u64(mul_u64(n_layers, 2, r.op(), "pool"), block_tokens, r.op(), "pool"), kv_dim, r.op(), "pool");
-        p.pool = r.f32(pool, n_pool_blocks, block_floats, access, "kv_pool");
+        // Not dirty-tracked here: the operand spans every block, but KV_WRITE writes only the
+        // blocks of its own rows and marks those exact ranges (see kv_write); ATTENTION only reads.
+        p.pool = r.f32(pool, n_pool_blocks, block_floats, access, "kv_pool", /*track=*/false);
         HALO_CHECK(p.pool.extent == 0 || p.pool.stride == block_floats * kF32, ErrorCode::Kernel, "{}: kv_pool must be dense",
                    r.op());
         p.table = r.get(table, 1, mul_u64(n_table, 4, r.op(), "block_table"), 4, Access::Read, "block_table");
@@ -802,9 +885,9 @@ private:
 // ---------------------------------------------------------------------------------------
 
 VkBuf::VkBuf(VulkanBackend* owner, hv::Buffer dev, std::uint64_t bytes, Tier tier, bool writable, const std::byte* ro_host,
-             std::span<std::byte> rw_host)
+             std::span<std::byte> rw_host, std::uint64_t wb_limit)
     : owner_(owner), dev_(std::move(dev)), bytes_(bytes), tier_(tier), writable_(writable), ro_host_(ro_host),
-      rw_host_(rw_host) {
+      rw_host_(rw_host), wb_limit_(std::min(wb_limit, bytes)) {
     if (!rw_host_.empty()) owner_->register_import(this);
 }
 

@@ -249,6 +249,12 @@ struct Qwen35::Impl {
             arena.push_back(I.be->import_host(std::as_writable_bytes(v)));
             return TensorRef::of(*arena.back());
         }
+        /// Write-only import for rollback slots: only the first `wb` bytes (the slots this
+        /// call writes) are mirrored back; the rest of the caller's span stays untouched.
+        TensorRef import_wo(std::span<float> v, std::uint64_t wb) {
+            arena.push_back(I.be->import_host_writeonly(std::as_writable_bytes(v), wb));
+            return TensorRef::of(*arena.back());
+        }
         TensorRef import_ro(std::span<const std::byte> v) {
             arena.push_back(I.be->import_host_readonly(v));
             return TensorRef::of(*arena.back());
@@ -409,7 +415,9 @@ struct Qwen35::Impl {
             const cpu::Rows cs = g.gdn->conv(gdn_layer);
             const TensorRef conv_state = st.import(std::span<float>(cs.data(), cs.rows() * cs.cols()));
             const std::span<float> conv_slots = g.gdn->conv_slots(gdn_layer, g.n_slots);
-            const TensorRef cslots = conv_slots.empty() ? TensorRef{} : st.import(conv_slots);
+            // The conv op writes slots s < min(T, n_slots) and leaves the rest caller-owned.
+            const std::uint64_t cslot_wb = std::min(s.n, g.n_slots) * (conv_k - 1) * conv_c * kF32;
+            const TensorRef cslots = conv_slots.empty() ? TensorRef{} : st.import_wo(conv_slots, cslot_wb);
             const TensorRef xs = rows_at(a.conv, s.r0, conv_c);
             be->conv1d_silu(*st.s, backend::Conv1dArgs{rows_at(a.qkv, s.r0, conv_c), w.conv.ref(), conv_state, xs, cslots,
                                                        u32(s.n), u32(conv_c), u32(conv_k), u32(g.n_slots), {}});
@@ -428,7 +436,9 @@ struct Qwen35::Impl {
             ga.g = rows_at(a.g, s.r0, nv);
             ga.beta = rows_at(a.bs, s.r0, nv);
             ga.state = st.import(g.gdn->recurrent(gdn_layer));
-            ga.state_slots = rec_slots.empty() ? TensorRef{} : st.import(rec_slots);
+            // The GDN op writes slots s < min(T, n_slots) and leaves the rest caller-owned.
+            const std::uint64_t rslot_wb = std::min(s.n, g.n_slots) * nv * d_k * d_v * kF32;
+            ga.state_slots = rec_slots.empty() ? TensorRef{} : st.import_wo(rec_slots, rslot_wb);
             ga.out = rows_at(a.o, s.r0, value_dim);
             ga.n_k = u32(n_k);
             ga.n_v = u32(n_v);

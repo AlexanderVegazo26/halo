@@ -4,6 +4,13 @@
 /// VkDeviceMemory allocation (no suballocator yet); both are released in the destructor,
 /// including during stack unwinding. Host-visible memory is persistently mapped.
 ///
+/// Complete buffers are not destroyed on release: they go to the context's recycling
+/// cache (Context::recycle_put) fully bound and still mapped, and Buffer::create adopts a
+/// fitting cached allocation instead of calling vkAllocateMemory/vkMapMemory. The engine
+/// re-creates identically-sized buffers every decode step, so this removes the per-token
+/// driver allocation churn and the first-touch page-fault cost of fresh mappings. Recycled
+/// content is unspecified — callers that need zeros fill explicitly.
+///
 /// Every buffer is created with STORAGE | TRANSFER_SRC | TRANSFER_DST usage.
 ///
 /// Synchronization contract: upload()/download() are synchronous with respect to the
@@ -77,11 +84,13 @@ private:
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkDeviceSize size_ = 0;
     VkDeviceSize alloc_size_ = 0;
+    VkDeviceSize buffer_size_ = 0;  ///< size the VkBuffer was created with (>= size_ when recycled)
     MemoryUsage usage_ = MemoryUsage::DeviceLocal;
     std::uint32_t memory_type_ = 0;
     VkMemoryPropertyFlags memory_flags_ = 0;
     MemoryTier tier_ = MemoryTier::Vram;
     std::byte* mapped_ = nullptr;
+    bool complete_ = false;  ///< fully constructed (bound + mapped): eligible for recycling
 };
 
 }  // namespace halo::vulkan

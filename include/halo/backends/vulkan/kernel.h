@@ -165,6 +165,15 @@ private:
     State state_ = State::Idle;
     bool needs_barrier_ = false;
     std::uint32_t dispatches_ = 0;
+    // HALO_VK_OP_TIMINGS=<path>: per-dispatch GPU timestamps, appended to <path> at wait()
+    // as "<kernel> <ns>" lines (diagnostics; off by default, one branch per dispatch).
+    bool op_timings_ = false;
+    std::string op_timings_path_;
+    struct OpMark {
+        std::string name;
+        std::uint32_t begin, end;
+    };
+    std::vector<OpMark> op_marks_;
 };
 
 }  // namespace halo::vulkan

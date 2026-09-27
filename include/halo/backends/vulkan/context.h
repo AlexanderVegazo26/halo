@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -141,6 +142,29 @@ public:
     /// `shader_set_hash()` when persisting.
     [[nodiscard]] std::vector<std::byte> pipeline_cache_data() const;
 
+    /// One retired Buffer allocation, kept fully set up (memory bound; still mapped when
+    /// host-visible) so Buffer::create can adopt it without any driver call. Recycled
+    /// content is unspecified: callers that need zeros must fill (the adapter does).
+    struct RecycledBuffer {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::byte* mapped = nullptr;    ///< persistent mapping of `memory` (null if not host-visible)
+        VkDeviceSize alloc_size = 0;    ///< bytes of the memory allocation
+        VkDeviceSize buffer_size = 0;   ///< size `buffer` was created with
+        std::uint32_t memory_type = 0;  ///< memory type index of `memory`
+    };
+    /// Takes the newest cached allocation of `memory_type` that fits a buffer of `size`
+    /// bytes with requirements `req_size`: buffer_size >= size, alloc_size >= req_size, and
+    /// alloc_size <= max(req_size*4, req_size + 64 MiB) so a huge block never serves a tiny
+    /// request. nullopt when nothing fits. Never throws.
+    [[nodiscard]] std::optional<RecycledBuffer> recycle_take(std::uint32_t memory_type,
+                                                             VkDeviceSize size,
+                                                             VkDeviceSize req_size) noexcept;
+    /// Returns a complete buffer to the cache (called from Buffer::release). When the ~2 GiB
+    /// total cap would be exceeded, the oldest cached allocations are destroyed instead.
+    /// Never throws: on any internal failure the allocation is destroyed outright.
+    void recycle_put(RecycledBuffer rb) noexcept;
+
     /// JSON description: selected device, policy warnings, all enumerated devices.
     [[nodiscard]] nlohmann::json describe() const;
 
@@ -182,6 +206,14 @@ private:
     std::byte* staging_mapped_ = nullptr;
     std::uint64_t staging_allocations_ = 0;
     std::uint64_t staging_chunks_ = 0;
+
+    // Buffer recycling cache (guarded by recycle_mutex_): retired buffers, front = oldest.
+    // Raw handles for the same reason as the staging buffer (a Buffer would create a
+    // shared_ptr cycle). Destroyed in ~Context before vkDestroyDevice.
+    void recycle_destroy(RecycledBuffer& rb) noexcept;
+    std::mutex recycle_mutex_;
+    std::deque<RecycledBuffer> recycle_;
+    VkDeviceSize recycle_bytes_ = 0;
 };
 
 /// JSON for one device (all fields of DeviceInfo, flags decoded).

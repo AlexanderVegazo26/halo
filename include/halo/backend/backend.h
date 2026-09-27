@@ -392,6 +392,16 @@ public:
     [[nodiscard]] virtual std::unique_ptr<Buffer> allocate(std::uint64_t bytes, Tier tier) = 0;
     /// Wraps caller-owned host memory (CPU: zero-copy). The memory must outlive the Buffer.
     [[nodiscard]] virtual std::unique_ptr<Buffer> import_host(std::span<std::byte> bytes) = 0;
+    /// Write-only variant for device-written snapshots (the GDN/conv rollback slots, D-012):
+    /// the device never reads the memory, so a backend may skip the upload entirely, and only
+    /// the first `writeback_bytes` (the slots the op actually writes) are mirrored back to the
+    /// caller at Stream::wait(); the rest of the caller's memory is left untouched. The default
+    /// is a plain writable import (the CPU backend is zero-copy either way).
+    [[nodiscard]] virtual std::unique_ptr<Buffer> import_host_writeonly(std::span<std::byte> bytes,
+                                                                        std::uint64_t writeback_bytes) {
+        (void)writeback_bytes;
+        return import_host(bytes);
+    }
     /// Read-only import (the mmapped GGUF weights): writable() is false.
     [[nodiscard]] virtual std::unique_ptr<Buffer> import_host_readonly(std::span<const std::byte> bytes) = 0;
     [[nodiscard]] virtual std::unique_ptr<Stream> create_stream() = 0;
