@@ -1,0 +1,113 @@
+{
+  "tests": 13,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "DType",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "IdsMapOneToOneWithGgml",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dtype.cpp",
+          "line": 11
+        },
+        {
+          "name": "GeometryMatchesGgufPy",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dtype.cpp",
+          "line": 43
+        },
+        {
+          "name": "DequantSupportedSetMatchesD007",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dtype.cpp",
+          "line": 76
+        }
+      ]
+    },
+    {
+      "name": "Fp16",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "AllBitPatternsWidenExactly",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_fp16.cpp",
+          "line": 32
+        },
+        {
+          "name": "RoundTripIsIdentityExceptNaN",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_fp16.cpp",
+          "line": 47
+        },
+        {
+          "name": "NarrowingRoundsToNearestEvenAndSaturatesToInf",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_fp16.cpp",
+          "line": 60
+        }
+      ]
+    },
+    {
+      "name": "Bf16",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "WidenIsShiftAndNarrowRoundsNearestEven",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_fp16.cpp",
+          "line": 75
+        }
+      ]
+    },
+    {
+      "name": "RowBytes",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "GeometryAndChecks",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dequant.cpp",
+          "line": 37
+        }
+      ]
+    },
+    {
+      "name": "Dequant",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "Q8_0HandBuiltBlock",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dequant.cpp",
+          "line": 50
+        },
+        {
+          "name": "Q4_0HandBuiltBlockNibbleOrder",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dequant.cpp",
+          "line": 59
+        },
+        {
+          "name": "RejectsBadArguments",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dequant.cpp",
+          "line": 72
+        }
+      ]
+    },
+    {
+      "name": "VecDot",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "MatchesDequantThenDot",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_dequant.cpp",
+          "line": 88
+        }
+      ]
+    },
+    {
+      "name": "QuantBlocks",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "BitExactVsGgufPy",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tensor\/test_quant_blocks.cpp",
+          "line": 44
+        }
+      ]
+    }
+  ]
+}

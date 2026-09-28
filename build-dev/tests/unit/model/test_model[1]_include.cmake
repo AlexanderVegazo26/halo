@@ -1,0 +1,5 @@
+if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/model/test_model[1]_tests.cmake")
+  include("/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/model/test_model[1]_tests.cmake")
+else()
+  add_test(test_model_NOT_BUILT test_model_NOT_BUILT)
+endif()

@@ -1,0 +1,344 @@
+{
+  "tests": 46,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "Smoke",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "ByteMatcher",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_smoke.cpp",
+          "line": 5
+        },
+        {
+          "name": "RealVocabFacts",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_smoke.cpp",
+          "line": 17
+        }
+      ]
+    },
+    {
+      "name": "SamplerParams",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "ValidateRejectsBadValuesWithApi",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 214
+        }
+      ]
+    },
+    {
+      "name": "SamplerInput",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "NanAndPosInfAreKernelErrorsNegInfIsLegal",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 246
+        },
+        {
+          "name": "AllNegInfExceptOneAlwaysPicksIt",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 275
+        },
+        {
+          "name": "PaddedLmHeadRowsNeverWinUnstructuredSampling",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 290
+        }
+      ]
+    },
+    {
+      "name": "SamplerGreedy",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "ExactArgmaxTiesToLowestId",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 305
+        }
+      ]
+    },
+    {
+      "name": "SamplerPenalties",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "WindowCountsSemantics",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 329
+        },
+        {
+          "name": "MatchLlamaCppFormula",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 338
+        },
+        {
+          "name": "AppliedThroughSamplerOverHistoryWindow",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 361
+        }
+      ]
+    },
+    {
+      "name": "SamplerFilters",
+      "tests": 5,
+      "testsuite": [
+        {
+          "name": "TopKMatchesReference",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 378
+        },
+        {
+          "name": "TopPMatchesReferenceIncludingEdges",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 397
+        },
+        {
+          "name": "MinPMatchesReferenceIncludingEdges",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 444
+        },
+        {
+          "name": "TypicalMatchesReference",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 465
+        },
+        {
+          "name": "ProbabilitiesAreStableForHugeLogits",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 484
+        }
+      ]
+    },
+    {
+      "name": "SamplerDraw",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "InverseCdfInIdOrderIndependentOfInputOrder",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 427
+        }
+      ]
+    },
+    {
+      "name": "SamplerDistribution",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "EmpiricalMatchesAnalyticChiSquare",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 501
+        }
+      ]
+    },
+    {
+      "name": "SamplerDeterminism",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "SeedResetAndOrderIndependence",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 529
+        }
+      ]
+    },
+    {
+      "name": "SamplerPrefilter",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "ExactPrefilterOkTruthTable",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 569
+        },
+        {
+          "name": "PrefilteredEqualsFullRowWheneverExact",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 597
+        },
+        {
+          "name": "PenaltyCanMakePrefilterInexact",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_sampler.cpp",
+          "line": 644
+        }
+      ]
+    },
+    {
+      "name": "JsonGrammar",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "AnyValueAcceptsValidJsonRejectsInvalid",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 56
+        },
+        {
+          "name": "JsonObjectModeAcceptsOnlyObjects",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 71
+        }
+      ]
+    },
+    {
+      "name": "JsonSchema",
+      "tests": 10,
+      "testsuite": [
+        {
+          "name": "ObjectRequiredOptionalNoAdditional",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 76
+        },
+        {
+          "name": "DuplicateRequiredNamesAreDeduplicated",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 87
+        },
+        {
+          "name": "AdditionalPropertiesDefaultTrueNeverShadowsDeclared",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 100
+        },
+        {
+          "name": "EnumConstAndTypeLists",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 108
+        },
+        {
+          "name": "ArraysItemsAndBounds",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 124
+        },
+        {
+          "name": "StringLengthCountsCodepoints",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 133
+        },
+        {
+          "name": "AnyOfOneOfAndRefs",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 141
+        },
+        {
+          "name": "UnsupportedFeaturesAreTypedErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 162
+        },
+        {
+          "name": "MalformedOrUnsatisfiableSchemasAreApiErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 179
+        },
+        {
+          "name": "AdversarialNestingAndSize",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "name": "JsonSchemaPattern",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "MatchesStdRegexOnEnumeratedStrings",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 258
+        },
+        {
+          "name": "NamedGroupsMatchTheUnnamedLanguage",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 268
+        },
+        {
+          "name": "UnicodeAndEscapesInsideStrings",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 275
+        }
+      ]
+    },
+    {
+      "name": "JsonSchemaWalk",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "ValidatorAcceptsOverflowingNumbersWithoutMaskingTypeErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 337
+        },
+        {
+          "name": "RandomByteWalksAlwaysValidate",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_grammar.cpp",
+          "line": 356
+        }
+      ]
+    },
+    {
+      "name": "TokenMask",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "SyntheticVocabMatchesReferenceScanOnRandomWalks",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 205
+        },
+        {
+          "name": "TokensEndingMidUtf8AreByteLevel",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 224
+        },
+        {
+          "name": "EosAcceptSnapshotAndErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 258
+        }
+      ]
+    },
+    {
+      "name": "StructuredSampler",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "SyntheticIntegrationAndErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 291
+        }
+      ]
+    },
+    {
+      "name": "TokenMaskReal",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "VocabularyFacts",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 380
+        },
+        {
+          "name": "MaskEqualsReferenceScanAndNeverAllowsDeadEnds",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 401
+        },
+        {
+          "name": "EosAllowedExactlyWhenCompleteAlongTokenizedDocuments",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 422
+        }
+      ]
+    },
+    {
+      "name": "StructuredSamplerReal",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "RandomSchemaRunsAlwaysProduceValidJson",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/sampling\/test_token_mask.cpp",
+          "line": 457
+        }
+      ]
+    }
+  ]
+}

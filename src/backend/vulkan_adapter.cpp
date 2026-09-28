@@ -73,6 +73,13 @@ public:
     /// The caller's memory a writable import mirrors, else empty.
     [[nodiscard]] std::span<std::byte> rw_host() const noexcept { return rw_host_; }
 
+    /// allocate() zero-fills lazily: the fill is recorded into the stream of the first op
+    /// that touches the buffer (stream-ordered before it), never as its own submission.
+    /// take_needs_zero() clears the flag; the recording stream re-marks it if the recording
+    /// is discarded before submission (the fill never ran then).
+    [[nodiscard]] bool take_needs_zero() const { return std::exchange(needs_zero_, false); }
+    void remark_zero() const { needs_zero_ = true; }
+
     /// Records a device-written byte range of a writable import (merged, sorted). Only the
     /// union of these ranges, clamped to `wb_limit_`, is written back at Stream::wait().
     void dirty_add(std::uint64_t lo, std::uint64_t hi) const {
@@ -115,6 +122,7 @@ private:
     /// Write-back ceiling for write-only imports (the untouched suffix stays caller-owned).
     std::uint64_t wb_limit_ = std::numeric_limits<std::uint64_t>::max();
     mutable std::vector<std::pair<std::uint64_t, std::uint64_t>> dirty_;
+    mutable bool needs_zero_ = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -128,11 +136,26 @@ public:
     VkStream(const VkStream&) = delete;
     VkStream& operator=(const VkStream&) = delete;
 
-    void submit() override { s_.submit(); }
+    void submit() override {
+        submitted_ = true;
+        s_.submit();
+    }
     void wait() override;
     void abort() noexcept override {
+        // A discarded (never submitted) recording's zero-fills never ran: re-mark those
+        // buffers so their next use fills them again. After a submission the fills ran (or
+        // the device is lost and every buffer's content is undefined anyway).
+        if (!submitted_) {
+            for (const VkBuf* b : zeroed_) b->remark_zero();
+        }
         s_.discard();
         clear();
+    }
+    /// Records the deferred zero-fill of an allocate()d buffer (see VkBuf::remark_zero),
+    /// in stream order before the op that first touches it.
+    void zero_fill(const VkBuf& b) {
+        s_.fill(b.dev(), 0, b.dev().size(), 0u);
+        zeroed_.push_back(&b);
     }
 
     [[nodiscard]] hv::Stream& s() noexcept { return s_; }
@@ -174,6 +197,8 @@ private:
         keep_.clear();
         downloads_.clear();
         status_ops_.clear();
+        zeroed_.clear();
+        submitted_ = false;
     }
 
     VulkanBackend* owner_;
@@ -183,6 +208,8 @@ private:
     std::vector<Pending> downloads_;
     std::deque<hv::Buffer> status_chunks_;  // reused across waits
     std::vector<std::string> status_ops_;
+    std::vector<const VkBuf*> zeroed_;      // deferred zero-fills recorded in this recording
+    bool submitted_ = false;                // the current recording was (at least once) submitted
 };
 
 // ---------------------------------------------------------------------------------------
@@ -202,7 +229,7 @@ struct Ref {
 
 class Resolver {
 public:
-    Resolver(const Backend* self, const char* op) : self_(self), op_(op) {}
+    Resolver(const Backend* self, const char* op, VkStream& st) : self_(self), op_(op), st_(&st) {}
 
     Ref get(const TensorRef& ref, std::uint64_t rows, std::uint64_t row_bytes, std::uint64_t align, Access access,
             const char* name, bool track = true) const {
@@ -231,6 +258,8 @@ public:
         o.buf = b;
         o.begin = ref.offset;
         o.view = hv::BufferView(b->dev(), ref.offset, limit, rows > 1 ? o.stride : 0);
+        // The deferred zero-fill of an allocate()d buffer, stream-ordered before this op.
+        if (b->take_needs_zero()) st_->zero_fill(*b);
         // Writable imports are mirrored to the caller's memory at wait(): track what ops write.
         if (track && access == Access::Write) b->dirty_add(o.begin, o.extent);
         return o;
@@ -256,6 +285,7 @@ public:
 private:
     const Backend* self_;
     const char* op_;
+    VkStream* st_;
 };
 
 void check_kernel(const KernelChoice& k, OpId op) {
@@ -321,12 +351,13 @@ public:
                                       : tier == Tier::Gtt ? hv::MemoryUsage::HostVisible
                                                           : hv::MemoryUsage::HostCached;
         hv::Buffer b = hv::Buffer::create(ctx_, std::max<std::uint64_t>(round_up4(bytes), 4), usage);
-        {  // zero-filled, as the CPU backend
-            hv::Stream s(ctx_);
-            s.fill(b, 0, b.size(), 0u);
-            s.submit_and_wait();
-        }
-        return std::make_unique<VkBuf>(this, std::move(b), bytes, tier, true, nullptr, std::span<std::byte>());
+        // Zero-filled, as the CPU backend — but lazily (WS-BI-7): the fill is recorded, in
+        // stream order, ahead of the first op that touches the buffer (Resolver::get). A
+        // synchronous fill per allocation was a full GPU round trip each, and the step
+        // arena allocates ~35 buffers per forward.
+        auto r = std::make_unique<VkBuf>(this, std::move(b), bytes, tier, true, nullptr, std::span<std::byte>());
+        r->remark_zero();
+        return r;
     }
     std::unique_ptr<Buffer> import_host(std::span<std::byte> bytes) override {
         const auto lo = std::bit_cast<std::uintptr_t>(bytes.data());
@@ -363,7 +394,7 @@ public:
 
     void upload(Stream& s, TensorRef dst, std::span<const std::byte> src) override {
         VkStream& st = stream(s, "upload");
-        const Resolver r(this, "upload");
+        const Resolver r(this, "upload", st);
         const Ref d = r.get(dst, 1, src.size(), 1, Access::Write, "dst");
         if (src.empty()) return;
         const hv::Buffer& staging = st.stage(src);
@@ -371,7 +402,7 @@ public:
     }
     void download(Stream& s, TensorRef src, std::span<std::byte> dst) override {
         VkStream& st = stream(s, "download");
-        const Resolver r(this, "download");
+        const Resolver r(this, "download", st);
         const Ref o = r.get(src, 1, dst.size(), 1, Access::Read, "src");
         if (dst.empty()) return;
         st.add_download(o.buf->dev(), o.begin, dst);
@@ -389,7 +420,7 @@ public:
         VkStream& st = stream(s, "GET_ROWS");
         check_kernel(a.kernel, OpId::GetRows);
         check_status(a.status, OpId::GetRows);
-        const Resolver r(this, "GET_ROWS");
+        const Resolver r(this, "GET_ROWS", st);
         const std::uint64_t rb = weight_row_bytes(a.type, a.cols);
         const Ref table = r.get(a.table, a.n_rows, rb, a.type == DType::F32 ? kF32 : 1, Access::Read, "table");
         const Ref ids = r.get(a.ids, 1, mul_u64(a.n_ids, 4, r.op(), "ids"), 4, Access::Read, "ids");
@@ -404,7 +435,7 @@ public:
     void rms_norm(Stream& s, const RmsNormArgs& a) override {
         VkStream& st = stream(s, "RMS_NORM");
         check_kernel(a.kernel, OpId::RmsNorm);
-        const Resolver r(this, "RMS_NORM");
+        const Resolver r(this, "RMS_NORM", st);
         const Ref x = r.f32(a.x, a.rows, a.cols, Access::Read, "x");
         const Ref w = r.f32(a.w, 1, a.cols, Access::Read, "w");
         const Ref out = r.f32(a.out, a.rows, a.cols, Access::Write, "out");
@@ -417,7 +448,7 @@ public:
     void add_rms_norm(Stream& s, const AddRmsNormArgs& a) override {
         VkStream& st = stream(s, "ADD_RMS_NORM");
         check_kernel(a.kernel, OpId::AddRmsNorm);
-        const Resolver r(this, "ADD_RMS_NORM");
+        const Resolver r(this, "ADD_RMS_NORM", st);
         const Ref x = r.f32(a.a, a.rows, a.cols, Access::Read, "a");
         const Ref y = r.f32(a.b, a.rows, a.cols, Access::Read, "b");
         const Ref h = r.f32(a.h, a.rows, a.cols, Access::Write, "h");
@@ -437,7 +468,7 @@ public:
     void gemv(Stream& s, const GemvArgs& a) override {
         VkStream& st = stream(s, "MATMUL");
         check_kernel(a.kernel, OpId::Gemv);
-        const Resolver r(this, "MATMUL");
+        const Resolver r(this, "MATMUL", st);
         const hv::GemvArgs g = resolve_gemv(r, a, true);
         if (a.n_vec == 0 || a.rows == 0) return;
         ops_.gemv(st.s(), g);
@@ -446,7 +477,7 @@ public:
     void gdn_gates(Stream& s, const GdnGateArgs& a) override {
         VkStream& st = stream(s, "GDN_GATES");
         check_kernel(a.kernel, OpId::GdnGates);
-        const Resolver r(this, "GDN_GATES");
+        const Resolver r(this, "GDN_GATES", st);
         const std::uint32_t T = a.n_tokens, nv = a.n_heads;
         const Ref alpha = r.f32(a.alpha, T, nv, Access::Read, "alpha");
         const Ref beta = r.f32(a.beta, T, nv, Access::Read, "beta");
@@ -468,7 +499,7 @@ public:
     void conv1d_silu(Stream& s, const Conv1dArgs& a) override {
         VkStream& st = stream(s, "CONV1D_SHORT");
         check_kernel(a.kernel, OpId::Conv1dSilu);
-        const Resolver r(this, "CONV1D_SHORT");
+        const Resolver r(this, "CONV1D_SHORT", st);
         HALO_CHECK(a.kernel_size > 0, ErrorCode::Kernel, "CONV1D_SHORT: kernel_size is 0");
         HALO_CHECK(a.kernel_size <= kMaxConvK, ErrorCode::Unsupported, "CONV1D_SHORT: kernel {} exceeds the vulkan limit {}",
                    a.kernel_size, kMaxConvK);
@@ -532,7 +563,7 @@ public:
         VkStream& st = stream(s, "GATED_DELTANET");
         check_kernel(a.kernel, OpId::GatedDeltaRule);
         check_status(a.status, OpId::GatedDeltaRule);
-        const Resolver r(this, "GATED_DELTANET");
+        const Resolver r(this, "GATED_DELTANET", st);
         HALO_CHECK(a.mapping == GdnHeadMapping::Tiled, ErrorCode::Unsupported,
                    "GATED_DELTANET: the vulkan kernels implement the GGUF tiled head mapping only");
         HALO_CHECK(a.d_k <= options_.ops.gdn_max_dk, ErrorCode::Unsupported, "GATED_DELTANET: d_k {} exceeds the vulkan limit {}",
@@ -633,7 +664,7 @@ public:
     void gated_rms_norm(Stream& s, const GatedNormArgs& a) override {
         VkStream& st = stream(s, "GATED_NORM");
         check_kernel(a.kernel, OpId::GatedRmsNorm);
-        const Resolver r(this, "GATED_NORM");
+        const Resolver r(this, "GATED_NORM", st);
         const Ref x = r.f32(a.x, a.rows, a.cols, Access::Read, "x");
         const Ref z = r.f32(a.z, a.rows, a.cols, Access::Read, "z");
         const Ref w = r.f32(a.w, 1, a.cols, Access::Read, "w");
@@ -648,7 +679,7 @@ public:
     void partial_rope(Stream& s, const RopeArgs& a) override {
         VkStream& st = stream(s, "PARTIAL_ROPE");
         check_kernel(a.kernel, OpId::PartialRope);
-        const Resolver r(this, "PARTIAL_ROPE");
+        const Resolver r(this, "PARTIAL_ROPE", st);
         HALO_CHECK(a.n_heads > 0, ErrorCode::Kernel, "PARTIAL_ROPE: n_heads is 0");
         const std::uint64_t hs = a.head_stride == 0 ? a.head_dim : a.head_stride;
         HALO_CHECK(hs >= a.head_dim, ErrorCode::Kernel, "PARTIAL_ROPE: head_stride {} < head_dim {}", hs, a.head_dim);
@@ -682,7 +713,7 @@ public:
         VkStream& st = stream(s, "KV_WRITE");
         check_kernel(a.kernel, OpId::KvWrite);
         check_status(a.status, OpId::KvWrite);
-        const Resolver r(this, "KV_WRITE");
+        const Resolver r(this, "KV_WRITE", st);
         const std::uint64_t end = std::uint64_t{a.start} + a.n_tokens;
         const PoolRefs p = pool_refs(r, a.kv_pool, a.block_table, a.n_pool_blocks, a.n_layers, a.layer, a.block_tokens, a.kv_dim,
                                      a.n_block_table, end, Access::Write);
@@ -713,7 +744,7 @@ public:
         VkStream& st = stream(s, "ATTENTION");
         check_kernel(a.kernel, OpId::Attention);
         check_status(a.status, OpId::Attention);
-        const Resolver r(this, "ATTENTION");
+        const Resolver r(this, "ATTENTION", st);
         HALO_CHECK(a.n_head > 0 && a.n_kv_head > 0 && a.n_head % a.n_kv_head == 0, ErrorCode::Kernel,
                    "ATTENTION: n_head {} / n_kv_head {}", a.n_head, a.n_kv_head);
         const std::uint64_t hd = a.head_dim, T = a.n_tokens;
@@ -760,7 +791,7 @@ public:
         check_kernel(a.kernel, OpId::LmHead);
         check_kernel(a.gemv.kernel, OpId::LmHead);
         check_status(a.status, OpId::LmHead);
-        const Resolver r(this, "LM_HEAD");
+        const Resolver r(this, "LM_HEAD", st);
         const GemvArgs& g = a.gemv;
         const hv::GemvArgs hg = resolve_gemv(r, g, !g.y.empty());
         const Ref w = r.get(g.w, g.rows, weight_row_bytes(g.wtype, g.cols), g.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
@@ -786,7 +817,7 @@ public:
         VkStream& st = stream(s, "ARGMAX_FUSED");
         check_kernel(a.kernel, OpId::Argmax);
         check_status(a.status, OpId::Argmax);
-        const Resolver r(this, "ARGMAX_FUSED");
+        const Resolver r(this, "ARGMAX_FUSED", st);
         const Ref l = r.f32(a.logits, a.n_vec, a.n, Access::Read, "logits");
         const Ref res = r.get(a.result, 1, mul_u64(a.n_vec, kArgmaxResultBytes, r.op(), "result"), 4, Access::Write, "result");
         r.no_overlap(res, l);
@@ -804,7 +835,7 @@ public:
         VkStream& st = stream(s, "TOP_K");
         check_kernel(a.kernel, OpId::TopK);
         check_status(a.status, OpId::TopK);
-        const Resolver r(this, "TOP_K");
+        const Resolver r(this, "TOP_K", st);
         const Ref l = r.f32(a.logits, a.n_vec, a.n, Access::Read, "logits");
         const Ref ids = r.get(a.ids, a.n_vec, mul_u64(a.k, 4, r.op(), "ids"), 4, Access::Write, "ids");
         const Ref vals = r.f32(a.values, a.n_vec, a.k, Access::Write, "values");
@@ -829,7 +860,7 @@ public:
     void copy(Stream& s, const CopyArgs& a) override {
         VkStream& st = stream(s, "COPY");
         check_kernel(a.kernel, OpId::Copy);
-        const Resolver r(this, "COPY");
+        const Resolver r(this, "COPY", st);
         const Ref src = r.get(a.src, 1, a.bytes, 1, Access::Read, "src");
         const Ref dst = r.get(a.dst, 1, a.bytes, 1, Access::Write, "dst");
         r.no_overlap(dst, src);
@@ -903,7 +934,7 @@ private:
         const char* name = op == OpId::Swiglu ? "SWIGLU" : op == OpId::MulSigmoid ? "MUL_SIGMOID" : "ADD";
         VkStream& st = stream(s, name);
         check_kernel(a.kernel, op);
-        const Resolver r(this, name);
+        const Resolver r(this, name, st);
         const Ref x = r.f32(a.a, a.rows, a.cols, Access::Read, "a");
         const Ref y = r.f32(a.b, a.rows, a.cols, Access::Read, "b");
         const Ref out = r.f32(a.out, a.rows, a.cols, Access::Write, "out");

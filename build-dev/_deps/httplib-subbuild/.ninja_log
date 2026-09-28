@@ -1,0 +1,21 @@
+# ninja log v7
+0	9	1790461722960044568	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-mkdir	1f941decfb326df4
+0	9	1790461722960044568	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-mkdir	1f941decfb326df4
+9	1204	1790461724155008613	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-download	1ba12308cc10089d
+9	1204	1790461724155008613	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-download	1ba12308cc10089d
+1204	1213	1790461724164008343	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-update	57d13d7cf49ef68
+1204	1213	1790461724164008343	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-update	57d13d7cf49ef68
+1213	1221	1790461724173008072	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-patch	c764a303c724b2ac
+1213	1221	1790461724173008072	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-patch	c764a303c724b2ac
+1221	1230	1790461724181007831	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-configure	7456b4be7ceb15a
+1221	1230	1790461724181007831	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-configure	7456b4be7ceb15a
+1230	1239	1790461724190007560	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-build	374e02d9ad9a33d
+1230	1239	1790461724190007560	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-build	374e02d9ad9a33d
+1239	1246	1790461724198007320	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-install	c87979e965095240
+1239	1246	1790461724198007320	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-install	c87979e965095240
+1246	1253	1790461724205007109	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-test	c1023cec8b5c4f7
+1246	1253	1790461724205007109	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-test	c1023cec8b5c4f7
+1253	1266	1790461724218006718	CMakeFiles/httplib-populate-complete	79a89bdb6469bd2d
+1253	1266	1790461724218006718	httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-done	79a89bdb6469bd2d
+1253	1266	1790461724218006718	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/CMakeFiles/httplib-populate-complete	79a89bdb6469bd2d
+1253	1266	1790461724218006718	/home/alexander-vegazo/Documents/repos/halo/build-dev/_deps/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-done	79a89bdb6469bd2d

@@ -100,12 +100,11 @@ void Stream::ensure_recording() {
     used_timestamps_ = 0;
     op_marks_.clear();
     dispatches_ = 0;
-    needs_barrier_ = false;
+    touched_.clear();
     state_ = State::Recording;
 }
 
-void Stream::barrier_if_needed() {
-    if (!needs_barrier_) return;
+void Stream::barrier() {
     VkMemoryBarrier mb{};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -113,7 +112,27 @@ void Stream::barrier_if_needed() {
                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     const VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     vkCmdPipelineBarrier(cmd_, stages, stages, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    needs_barrier_ = false;
+    touched_.clear();
+}
+
+void Stream::mark_touched(const Buffer* buf, bool write) {
+    auto& m = touched_[buf];
+    m.first = true;
+    m.second = m.second || write;
+}
+
+void Stream::barrier_for(std::span<const BufferBinding> buffers, std::uint64_t write_mask) {
+    // A barrier is needed iff some binding was written since the last barrier (RAW if we
+    // read it, WAW if we write it), or is written now and was read since (WAR).
+    bool hazard = false;
+    for (std::size_t i = 0; i < buffers.size() && !hazard; ++i) {
+        const auto it = touched_.find(buffers[i].buffer);
+        if (it == touched_.end()) continue;
+        const auto& [read, written] = it->second;
+        hazard = written || (read && ((write_mask >> i) & 1));
+    }
+    if (hazard) barrier();
+    for (std::size_t i = 0; i < buffers.size(); ++i) mark_touched(buffers[i].buffer, (write_mask >> i) & 1);
 }
 
 VkDescriptorSet Stream::allocate_set(VkDescriptorSetLayout layout, std::uint32_t num_buffers) {
@@ -150,7 +169,7 @@ VkDescriptorSet Stream::allocate_set(VkDescriptorSetLayout layout, std::uint32_t
 }
 
 void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffers,
-                      std::span<const std::byte> push, GroupCount groups) {
+                      std::span<const std::byte> push, GroupCount groups, std::uint64_t write_mask) {
     // Very long single command buffers (thousands of compute dispatches, e.g. a large
     // prefill) wedge the compute ring on this platform (gfx1151 / RADV, observed as
     // VK_ERROR_DEVICE_LOST at prompts >= 24 tokens). Bound a command buffer to
@@ -208,7 +227,7 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
     vkUpdateDescriptorSets(ctx_->device(), static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
                            nullptr);
 
-    barrier_if_needed();
+    barrier_for(buffers, write_mask);
     const std::optional<std::uint32_t> t0 = op_timings_ ? timestamp() : std::nullopt;
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline());
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.layout(), 0, 1, &set, 0, nullptr);
@@ -231,7 +250,6 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
         }
         ++sync_logged_;
     }
-    needs_barrier_ = true;
     ++dispatches_;
 }
 
@@ -244,10 +262,10 @@ void Stream::copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
     HALO_CHECK(dst_offset <= dst.size() && size <= dst.size() - dst_offset, ErrorCode::Kernel,
                "copy destination range out of bounds");
     ensure_recording();
-    barrier_if_needed();
+    const std::array bindings{BufferBinding{&src, src_offset, size}, BufferBinding{&dst, dst_offset, size}};
+    barrier_for(bindings, 0b10);  // src read, dst written
     const VkBufferCopy region{src_offset, dst_offset, size};
     vkCmdCopyBuffer(cmd_, src.handle(), dst.handle(), 1, &region);
-    needs_barrier_ = true;
 }
 
 void Stream::discard() noexcept {
@@ -258,7 +276,6 @@ void Stream::discard() noexcept {
     // A Recording command buffer is never submitted; ensure_recording() resets it (and the
     // descriptor pools) before the next recording begins.
     state_ = State::Idle;
-    needs_barrier_ = false;
 }
 
 void Stream::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value) {
@@ -268,9 +285,9 @@ void Stream::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std
     HALO_CHECK(offset <= dst.size() && size <= dst.size() - offset, ErrorCode::Kernel,
                "fill range [{}, +{}) exceeds the buffer ({} bytes)", offset, size, dst.size());
     ensure_recording();
-    barrier_if_needed();
+    const std::array bindings{BufferBinding{&dst, offset, size}};
+    barrier_for(bindings, 0b1);  // dst written
     vkCmdFillBuffer(cmd_, dst.handle(), offset, size, value);
-    needs_barrier_ = true;
 }
 
 std::optional<std::uint32_t> Stream::timestamp() {

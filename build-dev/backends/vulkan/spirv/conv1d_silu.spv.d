@@ -1,0 +1,1 @@
+/home/alexander-vegazo/Documents/repos/halo/build-dev/backends/vulkan/spirv/conv1d_silu.spv: /home/alexander-vegazo/Documents/repos/halo/backends/vulkan/shaders/linear_attn/conv1d_silu.comp /home/alexander-vegazo/Documents/repos/halo/backends/vulkan/shaders/common/halo_math.glsl /home/alexander-vegazo/Documents/repos/halo/backends/vulkan/shaders/common/halo_common.glsl

@@ -1,0 +1,39 @@
+[INFO] vulkan: device 'AMD Radeon 8060S Graphics (RADV STRIX_HALO)' (radv, Mesa 26.0.8-1ubuntu0.3; API 1.4.335) — RADV (default/reference driver)
+[INFO] runtime: backend 'vulkan' selected; KV/GDN state stays host-resident until WS-BI-2
+[INFO] runtime: memory plan: prefix checkpoints: 1 per slot x 1 slots x 149.625 MiB = 0.15 GiB in VRAM
+[INFO] runtime: memory plan: activations/workspace are formula estimates until a backend reports measured sizes
+[INFO] vulkan: device 'AMD Radeon 8060S Graphics (RADV STRIX_HALO)' (radv, Mesa 26.0.8-1ubuntu0.3; API 1.4.335) — RADV (default/reference driver)
+[INFO] runtime: backend 'vulkan' selected; KV/GDN state stays host-resident until WS-BI-2
+[INFO] runtime: memory plan: prefix checkpoints: 1 per slot x 1 slots x 149.625 MiB = 0.15 GiB in VRAM
+[INFO] runtime: memory plan: activations/workspace are formula estimates until a backend reports measured sizes
+[INFO] vulkan: device 'AMD Radeon 8060S Graphics (RADV STRIX_HALO)' (radv, Mesa 26.0.8-1ubuntu0.3; API 1.4.335) — RADV (default/reference driver)
+[INFO] runtime: backend 'vulkan' selected; KV/GDN state stays host-resident until WS-BI-2
+[INFO] runtime: memory plan: prefix checkpoints: 1 per slot x 1 slots x 149.625 MiB = 0.15 GiB in VRAM
+[INFO] runtime: memory plan: activations/workspace are formula estimates until a backend reports measured sizes
+radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a hard recovery.
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] bench: prompt: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] bench: decode: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] bench: mtp_decode: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] bench: concurrency: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[INFO] bench: prefix_replay: context 33152 skipped: exceeds engine context_length 4096
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] runtime: tick failed: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[ERROR] bench: cancellation_storm: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+[halo bench] suite model: 2 records, 2 summaries, conformant false, valid false, written to process_tools/bench_model.json
+  note: FAILED: prompt: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+  note: FAILED: decode: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+  note: FAILED: mtp_decode: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+  note: FAILED: concurrency: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+  note: prefix_replay: context 33152 skipped: exceeds engine context_length 4096
+  note: FAILED: cancellation_storm: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)
+  this artifact is not valid for comparison (thermal drift, unpinned power mode, or below the methodology minimum)

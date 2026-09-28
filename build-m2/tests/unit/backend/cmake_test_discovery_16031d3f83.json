@@ -1,0 +1,62 @@
+{
+  "tests": 10,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "VulkanBackend",
+      "tests": 10,
+      "testsuite": [
+        {
+          "name": "IdentityLimitsVariantsAndZeroFill",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 149
+        },
+        {
+          "name": "ImportsAreDeviceMirrorsWrittenBackAtWait",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 179
+        },
+        {
+          "name": "AbortDiscardsTheRecordingAndNeverWritesBack",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 203
+        },
+        {
+          "name": "DownloadsSnapshotAtTheirStreamPosition",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 223
+        },
+        {
+          "name": "InterfaceRules",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 239
+        },
+        {
+          "name": "NormsAndElementwiseMatchCpu",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 280
+        },
+        {
+          "name": "GemvGetRowsLmHeadArgmaxTopKCopyMatchCpu",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 313
+        },
+        {
+          "name": "RopeKvWriteAttentionMatchCpu",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 380
+        },
+        {
+          "name": "ConvAndGatedDeltaRuleBothFormsMatchCpu",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 437
+        },
+        {
+          "name": "DeviceDataErrorsRaiseAtWaitAndSkipWriteBack",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_vulkan_backend.cpp",
+          "line": 519
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+/home/alexander-vegazo/Documents/repos/halo/build-dev/backends/vulkan/spirv/matvec_iq4_nl.spv: /home/alexander-vegazo/Documents/repos/halo/backends/vulkan/shaders/matmul/matvec_iq4_nl.comp /home/alexander-vegazo/Documents/repos/halo/backends/vulkan/shaders/common/matvec_iq4_nl_main.glsl /home/alexander-vegazo/Documents/repos/halo/backends/vulkan/shaders/common/halo_common.glsl

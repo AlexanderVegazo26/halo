@@ -1,0 +1,218 @@
+{
+  "tests": 28,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "Cli",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "UsageAndExitCodes",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 141
+        }
+      ]
+    },
+    {
+      "name": "CliConfig",
+      "tests": 5,
+      "testsuite": [
+        {
+          "name": "PrecedenceCliOverEnvOverFile",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 180
+        },
+        {
+          "name": "LoadSheddingSettingsReachTheServerConfig",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 205
+        },
+        {
+          "name": "StrictValidation",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 247
+        },
+        {
+          "name": "ServePrintConfigEndToEnd",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 284
+        },
+        {
+          "name": "EngineAndServerConfigMapping",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 298
+        }
+      ]
+    },
+    {
+      "name": "CliInspect",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "TinyModelTextAndJson",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 349
+        },
+        {
+          "name": "RealQwenHeaders",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 367
+        },
+        {
+          "name": "MissingAndMalformedFiles",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 408
+        }
+      ]
+    },
+    {
+      "name": "CliDevices",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "EvoX2Fixture",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 425
+        },
+        {
+          "name": "NoGpuFixtureFailsVerification",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 446
+        }
+      ]
+    },
+    {
+      "name": "CliTokenize",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "MatchesTheHfTokenizer",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 462
+        }
+      ]
+    },
+    {
+      "name": "CliTemplate",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "RendersAndProtectsSpecialTokens",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 482
+        }
+      ]
+    },
+    {
+      "name": "CliRun",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "RuntimeNotBuilt",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 525
+        },
+        {
+          "name": "StreamsContentAndHidesReasoning",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 543
+        }
+      ]
+    },
+    {
+      "name": "CliServe",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "ServesTheApiUntilStopped",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 582
+        },
+        {
+          "name": "UnsafeBindRefusedBeforeLoadingTheModel",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 614
+        },
+        {
+          "name": "EmptyApiKeyNeverDisablesAuthentication",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 637
+        },
+        {
+          "name": "UnsafeBrowserAndRemoteConfigurationsAreRefused",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 673
+        }
+      ]
+    },
+    {
+      "name": "CliOutput",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "OutputPathsNeverFollowSymlinksAndWriteFailuresAreErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 706
+        },
+        {
+          "name": "RewriteKeepsTheExistingModeAndNewFilesFollowTheUmask",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 757
+        },
+        {
+          "name": "FileIdentityDetectsAnInPlaceRewriteThatRestoresSizeAndMtime",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 787
+        }
+      ]
+    },
+    {
+      "name": "CliBench",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "MicroCpuKernels",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 814
+        },
+        {
+          "name": "ModelSuiteOverFakeEngine",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 856
+        },
+        {
+          "name": "SystemSuiteOverFakeEngine",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 898
+        }
+      ]
+    },
+    {
+      "name": "CliHashing",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "Sha256KnownAnswers",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 928
+        }
+      ]
+    },
+    {
+      "name": "CliTune",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "RequiredFlagsAndStrategyRules",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 949
+        },
+        {
+          "name": "TunesTinyModelThenListShowsTheLookup",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/cli\/test_cli.cpp",
+          "line": 993
+        }
+      ]
+    }
+  ]
+}

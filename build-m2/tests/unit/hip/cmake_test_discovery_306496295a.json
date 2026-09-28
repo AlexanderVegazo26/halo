@@ -1,0 +1,53 @@
+{
+  "tests": 7,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "HipDecodeEmu",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "GetRowsAllTypesBitExactVsDequantizeRow",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 102
+        },
+        {
+          "name": "GetRowsBadIdRaises",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 116
+        },
+        {
+          "name": "AddAndFusedAddRmsNormBitExactVsCpuComposition",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 196
+        },
+        {
+          "name": "GdnGatesBitExactVsCpuForwardComposition",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 256
+        }
+      ]
+    },
+    {
+      "name": "HipDecodeDevice",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "GetRowsAllTypesVsDequantizeRow",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 110
+        },
+        {
+          "name": "AddAndFusedAddRmsNormVsCpuComposition",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 204
+        },
+        {
+          "name": "GdnGatesVsCpuForwardComposition",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_decode.cpp",
+          "line": 264
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/backend/test_hip_backend[1]_tests.cmake")
+  include("/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/backend/test_hip_backend[1]_tests.cmake")
+else()
+  add_test(test_hip_backend_NOT_BUILT test_hip_backend_NOT_BUILT)
+endif()

@@ -147,7 +147,7 @@ void Ops::get_rows(Stream& stream, const GetRowsArgs& a) {
         const Push push{a.n_rows, a.cols,    a.n_ids,  slabs[si].off, slabs[si].stride, oi.off,
                         oo.off,   oo.stride, os.off,   static_cast<std::uint32_t>(r0),  n,  si == 0 ? 1u : 0u};
         const std::array bindings{slabs[si].binding, oi.binding, oo.binding, os.binding};
-        stream.dispatch(k, bindings, push, groups);
+        stream.dispatch(k, bindings, push, groups, 0b1100);  // out + status written
     }
 }
 
@@ -176,7 +176,7 @@ void Ops::kv_write(Stream& stream, const KvWriteArgs& a) {
     const std::array bindings{op_pool.binding, ot.binding, ok.binding, ov.binding, os.binding};
     const GroupCount groups = grid_1d(a.n_tokens, info.max_workgroup_count[0], info.max_workgroup_count[1]);
     zero_status(stream, a.status);
-    stream.dispatch(k, bindings, push, groups);
+    stream.dispatch(k, bindings, push, groups, 0b10001);  // pool + status written
 }
 
 void Ops::attention(Stream& stream, const AttentionArgs& a) {
@@ -220,7 +220,7 @@ void Ops::attention(Stream& stream, const AttentionArgs& a) {
     const std::array bindings{oq.binding, op_pool.binding, ot.binding, oo.binding, os.binding};
     const GroupCount groups = grid_1d(items, info.max_workgroup_count[0], info.max_workgroup_count[1]);
     zero_status(stream, a.status);
-    stream.dispatch(k, bindings, push, groups);
+    stream.dispatch(k, bindings, push, groups, 0b11000);  // out + status written
 }
 
 }  // namespace halo::vulkan

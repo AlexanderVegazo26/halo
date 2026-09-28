@@ -172,7 +172,8 @@ void Ops::top_k(Stream& stream, const TopKArgs& a) {
         const std::array bindings{sv.binding, si.binding, dv.binding, di.binding, os.binding};
         stream.dispatch(first ? k_first : k_next, bindings, push,
                         grid_1d(std::uint64_t{chunks} * a.n_vec, info.max_workgroup_count[0],
-                                info.max_workgroup_count[1]));
+                                info.max_workgroup_count[1]),
+                        0b11100);  // dst values/ids + status written
         count = std::uint64_t{chunks} * a.k;
         first = false;
         cur = 1 - cur;

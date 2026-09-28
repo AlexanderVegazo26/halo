@@ -1,0 +1,68 @@
+{
+  "tests": 10,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "HipRuntime",
+      "tests": 6,
+      "testsuite": [
+        {
+          "name": "ProbeNeverThrowsAndExplainsZeroDevices",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 16
+        },
+        {
+          "name": "ContextCreateWithoutDeviceIsDeviceError",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 28
+        },
+        {
+          "name": "ErrorTranslationUsesTypedCodes",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 38
+        },
+        {
+          "name": "CompiledForGfx1151",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 62
+        },
+        {
+          "name": "HostBufferRoundTripAndRangeChecks",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 67
+        },
+        {
+          "name": "RegistryListsGdnVariantsAndRejectsUnknownNames",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 87
+        }
+      ]
+    },
+    {
+      "name": "HipRuntimeDevice",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "ContextReportsGfx1151Properties",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 116
+        },
+        {
+          "name": "AllocatesEveryTierAndRoundTrips",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 129
+        },
+        {
+          "name": "StreamEventsTime",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 149
+        },
+        {
+          "name": "TargetRejectsWrongMemoryKind",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/hip\/test_hip_runtime.cpp",
+          "line": 160
+        }
+      ]
+    }
+  ]
+}

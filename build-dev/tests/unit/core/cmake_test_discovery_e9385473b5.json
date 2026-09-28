@@ -1,0 +1,117 @@
+{
+  "tests": 21,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "LogEnv",
+      "tests": 21,
+      "testsuite": [
+        {
+          "name": "DefaultIsInfoAsTextOnStderr",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 131
+        },
+        {
+          "name": "LevelTraceShowsTraceAndDebug",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 140
+        },
+        {
+          "name": "FormatJsonWritesOneObjectPerLineWithEpochMilliseconds",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 146
+        },
+        {
+          "name": "FileReceivesLinesWithMode0600AndNothingOnStderr",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 162
+        },
+        {
+          "name": "FileIsAppendedNotTruncated",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 170
+        },
+        {
+          "name": "PreExistingFileIsTightenedTo0600",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 177
+        },
+        {
+          "name": "SymlinkIsRefusedAndLoggingStaysOnStderr",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 185
+        },
+        {
+          "name": "SymlinkToExistingFileIsRefusedAndTargetUntouched",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 197
+        },
+        {
+          "name": "FifoDoesNotBlockAndFallsBackToStderr",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 209
+        },
+        {
+          "name": "FifoWithReaderIsRefusedWithoutBeingOpened",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 220
+        },
+        {
+          "name": "HardLinkedFileIsRefusedAndLeftUntouched",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 242
+        },
+        {
+          "name": "ForeignOwnedFileIsRefusedAndLeftUntouched",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 257
+        },
+        {
+          "name": "NonRegularFileIsRefused",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 270
+        },
+        {
+          "name": "UnknownLevelWarnsAndKeepsInfo",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 276
+        },
+        {
+          "name": "UnknownFormatWarnsAndKeepsText",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 283
+        },
+        {
+          "name": "ExplicitSetLevelBeforeFirstLineBeatsEnvironment",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 289
+        },
+        {
+          "name": "ExplicitSetJsonBeforeFirstLineBeatsEnvironment",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 296
+        },
+        {
+          "name": "SetLevelAfterLoggingStillApplies",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 301
+        },
+        {
+          "name": "EmptyValuesCountAsUnsetWithoutWarning",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 308
+        },
+        {
+          "name": "LogFileDescriptorIsNotInheritedAcrossExec",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 313
+        },
+        {
+          "name": "LinesSurviveAbortBecauseEachLineIsFlushed",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/core\/test_log_env.cpp",
+          "line": 321
+        }
+      ]
+    }
+  ]
+}

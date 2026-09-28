@@ -150,7 +150,8 @@ void Ops::rms_norm(Stream& stream, const BufferView& x, const BufferView& w, con
     const Kernel& k = kernel("rms_norm", 3, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     const std::array bindings{ox.binding, ow.binding, oy.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(rows, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k, bindings, push, grid_1d(rows, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b100);  // y written
 }
 
 void Ops::matvec(Stream& stream, DType wtype, const BufferView& w, const BufferView& x, const BufferView& y,
@@ -226,7 +227,7 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
                         ox.stride,
                         oy.off + t0 * oy.stride,
                         oy.stride};
-        stream.dispatch(k, bindings, push, groups);
+        stream.dispatch(k, bindings, push, groups, 0b100);  // y written
     }
 }
 
@@ -328,7 +329,7 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
         const std::array bindings{oq.binding, ok.binding,    ov.binding, og.binding,
                                   ob.binding, oin.binding,   osout.binding, oo.binding,
                                   ring ? oslab.binding : (osl ? osl->binding : oo.binding)};
-        stream.dispatch(k, bindings, push, groups);
+        stream.dispatch(k, bindings, push, groups, 0b111000000);  // state_out, out, slots written
         return;
     }
 
@@ -372,8 +373,8 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
                               ob.binding,  oin.binding, osout.binding, oo.binding,
                               ring ? oslab.binding : (osl ? osl->binding : oo.binding), ows.binding, ost.binding};
     stream.fill(*chunked->status.buffer, chunked->status.offset, k_status_bytes, 0u);
-    stream.dispatch(kc, check_bindings, check, check_groups);
-    stream.dispatch(k, bindings, push, groups);
+    stream.dispatch(kc, check_bindings, check, check_groups, 0b10);  // status written
+    stream.dispatch(k, bindings, push, groups, 0b11111000000);  // state_out, out, slots, workspace, status
 }
 
 void Ops::gated_delta_rule_decode(Stream& stream, const GdnDecodeArgs& a) { gdn_impl(stream, a, nullptr); }
@@ -422,9 +423,10 @@ void Ops::argmax(Stream& stream, const BufferView& logits, std::uint32_t n, cons
     const Kernel& k2 = kernel("argmax_final", 2, sizeof(Push2), {{0, wg}}, {wg, 1, 1});
     const DeviceInfo& info = ctx_->info();
     const std::array b1{ol.binding, os.binding};
-    stream.dispatch(k1, b1, p1, grid_1d(groups, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k1, b1, p1, grid_1d(groups, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b10);  // scratch written
     const std::array b2{os.binding, orr.binding};
-    stream.dispatch(k2, b2, p2, GroupCount{1, 1, 1});
+    stream.dispatch(k2, b2, p2, GroupCount{1, 1, 1}, 0b10);  // result written
 }
 
 }  // namespace halo::vulkan

@@ -1,0 +1,215 @@
+{
+  "tests": 31,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "TokenizerSpec",
+      "tests": 6,
+      "testsuite": [
+        {
+          "name": "BpeMergesLowestRankThenLeftmost",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 166
+        },
+        {
+          "name": "AddedTokensSplitFirstLongestWins",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 176
+        },
+        {
+          "name": "RejectsMalformedSpecsWithTypedErrors",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 194
+        },
+        {
+          "name": "DecodeRejectsOutOfRangeIds",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 226
+        },
+        {
+          "name": "InvalidUtf8IsReplacedBeforeEncoding",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 237
+        },
+        {
+          "name": "OffsetsForAddedTokensAndBytes",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 266
+        }
+      ]
+    },
+    {
+      "name": "StreamDecoder",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "HoldsPartialUtf8AndFlushesReplacement",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 246
+        }
+      ]
+    },
+    {
+      "name": "TokenizerHfJson",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "AcceptsSupportedConfig",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 318
+        },
+        {
+          "name": "RejectsUnimplementedConfigs",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 326
+        }
+      ]
+    },
+    {
+      "name": "TokenizerGolden",
+      "tests": 9,
+      "testsuite": [
+        {
+          "name": "VocabularyShape",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 368
+        },
+        {
+          "name": "CorpusMatchesHfTokenForToken",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 379
+        },
+        {
+          "name": "SeededFuzzMatchesHf",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 395
+        },
+        {
+          "name": "CodepointSweepMatchesHf",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 408
+        },
+        {
+          "name": "NfcSweepMatchesHf",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 440
+        },
+        {
+          "name": "DecodeAndStreamDecodeMatchHf",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 452
+        },
+        {
+          "name": "OffsetsPointAtTokenSources",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 474
+        },
+        {
+          "name": "LongPromptMatchesAndReportsThroughput",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 500
+        },
+        {
+          "name": "GgufVocabularyMatchesHfJson",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer.cpp",
+          "line": 532
+        }
+      ]
+    },
+    {
+      "name": "Utf8",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "ReplacesMaximalSubparts",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_unicode.cpp",
+          "line": 42
+        },
+        {
+          "name": "DecodeStepStatuses",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_unicode.cpp",
+          "line": 55
+        }
+      ]
+    },
+    {
+      "name": "Nfc",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "ComposesReordersAndHandlesHangul",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_unicode.cpp",
+          "line": 66
+        },
+        {
+          "name": "OffsetsStayMonotonic",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_unicode.cpp",
+          "line": 77
+        }
+      ]
+    },
+    {
+      "name": "Classes",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "MatchHfRegexClasses",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_unicode.cpp",
+          "line": 89
+        }
+      ]
+    },
+    {
+      "name": "PreTokenizer",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "RegexSemantics",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_unicode.cpp",
+          "line": 101
+        }
+      ]
+    },
+    {
+      "name": "TokenizerLimits",
+      "tests": 7,
+      "testsuite": [
+        {
+          "name": "EightyThousandAddedTokensBuildAndEncodeQuickly",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 114
+        },
+        {
+          "name": "SharedPrefixVocabularyEncodesInBoundedTime",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 134
+        },
+        {
+          "name": "AddedTokenCountAndLengthAreCapped",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 152
+        },
+        {
+          "name": "DuplicateAddedTokensStillRejected",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 174
+        },
+        {
+          "name": "TrieMatchingEqualsLeftmostLongestReference",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 227
+        },
+        {
+          "name": "TinyFileNamingAHugeIdIsRejectedWithoutAllocating",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 330
+        },
+        {
+          "name": "DenseIdsWithAddedTokenOverlapStillLoad",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/tokenizer\/test_tokenizer_limits.cpp",
+          "line": 343
+        }
+      ]
+    }
+  ]
+}

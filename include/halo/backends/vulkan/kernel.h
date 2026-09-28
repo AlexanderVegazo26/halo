@@ -11,10 +11,11 @@
 /// pool. Record dispatches/copies, `submit()`, then `wait()`. Waiting uses the stream's
 /// fence only — never vkDeviceWaitIdle / vkQueueWaitIdle.
 ///
-/// Synchronization inside a recording is conservative and automatic: every dispatch or
-/// copy after the first is preceded by a full compute+transfer memory barrier, and the
-/// recording ends with a device->host barrier so results are visible to mapped reads.
-/// (Dependency tracking to drop redundant barriers is future work.)
+/// Synchronization inside a recording is automatic: a dispatch/copy/fill is preceded by a
+/// full compute+transfer memory barrier iff one of its buffers was written since the last
+/// barrier (RAW/WAW), or it writes a buffer read since the last barrier (WAR); two
+/// dispatches that only read the same buffers share one barrier-free stretch. The recording
+/// ends with a device->host barrier so results are visible to mapped reads.
 ///
 /// Lifetime: resources bound in a recording (buffers, kernels) must stay alive until the
 /// stream has been waited on. A Stream is not thread-safe; use one per thread.
@@ -27,6 +28,7 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -105,14 +107,17 @@ public:
 
     /// Record a dispatch. `push` must be exactly the kernel's push_constant_bytes.
     /// Validates binding count, ranges, alignment, maxStorageBufferRange and group limits.
+    /// write_mask: bit i = binding i is written by the kernel (default: all bindings, the
+    /// conservative answer). Read-only bindings let the barrier elision skip a barrier
+    /// between two dispatches that only READ the same buffer.
     void dispatch(const Kernel& kernel, std::span<const BufferBinding> buffers,
-                  std::span<const std::byte> push, GroupCount groups);
+                  std::span<const std::byte> push, GroupCount groups, std::uint64_t write_mask = ~0ULL);
 
     template <typename Push>
         requires std::is_trivially_copyable_v<Push>
     void dispatch(const Kernel& kernel, std::span<const BufferBinding> buffers, const Push& push,
-                  GroupCount groups) {
-        dispatch(kernel, buffers, std::as_bytes(std::span(&push, 1)), groups);
+                  GroupCount groups, std::uint64_t write_mask = ~0ULL) {
+        dispatch(kernel, buffers, std::as_bytes(std::span(&push, 1)), groups, write_mask);
     }
 
     void copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
@@ -148,7 +153,11 @@ public:
 private:
     enum class State { Idle, Recording, Submitted };
     void ensure_recording();
-    void barrier_if_needed();
+    void barrier();
+    /// A barrier iff the op touching `buffers` (written per write_mask bits) hazards with
+    /// the buffers touched since the last barrier; then records this op's touches.
+    void barrier_for(std::span<const BufferBinding> buffers, std::uint64_t write_mask);
+    void mark_touched(const Buffer* buf, bool write);
     VkDescriptorSet allocate_set(VkDescriptorSetLayout layout, std::uint32_t num_buffers);
     void release() noexcept;
 
@@ -163,7 +172,8 @@ private:
     std::vector<VkDescriptorPool> desc_pools_;
     std::size_t current_pool_ = 0;
     State state_ = State::Idle;
-    bool needs_barrier_ = false;
+    // Barrier elision: per-buffer {read, written} marks since the last barrier.
+    std::unordered_map<const Buffer*, std::pair<bool, bool>> touched_;
     std::uint32_t dispatches_ = 0;
     // HALO_VK_OP_TIMINGS=<path>: per-dispatch GPU timestamps, appended to <path> at wait()
     // as "<kernel> <ns>" lines (diagnostics; off by default, one branch per dispatch).

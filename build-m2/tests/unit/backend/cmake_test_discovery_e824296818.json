@@ -1,0 +1,95 @@
+{
+  "tests": 13,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "HipForwardErrors",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "NoForwardStartsOnAnUnsupportedChunk",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 526
+        }
+      ]
+    },
+    {
+      "name": "Tiny\/HipForward",
+      "tests": 12,
+      "testsuite": [
+        {
+          "name": "MatchesTheCpuBackend\/f32_chunk64_bitwise_forward",
+          "value_param": "24-byte object <4D-9A 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q8_0_chunk64_bitwise_forward",
+          "value_param": "24-byte object <6A-12 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q4_k_m_chunk64_bitwise_forward",
+          "value_param": "24-byte object <36-91 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q6_k_chunk64_bitwise_forward",
+          "value_param": "24-byte object <73-35 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/iq4_xs_chunk64_bitwise_forward",
+          "value_param": "24-byte object <61-05 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q3_k_m_chunk64_bitwise_forward",
+          "value_param": "24-byte object <D6-80 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q5_k_m_chunk64_bitwise_forward",
+          "value_param": "24-byte object <E7-80 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q4_0_chunk64_bitwise_forward",
+          "value_param": "24-byte object <E0-17 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/f32_chunk8_bitwise_reverse",
+          "value_param": "24-byte object <4D-9A 4D-0C D5-63 00-00 08-00 00-00 00-00 00-00 01-01 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q6_k_chunk64_bitwise_reverse",
+          "value_param": "24-byte object <73-35 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 01-01 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/f32_chunk64_bounded_forward",
+          "value_param": "24-byte object <4D-9A 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        },
+        {
+          "name": "MatchesTheCpuBackend\/q6_k_chunk64_bounded_reverse",
+          "value_param": "24-byte object <73-35 4D-0C D5-63 00-00 40-00 00-00 00-00 00-00 00-01 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_hip_forward.cpp",
+          "line": 468
+        }
+      ]
+    }
+  ]
+}

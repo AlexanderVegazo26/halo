@@ -1,0 +1,582 @@
+{
+  "tests": 90,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "ApiJson",
+      "tests": 5,
+      "testsuite": [
+        {
+          "name": "DepthBoundaryIsExact",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 44
+        },
+        {
+          "name": "DeepNestingIsRejectedWithoutRecursion",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 59
+        },
+        {
+          "name": "StrictSyntax",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 71
+        },
+        {
+          "name": "EmbeddedJsonUsesTheSameDepthCap",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 87
+        },
+        {
+          "name": "TypedFieldAccess",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 97
+        }
+      ]
+    },
+    {
+      "name": "ApiErrors",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "InternalDetailNeverReachesTheClient",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 111
+        },
+        {
+          "name": "SanitizeForLog",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 135
+        },
+        {
+          "name": "NativeErrorBodies",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 144
+        },
+        {
+          "name": "ConstantTimeEqual",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 159
+        }
+      ]
+    },
+    {
+      "name": "PromptFixture",
+      "tests": 8,
+      "testsuite": [
+        {
+          "name": "SyntheticTokenizerMatchesUserDefinedTokensWithoutParseSpecial",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 182
+        },
+        {
+          "name": "BenignPromptIsExactlyWholeStringEncoding",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 190
+        },
+        {
+          "name": "CheckpointHintsAreMessageBoundaryTokenOffsetsBoundedToTheLastFew",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 200
+        },
+        {
+          "name": "ControlLiteralsInUserContentStayText",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 227
+        },
+        {
+          "name": "MarkupLiteralsInUserAndToolContentStayText",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 240
+        },
+        {
+          "name": "AssistantHistoryKeepsMarkupButNotControlTokens",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 259
+        },
+        {
+          "name": "ToolDefinitionsAreEscapedToo",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 273
+        },
+        {
+          "name": "EncodeAsTextNeverProducesAddedTokens",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 284
+        }
+      ]
+    },
+    {
+      "name": "PromptReal",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "QwenTokenizerAndTemplateResistInjection",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 295
+        }
+      ]
+    },
+    {
+      "name": "ApiStop",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "HoldsBackPartialMatchesAcrossPieces",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 325
+        },
+        {
+          "name": "FlushAndUtf8",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 338
+        }
+      ]
+    },
+    {
+      "name": "ApiAdmission",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "QueueFullTimeoutAndShutdown",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 349
+        }
+      ]
+    },
+    {
+      "name": "ApiRequests",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "TemplateKwargsAllowlist",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 368
+        },
+        {
+          "name": "Limits",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 389
+        },
+        {
+          "name": "ToolTextAndExpandedMessagesAreCapped",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 425
+        },
+        {
+          "name": "ReasoningEffortMapping",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 467
+        }
+      ]
+    },
+    {
+      "name": "ApiFuzz",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "RequestToPromptPathNeverCrashes",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_units.cpp",
+          "line": 483
+        }
+      ]
+    },
+    {
+      "name": "ApiServer",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "HealthModelsMetrics",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 81
+        },
+        {
+          "name": "ServedModelNameOverride",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 116
+        },
+        {
+          "name": "TokenizeAndApplyTemplate",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 124
+        }
+      ]
+    },
+    {
+      "name": "ApiOpenAI",
+      "tests": 13,
+      "testsuite": [
+        {
+          "name": "ChatNonStreamingSplitsReasoningAndContent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 151
+        },
+        {
+          "name": "SamplingParametersReachTheEngine",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 177
+        },
+        {
+          "name": "ChatStreamingEventSequence",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 199
+        },
+        {
+          "name": "ToolCallNonStreamingAndStreaming",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 233
+        },
+        {
+          "name": "ToolRoundTripRendersHistory",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 269
+        },
+        {
+          "name": "StructuredOutputPassthrough",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 283
+        },
+        {
+          "name": "StructuredOutputReturnsJsonAsContentWithThinkingOn",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 305
+        },
+        {
+          "name": "StopSequencesTruncateContent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 336
+        },
+        {
+          "name": "ReasoningEffortNoneDisablesThinking",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 357
+        },
+        {
+          "name": "ReasoningBudgetClosesThinkBlockAndLeavesHeadroom",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 369
+        },
+        {
+          "name": "EmptyContentDiagnostic",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 400
+        },
+        {
+          "name": "MaxTokensDefaultsAndContextClamp",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 416
+        },
+        {
+          "name": "CompletionsRawTextBothModes",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 434
+        }
+      ]
+    },
+    {
+      "name": "ApiAnthropic",
+      "tests": 6,
+      "testsuite": [
+        {
+          "name": "MessagesNonStreaming",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 459
+        },
+        {
+          "name": "MessagesStreamingEventSequence",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 480
+        },
+        {
+          "name": "ToolUseRoundTrip",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 520
+        },
+        {
+          "name": "ThinkingBudgetEffortAndStructuredOutput",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 567
+        },
+        {
+          "name": "MaxTokensStopReason",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 618
+        },
+        {
+          "name": "BudgetContinuationSkippedWhenContextIsFull",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_server.cpp",
+          "line": 628
+        }
+      ]
+    },
+    {
+      "name": "ApiErrorsHttp",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "MalformedAndInvalidRequests",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 60
+        },
+        {
+          "name": "EngineFailuresAreGenericAndSurvivable",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 79
+        },
+        {
+          "name": "EngineRejectionBeforeAnyTokenIs400",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 111
+        },
+        {
+          "name": "InvalidSchemasAreRejectedAtParseTime",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 178
+        }
+      ]
+    },
+    {
+      "name": "ApiLimits",
+      "tests": 7,
+      "testsuite": [
+        {
+          "name": "OversizeBodyIs413BeforeParsing",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 220
+        },
+        {
+          "name": "DeeplyNestedJsonIsRejectedAndServerSurvives",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 237
+        },
+        {
+          "name": "TemplateKwargsCannotReplaceTheConversation",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 270
+        },
+        {
+          "name": "SlowHeaderConnectionsCannotStarveTheServer",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 616
+        },
+        {
+          "name": "SlowBodyIsCutOffAtTheBodyDeadline",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 653
+        },
+        {
+          "name": "LongStreamsOutliveTheReadDeadlines",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 679
+        },
+        {
+          "name": "HeaderDeadlineRestartsAfterAStreamOnAKeepAliveConnection",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 704
+        }
+      ]
+    },
+    {
+      "name": "ApiInjection",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "ClientContentNeverBecomesControlTokens",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 285
+        },
+        {
+          "name": "RealQwenTokenizerOverHttp",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 313
+        },
+        {
+          "name": "CompletionsParseSpecialCanBeTurnedOff",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 750
+        }
+      ]
+    },
+    {
+      "name": "ApiAuth",
+      "tests": 2,
+      "testsuite": [
+        {
+          "name": "ApiKeyRequiredOnEveryRouteButHealth",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 332
+        },
+        {
+          "name": "ConfigValidation",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 355
+        }
+      ]
+    },
+    {
+      "name": "ApiBrowser",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "HostHeaderMustBeOneOfOurNames",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 414
+        },
+        {
+          "name": "CrossOriginDeniedByDefaultAndAllowlisted",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 426
+        },
+        {
+          "name": "PostBodiesMustBeJson",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 449
+        }
+      ]
+    },
+    {
+      "name": "ApiAdmissionHttp",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "QueueFullIs429AndQueueTimeoutIs503",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 466
+        },
+        {
+          "name": "AdmissionComesBeforeRenderingAndTokenizing",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 510
+        },
+        {
+          "name": "UtilityRoutesHaveTheirOwnAdmission",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 541
+        }
+      ]
+    },
+    {
+      "name": "ApiCancel",
+      "tests": 9,
+      "testsuite": [
+        {
+          "name": "StreamingClientDisconnectCancelsGeneration",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 767
+        },
+        {
+          "name": "AnthropicStreamDisconnectCancels",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 795
+        },
+        {
+          "name": "NonStreamingClientDisconnectCancelsGeneration",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 807
+        },
+        {
+          "name": "ServerStopCancelsInFlightGeneration",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 820
+        },
+        {
+          "name": "DisconnectDuringPrefillStopsTheEngine",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 849
+        },
+        {
+          "name": "RequestTimeoutCoversPrefill",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 879
+        },
+        {
+          "name": "StopDuringPrefillIsPrompt",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 894
+        },
+        {
+          "name": "WallClockLimitEndsLikeMaxTokens",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 906
+        },
+        {
+          "name": "DeeplyNestedModelOutputStopsGeneration",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 926
+        }
+      ]
+    },
+    {
+      "name": "ApiConcurrency",
+      "tests": 1,
+      "testsuite": [
+        {
+          "name": "ParallelRequestsAreIndependent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_security.cpp",
+          "line": 948
+        }
+      ]
+    },
+    {
+      "name": "ConnGuardUnit",
+      "tests": 6,
+      "testsuite": [
+        {
+          "name": "ScanKeepsConnectionsReportedAfterItsSnapshot",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 62
+        },
+        {
+          "name": "HeaderClockStartsWhenAWorkerReads",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 89
+        },
+        {
+          "name": "PerPeerCapClosesTheOldestStalledConnectionsOfThatPeer",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 107
+        },
+        {
+          "name": "OverloadShedsOnlyWhileACompleteRequestWaits",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 124
+        },
+        {
+          "name": "HttpQueueMustBeBounded",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 148
+        },
+        {
+          "name": "ShutdownActsOnTheCheckedSocketEvenIfTheNumberIsReused",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 213
+        }
+      ]
+    },
+    {
+      "name": "ApiGuard",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "AQueuedCompleteRequestIsNotCutOffByTheHeaderDeadline",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 331
+        },
+        {
+          "name": "PerPeerLimitFreesWorkersHeldByOneAddress",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 360
+        },
+        {
+          "name": "OverloadSheddingFreesWorkersHeldByManyAddresses",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 389
+        },
+        {
+          "name": "RollingReconnectDribblersCannotStarveHealth",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/api\/test_api_guard.cpp",
+          "line": 414
+        }
+      ]
+    }
+  ]
+}

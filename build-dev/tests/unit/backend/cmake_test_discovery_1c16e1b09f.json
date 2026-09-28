@@ -1,0 +1,77 @@
+{
+  "tests": 13,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "CpuBackendTest",
+      "tests": 13,
+      "testsuite": [
+        {
+          "name": "RegistryPinsOneReferenceVariantPerOp",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 96
+        },
+        {
+          "name": "BuffersAllocateZeroedAndImportZeroCopy",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 117
+        },
+        {
+          "name": "ValidationRejectsBadOperandsBeforeWriting",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 148
+        },
+        {
+          "name": "NormsAndEltwiseEqualCpuOps",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 219
+        },
+        {
+          "name": "GemvF32AndQuantizedEqualCpuMatmul",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 257
+        },
+        {
+          "name": "GdnGatesEqualTheQwen35Sequence",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 286
+        },
+        {
+          "name": "ConvAndGatedDeltaRuleWithSlotsEqualCpuOps",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 304
+        },
+        {
+          "name": "HeadStridedRopeEqualsDenseRopeOnDeinterleavedCopy",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 361
+        },
+        {
+          "name": "KvWriteAndAttentionOverThePoolImageEqualCpuOps",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 406
+        },
+        {
+          "name": "LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNPoisonsOnlyItsRow",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 479
+        },
+        {
+          "name": "LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogits",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 541
+        },
+        {
+          "name": "GetRowsAndCopyEqualDequantizeRow",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 574
+        },
+        {
+          "name": "ValidationRejectsBadShapesAndLayouts",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/backend\/test_cpu_backend.cpp",
+          "line": 598
+        }
+      ]
+    }
+  ]
+}

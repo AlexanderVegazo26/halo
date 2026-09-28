@@ -114,7 +114,8 @@ void Ops::causal_conv1d_silu(Stream& stream, const Conv1dArgs& a) {
     const DeviceInfo& info = ctx_->info();
     stream.dispatch(k, bindings, push,
                     grid_1d((std::uint64_t{a.channels} + wg - 1) / wg, info.max_workgroup_count[0],
-                            info.max_workgroup_count[1]));
+                            info.max_workgroup_count[1]),
+                    0b11100);  // conv state, out, slots written
 }
 
 void Ops::gated_rms_norm(Stream& stream, const GatedNormArgs& a) {
@@ -139,7 +140,8 @@ void Ops::gated_rms_norm(Stream& stream, const GatedNormArgs& a) {
     const Kernel& k = kernel("gated_rms_norm", 4, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     const std::array bindings{ox.binding, oz.binding, ow.binding, oo.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b1000);  // out written
 }
 
 void Ops::partial_rope_neox(Stream& stream, const RopeArgs& a) {
@@ -165,7 +167,8 @@ void Ops::partial_rope_neox(Stream& stream, const RopeArgs& a) {
     const Kernel& k = kernel("rope_neox", 2, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     const std::array bindings{ox.binding, oc.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(a.n_tokens, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k, bindings, push, grid_1d(a.n_tokens, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b01);  // x written in place
 }
 
 void Ops::eltwise(Stream& stream, const EltwiseArgs& a, std::uint32_t op_code, std::string_view op) {
@@ -184,7 +187,8 @@ void Ops::eltwise(Stream& stream, const EltwiseArgs& a, std::uint32_t op_code, s
     const Kernel& k = kernel("eltwise", 3, sizeof(Push), {{0, wg}, {1, op_code}}, {wg, 1, 1});
     const std::array bindings{oa.binding, ob.binding, oo.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b100);  // out written
 }
 
 void Ops::add(Stream& stream, const EltwiseArgs& args) { eltwise(stream, args, 0, "add"); }
@@ -215,7 +219,8 @@ void Ops::add_rms_norm(Stream& stream, const AddRmsNormArgs& a) {
     const Kernel& k = kernel("add_rms_norm", 5, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     const std::array bindings{oa.binding, ob.binding, oh.binding, ow.binding, oy.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b10100);  // h (in place) and y written
 }
 
 void Ops::gdn_gates(Stream& stream, const GdnGateArgs& a) {
@@ -241,7 +246,8 @@ void Ops::gdn_gates(Stream& stream, const GdnGateArgs& a) {
     const Kernel& k = kernel("gdn_gates", 6, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     const std::array bindings{ob.binding, oa.binding, od.binding, os.binding, obt.binding, og.binding};
     const DeviceInfo& info = ctx_->info();
-    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]));
+    stream.dispatch(k, bindings, push, grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                    0b110000);  // beta and g written
 }
 
 }  // namespace halo::vulkan

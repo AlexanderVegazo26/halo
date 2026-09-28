@@ -1,0 +1,409 @@
+{
+  "conformant": false,
+  "hardware_after": {
+    "captured_at": "2026-09-27T13:48:20Z",
+    "clocks_mhz": {
+      "sclk": 2325
+    },
+    "driver_version": null,
+    "gpu_arch": "gfx1151",
+    "gpu_device": "1002:1586",
+    "gpu_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "gpu_performance_level": "auto",
+    "gpu_power_profile": null,
+    "kernel": "7.0.0-31-generic",
+    "mesa_version": null,
+    "os": "Ubuntu 26.04.1 LTS",
+    "platform_power_mode": "",
+    "power_mode": "unknown|auto/unknown",
+    "power_w": 91.001,
+    "rocm_version": null,
+    "root": "/",
+    "temperature_c": 50.0,
+    "vulkan_api_version": "1.4.335",
+    "vulkan_drivers": [
+      "other",
+      "other",
+      "other",
+      "other",
+      "lavapipe",
+      "other",
+      "radv",
+      "other"
+    ]
+  },
+  "hardware_before": {
+    "captured_at": "2026-09-27T13:48:13Z",
+    "clocks_mhz": {
+      "sclk": 2273
+    },
+    "driver_version": null,
+    "gpu_arch": "gfx1151",
+    "gpu_device": "1002:1586",
+    "gpu_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "gpu_performance_level": "auto",
+    "gpu_power_profile": null,
+    "kernel": "7.0.0-31-generic",
+    "mesa_version": null,
+    "os": "Ubuntu 26.04.1 LTS",
+    "platform_power_mode": "",
+    "power_mode": "unknown|auto/unknown",
+    "power_w": 30.042,
+    "rocm_version": null,
+    "root": "/",
+    "temperature_c": 44.0,
+    "vulkan_api_version": "1.4.335",
+    "vulkan_drivers": [
+      "other",
+      "other",
+      "other",
+      "other",
+      "lavapipe",
+      "other",
+      "radv",
+      "other"
+    ]
+  },
+  "notes": [
+    "FAILED: prompt: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)",
+    "FAILED: decode: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)",
+    "FAILED: mtp_decode: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)",
+    "FAILED: concurrency: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)",
+    "prefix_replay: context 33152 skipped: exceeds engine context_length 4096",
+    "FAILED: cancellation_storm: engine reported error: BACKEND_ERROR: vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)"
+  ],
+  "power_mode_pinned": {
+    "comparable": false,
+    "reason": "power mode not pinned/known ('unknown|auto/unknown' vs 'unknown|auto/unknown'); TRD §49 requires a pinned mode"
+  },
+  "records": [
+    {
+      "backend": "vulkan",
+      "batch": 1,
+      "clocks_mhz": {
+        "sclk": 2273
+      },
+      "concurrency": 1,
+      "context": 0,
+      "decode_effective_tps": null,
+      "decode_tps": null,
+      "driver": "",
+      "efficiency": null,
+      "engine": "halo",
+      "extra": {},
+      "gpu": "gfx1151",
+      "hardware_after": {
+        "captured_at": "2026-09-27T13:48:20Z",
+        "clocks_mhz": {
+          "sclk": 2325
+        },
+        "driver_version": null,
+        "gpu_arch": "gfx1151",
+        "gpu_device": "1002:1586",
+        "gpu_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+        "gpu_performance_level": "auto",
+        "gpu_power_profile": null,
+        "kernel": "7.0.0-31-generic",
+        "mesa_version": null,
+        "os": "Ubuntu 26.04.1 LTS",
+        "platform_power_mode": "",
+        "power_mode": "unknown|auto/unknown",
+        "power_w": 91.001,
+        "rocm_version": null,
+        "root": "/",
+        "temperature_c": 50.0,
+        "vulkan_api_version": "1.4.335",
+        "vulkan_drivers": [
+          "other",
+          "other",
+          "other",
+          "other",
+          "lavapipe",
+          "other",
+          "radv",
+          "other"
+        ]
+      },
+      "hardware_before": {
+        "captured_at": "2026-09-27T13:48:13Z",
+        "clocks_mhz": {
+          "sclk": 2273
+        },
+        "driver_version": null,
+        "gpu_arch": "gfx1151",
+        "gpu_device": "1002:1586",
+        "gpu_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+        "gpu_performance_level": "auto",
+        "gpu_power_profile": null,
+        "kernel": "7.0.0-31-generic",
+        "mesa_version": null,
+        "os": "Ubuntu 26.04.1 LTS",
+        "platform_power_mode": "",
+        "power_mode": "unknown|auto/unknown",
+        "power_w": 30.042,
+        "rocm_version": null,
+        "root": "/",
+        "temperature_c": 44.0,
+        "vulkan_api_version": "1.4.335",
+        "vulkan_drivers": [
+          "other",
+          "other",
+          "other",
+          "other",
+          "lavapipe",
+          "other",
+          "radv",
+          "other"
+        ]
+      },
+      "host_label": "evo-x2",
+      "invocation": {
+        "argv": [
+          "./build-dev/tools/halo/halo",
+          "bench",
+          "/home/alexander-vegazo/Documents/models/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+          "--host-label",
+          "evo-x2",
+          "--backend",
+          "vulkan",
+          "--ctx",
+          "4096",
+          "--parallel",
+          "1",
+          "--repetitions",
+          "1",
+          "--allow-nonconformant",
+          "-o",
+          "process_tools/bench_model.json"
+        ],
+        "binary": "./build-dev/tools/halo/halo",
+        "commit": "",
+        "environment": {},
+        "version": "0.2.0"
+      },
+      "lm_head": "",
+      "load_time_s": 1.9513260570000002,
+      "measured_bandwidth_gbps": null,
+      "memory_by_tier_gb": {},
+      "mode": "load_time",
+      "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "model_hash": "",
+      "mtp_acceptance": null,
+      "mtp_hash": "",
+      "pack": "/home/alexander-vegazo/Documents/models/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "pack_hash": "",
+      "phase": "cold",
+      "power_mode": "unknown|auto/unknown",
+      "predicted_bytes_per_token": null,
+      "prefix_cache_hit_rate": null,
+      "prompt_tps": null,
+      "quantization": "",
+      "repetition": 0,
+      "schema": "halo.bench.record/1",
+      "suite": "model",
+      "temperature_c": 44.0,
+      "ttft_cached_ms": null,
+      "ttft_ms": null
+    },
+    {
+      "backend": "vulkan",
+      "batch": 1,
+      "clocks_mhz": {
+        "sclk": 2273
+      },
+      "concurrency": 1,
+      "context": 0,
+      "decode_effective_tps": null,
+      "decode_tps": null,
+      "driver": "",
+      "efficiency": null,
+      "engine": "halo",
+      "extra": {},
+      "gpu": "gfx1151",
+      "hardware_after": {
+        "captured_at": "2026-09-27T13:48:20Z",
+        "clocks_mhz": {
+          "sclk": 2325
+        },
+        "driver_version": null,
+        "gpu_arch": "gfx1151",
+        "gpu_device": "1002:1586",
+        "gpu_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+        "gpu_performance_level": "auto",
+        "gpu_power_profile": null,
+        "kernel": "7.0.0-31-generic",
+        "mesa_version": null,
+        "os": "Ubuntu 26.04.1 LTS",
+        "platform_power_mode": "",
+        "power_mode": "unknown|auto/unknown",
+        "power_w": 91.001,
+        "rocm_version": null,
+        "root": "/",
+        "temperature_c": 50.0,
+        "vulkan_api_version": "1.4.335",
+        "vulkan_drivers": [
+          "other",
+          "other",
+          "other",
+          "other",
+          "lavapipe",
+          "other",
+          "radv",
+          "other"
+        ]
+      },
+      "hardware_before": {
+        "captured_at": "2026-09-27T13:48:13Z",
+        "clocks_mhz": {
+          "sclk": 2273
+        },
+        "driver_version": null,
+        "gpu_arch": "gfx1151",
+        "gpu_device": "1002:1586",
+        "gpu_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+        "gpu_performance_level": "auto",
+        "gpu_power_profile": null,
+        "kernel": "7.0.0-31-generic",
+        "mesa_version": null,
+        "os": "Ubuntu 26.04.1 LTS",
+        "platform_power_mode": "",
+        "power_mode": "unknown|auto/unknown",
+        "power_w": 30.042,
+        "rocm_version": null,
+        "root": "/",
+        "temperature_c": 44.0,
+        "vulkan_api_version": "1.4.335",
+        "vulkan_drivers": [
+          "other",
+          "other",
+          "other",
+          "other",
+          "lavapipe",
+          "other",
+          "radv",
+          "other"
+        ]
+      },
+      "host_label": "evo-x2",
+      "invocation": {
+        "argv": [
+          "./build-dev/tools/halo/halo",
+          "bench",
+          "/home/alexander-vegazo/Documents/models/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+          "--host-label",
+          "evo-x2",
+          "--backend",
+          "vulkan",
+          "--ctx",
+          "4096",
+          "--parallel",
+          "1",
+          "--repetitions",
+          "1",
+          "--allow-nonconformant",
+          "-o",
+          "process_tools/bench_model.json"
+        ],
+        "binary": "./build-dev/tools/halo/halo",
+        "commit": "",
+        "environment": {},
+        "version": "0.2.0"
+      },
+      "lm_head": "",
+      "load_time_s": 1.9882248400000002,
+      "measured_bandwidth_gbps": null,
+      "memory_by_tier_gb": {},
+      "mode": "load_time",
+      "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "model_hash": "",
+      "mtp_acceptance": null,
+      "mtp_hash": "",
+      "pack": "/home/alexander-vegazo/Documents/models/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "pack_hash": "",
+      "phase": "steady",
+      "power_mode": "unknown|auto/unknown",
+      "predicted_bytes_per_token": null,
+      "prefix_cache_hit_rate": null,
+      "prompt_tps": null,
+      "quantization": "",
+      "repetition": 0,
+      "schema": "halo.bench.record/1",
+      "suite": "model",
+      "temperature_c": 44.0,
+      "ttft_cached_ms": null,
+      "ttft_ms": null
+    }
+  ],
+  "schema": "halo.bench.artifact/1",
+  "suite": "model",
+  "summaries": [
+    {
+      "concurrency": 1,
+      "conformant": false,
+      "context": 0,
+      "engine": "halo",
+      "measured_count": 1,
+      "metrics": {
+        "load_time_s": {
+          "stability": "too_few_samples",
+          "stats": {
+            "cv": 0.0,
+            "max": 1.9513260570000002,
+            "mean": 1.9513260570000002,
+            "median": 1.9513260570000002,
+            "min": 1.9513260570000002,
+            "n": 1,
+            "p50": 1.9513260570000002,
+            "p95": 1.9513260570000002,
+            "p99": 1.9513260570000002,
+            "percentile_method": "linear (Hyndman-Fan type 7)",
+            "stddev": 0.0
+          }
+        }
+      },
+      "mode": "load_time",
+      "phase": "cold",
+      "required_measured": 3,
+      "schema": "halo.bench.summary/1",
+      "suite": "model",
+      "warmup_count": 0
+    },
+    {
+      "concurrency": 1,
+      "conformant": false,
+      "context": 0,
+      "engine": "halo",
+      "measured_count": 1,
+      "metrics": {
+        "load_time_s": {
+          "stability": "too_few_samples",
+          "stats": {
+            "cv": 0.0,
+            "max": 1.9882248400000002,
+            "mean": 1.9882248400000002,
+            "median": 1.9882248400000002,
+            "min": 1.9882248400000002,
+            "n": 1,
+            "p50": 1.9882248400000002,
+            "p95": 1.9882248400000002,
+            "p99": 1.9882248400000002,
+            "percentile_method": "linear (Hyndman-Fan type 7)",
+            "stddev": 0.0
+          }
+        }
+      },
+      "mode": "load_time",
+      "phase": "steady",
+      "required_measured": 3,
+      "schema": "halo.bench.summary/1",
+      "suite": "model",
+      "warmup_count": 1
+    }
+  ],
+  "thermal": {
+    "drift_c": 6.0,
+    "reason": "thermal drift 6.0 C exceeds threshold 5.0 C",
+    "valid": false
+  },
+  "valid": false
+}

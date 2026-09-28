@@ -1,0 +1,99 @@
+{
+  "tests": 14,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "BackendLimits",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "EveryLimitIsCheckedAtConstruction",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 528
+        },
+        {
+          "name": "ChunkAboveCpuLimitFailsAtConstruction",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 561
+        },
+        {
+          "name": "BackendWithoutChunkedFormRunsRecurrent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 579
+        }
+      ]
+    },
+    {
+      "name": "TinyFiles\/BackendGate",
+      "tests": 11,
+      "testsuite": [
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/f32_chunk64_pool_poolctor",
+          "value_param": "24-byte object <6C-AC 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 6E-3A 2F-68 6F-6D>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q8_0_chunk64_pool_poolctor",
+          "value_param": "24-byte object <31-40 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 2F-44 6F-63 75-6D>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q4_k_m_chunk64_pool_poolctor",
+          "value_param": "24-byte object <A9-A5 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 69-6C 64-2D 6D-32>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q6_k_chunk64_pool_poolctor",
+          "value_param": "24-byte object <A9-5B 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 2F-63 6D-61 6B-65>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/iq4_xs_chunk64_pool_poolctor",
+          "value_param": "24-byte object <53-31 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 61-38 37-61 38-30>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q3_k_m_chunk64_pool_poolctor",
+          "value_param": "24-byte object <DD-95 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q5_k_m_chunk64_pool_poolctor",
+          "value_param": "24-byte object <EE-95 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q4_0_chunk64_pool_poolctor",
+          "value_param": "24-byte object <D5-44 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/f32_chunk8_nopool_backendctor",
+          "value_param": "24-byte object <6C-AC 34-3E 14-5A 00-00 08-00 00-00 00-00 00-00 00-01 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/f32_chunk64_pool_backendctor",
+          "value_param": "24-byte object <6C-AC 34-3E 14-5A 00-00 40-00 00-00 00-00 00-00 01-01 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        },
+        {
+          "name": "ForwardOverCpuBackendIsBitIdenticalToLegacy\/q4_k_m_chunk8_pool_backendctor",
+          "value_param": "24-byte object <A9-A5 34-3E 14-5A 00-00 08-00 00-00 00-00 00-00 01-01 00-00 00-00 00-00>",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_backend_gate.cpp",
+          "line": 418
+        }
+      ]
+    }
+  ]
+}

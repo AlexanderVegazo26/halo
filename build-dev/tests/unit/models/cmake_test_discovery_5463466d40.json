@@ -1,0 +1,158 @@
+{
+  "tests": 25,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "ModelsAdapters",
+      "tests": 4,
+      "testsuite": [
+        {
+          "name": "WeightMatrixRowsEqualDequantizeRowForEveryType",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_adapters.cpp",
+          "line": 42
+        },
+        {
+          "name": "WeightVectorAndEmbeddingRow",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_adapters.cpp",
+          "line": 71
+        },
+        {
+          "name": "VocabSpecFromGgufReproducesTokenizerGolden",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_adapters.cpp",
+          "line": 85
+        },
+        {
+          "name": "VocabSpecRejectsForeignTokenizers",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_adapters.cpp",
+          "line": 105
+        }
+      ]
+    },
+    {
+      "name": "Qwen35F32",
+      "tests": 12,
+      "testsuite": [
+        {
+          "name": "EmbeddingAndLayerInputsMatchTransformers",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 129
+        },
+        {
+          "name": "FinalHiddenMatchesTransformers",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 154
+        },
+        {
+          "name": "LogitsRowsAndArgmaxMatchTransformers",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 172
+        },
+        {
+          "name": "GreedyDecodeWithCacheMatchesTransformers",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 220
+        },
+        {
+          "name": "PrefillUsesChunkedPathAndChunkedDiffersFromRecurrent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 255
+        },
+        {
+          "name": "PrefillInPiecesEqualsOneShot",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 314
+        },
+        {
+          "name": "BatchedSequencesAreBitIdenticalToAlone",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 337
+        },
+        {
+          "name": "MtpMatchesGoldenGivenGoldenHidden",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 420
+        },
+        {
+          "name": "MtpEndToEndOnOwnHidden",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 436
+        },
+        {
+          "name": "MtpInPiecesEqualsOneShotAndDraftChainIsSelfConsistent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 449
+        },
+        {
+          "name": "InvalidStepLeavesStateUnchanged",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 522
+        },
+        {
+          "name": "KvPoolExhaustionIsMemoryErrorAndAtomic",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 546
+        }
+      ]
+    },
+    {
+      "name": "Files\/Qwen35Quant",
+      "tests": 9,
+      "testsuite": [
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q8_0_p0",
+          "value_param": "(0x5c8d16c43663 pointing to \"tiny-q8_0.gguf\", 0x5c8d16c46d77 pointing to \"p0\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q8_0_p1",
+          "value_param": "(0x5c8d16c43663 pointing to \"tiny-q8_0.gguf\", 0x5c8d16c45c3a pointing to \"p1\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q8_0_p2",
+          "value_param": "(0x5c8d16c43663 pointing to \"tiny-q8_0.gguf\", 0x5c8d16c4684a pointing to \"p2\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q4_k_m_p0",
+          "value_param": "(0x5c8d16c4b9f1 pointing to \"tiny-q4_k_m.gguf\", 0x5c8d16c46d77 pointing to \"p0\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q4_k_m_p1",
+          "value_param": "(0x5c8d16c4b9f1 pointing to \"tiny-q4_k_m.gguf\", 0x5c8d16c45c3a pointing to \"p1\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q4_k_m_p2",
+          "value_param": "(0x5c8d16c4b9f1 pointing to \"tiny-q4_k_m.gguf\", 0x5c8d16c4684a pointing to \"p2\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q6_k_p0",
+          "value_param": "(0x5c8d16c45bda pointing to \"tiny-q6_k.gguf\", 0x5c8d16c46d77 pointing to \"p0\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q6_k_p1",
+          "value_param": "(0x5c8d16c45bda pointing to \"tiny-q6_k.gguf\", 0x5c8d16c45c3a pointing to \"p1\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        },
+        {
+          "name": "BitIdenticalToF32ForwardOverDequantizedWeights\/q6_k_p2",
+          "value_param": "(0x5c8d16c45bda pointing to \"tiny-q6_k.gguf\", 0x5c8d16c4684a pointing to \"p2\")",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/models\/test_qwen35_golden.cpp",
+          "line": 712
+        }
+      ]
+    }
+  ]
+}

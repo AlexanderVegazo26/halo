@@ -1,0 +1,21 @@
+# ninja log v7
+0	8	1790462461909828834	minja-populate-prefix/src/minja-populate-stamp/minja-populate-mkdir	5b5725d1b4d1cb0
+0	8	1790462461909828834	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-mkdir	5b5725d1b4d1cb0
+8	709	1790462462609807811	minja-populate-prefix/src/minja-populate-stamp/minja-populate-download	c1b48e7b4dd78de1
+8	709	1790462462609807811	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-download	c1b48e7b4dd78de1
+709	721	1790462462621807450	minja-populate-prefix/src/minja-populate-stamp/minja-populate-update	f5eee87ac4180529
+709	721	1790462462621807450	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-update	f5eee87ac4180529
+721	735	1790462462636807000	minja-populate-prefix/src/minja-populate-stamp/minja-populate-patch	ef22546f4ffb1127
+721	735	1790462462636807000	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-patch	ef22546f4ffb1127
+735	743	1790462462644806760	minja-populate-prefix/src/minja-populate-stamp/minja-populate-configure	ae5a8f867933d475
+735	743	1790462462644806760	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-configure	ae5a8f867933d475
+743	751	1790462462651806549	minja-populate-prefix/src/minja-populate-stamp/minja-populate-build	aa2dfb30b123ec6e
+743	751	1790462462651806549	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-build	aa2dfb30b123ec6e
+751	758	1790462462659806309	minja-populate-prefix/src/minja-populate-stamp/minja-populate-install	59fef38a58b5c88d
+751	758	1790462462659806309	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-install	59fef38a58b5c88d
+758	765	1790462462666806099	minja-populate-prefix/src/minja-populate-stamp/minja-populate-test	e72ec3606fc84482
+758	765	1790462462666806099	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-test	e72ec3606fc84482
+765	775	1790462462676805798	CMakeFiles/minja-populate-complete	c0b6a3c16f42c480
+765	775	1790462462676805798	minja-populate-prefix/src/minja-populate-stamp/minja-populate-done	c0b6a3c16f42c480
+765	775	1790462462676805798	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/CMakeFiles/minja-populate-complete	c0b6a3c16f42c480
+765	775	1790462462676805798	/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-subbuild/minja-populate-prefix/src/minja-populate-stamp/minja-populate-done	c0b6a3c16f42c480

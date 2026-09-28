@@ -1,0 +1,27 @@
+{
+  "tests": 3,
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "CpuTune",
+      "tests": 3,
+      "testsuite": [
+        {
+          "name": "MatmulTunePersistReopenLookup",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/autotune\/test_cpu_tune.cpp",
+          "line": 39
+        },
+        {
+          "name": "GdnChunkedCandidatesValidateAgainstRecurrent",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/autotune\/test_cpu_tune.cpp",
+          "line": 74
+        },
+        {
+          "name": "HeuristicWithMeasuredBandwidth",
+          "file": "\/home\/alexander-vegazo\/Documents\/repos\/halo\/tests\/unit\/autotune\/test_cpu_tune.cpp",
+          "line": 100
+        }
+      ]
+    }
+  ]
+}
