@@ -28,6 +28,7 @@
 #include "halo/backends/cpu/ops.h"
 #include "halo/backends/vulkan/context.h"
 #include "halo/core/error.h"
+#include "halo/kv_cache/paged_kv.h"
 #include "halo/state/gdn_state.h"
 #include "halo/tensor/quant.h"
 #include "vulkan/vk_test_util.h"
@@ -393,7 +394,7 @@ TEST(VulkanBackend, RopeKvWriteAttentionMatchCpu) {
         const hb::TensorRef rq = d.put(qg), rk = d.put(kin), rv = d.put(vin);
         const hb::TensorRef rpos = d.import_ro(std::as_bytes(std::span(pos)));
         const hb::TensorRef rt = d.import_ro(std::as_bytes(std::span(table)));
-        const hb::TensorRef rp = d.import_rw(std::as_writable_bytes(std::span(pool)));
+        const hb::TensorRef rp = d.put_bytes(std::as_bytes(std::span(pool)));  // State-arena style: backend buffer
         const hb::TensorRef out = d.zeros(std::size_t{T} * nh * hd * 4);
         // Q in place inside [Q | gate] (head stride 2 * hd), K dense.
         be.partial_rope(*d.s, hb::RopeArgs{rq.with_stride(nh * 2 * hd * 4), rpos, T, nh, hd, rot, 1e7f, 2 * hd, {}});
@@ -417,8 +418,8 @@ TEST(VulkanBackend, RopeKvWriteAttentionMatchCpu) {
         at.q_offset = start;
         at.scale = 0.125f;
         be.attention(*d.s, at);
-        std::array<std::vector<float>, 3> r{d.get<float>(rq, qg.size()), d.get<float>(rk, kin.size()),
-                                            d.get<float>(out, std::size_t{T} * nh * hd)};
+        std::array<std::vector<float>, 4> r{d.get<float>(rq, qg.size()), d.get<float>(rk, kin.size()),
+                                            d.get<float>(out, std::size_t{T} * nh * hd), d.get<float>(rp, pool_floats)};
         return r;
     };
     std::vector<float> pc = pool0, pv = pool0;
@@ -426,7 +427,7 @@ TEST(VulkanBackend, RopeKvWriteAttentionMatchCpu) {
     const auto v = run(*p.vk, pv);
     EXPECT_TRUE(bitwise(v[0], c[0], "rope Q in [Q|gate] (head stride)"));
     EXPECT_TRUE(bitwise(v[1], c[1], "rope K dense"));
-    EXPECT_TRUE(bitwise(pv, pc, "KV pool after kv_write (import written back)"));
+    EXPECT_TRUE(bitwise(v[3], c[3], "KV pool after kv_write (device-resident readback)"));
     EXPECT_TRUE(close(v[2], c[2], k_wiring, "attention (head-strided q, fragmented table, layer 1)"));
     // Positions that live only on the device cannot feed the host cos/sin table.
     Dev d(*p.vk);
@@ -669,4 +670,64 @@ TEST(VulkanBackend, GdnRingStateIsUntouchedByAFailedStep) {
     EXPECT_TRUE(bitwise(ga.slab().subspan(std::size_t{ga.live()} * sn, sn),
                         gb.slab().subspan(std::size_t{gb.live()} * sn, sn),
                         "live state: failed-then-retried == uninterrupted"));
+}
+
+// ADR-001 §5.2: a device-resident KvPool keeps prefix sharing + copy-on-write correct:
+// reserve() copying a shared block runs a synchronous device-side copy, so the shared
+// block's content is never modified and the sequence's new block holds the same bytes.
+TEST(VulkanBackend, KvPoolDeviceResidentCopyOnWrite) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    Pair p = make_pair(ctx);
+    namespace kvc = halo::kv_cache;
+    const std::size_t layers = 2, kvd = 8, bt = 4;  // block_floats = 2 * 2 * 4 * 8 = 128
+    kvc::KvPool pool({layers, kvd, bt}, 4);
+    kvc::SequenceKv a(pool), b(pool);
+    // Six rows of A on the host (pool still host-resident): blocks 0 (rows 0..3) and 1
+    // (rows 4..5). K row i of layer l: all i + l; V: -(i + l).
+    a.reserve(6);
+    for (std::size_t l = 0; l < layers; ++l)
+        for (std::size_t i = 0; i < 6; ++i) {
+            const std::vector<float> k(kvd, static_cast<float>(i + l)), v(kvd, -static_cast<float>(i + l));
+            a.write(l, i, k, v);
+        }
+    a.commit(6);
+    b.share_prefix(a, 5);  // b references blocks 0 and 1 (row 4 sits in block 1)
+    ASSERT_EQ(pool.refcount(a.blocks()[1]), 2u);
+    pool.attach(*p.vk);  // device-resident from here; the content carries over
+    // B appends row 5: block 1 is shared -> reserve() COW-copies it on the device.
+    b.reserve(1);
+    b.commit(1);
+    ASSERT_EQ(pool.refcount(a.blocks()[1]), 1u) << "the COW dropped the sharing";
+    // Write B's row 5 through the backend (into the copied block).
+    const auto k5 = randn(kvd, 60), v5 = randn(kvd, 61);
+    {
+        Dev d(*p.vk);
+        const hb::TensorRef rt = d.import_ro(std::as_bytes(b.blocks()));
+        const hb::TensorRef rk = d.put(k5), rv = d.put(v5);
+        p.vk->kv_write(*d.s, hb::KvWriteArgs{pool.storage_ref(), rt, rk, rv, 4, 2, 0, 4, 8, 2, 5, 1, {}, {}});
+        d.sync();
+    }
+    const std::vector<float> img = pool.read_all();
+    // Block layout: block[layer][K|V][token][kv_dim], block_floats = 128, layer slab = 64.
+    const std::size_t bf = 128;
+    const std::size_t a1 = std::size_t{a.blocks()[1]} * bf, b1 = std::size_t{b.blocks()[1]} * bf;
+    // In a layer slab (64 floats): K tokens first (token t at t*kv_dim), then V tokens.
+    // A's block 1, layer 0: K tokens 0..1 = rows 4..5 (4, 5), V tokens 0..1 = (-4, -5) — the
+    // shared block was not modified by B's COW + write.
+    std::vector<float> awant(64, 0.0f);  // tokens 2..3 stay zero (fresh pool)
+    std::fill_n(awant.data() + 0 * kvd, kvd, 4.0f);
+    std::fill_n(awant.data() + 1 * kvd, kvd, 5.0f);
+    std::fill_n(awant.data() + 32 + 0 * kvd, kvd, -4.0f);
+    std::fill_n(awant.data() + 32 + 1 * kvd, kvd, -5.0f);
+    EXPECT_TRUE(bitwise(std::span<const float>(img).subspan(a1, 64), awant, "A's shared block (layer 0)"));
+    // B's copied block, layer 0: row 4 from the copy, row 5 is B's kv_write row.
+    std::vector<float> bwant(64, 0.0f);
+    std::fill_n(bwant.data() + 0 * kvd, kvd, 4.0f);
+    std::copy(k5.begin(), k5.end(), bwant.data() + 1 * kvd);
+    std::fill_n(bwant.data() + 32 + 0 * kvd, kvd, -4.0f);
+    std::copy(v5.begin(), v5.end(), bwant.data() + 32 + 1 * kvd);
+    EXPECT_TRUE(bitwise(std::span<const float>(img).subspan(b1, 64), bwant, "B's copied block (layer 0)"));
+    // Layer 1 (not written this step) was copied whole.
+    EXPECT_TRUE(bitwise(std::span<const float>(img).subspan(a1 + 64, 64),
+                        std::span<const float>(img).subspan(b1 + 64, 64), "layer 1 copied whole"));
 }

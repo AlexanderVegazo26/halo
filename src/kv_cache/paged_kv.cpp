@@ -38,7 +38,9 @@ KvPool::KvPool(KvLayout layout, std::size_t n_blocks) : layout_(layout), block_f
                n_blocks);
     const std::size_t total = mul_checked(block_floats_, n_blocks, "pool");
     try {
-        storage_ = std::make_unique_for_overwrite<float[]>(total);
+        // Zero-filled, as the backends' allocate() (the State-arena image starts zeroed on
+        // every backend, so attach() uploads content only after real host writes).
+        storage_ = std::make_unique<float[]>(total);
     } catch (const std::bad_alloc&) {
         throw_error(ErrorCode::Memory, "KvPool: cannot allocate {} bytes for {} KV blocks", total * sizeof(float), n_blocks);
     }
@@ -90,10 +92,82 @@ std::size_t KvPool::offset(BlockId id, std::size_t layer, std::size_t kv) const 
     return static_cast<std::size_t>(id) * block_floats_ + (layer * 2 + kv) * layout_.block_tokens * layout_.kv_dim;
 }
 
-float* KvPool::k_rows(BlockId id, std::size_t layer) noexcept { return storage_.get() + offset(id, layer, 0); }
-float* KvPool::v_rows(BlockId id, std::size_t layer) noexcept { return storage_.get() + offset(id, layer, 1); }
-const float* KvPool::k_rows(BlockId id, std::size_t layer) const noexcept { return storage_.get() + offset(id, layer, 0); }
-const float* KvPool::v_rows(BlockId id, std::size_t layer) const noexcept { return storage_.get() + offset(id, layer, 1); }
+float* KvPool::host_storage(const char* what) const {
+    HALO_CHECK(coherent_, ErrorCode::Unsupported,
+               "KvPool: {} on a device-resident pool (host storage was released at attach; use read_all())", what);
+    return storage_.get();
+}
+
+float* KvPool::k_rows(BlockId id, std::size_t layer) {
+    host_dirty_ = true;
+    return host_storage("k_rows") + offset(id, layer, 0);
+}
+float* KvPool::v_rows(BlockId id, std::size_t layer) {
+    host_dirty_ = true;
+    return host_storage("v_rows") + offset(id, layer, 1);
+}
+const float* KvPool::k_rows(BlockId id, std::size_t layer) const { return host_storage("k_rows") + offset(id, layer, 0); }
+const float* KvPool::v_rows(BlockId id, std::size_t layer) const { return host_storage("v_rows") + offset(id, layer, 1); }
+
+// ---- backend attachment (ADR-001 §5.2) ----------------------------------------------------
+
+void KvPool::attach(backend::Backend& be) {
+    if (be_ == &be) return;
+    HALO_CHECK(be_ == nullptr, ErrorCode::Api, "KvPool: already attached to another backend");
+    const bool zero_copy = be.kind() == backend::Kind::Cpu || be.kind() == backend::Kind::HipEmulation;
+    if (zero_copy) {
+        dev_ = be.import_host(std::as_writable_bytes(std::span(storage_.get(), block_floats_ * total_blocks())));
+        HALO_CHECK(dev_->host_ptr() == static_cast<void*>(storage_.get()), ErrorCode::Backend,
+                   "KvPool: a zero-copy backend returned an import that does not wrap the pool storage");
+    } else {
+        // Device-resident (State arena). allocate() zero-fills on the cpu/vulkan backends;
+        // host writes made so far (test sentinels) carry over.
+        dev_ = be.allocate(block_floats_ * total_blocks() * sizeof(float), backend::Tier::Vram);
+        be_ = &be;
+        if (host_dirty_) {
+            const auto s = be_->create_stream();
+            be_->upload(*s, storage_ref(),
+                        std::as_bytes(std::span(storage_.get(), block_floats_ * total_blocks())));
+            s->submit();
+            s->wait();
+        }
+    }
+    be_ = &be;
+    coherent_ = zero_copy;
+    if (!zero_copy) storage_.reset();  // the host image is released (GBs); accessors throw
+}
+
+backend::TensorRef KvPool::storage_ref() const {
+    HALO_CHECK(dev_ != nullptr, ErrorCode::Api, "KvPool: not attached to a backend");
+    return backend::TensorRef::of(*dev_);
+}
+
+std::vector<float> KvPool::read_all() const {
+    const std::size_t n = block_floats_ * total_blocks();
+    if (coherent_) return {storage_.get(), storage_.get() + n};
+    std::vector<float> out(n);
+    const auto s = be_->create_stream();
+    be_->download(*s, storage_ref(), std::as_writable_bytes(std::span(out)));
+    s->submit();
+    s->wait();
+    return out;
+}
+
+void KvPool::copy_block(BlockId dst, BlockId src) {
+    HALO_CHECK(!coherent_, ErrorCode::Api, "KvPool::copy_block is the device-resident COW path");
+    // Synchronous so SequenceKv::reserve keeps its strong guarantee: the block table swap
+    // happens only after the copy completed (ADR-001 §5.2: the host bookkeeping stays
+    // strongly atomic). COW is rare (a write into a shared block).
+    const std::uint64_t bytes = block_floats_ * sizeof(float);
+    const auto s = be_->create_stream();
+    be_->copy(*s,
+              backend::CopyArgs{{dev_.get(), static_cast<std::uint64_t>(src) * bytes, bytes, 0},
+                                {dev_.get(), static_cast<std::uint64_t>(dst) * bytes, bytes, 0},
+                                bytes,
+                                {}});
+    s->submit();
+    s->wait();
+}
 
 // ---------------------------------------------------------------------------------------
 // SequenceKv
@@ -140,14 +214,31 @@ void SequenceKv::reserve(std::size_t n) {
     const std::size_t add = need_blocks > blocks_.size() ? need_blocks - blocks_.size() : 0;
     blocks_.reserve(need_blocks);                                       // may throw; nothing changed yet
     std::vector<BlockId> fresh = pool_->allocate_n(add + cow.size());  // throws before any change
-    // --- no-throw from here on ---
+    // --- host bookkeeping is no-throw from here on ---
     const std::size_t block_floats = pool_->layout().block_floats();
     std::size_t next = 0;
-    for (const std::size_t b : cow) {
-        const BlockId dst = fresh[next++];
-        std::memcpy(pool_->k_rows(dst, 0), pool_->k_rows(blocks_[b], 0), block_floats * sizeof(float));
-        pool_->release(blocks_[b]);
-        blocks_[b] = dst;
+    if (pool_->host_coherent()) {
+        for (const std::size_t b : cow) {
+            const BlockId dst = fresh[next++];
+            std::memcpy(pool_->k_rows(dst, 0), pool_->k_rows(blocks_[b], 0), block_floats * sizeof(float));
+            pool_->release(blocks_[b]);
+            blocks_[b] = dst;
+        }
+    } else {
+        // Device-resident pool (ADR-001 §5.2): a synchronous device-side copy per shared
+        // block, so the block table changes only for copies that completed. A completed
+        // swap is content-identical; a failed copy releases the not-yet-used fresh blocks.
+        try {
+            for (const std::size_t b : cow) {
+                const BlockId dst = fresh[next++];
+                pool_->copy_block(dst, blocks_[b]);
+                pool_->release(blocks_[b]);
+                blocks_[b] = dst;
+            }
+        } catch (...) {
+            for (std::size_t i = next; i < fresh.size(); ++i) pool_->release(fresh[i]);
+            throw;
+        }
     }
     while (next < fresh.size()) blocks_.push_back(fresh[next++]);
 }

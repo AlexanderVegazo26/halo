@@ -2,10 +2,9 @@
 // queues drained on the caller's thread, prefix cache (KV sharing + GDN checkpoints),
 // MTP speculative decoding with a k = 0 fallback on MTP-KV exhaustion.
 // BI-6: the forward runs on the backend named by EngineConfig::backend (cpu | vulkan |
-// hip; "auto" = cpu until a measured GPU default policy exists, WS-BI-4). GDN/conv state is
-// device-resident (the WS-BI-2 stage-1 ring); KV pools are still host memory imported per
-// forward call (stage 2), so a GPU engine pays one KV image import per step, and HIP device
-// mode cannot run a forward at all yet (hip_adapter's import_host raises Unsupported).
+// hip; "auto" = cpu until a measured GPU default policy exists, WS-BI-4). GDN/conv state
+// (the §5.3 ring) and the KV pools are State-arena buffers of that backend (WS-BI-2):
+// device-resident on GPU backends, zero-copy host memory on the CPU backend.
 
 #include <algorithm>
 #include <atomic>
@@ -75,9 +74,8 @@ std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
 #if defined(HALO_RUNTIME_HIP)
     if (name == "hip") {
         // Device mode. Construction succeeds (weights are read-only imports, copied into
-        // VRAM), but the forward needs WS-BI-2 stage-2 KV placement: the first step raises
-        // Error(Unsupported) from the adapter's import_host until the KV pool lives on a
-        // backend buffer.
+        // VRAM). With WS-BI-2 the forward no longer needs writable host imports (GDN ring +
+        // KV pools are backend buffers), but the HIP device path is not covered by tests yet.
         backend::HipBackendOptions o;
         o.mode = backend::HipMode::Device;
         return backend::make_hip_backend(o);
@@ -323,7 +321,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
             throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", cfg.backend);
 #endif
         }
-        HALO_INFO("runtime", "backend '{}' selected; GDN state is device-resident (WS-BI-2 stage 1); KV stays host-resident until stage 2", cfg.backend);
+        HALO_INFO("runtime", "backend '{}' selected; GDN + KV state is device-resident (WS-BI-2)", cfg.backend);
         model_ = std::make_unique<models::Qwen35>(*nm_, *backend_, mo);
     }
     const auto piece = [&](std::optional<std::int32_t> id) { return id ? tok_->token_to_piece(*id) : std::string(); };
@@ -363,7 +361,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     const std::size_t bt = opts.kv_block_tokens;
     std::size_t per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;  // +1: one COW copy
     cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
-    // The KV pool is imported as ONE span per forward; a backend with a single-allocation
+    // The KV pool is ONE backend allocation; a backend with a single-allocation
     // cap (RADV: maxMemoryAllocationSize = 4 GiB) fails the whole run when the pool is
     // larger. Drop the prefix-cache slots first, then halve the context until it fits.
     // (backend_ is set only on the GPU paths; the CPU path's internal backend is the model's.)
@@ -395,9 +393,13 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     }
     const std::size_t blocks = opts.kv_blocks.value_or(per_seq * (cfg.max_sequences + cache_cap_));
     kv_pool_ = std::make_unique<kv_cache::KvPool>(model_->kv_layout(bt), blocks);
+    // ADR-001 §5.2 (WS-BI-2 stage 2): the pool image is a State-arena buffer of the model's
+    // backend — device-resident on GPU backends, zero-copy host memory on the CPU backend.
+    kv_pool_->attach(model_->backend());
     if (mtp) {
         mtp_pool_ = std::make_unique<kv_cache::KvPool>(model_->mtp_kv_layout(bt),
                                                        opts.mtp_kv_blocks.value_or(per_seq * (cfg.max_sequences + cache_cap_)));
+        mtp_pool_->attach(model_->backend());
     }
     free_slots_.reserve(cfg.max_sequences);
     for (std::size_t i = 0; i < cfg.max_sequences; ++i) {

@@ -167,7 +167,7 @@ public:
         fake[0].logit_rows = rows;
         fake[0].logits = hm::LogitsMode::Full;
         compare_results(what, rv, rc, fake);
-        check("mtp pool", rel_l2_masked(pool_span(*vk_.mtp_pool), pool_span(*cpu_.mtp_pool)));
+        check("mtp pool", rel_l2_masked(pool_image(*vk_.mtp_pool), pool_image(*cpu_.mtp_pool)));
     }
 
     /// The same host-side state operation on both sides.
@@ -180,9 +180,7 @@ public:
     std::size_t near_ties = 0;
 
 private:
-    static std::span<const float> pool_span(const KvPool& p) {
-        return {p.k_rows(0, 0), p.total_blocks() * p.layout().block_floats()};
-    }
+    static std::vector<float> pool_image(const KvPool& p) { return p.read_all(); }  // downloads on the Vulkan side
 
     /// Sentinel positions must match exactly; relative L2 over the written ones.
     double rel_l2_masked(std::span<const float> vk, std::span<const float> cpu) {
@@ -249,7 +247,7 @@ private:
     }
 
     void compare_state(const std::string& what) {
-        check(what + " trunk KV pool", rel_l2_masked(pool_span(*vk_.kv_pool), pool_span(*cpu_.kv_pool)));
+        check(what + " trunk KV pool", rel_l2_masked(pool_image(*vk_.kv_pool), pool_image(*cpu_.kv_pool)));
         const auto shape = vk_.model->gdn_shape();
         for (std::size_t si = 0; si < vk_.seqs.size(); ++si) {
             auto& gv = vk_.seqs[si]->gdn;

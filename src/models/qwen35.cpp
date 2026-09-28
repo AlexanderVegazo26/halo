@@ -18,7 +18,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <optional>
 #include <string>
 
@@ -243,16 +242,6 @@ struct Qwen35::Impl {
 
         TensorRef alloc(std::size_t floats) {
             arena.push_back(I.be->allocate(floats * kF32, backend::Tier::Vram));
-            return TensorRef::of(*arena.back());
-        }
-        TensorRef import(std::span<float> v) {
-            arena.push_back(I.be->import_host(std::as_writable_bytes(v)));
-            return TensorRef::of(*arena.back());
-        }
-        /// Write-only import for rollback slots: only the first `wb` bytes (the slots this
-        /// call writes) are mirrored back; the rest of the caller's span stays untouched.
-        TensorRef import_wo(std::span<float> v, std::uint64_t wb) {
-            arena.push_back(I.be->import_host_writeonly(std::as_writable_bytes(v), wb));
             return TensorRef::of(*arena.back());
         }
         TensorRef import_ro(std::span<const std::byte> v) {
@@ -527,16 +516,13 @@ struct Qwen35::Impl {
         st.cost.activation_bytes += cpu::traffic_matmul(n, E, n_vocab, 0).total();
     }
 
-    /// The KV pool storage image (block[layer][K|V][token][kv_dim] for every block) and the
-    /// sequence's block table, imported for this call.
-    void import_kv(Step& st, SeqRows& s, std::map<const kv_cache::KvPool*, TensorRef>& pools) const {
+    /// The KV pool storage image is the pool's State-arena buffer (ADR-001 §5.2, WS-BI-2
+    /// stage 2: device-resident on GPU backends, attached once per pool); the host-owned
+    /// block table is uploaded per step.
+    void import_kv(Step& st, SeqRows& s) const {
         kv_cache::KvPool& pool = s.kv->pool();
-        auto it = pools.find(&pool);
-        if (it == pools.end()) {
-            const std::size_t floats = pool.total_blocks() * pool.layout().block_floats();
-            it = pools.emplace(&pool, st.import(std::span<float>(pool.k_rows(0, 0), floats))).first;
-        }
-        s.pool = it->second;
+        if (!pool.attached()) pool.attach(*be);  // tests build pools by hand; the engine attaches up front
+        s.pool = pool.storage_ref();
         s.table = st.import_ro(std::as_bytes(s.kv->blocks()));
     }
 };
@@ -757,8 +743,7 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     }
     const TensorRef rids = st.import_ro(std::as_bytes(std::span(ids)));
     const TensorRef rpos = st.import_ro(std::as_bytes(std::span(pos)));
-    std::map<const kv_cache::KvPool*, TensorRef> pools;
-    for (SeqRows& s : seqs) I.import_kv(st, s, pools);
+    for (SeqRows& s : seqs) I.import_kv(st, s);
     const bool any_gdn = std::any_of(I.layers.begin(), I.layers.end(), [](const LayerW& l) { return l.gdn.has_value(); });
     const Impl::Acts a = I.make_acts(st, R, any_gdn);
     const TensorRef hbuf = st.alloc(R * E);
@@ -859,8 +844,7 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     }
     const TensorRef rids = st.import_ro(std::as_bytes(std::span(ids)));
     const TensorRef rpos = st.import_ro(std::as_bytes(std::span(pos)));
-    std::map<const kv_cache::KvPool*, TensorRef> pools;
-    for (SeqRows& s : seqs) I.import_kv(st, s, pools);
+    for (SeqRows& s : seqs) I.import_kv(st, s);
     const Impl::Acts a = I.make_acts(st, R, false);
     // concat(rmsnorm(embed(tok); enorm), rmsnorm(h; hnorm)) — embedding first (D-005): both
     // norms write straight into their half of the [R, 2E] concat rows.

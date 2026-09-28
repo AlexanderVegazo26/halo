@@ -691,29 +691,8 @@ public:
         r.no_overlap(p.pool, k);
         r.no_overlap(p.pool, v);
         if (a.n_tokens == 0) return;
-        // The kernel writes only the blocks of rows [start, +n_tokens): mark exactly those
-        // block ranges of the pool import dirty for the wait() write-back (pool_refs resolved
-        // the whole-pool operand untracked). The block table is a read-only host import, so
-        // its entries are readable here; anything unexpected falls back to the whole image.
-        if (p.pool.extent > 0 && p.pool.buf != nullptr) {
-            const std::uint64_t layer_floats = 2ULL * a.block_tokens * a.kv_dim;
-            const std::uint64_t block_bytes = std::uint64_t{a.n_layers} * layer_floats * kF32;
-            bool precise = p.table.buf != nullptr && p.table.buf->ro_host() != nullptr;
-            if (precise) {
-                const auto* tab = reinterpret_cast<const std::uint32_t*>(p.table.buf->ro_host() + p.table.begin);
-                const std::uint64_t t0 = a.start / a.block_tokens, t1 = (end - 1) / a.block_tokens;
-                for (std::uint64_t t = t0; t <= t1 && precise; ++t) {
-                    if (tab[t] >= a.n_pool_blocks) {
-                        precise = false;  // out of range: the kernel raises bad-block; mirror everything
-                    } else {
-                        const std::uint64_t lo =
-                            p.pool.begin + tab[t] * block_bytes + std::uint64_t{a.layer} * layer_floats * kF32;
-                        p.pool.buf->dirty_add(lo, lo + layer_floats * kF32);
-                    }
-                }
-            }
-            if (!precise) p.pool.buf->dirty_add(p.pool.begin, p.pool.begin + p.pool.extent);
-        }
+        // The KV pool is a device-resident State-arena buffer (ADR-001 §5.2, WS-BI-2): the
+        // kernel's writes stay on the device; there is no import write-back to track.
         hv::KvWriteArgs w;
         w.kv_pool = p.pool.view;
         w.n_pool_blocks = a.n_pool_blocks;
@@ -906,8 +885,8 @@ private:
         PoolRefs p;
         const std::uint64_t block_floats =
             mul_u64(mul_u64(mul_u64(n_layers, 2, r.op(), "pool"), block_tokens, r.op(), "pool"), kv_dim, r.op(), "pool");
-        // Not dirty-tracked here: the operand spans every block, but KV_WRITE writes only the
-        // blocks of its own rows and marks those exact ranges (see kv_write); ATTENTION only reads.
+        // Not dirty-tracked: the pool is a device-resident State-arena buffer (ADR-001 §5.2,
+        // WS-BI-2 stage 2), so its writes never mirror back to host memory.
         p.pool = r.f32(pool, n_pool_blocks, block_floats, access, "kv_pool", /*track=*/false);
         HALO_CHECK(p.pool.extent == 0 || p.pool.stride == block_floats * kF32, ErrorCode::Kernel, "{}: kv_pool must be dense",
                    r.op());

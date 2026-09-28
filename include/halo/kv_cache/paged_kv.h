@@ -7,9 +7,17 @@
 // so one block table per sequence serves all layers. The trunk and the MTP layer use
 // separate pools (different layer counts).
 //
+// Placement (ADR-001 §5.2, WS-BI-2 stage 2): the pool image lives in host memory until
+// attach(backend) gives it a State-arena backend buffer — zero-copy over the host storage
+// on the CPU / HIP-emulation backends (host accessors stay valid), device-resident on GPU
+// backends. On a device-resident pool the host accessors throw Error(Unsupported) (the ADR's
+// rule for a pool whose host_ptr() is null); read_all() works in both modes (tests).
+//
 // Sharing (prefix reuse): blocks are refcounted. SequenceKv::share_prefix() makes a new
 // sequence reference another sequence's blocks; a write into a block with refcount > 1
-// copies it first (copy-on-write), so a shared prefix is never modified.
+// copies it first (copy-on-write) — a host memcpy on host pools, a synchronous device-side
+// Backend::copy on device-resident pools (synchronous so reserve() keeps its strong
+// guarantee: the block table changes only after the copy completed).
 //
 // Exhaustion: allocation from an empty pool throws halo::Error(Memory). Every mutating
 // SequenceKv operation either completes or leaves the sequence unchanged (strong guarantee):
@@ -27,6 +35,7 @@
 #include <span>
 #include <vector>
 
+#include "halo/backend/backend.h"
 #include "halo/backends/cpu/views.h"
 
 namespace halo::kv_cache {
@@ -65,17 +74,43 @@ public:
     void release(BlockId id) noexcept;
     [[nodiscard]] std::uint32_t refcount(BlockId id) const;
 
-    [[nodiscard]] float* k_rows(BlockId id, std::size_t layer) noexcept;
-    [[nodiscard]] float* v_rows(BlockId id, std::size_t layer) noexcept;
-    [[nodiscard]] const float* k_rows(BlockId id, std::size_t layer) const noexcept;
-    [[nodiscard]] const float* v_rows(BlockId id, std::size_t layer) const noexcept;
+    [[nodiscard]] float* k_rows(BlockId id, std::size_t layer);
+    [[nodiscard]] float* v_rows(BlockId id, std::size_t layer);
+    [[nodiscard]] const float* k_rows(BlockId id, std::size_t layer) const;
+    [[nodiscard]] const float* v_rows(BlockId id, std::size_t layer) const;
+
+    // ---- backend attachment (ADR-001 §5.2: the pool image is a State-arena buffer) --------
+    /// Gives the pool image a backend-owned image (idempotent for the same backend;
+    /// Error(Api) for another). CPU / HIP emulation: zero-copy over the host storage. GPU
+    /// backends: a device-resident buffer; the current host content (zeros, or test
+    /// sentinels written so far) is uploaded, then the host storage is released.
+    /// Error(Memory) on allocation failure.
+    void attach(backend::Backend& be);
+    [[nodiscard]] bool attached() const noexcept { return be_ != nullptr; }
+    /// True when the host storage is the image (unattached, or a zero-copy attachment), so
+    /// the host accessors are valid. False on a device-resident pool (accessors then throw
+    /// Error(Unsupported), per ADR-001 §5.2).
+    [[nodiscard]] bool host_coherent() const noexcept { return coherent_; }
+    /// The whole pool image as a backend operand (attached only; Error(Api) otherwise).
+    [[nodiscard]] backend::TensorRef storage_ref() const;
+    /// A copy of the whole pool image (host pools: a host copy; device pools: a download).
+    /// For tests.
+    [[nodiscard]] std::vector<float> read_all() const;
+    /// Device-side copy of block `src` to block `dst`, synchronously (the COW of
+    /// SequenceKv::reserve on a device-resident pool). Error(Api) on a host-coherent pool.
+    void copy_block(BlockId dst, BlockId src);
 
 private:
     [[nodiscard]] std::size_t offset(BlockId id, std::size_t layer, std::size_t kv) const noexcept;
+    [[nodiscard]] float* host_storage(const char* what) const;  // Error(Unsupported) if device-resident
 
     KvLayout layout_;
     std::size_t block_floats_ = 0;
-    std::unique_ptr<float[]> storage_;
+    std::unique_ptr<float[]> storage_;  // null on a device-resident pool
+    backend::Backend* be_ = nullptr;
+    std::unique_ptr<backend::Buffer> dev_;
+    bool coherent_ = true;
+    bool host_dirty_ = false;  // host writes since construction (attach uploads them)
     mutable std::mutex mu_;
     std::vector<std::uint32_t> refcount_;  // 0 = free
     std::vector<BlockId> free_list_;
