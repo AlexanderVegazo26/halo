@@ -387,13 +387,28 @@ public:
         const std::size_t T = a.n_tokens, C = a.channels, K = a.kernel_size;
         const Operand x = r.f32(a.x, T, C, Access::Read, "x");
         const Operand w = r.f32(a.weight, C, K, Access::Read, "weight");
-        const Operand st = r.f32(a.conv_state, K - 1, C, Access::Write, "conv_state");
         const Operand out = r.f32(a.out, T, C, Access::Write, "out");
+        r.no_overlap(out, x);
+        r.no_overlap(out, w);
+        const std::uint64_t state_floats = mul_u64(K - 1, C, r.op(), "conv_state");
+        if (a.ring) {
+            // ADR-001 §5.3: conv_state is the whole slab of P dense conv states.
+            const Operand slab = r.f32(a.conv_state, 1, mul_u64(a.ring->p, state_floats, r.op(), "slab"),
+                                       Access::Write, "conv_state slab");
+            HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                       "CONV1D_SHORT: with a state ring, state_slots is derived from the slab and must be empty");
+            r.no_overlap(slab, x);
+            r.no_overlap(slab, w);
+            r.no_overlap(out, slab);
+            const cpu::StateRingView ring{std::span<float>(slab.wf(), slab.extent / kF32), a.ring->p, a.ring->live,
+                                          a.n_slots};
+            cpu::causal_conv1d_silu(crows(x, T, C), crows(w, C, K), ring, wrows(out, T, C), pool_);
+            return;
+        }
+        const Operand st = r.f32(a.conv_state, K - 1, C, Access::Write, "conv_state");
         const std::uint64_t slot_floats = mul_u64(mul_u64(a.n_slots, K - 1, r.op(), "slots"), C, r.op(), "slots");
         const Operand sl = r.f32(a.state_slots, 1, slot_floats, Access::Write, "state_slots");
         HALO_CHECK(st.extent == 0 || st.stride == C * kF32, ErrorCode::Kernel, "CONV1D_SHORT: conv_state must be dense");
-        r.no_overlap(out, x);
-        r.no_overlap(out, w);
         r.no_overlap(out, st);
         r.no_overlap(out, sl);
         r.no_overlap(st, x);
@@ -419,21 +434,38 @@ public:
         const Operand v = r.f32(a.v, T, v_cols, Access::Read, "v");
         const Operand g = r.f32(a.g, T, a.n_v, Access::Read, "g");
         const Operand beta = r.f32(a.beta, T, a.n_v, Access::Read, "beta");
+        const Operand out = r.f32(a.out, T, v_cols, Access::Write, "out");
+        const cpu::GdnDims dims{a.n_k, a.n_v, a.d_k, a.d_v,
+                                a.mapping == GdnHeadMapping::Tiled ? cpu::GdnHeadMapping::Tiled : cpu::GdnHeadMapping::Grouped};
+        const cpu::GdnInputs in{crows(q, T, qk_cols), crows(k, T, qk_cols), crows(v, T, v_cols), crows(g, T, a.n_v),
+                                crows(beta, T, a.n_v)};
+        const cpu::GdnQkParams qk{.qk_l2norm = a.qk_l2norm, .q_scale = a.q_scale};
+        if (a.ring) {
+            // ADR-001 §5.3: state is the whole slab of P dense states; slots are derived.
+            const Operand slab =
+                r.f32(a.state, 1, mul_u64(a.ring->p, state_floats, r.op(), "slab"), Access::Write, "state slab");
+            HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                       "GATED_DELTANET: with a state ring, state_slots is derived from the slab and must be empty");
+            for (const Operand* i : {&q, &k, &v, &g, &beta}) r.no_overlap(slab, *i);
+            r.no_overlap(out, slab);
+            const cpu::StateRingView ring{std::span<float>(slab.wf(), slab.extent / kF32), a.ring->p, a.ring->live,
+                                          a.n_slots};
+            if (a.form == GdnForm::Chunked) {
+                cpu::gated_delta_rule_chunked(dims, in, ring, wrows(out, T, v_cols), qk, a.chunk_size, pool_);
+            } else {
+                cpu::gated_delta_rule_recurrent(dims, in, ring, wrows(out, T, v_cols), qk, pool_);
+            }
+            return;
+        }
         const Operand st = r.f32(a.state, 1, state_floats, Access::Write, "state");
         const std::uint64_t slot_floats = mul_u64(a.n_slots, state_floats, r.op(), "slots");
         const Operand sl = r.f32(a.state_slots, 1, slot_floats, Access::Write, "state_slots");
-        const Operand out = r.f32(a.out, T, v_cols, Access::Write, "out");
         for (const Operand* o : {&st, &sl, &out}) {
             for (const Operand* i : {&q, &k, &v, &g, &beta}) r.no_overlap(*o, *i);
         }
         r.no_overlap(out, st);
         r.no_overlap(out, sl);
         r.no_overlap(sl, st);
-        const cpu::GdnDims dims{a.n_k, a.n_v, a.d_k, a.d_v,
-                                a.mapping == GdnHeadMapping::Tiled ? cpu::GdnHeadMapping::Tiled : cpu::GdnHeadMapping::Grouped};
-        const cpu::GdnInputs in{crows(q, T, qk_cols), crows(k, T, qk_cols), crows(v, T, v_cols), crows(g, T, a.n_v),
-                                crows(beta, T, a.n_v)};
-        const cpu::GdnQkParams qk{.qk_l2norm = a.qk_l2norm, .q_scale = a.q_scale};
         const std::span<float> state(st.wf(), state_floats);
         const std::span<float> slots(sl.wf(), slot_floats);
         if (a.form == GdnForm::Chunked) {

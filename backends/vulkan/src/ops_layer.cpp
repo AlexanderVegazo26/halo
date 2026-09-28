@@ -65,7 +65,16 @@ void Ops::causal_conv1d_silu(Stream& stream, const Conv1dArgs& a) {
     HALO_CHECK(a.kernel >= 1 && a.kernel <= k_max_conv_kernel, ErrorCode::Kernel, "{}: kernel {} outside 1..{}", op,
                a.kernel, k_max_conv_kernel);
     const std::uint32_t hist = a.kernel - 1;
-    HALO_CHECK(a.n_slots == 0 || (hist > 0 && !a.state_slots.empty()), ErrorCode::Kernel,
+    const bool ring = a.ring.has_value();
+    if (ring) {
+        HALO_CHECK(a.ring->p >= 2 && a.ring->live < a.ring->p, ErrorCode::Kernel,
+                   "{}: state ring p={} live={} is out of range", op, a.ring->p, a.ring->live);
+        HALO_CHECK(a.n_slots <= a.ring->p - 1, ErrorCode::Kernel, "{}: {} slots requested, ring p - 1 = {}", op,
+                   a.n_slots, a.ring->p - 1);
+        HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                   "{}: with a state ring, state_slots is derived from the slab and must be unset", op);
+    }
+    HALO_CHECK(ring || a.n_slots == 0 || (hist > 0 && !a.state_slots.empty()), ErrorCode::Kernel,
                "{}: n_slots={} needs kernel >= 2 and a state_slots view", op, a.n_slots);
     const std::uint64_t align = ctx_->info().min_storage_buffer_offset_alignment;
     const std::uint64_t row = std::uint64_t{a.channels} * k_f32;
@@ -74,14 +83,18 @@ void Ops::causal_conv1d_silu(Stream& stream, const Conv1dArgs& a) {
     const Operand oo = operand(a.out, a.n_tokens, row, Access::Floats, align, op, "out");
     require_disjoint_or_exact(oo, "out", ox, "x", op);
     require_disjoint(oo, "out", {{&ow, "weight"}}, op);
+    // Ring (ADR-001 §5.3): conv_state is the whole slab of p dense states; the kernel derives
+    // input/final/slot addresses from ring {p, live} (one binding for all roles).
+    const std::uint64_t state_row = std::uint64_t{hist} * k_f32 * a.channels;
     std::optional<Operand> os;
     if (hist > 0) {
-        os = operand(a.conv_state, hist, row, Access::Floats, align, op, "conv_state");
-        require_disjoint(*os, "conv_state", {{&ox, "x"}, {&ow, "weight"}, {&oo, "out"}}, op);
+        os = ring ? operand(a.conv_state, a.ring->p, state_row, Access::Floats, align, op, "conv state slab")
+                  : operand(a.conv_state, hist, row, Access::Floats, align, op, "conv_state");
+        require_disjoint(*os, ring ? "conv state slab" : "conv_state", {{&ox, "x"}, {&ow, "weight"}, {&oo, "out"}}, op);
     }
     const std::uint64_t used = std::min<std::uint64_t>(a.n_tokens, a.n_slots);
     std::optional<Operand> osl;
-    if (used > 0) {
+    if (!ring && used > 0) {
         osl = operand(a.state_slots, 1, checked_mul(checked_mul(used, hist, op), row, op), Access::Floats, align, op,
                       "state_slots (written slots)");
         require_disjoint(*osl, "state_slots", {{&ox, "x"}, {&ow, "weight"}, {&oo, "out"}, {os ? &*os : nullptr, "conv_state"}}, op);
@@ -89,14 +102,15 @@ void Ops::causal_conv1d_silu(Stream& stream, const Conv1dArgs& a) {
     const std::uint32_t wg = k_eltwise_wg;
     struct Push {
         std::uint32_t n_tokens, channels, kernel, n_slots, x_off, x_stride, w_off, w_stride, st_off, st_stride, o_off,
-            o_stride, sl_off;
+            o_stride, sl_off, ring_p, ring_live;  // ring: ADR-001 §5.3; ring_p == 0 = in-place + slots
     } push{a.n_tokens, a.channels, a.kernel,  static_cast<std::uint32_t>(used),
            ox.off,     ox.stride,  ow.off,    ow.stride,
-           os ? os->off : 0u,      os ? os->stride : 0u, oo.off, oo.stride, osl ? osl->off : 0u};
+           os ? os->off : 0u,      ring ? a.channels : (os ? os->stride : 0u), oo.off, oo.stride, osl ? osl->off : 0u,
+           ring ? a.ring->p : 0u,  ring ? a.ring->live : 0u};
     const Kernel& k = kernel("conv1d_silu", 5, sizeof(Push), {{0, wg}}, {wg, 1, 1});
     // Placeholders (never accessed): x for an absent conv_state, out for absent slots.
     const std::array bindings{ox.binding, ow.binding, os ? os->binding : ox.binding, oo.binding,
-                              osl ? osl->binding : oo.binding};
+                              ring && os ? os->binding : (osl ? osl->binding : oo.binding)};
     const DeviceInfo& info = ctx_->info();
     stream.dispatch(k, bindings, push,
                     grid_1d((std::uint64_t{a.channels} + wg - 1) / wg, info.max_workgroup_count[0],

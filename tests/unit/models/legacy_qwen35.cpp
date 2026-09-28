@@ -231,13 +231,15 @@ struct LegacyQwen35::Impl {
 
     /// The one call into the GATED_DELTANET op (D-016): raw q/k after conv+SiLU, the kernel
     /// L2-normalizes q and k per head and scales q by 1/sqrt(d_k) because we say so here.
-    void run_gdn(const cpu::GdnInputs& in, std::span<float> state, Rows o, bool chunked, std::span<float> slots) const {
+    /// WS-BI-2: over the state ring (bit-identical to the slot form it replaced, proven in
+    /// tests/unit/cpu_kernels).
+    void run_gdn(const cpu::GdnInputs& in, const cpu::StateRingView& ring, Rows o, bool chunked) const {
         const cpu::GdnQkParams qk{.qk_l2norm = true,
                                   .q_scale = 1.0f / std::sqrt(static_cast<float>(gdn_dims.d_k))};
         if (chunked) {
-            cpu::gated_delta_rule_chunked(gdn_dims, in, state, o, qk, gdn_chunk, pool, slots);
+            cpu::gated_delta_rule_chunked(gdn_dims, in, ring, o, qk, gdn_chunk, pool);
         } else {
-            cpu::gated_delta_rule_recurrent(gdn_dims, in, state, o, qk, pool, slots);
+            cpu::gated_delta_rule_recurrent(gdn_dims, in, ring, o, qk, pool);
         }
     }
 
@@ -274,7 +276,7 @@ struct LegacyQwen35::Impl {
             const SeqRows& s = seqs[si];
             const GdnSeq& g = gseqs[si];
             const Rows xs(&qkv[s.r0 * conv_c], s.n, conv_c, conv_c);
-            cpu::causal_conv1d_silu(xs, conv_w, g.gdn->conv(gdn_layer), xs, pool, g.gdn->conv_slots(gdn_layer, g.n_slots));
+            cpu::causal_conv1d_silu(xs, conv_w, g.gdn->conv_ring(gdn_layer, g.n_slots), xs, pool);
             const cpu::OpTraffic tc = cpu::traffic_causal_conv1d(s.n, conv_c, conv_k, g.n_slots);
             const std::uint64_t conv_state = 4ULL * (conv_k - 1) * conv_c;
             const std::uint64_t conv_slots = std::min(s.n, g.n_slots) * conv_state;
@@ -287,8 +289,8 @@ struct LegacyQwen35::Impl {
                 ConstRows(&alpha[s.r0 * nv], s.n, nv, nv),
                 ConstRows(&beta[s.r0 * nv], s.n, nv, nv),
             };
-            run_gdn(in, g.gdn->recurrent(gdn_layer), Rows(&o[s.r0 * value_dim], s.n, value_dim, value_dim), g.chunked,
-                    g.gdn->recurrent_slots(gdn_layer, g.n_slots));
+            run_gdn(in, g.gdn->recurrent_ring(gdn_layer, g.n_slots), Rows(&o[s.r0 * value_dim], s.n, value_dim, value_dim),
+                    g.chunked);
             const cpu::OpTraffic tg = cpu::traffic_gated_delta_rule(gdn_dims, s.n, g.n_slots);
             const std::uint64_t st = 4ULL * nv * gdn_dims.d_k * dv;
             const std::uint64_t slots = std::min(s.n, g.n_slots) * st;
@@ -501,6 +503,7 @@ void LegacyQwen35::forward(std::span<const SeqStep> steps, StepResult& out, cons
                    ErrorCode::Api, "forward step {}: GDN state shape does not match the model", si);
         HALO_CHECK(s.n_state_slots <= s.gdn->max_slots(), ErrorCode::Api, "forward step {}: {} state slots, state has {}", si,
                    s.n_state_slots, s.gdn->max_slots());
+        s.gdn->begin_step(s.tokens.size(), s.n_state_slots);  // ADR-001 §5.3: record the base; uncommitted-verify guard
         for (std::size_t sj = 0; sj < si; ++sj) {
             HALO_CHECK(steps[sj].kv != s.kv && steps[sj].gdn != s.gdn, ErrorCode::Api,
                        "forward: steps {} and {} share a sequence's state", sj, si);

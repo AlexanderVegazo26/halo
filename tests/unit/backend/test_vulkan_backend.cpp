@@ -28,6 +28,7 @@
 #include "halo/backends/cpu/ops.h"
 #include "halo/backends/vulkan/context.h"
 #include "halo/core/error.h"
+#include "halo/state/gdn_state.h"
 #include "halo/tensor/quant.h"
 #include "vulkan/vk_test_util.h"
 
@@ -573,4 +574,99 @@ TEST(VulkanBackend, DeviceDataErrorsRaiseAtWaitAndSkipWriteBack) {
     expect_code([&] { d.s->wait(); }, halo::ErrorCode::Kernel, "bad row id at wait");
     // The stream stays usable.
     EXPECT_NO_THROW(d.sync());
+}
+
+// ADR-001 §5.3 "Failure" + §5.5 step atomicity for the state ring: a device data error
+// (here: a bad KV block id, detected on the device, raised at wait()) must leave the
+// sequence bit-for-bit at its pre-step state — live is not advanced, slab[live] is never
+// written — and re-running the step cleanly must give the state of an uninterrupted run.
+TEST(VulkanBackend, GdnRingStateIsUntouchedByAFailedStep) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    Pair p = make_pair(ctx);
+    const std::uint32_t nv = 2, dk = 16, dv = 16;
+    const std::uint32_t T1 = 3, T2 = 2;
+    const auto q1 = randn(std::size_t{T1} * dk, 50), k1 = randn(std::size_t{T1} * dk, 51),
+               v1 = randn(std::size_t{T1} * nv * dv, 52);
+    const auto q2 = randn(std::size_t{T2} * dk, 53), k2 = randn(std::size_t{T2} * dk, 54),
+               v2 = randn(std::size_t{T2} * nv * dv, 55);
+    const std::vector<float> g1(std::size_t{T1} * nv, -0.3f), beta1(std::size_t{T1} * nv, 0.5f);
+    const std::vector<float> g2(std::size_t{T2} * nv, -0.7f), beta2(std::size_t{T2} * nv, 0.4f);
+
+    const halo::state::GdnShape shape{1, nv, dk, dv, 4, 8};
+    halo::state::GdnState ga(shape, 2), gb(shape, 2);  // P = 3
+    ga.attach(*p.vk);
+    gb.attach(*p.vk);
+
+    // Imports must outlive their buffers: these live for the whole test.
+    const std::vector<std::uint32_t> bad_table{0, 99};
+    std::vector<float> bad_pool(std::size_t{2} * 2 * 4 * 8, 0.0f);
+
+    const auto ring_step = [&](halo::state::GdnState& st, Dev& d, const std::vector<float>& q,
+                               const std::vector<float>& k, const std::vector<float>& v, const std::vector<float>& g,
+                               const std::vector<float>& beta, std::uint32_t T, bool fail) {
+        st.begin_step(T, 1);
+        hb::GdnArgs a;
+        a.q = d.put(q);
+        a.k = d.put(k);
+        a.v = d.put(v);
+        a.g = d.put(g);
+        a.beta = d.put(beta);
+        a.state = st.recurrent_ref(0);
+        a.out = d.zeros(std::size_t{T} * nv * dv * 4);
+        a.n_k = 1;
+        a.n_v = nv;
+        a.d_k = dk;
+        a.d_v = dv;
+        a.n_tokens = T;
+        a.n_slots = 1;
+        a.ring = hb::StateRing{static_cast<std::uint32_t>(st.ring_size()), st.live()};
+        p.vk->gated_delta_rule(*d.s, a);
+        if (fail) {
+            // A device-detected data error in the same step: bad block id in a KV write.
+            const hb::TensorRef rt = d.import_ro(std::as_bytes(std::span(bad_table)));
+            const hb::TensorRef rp = d.import_rw(std::as_writable_bytes(std::span(bad_pool)));
+            const hb::TensorRef kv = d.put(randn(8, 44));
+            p.vk->kv_write(*d.s, hb::KvWriteArgs{rp, rt, kv, kv, 2, 1, 0, 4, 8, 2, 4, 1, {}, {}});
+        }
+    };
+
+    Dev da(*p.vk), db(*p.vk);
+    // Step 1 (clean) on both.
+    ring_step(ga, da, q1, k1, v1, g1, beta1, T1, false);
+    ring_step(gb, db, q1, k1, v1, g1, beta1, T1, false);
+    da.sync();
+    db.sync();
+    ga.mark_slots_written(T1, 1);
+    gb.mark_slots_written(T1, 1);
+    ga.drop_slots();
+    gb.drop_slots();
+    ASSERT_EQ(ga.live(), 1u);
+    // Step 2 on A fails at wait() (bad block id): nothing is committed.
+    ga.pull();
+    const std::vector<float> pre_step(ga.slab().begin(), ga.slab().end());
+    ring_step(ga, da, q2, k2, v2, g2, beta2, T2, true);
+    da.s->submit();
+    expect_code([&] { da.s->wait(); }, halo::ErrorCode::Kernel, "bad block id at wait");
+    EXPECT_EQ(ga.live(), 1u) << "a failed step must not advance live";
+    ga.pull();
+    const std::size_t sn = shape.recurrent_floats();
+    EXPECT_TRUE(bitwise(ga.slab().subspan(std::size_t{ga.live()} * sn, sn),
+                        std::span<const float>(pre_step).subspan(std::size_t{ga.live()} * sn, sn),
+                        "slab[live] after the failed step"));
+    // Retry the same step cleanly; B runs it uninterrupted. Final live states must match
+    // bit for bit (the failed attempt's writes went to slots the retry overwrites).
+    ring_step(ga, da, q2, k2, v2, g2, beta2, T2, false);
+    ring_step(gb, db, q2, k2, v2, g2, beta2, T2, false);
+    da.sync();
+    db.sync();
+    ga.mark_slots_written(T2, 1);
+    gb.mark_slots_written(T2, 1);
+    ga.drop_slots();
+    gb.drop_slots();
+    ASSERT_EQ(ga.live(), gb.live());
+    ga.pull();
+    gb.pull();
+    EXPECT_TRUE(bitwise(ga.slab().subspan(std::size_t{ga.live()} * sn, sn),
+                        gb.slab().subspan(std::size_t{gb.live()} * sn, sn),
+                        "live state: failed-then-retried == uninterrupted"));
 }

@@ -412,22 +412,21 @@ struct Qwen35::Impl {
         for (std::size_t si = 0; si < seqs.size(); ++si) {
             const SeqRows& s = seqs[si];
             const GdnSeq& g = gseqs[si];
-            const cpu::Rows cs = g.gdn->conv(gdn_layer);
-            const TensorRef conv_state = st.import(std::span<float>(cs.data(), cs.rows() * cs.cols()));
-            const std::span<float> conv_slots = g.gdn->conv_slots(gdn_layer, g.n_slots);
-            // The conv op writes slots s < min(T, n_slots) and leaves the rest caller-owned.
-            const std::uint64_t cslot_wb = std::min(s.n, g.n_slots) * (conv_k - 1) * conv_c * kF32;
-            const TensorRef cslots = conv_slots.empty() ? TensorRef{} : st.import_wo(conv_slots, cslot_wb);
+            state::GdnState& gdn_st = *g.gdn;
+            // ADR-001 §5.3: the conv and recurrent state are one device-resident ring slab
+            // per sequence; the kernels read slab[live] and write the final state plus the
+            // rollback slots to other physical slots (no host import/export per forward).
+            const backend::StateRing ring{u32(gdn_st.ring_size()), gdn_st.live()};
             const TensorRef xs = rows_at(a.conv, s.r0, conv_c);
-            be->conv1d_silu(*st.s, backend::Conv1dArgs{rows_at(a.qkv, s.r0, conv_c), w.conv.ref(), conv_state, xs, cslots,
-                                                       u32(s.n), u32(conv_c), u32(conv_k), u32(g.n_slots), {}});
+            be->conv1d_silu(*st.s, backend::Conv1dArgs{rows_at(a.qkv, s.r0, conv_c), w.conv.ref(),
+                                                       gdn_st.conv_ref(gdn_layer), xs, {},
+                                                       u32(s.n), u32(conv_c), u32(conv_k), u32(g.n_slots), ring, {}});
             const cpu::OpTraffic tc = cpu::traffic_causal_conv1d(s.n, conv_c, conv_k, g.n_slots);
             const std::uint64_t conv_state_bytes = 4ULL * (conv_k - 1) * conv_c;
             const std::uint64_t conv_slot_bytes = std::min(s.n, g.n_slots) * conv_state_bytes;
             cost.state_bytes += 2 * conv_state_bytes + conv_slot_bytes;
             cost.activation_bytes += tc.total() - 2 * conv_state_bytes - conv_slot_bytes;
 
-            const std::span<float> rec_slots = g.gdn->recurrent_slots(gdn_layer, g.n_slots);
             backend::GdnArgs ga{};
             ga.form = g.chunked ? backend::GdnForm::Chunked : backend::GdnForm::Recurrent;
             ga.q = xs.with_stride(cstride);
@@ -435,10 +434,7 @@ struct Qwen35::Impl {
             ga.v = xs.shifted(2 * key_dim * kF32).with_stride(cstride);
             ga.g = rows_at(a.g, s.r0, nv);
             ga.beta = rows_at(a.bs, s.r0, nv);
-            ga.state = st.import(g.gdn->recurrent(gdn_layer));
-            // The GDN op writes slots s < min(T, n_slots) and leaves the rest caller-owned.
-            const std::uint64_t rslot_wb = std::min(s.n, g.n_slots) * nv * d_k * d_v * kF32;
-            ga.state_slots = rec_slots.empty() ? TensorRef{} : st.import_wo(rec_slots, rslot_wb);
+            ga.state = gdn_st.recurrent_ref(gdn_layer);
             ga.out = rows_at(a.o, s.r0, value_dim);
             ga.n_k = u32(n_k);
             ga.n_v = u32(n_v);
@@ -452,6 +448,7 @@ struct Qwen35::Impl {
             ga.qk_l2norm = true;
             ga.q_scale = 1.0f / std::sqrt(static_cast<float>(d_k));
             ga.chunk_size = u32(gdn_chunk);
+            ga.ring = ring;
             be->gated_delta_rule(*st.s, ga);
             const cpu::OpTraffic tg = cpu::traffic_gated_delta_rule(dims, s.n, g.n_slots);
             const std::uint64_t stb = 4ULL * nv * d_k * dv;
@@ -711,6 +708,10 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
                    ErrorCode::Api, "forward step {}: GDN state shape does not match the model", si);
         HALO_CHECK(s.n_state_slots <= s.gdn->max_slots(), ErrorCode::Api, "forward step {}: {} state slots, state has {}", si,
                    s.n_state_slots, s.gdn->max_slots());
+        // ADR-001 §5.3: attach the ring slab to this backend on first use, then record the
+        // step's base (live) — an uncommitted verify on this sequence is Error(Api) here.
+        if (!s.gdn->attached()) s.gdn->attach(*I.be);
+        s.gdn->begin_step(s.tokens.size(), s.n_state_slots);
         for (std::size_t sj = 0; sj < si; ++sj) {
             HALO_CHECK(steps[sj].kv != s.kv && steps[sj].gdn != s.gdn, ErrorCode::Api,
                        "forward: steps {} and {} share a sequence's state", sj, si);

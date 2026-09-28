@@ -25,9 +25,13 @@
 // state is modified, so a thrown Error (bad token, KV pool exhausted) leaves every
 // sequence's KV and GDN state as they were.
 //
-// Not implemented yet (ADR-001 §9): the GDN state ring and commit-after-status ordering
-// (WS-BI-2; today KV is committed before the LM head, TD-2), the KernelPlan (WS-BI-4); the
-// state still lives in host memory (KvPool / GdnState, imported per call).
+// GDN/conv state is the ADR-001 §5.3 ring (WS-BI-2 stage 1): each sequence's state is one
+// slab of P physical states per layer attached to the backend (device-resident on GPU
+// backends), and the commit is the `live` integer advance after the LM head succeeds
+// (mark_slots_written); a failure leaves the sequence bit-for-bit at its pre-step state.
+//
+// Not implemented yet (ADR-001 §9): the KernelPlan (WS-BI-4); KV state still lives in host
+// memory (KvPool, imported per call — WS-BI-2 stage 2).
 //
 // Thread-safety: a Qwen35 is immutable after construction. On the CPU backend, forward()
 // may be called from several threads with disjoint sequences (it shares the ThreadPool,

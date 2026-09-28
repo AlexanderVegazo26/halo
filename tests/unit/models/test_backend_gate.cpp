@@ -8,7 +8,8 @@
 //     inputs (capture_layer_inputs), the resolved GDN paths;
 //   - the WHOLE storage of both KV pools (filled with the same sentinel first, so a write to
 //     a wrong row or a read of an unwritten row shows up), every block table and length;
-//   - every GDN layer's live recurrent and conv state, all max_slots slots, slot bookkeeping;
+//   - every GDN layer's live recurrent and conv state, the whole ring slab (every physical
+//     slot) and the ring bookkeeping (live, pending rows/slots);
 //   - the D-011 cost: every StepCost field exactly; activation_bytes is the legacy value minus
 //     exactly the removed [Q | gate] de-interleave copy (16 * rows * n_head * head_dim bytes
 //     per attention layer call).
@@ -202,15 +203,15 @@ private:
             EXPECT_TRUE(std::ranges::equal(a.mtp_kv.blocks(), b.mtp_kv.blocks())) << s << " MTP block table";
             EXPECT_EQ(a.gdn.slot_rows(), b.gdn.slot_rows()) << s;
             EXPECT_EQ(a.gdn.slots_valid(), b.gdn.slots_valid()) << s;
+            EXPECT_EQ(a.gdn.live(), b.gdn.live()) << s << " ring live";
+            // The whole ring slab (ADR-001 §5.3): live state + every physical slot, bitwise.
+            EXPECT_TRUE(same_bits(a.gdn.slab(), b.gdn.slab(), s + " GDN ring slab"));
             for (std::size_t layer = 0; layer < a.gdn.shape().n_layers; ++layer) {
                 const std::string sl = s + " GDN layer " + std::to_string(layer);
                 EXPECT_TRUE(same_bits(a.gdn.recurrent(layer), b.gdn.recurrent(layer), sl + " live recurrent"));
                 const auto ca = a.gdn.conv(layer);
                 const auto cb = b.gdn.conv(layer);
                 EXPECT_TRUE(same_bits({ca.data(), ca.rows() * ca.cols()}, {cb.data(), cb.rows() * cb.cols()}, sl + " live conv"));
-                EXPECT_TRUE(same_bits(a.gdn.recurrent_slots(layer, kSlots), b.gdn.recurrent_slots(layer, kSlots),
-                                      sl + " recurrent slots"));
-                EXPECT_TRUE(same_bits(a.gdn.conv_slots(layer, kSlots), b.gdn.conv_slots(layer, kSlots), sl + " conv slots"));
             }
         }
     }

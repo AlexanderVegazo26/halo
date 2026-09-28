@@ -93,6 +93,14 @@ HALO_HD inline double hsin(double x) {
 
 HALO_HD inline bool hisnan(float x) { return x != x; }
 
+/// State ring (ADR-001 §5.3): element offset of logical slot `slot` within a slab of
+/// `ring_p` dense states of `state_elems` floats each. ring_p == 0 = the legacy contiguous
+/// slots region (slot s at s * state_elems).
+HALO_HD inline std::uint64_t ring_slot_off(unsigned ring_p, unsigned ring_live, unsigned slot, std::uint64_t state_elems) {
+    const unsigned phys = ring_p == 0u ? slot : (ring_live + 1u + slot) % ring_p;
+    return static_cast<std::uint64_t>(phys) * state_elems;
+}
+
 /// Same expressions as halo::cpu::detail (backends/cpu/kernel_common.h).
 HALO_HD inline float sigmoidf(float x) { return 1.0f / (1.0f + hexp(-x)); }
 HALO_HD inline float siluf(float x) { return x / (1.0f + hexp(-x)); }

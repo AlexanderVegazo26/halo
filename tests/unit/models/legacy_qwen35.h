@@ -3,6 +3,8 @@
 // 8065734; verbatim in
 // legacy_qwen35.cpp), the reference of the WS-BI-1 migration gate (ADR-001 §6.2). Same
 // public API as models::Qwen35 over the same step/result types. Delete at the end of WS-BI-2.
+// WS-BI-2 note: the GDN/conv state calls moved to the state ring overloads (ADR §5.3), which
+// are bit-identical to the slot overloads this file used before (tests/unit/cpu_kernels).
 
 #include <cstddef>
 #include <cstdint>

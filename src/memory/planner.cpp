@@ -182,7 +182,7 @@ SizeBreakdown compute_sizes(const ModelShape& m, const PlanRequest& r) {
     s.gdn_state_per_copy = add_or_throw(rec_per_seq, conv_per_seq, "GDN state per copy");
     s.gdn_recurrent = mul_or_throw(rec_per_seq, r.max_sequences, "GDN recurrent state");
     s.gdn_conv = mul_or_throw(conv_per_seq, r.max_sequences, "GDN conv state");
-    s.gdn_rollback_copies = r.gdn_rollback_copies.value_or(r.mtp_enabled ? r.mtp_draft_depth + 1 : 0);
+    s.gdn_rollback_copies = r.gdn_rollback_copies.value_or(r.mtp_enabled ? r.mtp_draft_depth + 1 : 1);
     s.gdn_rollback = mul3(s.gdn_state_per_copy, s.gdn_rollback_copies, r.max_sequences, "GDN rollback state");
     if (r.prefix_checkpoints.enabled && m.n_gdn_layers > 0) {
         const auto& pc = r.prefix_checkpoints;

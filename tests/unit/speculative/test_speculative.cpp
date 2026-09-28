@@ -827,8 +827,9 @@ TEST_F(Spec, VerifyCostsOneWeightPassAndRollbackCostsOnlySlotTraffic) {
     const std::uint64_t state = sh.total_bytes();
     // Slot traffic: K = 4 slots written (slot 0 duplicates the live state; see report).
     EXPECT_EQ(rv.cost.state_bytes - rd.cost.state_bytes, 4 * state);
-    // Rollback itself: a partial accept copies one slot into the live state (read + write).
-    EXPECT_EQ(b->gdn.commit_bytes(4, 2), 2 * state);
+    // Rollback itself is free: under the state ring (ADR-001 §5.3) the commit advances one
+    // integer (live = base + 1 + (T - m) mod P), no copy, no device work.
+    EXPECT_EQ(b->gdn.commit_bytes(4, 2), 0u);
     EXPECT_EQ(b->gdn.commit_bytes(4, 4), 0u);
     // The speculator's tick with k drafts = 1 trunk pass + k MTP passes.
     auto s = seq();

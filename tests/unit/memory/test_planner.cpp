@@ -84,7 +84,10 @@ TEST(PlannerSizes, PerSequenceLayoutAndQuantizedKv) {
     r.mtp_enabled = false;
     const auto s = compute_sizes(qwen(), r);
     EXPECT_EQ(s.mtp_kv, 0u);
-    EXPECT_EQ(s.gdn_rollback, 0u);
+    // ADR-001 §5.3 (line 371): even without MTP the state ring needs P = 2 physical states
+    // per sequence, so the planner reserves one rollback copy.
+    EXPECT_EQ(s.gdn_rollback_copies, 1u);
+    EXPECT_EQ(s.gdn_rollback, 8 * kGdnStatePerCopy);
     EXPECT_EQ(s.weights.mtp, 0u);  // blk.64 not resident without MTP
     EXPECT_EQ(s.weights.total(), kUdWeightsTotal - ud_q4_k_xl_weights().mtp);
 }

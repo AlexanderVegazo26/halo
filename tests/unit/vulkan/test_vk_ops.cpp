@@ -750,6 +750,159 @@ TEST(VkGdn, ValidatesRegionsAndSizes) {
     s.submit_and_wait();
 }
 
+// ---------------------------------------------------------------- state ring (ADR-001 §5.3)
+
+namespace {
+
+bool bit_eq(std::span<const float> a, std::span<const float> b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](float x, float y) {
+               return std::bit_cast<std::uint32_t>(x) == std::bit_cast<std::uint32_t>(y);
+           });
+}
+
+/// Ring-mode decode/chunked vs the legacy state_out + slots form of the same kernel: the
+/// values must be bit-identical (same arithmetic, modular slot addressing), the input slot
+/// untouched, unwritten physical slots sentinel.
+void gdn_ring_case(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, std::uint32_t T, std::uint32_t K,
+                   std::uint32_t P, std::uint32_t live, bool chunked, const std::string& label) {
+    hv::Ops ops(ctx);
+    std::mt19937 rng(31000 + T * 100 + K * 10 + P + live + chunked);
+    const auto s0 = random_state(d, rng);
+    std::vector<GdnRow> rows;
+    for (std::uint32_t t = 0; t < T; ++t) rows.push_back(gdn_row(d, rng));
+    const GdnRow all = concat(rows);
+    const std::size_t S = d.state_elems();
+    const std::size_t out_elems = std::size_t{T} * d.n_v * d.d_v;
+    GdnBuffers b = gdn_upload(ctx, all, out_elems);
+    GdnBuffers b2 = gdn_upload(ctx, all, out_elems);
+
+    // Legacy form: input in its own buffer, output + slots separate.
+    hv::Buffer in_leg = upload(ctx, std::span<const float>(s0), hv::MemoryUsage::HostVisible);
+    hv::Buffer out_leg = hv::Buffer::create(ctx, S * 4, hv::MemoryUsage::HostCached);
+    hv::Buffer slots_leg = hv::Buffer::create(ctx, std::max<std::size_t>(std::size_t{K} * S, 1) * 4,
+                                              hv::MemoryUsage::HostCached);
+    // Ring form: one slab, sentinel-filled, live slot = s0.
+    std::vector<float> slab_host(std::size_t{P} * S, 42.0f);
+    std::copy(s0.begin(), s0.end(), slab_host.begin() + static_cast<std::ptrdiff_t>(std::size_t{live} * S));
+    hv::Buffer slab = upload(ctx, std::span<const float>(slab_host), hv::MemoryUsage::HostCached);
+    hv::Buffer status = hv::Buffer::create(ctx, 8, hv::MemoryUsage::HostCached);
+    hv::Buffer ws_l, ws_r;  // chunked workspace; must outlive the stream
+    if (chunked) {
+        ws_l = hv::Buffer::create(ctx, hv::gdn_chunked_workspace_bytes(gdn_args(b, in_leg, d, T), 64),
+                                  hv::MemoryUsage::DeviceLocal);
+        ws_r = hv::Buffer::create(ctx, hv::gdn_chunked_workspace_bytes(gdn_args(b2, slab, d, T), 64),
+                                  hv::MemoryUsage::DeviceLocal);
+    }
+
+    hv::Stream s(ctx);
+    hv::GdnDecodeArgs leg = gdn_args(b, in_leg, d, T);
+    leg.state_out = hv::BufferView(out_leg);
+    if (K > 0) leg.state_slots = hv::BufferView(slots_leg);
+    leg.n_slots = K;
+    hv::GdnDecodeArgs ring = gdn_args(b2, slab, d, T);
+    ring.n_slots = K;
+    ring.ring = hv::GdnRing{P, live};
+    if (!chunked) {
+        ops.gated_delta_rule_decode(s, leg);
+        ops.gated_delta_rule_decode(s, ring);
+    } else {
+        hv::GdnChunkedArgs cl, cr;
+        cl.gdn = leg;
+        cl.chunk_size = 64;
+        cl.workspace = hv::BufferView(ws_l);
+        cl.status = hv::BufferView(status, 0, 4);
+        cr.gdn = ring;
+        cr.chunk_size = 64;
+        cr.workspace = hv::BufferView(ws_r);
+        cr.status = hv::BufferView(status, 4, 4);
+        ops.gated_delta_rule_chunked(s, cl);
+        ops.gated_delta_rule_chunked(s, cr);
+    }
+    s.submit_and_wait();
+    if (chunked) {
+        EXPECT_EQ(hv::read_status(status, 0), 0u) << label;
+        EXPECT_EQ(hv::read_status(status, 4), 0u) << label;
+    }
+
+    EXPECT_TRUE(bit_eq(download<float>(b.out, out_elems), download<float>(b2.out, out_elems)))
+        << label << ": out differs bitwise";
+    const auto slab_got = download<float>(slab, slab_host.size());
+    const auto fin_leg = download<float>(out_leg, S);
+    const auto slots_got = download<float>(slots_leg, std::size_t{K} * S);
+    const std::uint32_t used = std::min(T, K);
+    for (std::uint32_t p = 0; p < P; ++p) {
+        const std::span<const float> phys(slab_got.data() + std::size_t{p} * S, S);
+        if (p == live) {
+            EXPECT_TRUE(bit_eq(phys, s0)) << label << ": input slot written (p=" << p << ")";
+            continue;
+        }
+        const std::uint32_t sl = (p + P - ((live + 1) % P)) % P;
+        if (sl == 0) {
+            EXPECT_TRUE(bit_eq(phys, fin_leg)) << label << ": final state (physical " << p << ")";
+        } else if (sl < used) {
+            EXPECT_TRUE(bit_eq(phys, std::span<const float>(slots_got).subspan(std::size_t{sl} * S, S)))
+                << label << ": slot " << sl;
+        } else {
+            EXPECT_TRUE(std::all_of(phys.begin(), phys.end(), [](float x) { return x == 42.0f; }))
+                << label << ": unwritten physical slot " << p;
+        }
+    }
+}
+
+}  // namespace
+
+TEST(VkGdn, RingFormMatchesSlotFormBitwise) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const GdnDims small{6, 2, 16, 8};
+    for (const bool chunked : {false, true}) {
+        gdn_ring_case(ctx, small, 1, 0, 2, 0, chunked, "decode ring T=1 K=0 P=2 live=0");
+        gdn_ring_case(ctx, small, 1, 0, 2, 1, chunked, "decode ring T=1 K=0 P=2 live=1 (wrap)");
+        gdn_ring_case(ctx, small, 4, 3, 4, 2, chunked, "ring T=4 K=3 P=4 live=2");
+        gdn_ring_case(ctx, small, 3, 5, 6, 5, chunked, "ring T=3 K=5 P=6 live=5 (wrap, slots past T untouched)");
+        gdn_ring_case(ctx, small, 5, 5, 6, 0, chunked, "ring T=5 K=5 P=6 live=0");
+    }
+    // A multi-chunk prefill-sized call on the chunked form, and the real 27B dims once.
+    gdn_ring_case(ctx, small, 70, 2, 4, 3, true, "chunked ring T=70 (two chunks) K=2 P=4 live=3");
+    gdn_ring_case(ctx, {48, 16, 128, 128}, 4, 3, 4, 1, false, "decode ring real dims T=4 K=3");
+    gdn_ring_case(ctx, {48, 16, 128, 128}, 3, 0, 2, 1, true, "chunked ring real dims T=3");
+}
+
+TEST(VkGdn, RingValidation) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const GdnDims d{6, 2, 16, 8};
+    const std::size_t S = d.state_elems();
+    hv::Ops ops(ctx);
+    std::mt19937 rng(3);
+    const GdnRow r = concat({gdn_row(d, rng), gdn_row(d, rng)});
+    GdnBuffers b = gdn_upload(ctx, r, 2 * std::size_t{d.n_v} * d.d_v);
+    hv::Buffer slab = hv::Buffer::create(ctx, 3 * S * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx);
+    auto base = [&] {
+        hv::GdnDecodeArgs a = gdn_args(b, slab, d, 2);
+        a.ring = hv::GdnRing{3, 0};
+        return a;
+    };
+    EXPECT_NO_THROW(ops.gated_delta_rule_decode(s, base()));
+    auto a = base();
+    a.ring = hv::GdnRing{1, 0};  // P < 2
+    EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
+    a = base();
+    a.ring = hv::GdnRing{3, 3};  // live >= P
+    EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
+    a = base();
+    a.ring = hv::GdnRing{3, 0};
+    a.n_slots = 3;  // slots > P-1
+    EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
+    a = base();
+    a.state_out = hv::BufferView(slab, 0, S * 4);  // state_out must be unset with a ring
+    EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
+    a = base();
+    a.state = f32_view(slab, S);  // slab view too small for P states from here
+    EXPECT_THROW(ops.gated_delta_rule_decode(s, a), halo::Error);
+    s.submit_and_wait();
+}
+
 // ---------------------------------------------------------------- argmax
 
 namespace {

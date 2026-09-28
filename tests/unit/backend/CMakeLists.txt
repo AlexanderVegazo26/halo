@@ -9,7 +9,7 @@ target_compile_options(test_backend PRIVATE -ffp-contract=off)
 if(TARGET halo_backend_vulkan)
   halo_add_test(test_vulkan_backend
     SOURCES test_vulkan_backend.cpp
-    LIBS halo_backend_vulkan_adapter halo_tensor)
+    LIBS halo_backend_vulkan_adapter halo_tensor halo_state)
   target_include_directories(test_vulkan_backend PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)
 endif()
 # WS-BI-3 (ADR-001 §6.3): the HIP backend adapter in host emulation vs the CPU backend, per op

@@ -475,14 +475,38 @@ public:
         const std::uint32_t T = a.n_tokens, C = a.channels, K = a.kernel_size;
         const Ref x = r.f32(a.x, T, C, Access::Read, "x");
         const Ref w = r.f32(a.weight, C, K, Access::Read, "weight");
-        const Ref cs = r.f32(a.conv_state, K - 1, C, Access::Write, "conv_state");
         const Ref out = r.f32(a.out, T, C, Access::Write, "out");
+        const std::uint64_t state_floats = mul_u64(K - 1, C, r.op(), "conv_state");
+        r.no_overlap(out, x);
+        r.no_overlap(out, w);
+        if (a.ring) {
+            // ADR-001 §5.3: conv_state is the whole slab of P dense conv states; the kernel
+            // derives input/final/slot addresses from the ring.
+            const Ref slab = r.f32(a.conv_state, a.ring->p, state_floats, Access::Write, "conv_state slab");
+            HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                       "CONV1D_SHORT: with a state ring, state_slots is derived from the slab and must be empty");
+            r.no_overlap(out, slab);
+            r.no_overlap(slab, x);
+            r.no_overlap(slab, w);
+            if (T == 0 || C == 0) return;
+            hv::Conv1dArgs c;
+            c.x = x.view;
+            c.weight = w.view;
+            if (state_floats > 0) c.conv_state = slab.view;
+            c.out = out.view;
+            c.n_tokens = T;
+            c.channels = C;
+            c.kernel = K;
+            c.n_slots = a.n_slots;
+            c.ring = hv::GdnRing{a.ring->p, a.ring->live};
+            ops_.causal_conv1d_silu(st.s(), c);
+            return;
+        }
+        const Ref cs = r.f32(a.conv_state, K - 1, C, Access::Write, "conv_state");
         const std::uint64_t slot_floats = mul_u64(mul_u64(a.n_slots, K - 1, r.op(), "slots"), C, r.op(), "slots");
         const Ref sl = r.f32(a.state_slots, 1, slot_floats, Access::Write, "state_slots");
         HALO_CHECK(cs.extent == 0 || cs.stride == std::uint64_t{C} * kF32, ErrorCode::Kernel,
                    "CONV1D_SHORT: conv_state must be dense");
-        r.no_overlap(out, x);
-        r.no_overlap(out, w);
         r.no_overlap(out, cs);
         r.no_overlap(out, sl);
         r.no_overlap(cs, x);
@@ -528,10 +552,48 @@ public:
         const Ref v = r.f32(a.v, T, v_cols, Access::Read, "v");
         const Ref g = r.f32(a.g, T, a.n_v, Access::Read, "g");
         const Ref beta = r.f32(a.beta, T, a.n_v, Access::Read, "beta");
+        const Ref out = r.f32(a.out, T, v_cols, Access::Write, "out");
+        if (a.ring) {
+            // ADR-001 §5.3: state is the whole slab of P dense states; the kernel derives
+            // the input (slab[live]), final state and rollback slots from the ring.
+            const Ref slab = r.f32(a.state, a.ring->p, state_floats, Access::Write, "state slab");
+            HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                       "GATED_DELTANET: with a state ring, state_slots is derived from the slab and must be empty");
+            for (const Ref* i : {&q, &k, &v, &g, &beta}) r.no_overlap(slab, *i);
+            r.no_overlap(out, slab);
+            if (T == 0) return;
+            hv::GdnDecodeArgs d;
+            d.q = q.view;
+            d.k = k.view;
+            d.v = v.view;
+            d.g = g.view;
+            d.beta = beta.view;
+            d.state = slab.view;
+            d.out = out.view;
+            d.n_v = a.n_v;
+            d.n_k = a.n_k;
+            d.d_k = a.d_k;
+            d.d_v = a.d_v;
+            d.n_tokens = T;
+            d.n_slots = a.n_slots;
+            d.qk_l2norm = a.qk_l2norm;
+            d.q_scale = a.q_scale;
+            d.ring = hv::GdnRing{a.ring->p, a.ring->live};
+            if (!chunked) {
+                ops_.gated_delta_rule_decode(st.s(), d);
+                return;
+            }
+            hv::GdnChunkedArgs c;
+            c.gdn = d;
+            c.chunk_size = a.chunk_size;
+            c.workspace = st.scratch(hv::gdn_chunked_workspace_bytes(d, a.chunk_size));
+            c.status = st.status_word("GATED_DELTANET (chunked)");
+            ops_.gated_delta_rule_chunked(st.s(), c);
+            return;
+        }
         const Ref stt = r.f32(a.state, 1, state_floats, Access::Write, "state");
         const std::uint64_t slot_floats = mul_u64(a.n_slots, state_floats, r.op(), "slots");
         const Ref sl = r.f32(a.state_slots, 1, slot_floats, Access::Write, "state_slots");
-        const Ref out = r.f32(a.out, T, v_cols, Access::Write, "out");
         for (const Ref* o : {&stt, &sl, &out}) {
             for (const Ref* i : {&q, &k, &v, &g, &beta}) r.no_overlap(*o, *i);
         }

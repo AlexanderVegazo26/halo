@@ -16,7 +16,7 @@
 //     Compared after every call: per-layer inputs (capture_layer_inputs), hidden rows, full
 //     logits rows, the whole KV pool storage of both pools (sentinel positions must match
 //     exactly, i.e. both sides wrote the same rows), and every GDN layer's live recurrent and
-//     conv state plus the written slots.
+//     conv state plus the whole ring slab (every physical slot, ADR-001 §5.3).
 //     Derivation: the Vulkan kernels are within ~1e2 u (u = 2^-24, ~6e-6 relative) of the CPU
 //     op per op (a-priori bounds, tests/unit/vulkan; observed 1e-3..1e-1 of those bounds). A
 //     forward of the tiny model is ~9 layers x ~15 ops; rounding differences propagate through
@@ -255,14 +255,24 @@ private:
             auto& gv = vk_.seqs[si]->gdn;
             auto& gc = cpu_.seqs[si]->gdn;
             EXPECT_EQ(vk_.seqs[si]->kv.length(), cpu_.seqs[si]->kv.length());
+            EXPECT_EQ(gv.live(), gc.live()) << what << " seq " << si << " ring live";
+            // The Vulkan slab is device-resident: refresh its host mirror, then compare the
+            // whole ring (live state + every physical slot, ADR-001 §5.3).
+            gv.pull();
+            const std::size_t p = gv.ring_size();
             for (std::size_t l = 0; l < shape.n_layers; ++l) {
-                const std::string p = what + " seq " + std::to_string(si) + " gdn layer " + std::to_string(l);
-                check(p + " recurrent", rel_l2(gv.recurrent(l), gc.recurrent(l)));
+                const std::string pr = what + " seq " + std::to_string(si) + " gdn layer " + std::to_string(l);
+                check(pr + " recurrent", rel_l2(gv.recurrent(l), gc.recurrent(l)));
                 const auto cv = gv.conv(l), cc = gc.conv(l);
-                check(p + " conv", rel_l2(std::span<const float>(cv.data(), cv.rows() * cv.cols()),
-                                          std::span<const float>(cc.data(), cc.rows() * cc.cols())));
-                check(p + " recurrent slots", rel_l2(gv.recurrent_slots(l, k_slots), gc.recurrent_slots(l, k_slots)));
-                check(p + " conv slots", rel_l2(gv.conv_slots(l, k_slots), gc.conv_slots(l, k_slots)));
+                check(pr + " conv", rel_l2(std::span<const float>(cv.data(), cv.rows() * cv.cols()),
+                                           std::span<const float>(cc.data(), cc.rows() * cc.cols())));
+                check(pr + " recurrent ring", rel_l2(gv.slab().subspan(l * p * shape.recurrent_floats(),
+                                                                       p * shape.recurrent_floats()),
+                                                       gc.slab().subspan(l * p * shape.recurrent_floats(),
+                                                                         p * shape.recurrent_floats())));
+                const std::size_t cb = shape.n_layers * p * shape.recurrent_floats() + l * p * shape.conv_floats();
+                check(pr + " conv ring", rel_l2(gv.slab().subspan(cb, p * shape.conv_floats()),
+                                                gc.slab().subspan(cb, p * shape.conv_floats())));
             }
         }
     }

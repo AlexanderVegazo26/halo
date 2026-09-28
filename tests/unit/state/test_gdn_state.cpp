@@ -49,25 +49,27 @@ Inputs make_inputs(std::size_t T, unsigned seed) {
     return in;
 }
 
-/// Runs rows [r0, r0 + n) of `in` through layer `layer` of `s` (conv then GDN), writing
-/// n_slots slots, and records them as the forward does.
+/// Runs rows [r0, r0 + n) of `in` through layer `layer` of `s` (conv then GDN) over the
+/// state ring, writing n_slots slots.
 void run(GdnState& s, std::size_t layer, const Inputs& in, std::size_t r0, std::size_t n, std::size_t n_slots) {
     using halo::cpu::ConstRows;
     using halo::cpu::Rows;
     std::vector<float> x(in.x.begin() + static_cast<std::ptrdiff_t>(r0 * 48), in.x.begin() + static_cast<std::ptrdiff_t>((r0 + n) * 48));
     halo::cpu::causal_conv1d_silu(ConstRows(std::span<const float>(x), n, 48), ConstRows(std::span<const float>(in.w), 48, 4),
-                                  s.conv(layer), Rows(std::span(x), n, 48), nullptr, s.conv_slots(layer, n_slots));
+                                  s.conv_ring(layer, n_slots), Rows(std::span(x), n, 48));
     const halo::cpu::GdnInputs gi{
         ConstRows(&in.q[r0 * 16], n, 16, 16), ConstRows(&in.k[r0 * 16], n, 16, 16), ConstRows(&in.v[r0 * 32], n, 32, 32),
         ConstRows(&in.g[r0 * 4], n, 4, 4),    ConstRows(&in.beta[r0 * 4], n, 4, 4),
     };
     std::vector<float> o(n * 32);
-    halo::cpu::gated_delta_rule_recurrent(kDims, gi, s.recurrent(layer), Rows(std::span(o), n, 32),
-                                          halo::cpu::GdnQkParams{.qk_l2norm = true, .q_scale = 0.25f}, nullptr,
-                                          s.recurrent_slots(layer, n_slots));
+    halo::cpu::gated_delta_rule_recurrent(kDims, gi, s.recurrent_ring(layer, n_slots), Rows(std::span(o), n, 32),
+                                          halo::cpu::GdnQkParams{.qk_l2norm = true, .q_scale = 0.25f});
 }
 
+/// A forward over n rows, as models::Qwen35 drives the state: record the base, run every
+/// layer, commit (live advance) with the slots recorded.
 void run_all_layers(GdnState& s, const Inputs& a, const Inputs& b, std::size_t r0, std::size_t n, std::size_t n_slots) {
+    s.begin_step(n, n_slots);
     run(s, 0, a, r0, n, n_slots);
     run(s, 1, b, r0, n, n_slots);
     s.mark_slots_written(n, n_slots);
@@ -94,19 +96,50 @@ TEST(GdnState, CommitRowsKeptEqualsRunningOnlyTheKeptRowsBitwise) {
         // history of 3 rows, then a slot-writing call over T rows, keep `kept`
         GdnState spec(kShape, T);
         run_all_layers(spec, a, b, 0, 3, 0);
-        spec.drop_slots();
         run_all_layers(spec, a, b, 3, T, T);
         EXPECT_EQ(spec.slot_rows(), T);
         EXPECT_EQ(spec.slots_valid(), T);
         spec.commit_rows_kept(T, kept);
-        EXPECT_EQ(spec.slots_valid(), 0u) << "commit invalidates the slots";
+        EXPECT_EQ(spec.slots_valid(), 0u) << "commit ends the pending verify";
         // reference: the same history, then only the kept rows, no slots
         GdnState ref(kShape, 0);
         run_all_layers(ref, a, b, 0, 3, 0);
         run_all_layers(ref, a, b, 3, kept, 0);
         EXPECT_EQ(spec.snapshot().data, ref.snapshot().data) << "recurrent + conv state of every layer";
-        EXPECT_EQ(spec.commit_bytes(T, kept), kept == T ? 0u : 2 * kShape.total_bytes());
+        EXPECT_EQ(spec.commit_bytes(T, kept), 0u) << "the ring commit moves one integer, not a state";
     }
+}
+
+TEST(GdnState, RingCommitIsOneIntegerFromTheRecordedBase) {
+    // ADR-001 §5.3: decode/prefill commit is live = (base+1) mod P; a verify commit is
+    // live = (base + 1 + (T - m)) mod P; a failure leaves live unchanged.
+    const Inputs a = make_inputs(8, 7), b = make_inputs(8, 8);
+    GdnState s(kShape, 2);  // P = 3
+    EXPECT_EQ(s.live(), 0u);
+    EXPECT_EQ(s.ring_size(), 3u);
+    s.begin_step(3, 0);  // a step that then "fails": no mark -> live unchanged
+    EXPECT_EQ(s.live(), 0u);
+    run_all_layers(s, a, b, 0, 3, 0);
+    EXPECT_EQ(s.live(), 1u) << "decode commit: live = base + 1";
+    run_all_layers(s, a, b, 3, 2, 0);
+    EXPECT_EQ(s.live(), 2u);
+    run_all_layers(s, a, b, 5, 3, 0);
+    EXPECT_EQ(s.live(), 0u) << "the ring wraps mod P";
+    run_all_layers(s, a, b, 0, 5, 2);
+    EXPECT_EQ(s.live(), 1u) << "after a clean status, before the verify commit";
+    EXPECT_THROW(s.begin_step(1, 0), halo::Error) << "a forward with an uncommitted verify is Error(Api)";
+    EXPECT_EQ(s.live(), 1u);
+    EXPECT_THROW(s.commit_rows_kept(5, 3), halo::Error) << "slot 2 was never written (only 2 slots requested)";
+    s.commit_rows_kept(5, 4);  // keep 4 of 5: live = base(0) + 1 + slot 1
+    EXPECT_EQ(s.live(), 2u);
+    EXPECT_EQ(s.slots_valid(), 0u);
+    // drop_slots accepts the whole call.
+    run_all_layers(s, a, b, 0, 4, 2);
+    EXPECT_EQ(s.live(), 0u);
+    s.drop_slots();
+    EXPECT_EQ(s.live(), 0u);
+    run_all_layers(s, a, b, 0, 1, 0);
+    EXPECT_EQ(s.live(), 1u);
 }
 
 TEST(GdnState, FewerSlotsThanRowsLimitsRollbackDepth) {
@@ -125,7 +158,7 @@ TEST(GdnState, FewerSlotsThanRowsLimitsRollbackDepth) {
     GdnState ref(kShape, 0);
     run_all_layers(ref, a, b, 0, 5, 0);
     EXPECT_EQ(s.snapshot().data, ref.snapshot().data);
-    EXPECT_THROW((void)s.recurrent_slots(0, 5), halo::Error) << "more slots than allocated";
+    EXPECT_THROW(s.begin_step(1, 5), halo::Error) << "more slots than the ring holds";
     EXPECT_THROW((void)s.recurrent(2), halo::Error) << "layer out of range";
 }
 

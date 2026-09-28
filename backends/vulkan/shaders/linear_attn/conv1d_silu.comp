@@ -27,6 +27,10 @@ layout(push_constant) uniform Push {
     uint kernel;
     uint n_slots;   // slots actually written: min(T, n_slots)
     uint x_off, x_stride, w_off, w_stride, st_off, st_stride, o_off, o_stride, sl_off;
+    // State ring (ADR-001 §5.3): ring_p != 0 -> the state and slot bindings name the slab of
+    // ring_p dense conv states (st_off = slot 0's offset); input slab[ring_live], final
+    // state slab[(ring_live+1) mod ring_p], logical slot s at slab[(ring_live+1+s) mod p].
+    uint ring_p, ring_live;
 } pc;
 
 void main() {
@@ -36,8 +40,11 @@ void main() {
     float wt[MAX_K];
     float h[MAX_K];
     for (uint j = 0u; j < pc.kernel; ++j) wt[j] = w[pc.w_off + c * pc.w_stride + j];
-    for (uint j = 0u; j < hist; ++j) h[j] = st[pc.st_off + j * pc.st_stride + c];
     const uint slot_n = hist * pc.channels;
+    const bool ring = pc.ring_p != 0u;
+    const uint st_in = ring ? pc.st_off + pc.ring_live * slot_n : pc.st_off;
+    const uint st_out = ring ? pc.st_off + ((pc.ring_live + 1u) % pc.ring_p) * slot_n : pc.st_off;
+    for (uint j = 0u; j < hist; ++j) h[j] = st[st_in + j * pc.st_stride + c];
     for (uint t = 0u; t < pc.n_tokens; ++t) {
         const float xv = x[pc.x_off + t * pc.x_stride + c];
         precise float acc = 0.0;
@@ -54,8 +61,10 @@ void main() {
         o[pc.o_off + t * pc.o_stride + c] = halo_silu(acc);
         const uint slot = pc.n_tokens - 1u - t;
         if (slot < pc.n_slots) {
-            for (uint j = 0u; j < hist; ++j) slots[pc.sl_off + slot * slot_n + j * pc.channels + c] = h[j];
+            const uint dst = ring ? pc.st_off + ((pc.ring_live + 1u + slot) % pc.ring_p) * slot_n
+                                  : pc.sl_off + slot * slot_n;
+            for (uint j = 0u; j < hist; ++j) slots[dst + j * pc.channels + c] = h[j];
         }
     }
-    for (uint j = 0u; j < hist; ++j) st[pc.st_off + j * pc.st_stride + c] = h[j];
+    for (uint j = 0u; j < hist; ++j) st[st_out + j * pc.st_stride + c] = h[j];
 }

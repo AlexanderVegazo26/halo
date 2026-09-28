@@ -293,8 +293,67 @@ TEST(CpuConv1d, RollbackSlotsEqualTruncatedRunBitwise) {
                  halo::Error);
 }
 
-// ---------------------------------------------------------------------------- elementwise
+TEST(CpuConv1d, RingFormMatchesSlotFormBitwise) {
+    // ADR-001 §5.3: the ring form places the same values the conv_state/state_slots form
+    // computes: final state at slab[(live+1) mod P], logical slot s at slab[(live+1+s) mod P].
+    Rng rng(14);
+    const std::size_t C = 70, K = 4;
+    for (std::size_t T : {1u, 2u, 3u, 9u}) {
+        auto x = rng.normal(T * C), w = rng.normal(C * K, 0.5f), st0 = rng.normal((K - 1) * C);
+        for (std::size_t n_slots : {0u, 3u}) {
+            for (std::size_t P : {2u, 5u}) {
+                if (n_slots > P - 1) continue;
+                for (std::size_t live : {std::size_t{0}, P - 1}) {  // covers the wrap
+                    SCOPED_TRACE(testing::Message() << "T=" << T << " n_slots=" << n_slots << " P=" << P
+                                                    << " live=" << live);
+                    auto st = st0;
+                    std::vector<float> y(T * C), slots(n_slots * (K - 1) * C, 12345.0f);
+                    causal_conv1d_silu(cview(x, T, C), cview(w, C, K), view(st, K - 1, C), view(y, T, C), nullptr,
+                                       slots);
+                    const std::size_t sn = (K - 1) * C;
+                    std::vector<float> slab(P * sn, 12345.0f);
+                    std::copy_n(st0.begin(), sn, slab.begin() + static_cast<std::ptrdiff_t>(live * sn));
+                    std::vector<float> yr(T * C);
+                    causal_conv1d_silu(cview(x, T, C), cview(w, C, K),
+                                       StateRingView{std::span<float>(slab), P, live, n_slots}, view(yr, T, C));
+                    EXPECT_TRUE(bitwise_equal(y, yr)) << "out differs";
+                    // The ring always writes the final state (logical slot 0), n_slots or
+                    // not; rollback slots are s < min(T, n_slots) (ADR-001 §5.3).
+                    const std::size_t used = std::max<std::size_t>(1, std::min(T, n_slots));
+                    for (std::size_t p = 0; p < P; ++p) {
+                        const auto phys = std::span(slab).subspan(p * sn, sn);
+                        if (p == live) {
+                            EXPECT_TRUE(bitwise_equal(phys, st0)) << "the input slot was written";
+                            continue;
+                        }
+                        const std::size_t s = (p + P - ((live + 1) % P)) % P;
+                        if (s >= used) {
+                            for (float e : phys) EXPECT_EQ(e, 12345.0f) << "unwritten physical slot " << p;
+                        } else if (s == 0) {
+                            EXPECT_TRUE(bitwise_equal(phys, st)) << "final state";
+                        } else {
+                            EXPECT_TRUE(bitwise_equal(phys, std::span(slots).subspan(s * sn, sn))) << "slot " << s;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Validation.
+    const std::size_t sn = (K - 1) * C;
+    std::vector<float> x(2 * C), w(C * K), slab(5 * sn, 0.0f), y(2 * C);
+    EXPECT_THROW(causal_conv1d_silu(cview(x, 2, C), cview(w, C, K), StateRingView{slab, 1, 0, 0}, view(y, 2, C)),
+                 halo::Error)
+        << "P < 2";
+    EXPECT_THROW(causal_conv1d_silu(cview(x, 2, C), cview(w, C, K), StateRingView{slab, 5, 5, 0}, view(y, 2, C)),
+                 halo::Error)
+        << "live >= P";
+    EXPECT_THROW(causal_conv1d_silu(cview(x, 2, C), cview(w, C, K), StateRingView{slab, 5, 0, 5}, view(y, 2, C)),
+                 halo::Error)
+        << "slots > P-1";
+}
 
+// ---------------------------------------------------------------------------- elementwise
 TEST(CpuElementwise, MatchFp64AndTorchThresholds) {
     std::vector<float> x;
     for (int i = -3000; i <= 3000; ++i) x.push_back(static_cast<float>(i) * 0.01f);

@@ -28,8 +28,9 @@
 /// WS-BI-1 scope. Status words (StatusRef) are part of the contract, but no backend
 /// implements them yet: every args struct's `status` must be empty, and a data error
 /// (NaN logit, positive g in chunked GDN, bad block id) raises Error(Kernel) synchronously
-/// on the CPU backend, exactly as the halo::cpu function does. Status words, per-sequence
-/// owners and the GDN state ring (ADR §5.3) arrive in WS-BI-2.
+/// on the CPU backend, exactly as the halo::cpu function does. Per-sequence status words
+/// arrive with the rest of WS-BI-2. The GDN/conv state ring (ADR §5.3) exists: GdnArgs /
+/// Conv1dArgs carry an optional StateRing, implemented by the CPU, Vulkan and HIP backends.
 ///
 /// Threading: a Backend and its Streams are driven by one thread (the engine worker). The
 /// CPU backend is the exception: its ops are synchronous and share only the ThreadPool, so
@@ -235,12 +236,25 @@ struct GdnGateArgs {
     KernelChoice kernel{};
 };
 
+/// State ring addressing (ADR-001 §5.3): with this set, the op's state operand names the
+/// sequence's whole per-layer slab of `p` dense physical states. The op reads slab[live]
+/// (never written), always writes the final state (logical slot 0) to slab[(live+1) mod p]
+/// and rollback slot s to slab[(live+1+s) mod p] for s < min(T, n_slots). Requires
+/// p >= 2, live < p and n_slots <= p - 1.
+struct StateRing {
+    std::uint32_t p = 0;
+    std::uint32_t live = 0;
+};
+
 /// CONV1D_SHORT (cpu::causal_conv1d_silu). x, out: n_tokens rows of [channels]; weight:
-/// channels rows of [kernel_size]; conv_state: kernel_size-1 rows of [channels], in/out (WS-BI-1:
-/// in place, as today); state_slots: n_slots dense states (D-012). out must not overlap x.
+/// channels rows of [kernel_size]; conv_state: kernel_size-1 rows of [channels], in/out;
+/// state_slots: n_slots dense states (D-012). out must not overlap x.
+/// With `ring` set (ADR-001 §5.3), conv_state instead names the whole slab of ring.p dense
+/// conv states and state_slots must be empty — the ring overload of the cpu reference.
 struct Conv1dArgs {
     TensorRef x{}, weight{}, conv_state{}, out{}, state_slots{};
     std::uint32_t n_tokens = 0, channels = 0, kernel_size = 4, n_slots = 0;
+    std::optional<StateRing> ring{};
     KernelChoice kernel{};
 };
 
@@ -248,8 +262,10 @@ enum class GdnForm : std::uint8_t { Recurrent, Chunked };
 enum class GdnHeadMapping : std::uint8_t { Tiled, Grouped };
 
 /// GATED_DELTANET (cpu::gated_delta_rule_recurrent / _chunked). D-016: q, k are raw; the
-/// forward always sets qk_l2norm and q_scale explicitly. state: [n_v, d_k, d_v] in/out
-/// (WS-BI-1: in place); state_slots: n_slots states (D-012); out must not overlap anything.
+/// forward always sets qk_l2norm and q_scale explicitly. state: [n_v, d_k, d_v] in/out;
+/// state_slots: n_slots states (D-012); out must not overlap anything.
+/// With `ring` set (ADR-001 §5.3), state instead names the whole slab of ring.p dense
+/// states and state_slots must be empty (the ring overloads of the cpu reference).
 struct GdnArgs {
     GdnForm form = GdnForm::Recurrent;
     TensorRef q{}, k{}, v{}, g{}, beta{}, state{}, state_slots{}, out{};
@@ -258,6 +274,7 @@ struct GdnArgs {
     bool qk_l2norm = true;
     std::optional<float> q_scale{};  ///< nullopt = 1/sqrt(d_k) (D-016 amendment)
     std::uint32_t chunk_size = 64;   ///< Chunked only
+    std::optional<StateRing> ring{};
     KernelChoice kernel{};
     StatusRef status{};
 };

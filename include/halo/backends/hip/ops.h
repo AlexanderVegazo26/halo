@@ -88,7 +88,16 @@ enum class GdnHeadMapping {
 ///  - out: T rows of [n_v * d_v]; must not overlap any other operand.
 ///  - state_slots (D-012; empty = none): n_slots states back to back; slot s receives the
 ///    state after row T-1-s for s < min(T, n_slots); slots s >= T are left untouched.
+///  - ring (ADR-001 §5.3, WS-BI-2): when set, `state` names the whole slab of ring->p dense
+///    states, and state_out / state_slots must stay unset — they are derived: the kernel
+///    reads slab[live] (never written), writes the final state to slab[(live+1) mod p] and
+///    logical slot s to slab[(live+1+s) mod p]. Requires p >= 2 and n_slots <= p - 1.
 /// Limits of this backend: d_k <= 128 (register-resident state column), n_tokens >= 1.
+struct GdnRing {
+    std::uint32_t p = 0;
+    std::uint32_t live = 0;
+};
+
 struct GdnArgs {
     BufferView q{}, k{}, v{}, g{}, beta{};
     BufferView state{};
@@ -104,6 +113,7 @@ struct GdnArgs {
     GdnHeadMapping mapping = GdnHeadMapping::Tiled;
     bool qk_l2norm = true;         ///< D-016
     std::optional<float> q_scale{};  ///< D-016; nullopt = 1/sqrt(d_k)
+    std::optional<GdnRing> ring{};   ///< ADR-001 §5.3
 };
 
 /// Extra operands of the chunked form.
@@ -133,7 +143,10 @@ inline constexpr std::uint32_t kStatusBadBlock = 4u;
 
 /// CONV1D_SHORT (cpu::causal_conv1d_silu): causal depthwise conv1d (no bias) + SiLU.
 ///  - x: T rows of [C]; weight: C rows of [K] (tap K-1 = current input); K in 1..8.
-///  - conv_state: K-1 rows of [C], in/out (oldest first).
+///  - conv_state: K-1 rows of [C], in/out (oldest first). With `ring` set (ADR-001 §5.3):
+///    the whole slab of ring->p dense conv states instead; the kernel reads slab[live]
+///    (never written) and writes the final state to slab[(live+1) mod p] and logical slot s
+///    to slab[(live+1+s) mod p]; state_slots must stay empty then.
 ///  - out: T rows of [C]; may alias x exactly.
 ///  - state_slots (optional): n_slots * (K-1) * C floats, slot s = conv state after row
 ///    T-1-s for s < min(T, n_slots) (dense [K-1, C] per slot).
@@ -144,6 +157,7 @@ struct Conv1dArgs {
     std::uint32_t channels = 0;
     std::uint32_t kernel = 4;
     std::uint32_t n_slots = 0;
+    std::optional<GdnRing> ring{};  ///< ADR-001 §5.3
 };
 
 /// GATED_NORM (cpu::gated_rms_norm): out[r] = (w * (x̂[r])) * silu(z[r]), x̂ = x * rsqrt(

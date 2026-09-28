@@ -166,6 +166,116 @@ TEST(VkLayer, Conv1dSiluMatchesCpuStateAndSlotsBitwise) {
     conv_case(ctx, 3, 50, 1, 0, false, 6);      // kernel 1 (no state)
 }
 
+namespace {
+
+/// Ring form (ADR-001 §5.3) vs the legacy conv_state + slots form: bit-identical values at
+/// modular slab positions; the input slot and unwritten physical slots stay untouched.
+void conv_ring_case(const std::shared_ptr<hv::Context>& ctx, std::uint32_t T, std::uint32_t C, std::uint32_t K,
+                    std::uint32_t n_slots, std::uint32_t P, std::uint32_t live, std::uint64_t seed) {
+    const std::string what = "conv1d ring T=" + std::to_string(T) + " C=" + std::to_string(C) + " K=" +
+                             std::to_string(K) + " slots=" + std::to_string(n_slots) + " P=" + std::to_string(P) +
+                             " live=" + std::to_string(live);
+    hv::Ops ops(ctx);
+    ct::Rng rng(seed);
+    const std::vector<float> x = rng.normal(std::size_t{T} * C, 1.5f);
+    const std::vector<float> w = rng.normal(std::size_t{C} * K, 0.6f);
+    const std::size_t hist = K - 1;
+    const std::size_t sn = hist * C;
+    const std::vector<float> s0 = rng.normal(sn, 1.0f);
+    const float sentinel = 99.0f;
+    // CPU reference: the ring overload over a host slab (bit-identical to the slot form,
+    // tests/unit/cpu_kernels) — the Vulkan kernel must match it bit for bit (state/slots are
+    // pure copies; the conv accumulation order is shared).
+    std::vector<float> slab_cpu(std::size_t{P} * sn, sentinel);
+    std::copy(s0.begin(), s0.end(), slab_cpu.begin() + static_cast<std::ptrdiff_t>(live * sn));
+    std::vector<float> out_cpu(x.size());
+    hc::causal_conv1d_silu(crows(x, T, C), crows(w, C, K),
+                           hc::StateRingView{std::span<float>(slab_cpu), P, live, n_slots}, mrows(out_cpu, T, C));
+    // Vulkan.
+    hv::Buffer bx = upload(ctx, std::span<const float>(x), hv::MemoryUsage::HostCached);
+    hv::Buffer bw = upload(ctx, std::span<const float>(w));
+    hv::Buffer bs = upload(ctx, std::span<const float>(slab_cpu), hv::MemoryUsage::HostCached);
+    hv::Buffer bo = hv::Buffer::create(ctx, x.size() * 4, hv::MemoryUsage::HostCached);
+    hv::Conv1dArgs a;
+    a.x = bx;
+    a.weight = bw;
+    if (hist > 0) a.conv_state = bs;
+    a.out = bo;
+    a.n_tokens = T;
+    a.channels = C;
+    a.kernel = K;
+    a.n_slots = n_slots;
+    a.ring = hv::GdnRing{P, live};
+    hv::Stream s(ctx);
+    ops.causal_conv1d_silu(s, a);
+    s.submit_and_wait();
+    // out uses the device exp in SiLU (same bound as the legacy form's test); the state
+    // placement is pure copies and must be bit-identical to the CPU ring overload's slab.
+    const auto out = download<float>(bo, x.size());
+    std::vector<double> acc(x.size());
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t c = 0; c < C; ++c) {
+            double v = 0;
+            for (std::size_t j = 0; j < K; ++j) {
+                const std::ptrdiff_t src = std::ptrdiff_t(t) - std::ptrdiff_t(hist) + std::ptrdiff_t(j);
+                const double in = src >= 0 ? x[std::size_t(src) * C + c] : s0[std::size_t(std::ptrdiff_t(hist) + src) * C + c];
+                v += double(w[c * K + j]) * in;
+            }
+            acc[t * C + c] = std::abs(v);
+        }
+    check_rel(out, out_cpu, [&](std::size_t i) { return 12.0 + 2.0 * acc[i] * 1.001 + 1.0; }, what + " out");
+    if (hist > 0) {
+        EXPECT_TRUE(bitwise(download<float>(bs, slab_cpu.size()), slab_cpu)) << what << ": slab not bit-identical";
+    }
+}
+
+}  // namespace
+
+TEST(VkLayer, Conv1dRingMatchesCpuBitwise) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    conv_ring_case(ctx, 1, 10240, 4, 0, 2, 0, 11);     // decode, real channels
+    conv_ring_case(ctx, 1, 300, 4, 0, 2, 1, 12);       // decode at live=1 (wrap)
+    conv_ring_case(ctx, 5, 10240, 4, 4, 5, 3, 13);     // verify with slots
+    conv_ring_case(ctx, 3, 300, 4, 5, 6, 5, 14);       // slots past T untouched, wrap
+    conv_ring_case(ctx, 70, 257, 4, 0, 3, 2, 15);      // prefill-like
+}
+
+TEST(VkLayer, Conv1dRingValidation) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    hv::Buffer x = hv::Buffer::create(ctx, 4 * 64 * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer w = hv::Buffer::create(ctx, 64 * 4 * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer slab = hv::Buffer::create(ctx, 3 * 3 * 64 * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer o = hv::Buffer::create(ctx, 4 * 64 * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx);
+    auto base = [&] {
+        hv::Conv1dArgs a;
+        a.x = x;
+        a.weight = w;
+        a.conv_state = slab;
+        a.out = o;
+        a.n_tokens = 4;
+        a.channels = 64;
+        a.kernel = 4;
+        a.ring = hv::GdnRing{3, 0};
+        return a;
+    };
+    EXPECT_NO_THROW(ops.causal_conv1d_silu(s, base()));
+    auto a = base();
+    a.ring = hv::GdnRing{1, 0};  // P < 2
+    EXPECT_THROW(ops.causal_conv1d_silu(s, a), halo::Error);
+    a = base();
+    a.ring = hv::GdnRing{3, 3};  // live >= P
+    EXPECT_THROW(ops.causal_conv1d_silu(s, a), halo::Error);
+    a = base();
+    a.n_slots = 3;  // slots > P-1
+    EXPECT_THROW(ops.causal_conv1d_silu(s, a), halo::Error);
+    a = base();
+    a.state_slots = slab;  // slots view must be unset with a ring
+    EXPECT_THROW(ops.causal_conv1d_silu(s, a), halo::Error);
+    s.submit_and_wait();
+}
+
 TEST(VkLayer, Conv1dValidation) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);

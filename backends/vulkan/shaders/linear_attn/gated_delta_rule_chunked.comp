@@ -43,7 +43,7 @@ layout(push_constant) uniform Push {
     uint d_v;
     uint n_tokens;
     uint n_slots;
-    uint in_off, out_off, slots_off;
+    uint in_off, out_off, slots_off;  // ring: in_off = element offset of slot 0 of the slab
     uint qk_l2norm;
     float q_scale;
     uint q_off, q_stride, k_off, k_stride, v_off, v_stride;
@@ -51,6 +51,10 @@ layout(push_constant) uniform Push {
     uint cs;      // chunk size
     uint ws_off;  // element offset of head 0's scratch
     uint st_off;
+    // State ring (ADR-001 §5.3): ring_p != 0 -> the state bindings all name the slab of
+    // ring_p dense states; input slab[ring_live], final state slab[(ring_live+1) mod p],
+    // logical slot s at slab[(ring_live+1+s) mod p].
+    uint ring_p, ring_live;
 } pc;
 
 shared float sq[MAX_DK];
@@ -98,7 +102,29 @@ float dot8(uint a, uint b, uint n) {
     return r;
 }
 
-float state_at(bool first, uint e) { return first ? state_in[pc.in_off + e] : state_out[pc.out_off + e]; }
+// Chunk-start state element e: the input region for the first chunk, the output region
+// after. Ring mode (ADR-001 §5.3): both live in the slab, at modular slot offsets.
+float state_at(bool first, uint e) {
+    if (pc.ring_p != 0u) {
+        const uint state_elems = pc.n_v * pc.d_k * pc.d_v;
+        return first ? state_in[pc.in_off + pc.ring_live * state_elems + e]
+                     : state_out[pc.in_off + ((pc.ring_live + 1u) % pc.ring_p) * state_elems + e];
+    }
+    return first ? state_in[pc.in_off + e] : state_out[pc.out_off + e];
+}
+
+// The output-state element offset of e (the final-state region; the slab slot
+// (ring_live+1) mod p in ring mode).
+uint out_at(uint e) {
+    if (pc.ring_p != 0u) return pc.in_off + ((pc.ring_live + 1u) % pc.ring_p) * (pc.n_v * pc.d_k * pc.d_v) + e;
+    return pc.out_off + e;
+}
+
+// The slot-region element offset of e within logical slot s.
+uint slot_at(uint s, uint e) {
+    if (pc.ring_p != 0u) return pc.in_off + ((pc.ring_live + 1u + s) % pc.ring_p) * (pc.n_v * pc.d_k * pc.d_v) + e;
+    return pc.slots_off + s * (pc.n_v * pc.d_k * pc.d_v) + e;
+}
 
 void main() {
     const uint j = halo_group_id();
@@ -110,7 +136,6 @@ void main() {
     const uint dv = pc.d_v;
     const uint cs = pc.cs;
     const uint head = j * dk * dv;
-    const uint state_elems = pc.n_v * dk * dv;
     const uint W = pc.ws_off + j * head_floats();
     const bool l2 = pc.qk_l2norm != 0u;
     uint p2 = 1u;
@@ -250,8 +275,8 @@ void main() {
                     const uint e = head + i * dv + c;
                     precise float sd = state_at(first, e) * decay;
                     precise float r = sd + upd;
-                    if (slot < pc.n_slots) slots[pc.slots_off + slot * state_elems + e] = r;
-                    if (last) state_out[pc.out_off + e] = r;
+                    if (slot < pc.n_slots) slots[slot_at(slot, e)] = r;
+                    if (last) state_out[out_at(e)] = r;
                 }
             }
         }

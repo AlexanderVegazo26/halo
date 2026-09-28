@@ -42,15 +42,19 @@ layout(push_constant) uniform Push {
     uint d_v;
     uint n_tokens;
     uint n_slots;
-    uint in_off;     // element offset of the input state
-    uint out_off;    // element offset of the output state
-    uint slots_off;  // element offset of slot 0
+    uint in_off;     // element offset of the input state (ring: of slot 0 of the slab)
+    uint out_off;    // element offset of the output state (unused in ring mode)
+    uint slots_off;  // element offset of slot 0 (unused in ring mode)
     uint qk_l2norm;  // 1: L2-normalize q and k per head (eps 1e-6) before use (D-016)
     float q_scale;   // q *= q_scale after the optional normalization (D-016)
     // Operand views (code review S-1), in float elements: sub-alignment remainder of the
     // view and the distance between consecutive tokens (rows).
     uint q_off, q_stride, k_off, k_stride, v_off, v_stride;
     uint g_off, g_stride, b_off, b_stride, o_off, o_stride;
+    // State ring (ADR-001 §5.3): ring_p != 0 -> the three state bindings all name the slab
+    // of ring_p dense states; the input is slab[ring_live], the final state goes to
+    // slab[(ring_live+1) mod ring_p], logical slot s to slab[(ring_live+1+s) mod ring_p].
+    uint ring_p, ring_live;
 } pc;
 
 shared float sq[MAX_DK];
@@ -65,6 +69,9 @@ void main() {
     const uint kh = j % pc.n_k;
     const uint head = j * pc.d_k * pc.d_v;              // head offset inside one state
     const uint state_elems = pc.n_v * pc.d_k * pc.d_v;
+    const bool ring = pc.ring_p != 0u;
+    const uint sin_off = ring ? pc.in_off + pc.ring_live * state_elems : pc.in_off;
+    const uint sout_off = ring ? pc.in_off + ((pc.ring_live + 1u) % pc.ring_p) * state_elems : pc.out_off;
     uint p2 = 1u;  // smallest power of two >= WG
     while (p2 < WG) p2 <<= 1;
 
@@ -109,22 +116,23 @@ void main() {
         const bool first = t == 0u;
         const uint slot = pc.n_tokens - 1u - t;  // slot this row's state belongs to
         const bool to_slot = slot < pc.n_slots;
-        const uint slot_base = pc.slots_off + slot * state_elems + head;
+        const uint slot_base = (ring ? pc.in_off + ((pc.ring_live + 1u + slot) % pc.ring_p) * state_elems
+                                     : pc.slots_off + slot * state_elems) + head;
 
         for (uint b = tid; b < pc.d_v; b += WG) {
             float kv = 0.0;
             for (uint a = 0u; a < pc.d_k; ++a) {
                 const uint e = head + a * pc.d_v + b;
-                const float s0 = first ? state_in[pc.in_off + e] : state_out[pc.out_off + e];
+                const float s0 = first ? state_in[sin_off + e] : state_out[sout_off + e];
                 kv += (s0 * decay) * sk[a];
             }
             const float delta = (v[vrow + b] - kv) * bt;
             float acc = 0.0;
             for (uint a = 0u; a < pc.d_k; ++a) {
                 const uint e = head + a * pc.d_v + b;
-                const float s0 = first ? state_in[pc.in_off + e] : state_out[pc.out_off + e];
+                const float s0 = first ? state_in[sin_off + e] : state_out[sout_off + e];
                 const float s = s0 * decay + sk[a] * delta;
-                state_out[pc.out_off + e] = s;
+                state_out[sout_off + e] = s;
                 if (to_slot) slots[slot_base + a * pc.d_v + b] = s;
                 acc += s * sq[a];
             }

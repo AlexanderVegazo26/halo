@@ -19,15 +19,18 @@ struct ConvParams {
     std::uint64_t x_stride = 0;
     const float* w = nullptr;       // [C, K]
     std::uint64_t w_stride = 0;
-    float* state = nullptr;         // [K-1, C] in/out
+    float* state = nullptr;         // [K-1, C] in/out; ring: the slab[live] input region
     std::uint64_t state_stride = 0;
+    float* state_out = nullptr;     // null = in place (== state); ring: slab[(live+1) mod p]
     float* out = nullptr;           // may equal x (exact alias)
     std::uint64_t out_stride = 0;
-    float* slots = nullptr;         // n_slots * (K-1) * C, slot rows dense (stride C)
+    float* slots = nullptr;         // n_slots * (K-1) * C, slot rows dense (stride C); ring: slab base
     unsigned n_slots = 0;
     unsigned n_tok = 0;
     unsigned channels = 0;
     unsigned k = 0;
+    unsigned ring_p = 0;            ///< ADR-001 §5.3: slab size (0 = contiguous slots region)
+    unsigned ring_live = 0;         ///< the slab slot read this call
 };
 
 struct ConvRegs {
@@ -77,16 +80,17 @@ HALO_HD void conv1d_silu_body(Exec& ex, ConvShared&, const ConvParams& p, unsign
             p.out[t * p.out_stride + c] = siluf(acc);
             const unsigned slot = p.n_tok - 1u - t;
             if (slot < p.n_slots) {
-                float* dst = p.slots + slot * slot_n + c;
+                float* dst = p.slots + ring_slot_off(p.ring_p, p.ring_live, slot, slot_n) + c;
 #pragma unroll
                 for (unsigned j = 0; j < kConvMaxK - 1; ++j) {
                     if (j < hist) dst[static_cast<std::uint64_t>(j) * p.channels] = r.h[j];
                 }
             }
         }
+        float* sout = p.state_out != nullptr ? p.state_out : p.state;
 #pragma unroll
         for (unsigned j = 0; j < kConvMaxK - 1; ++j) {
-            if (j < hist) p.state[j * p.state_stride + c] = r.h[j];
+            if (j < hist) sout[j * p.state_stride + c] = r.h[j];
         }
     });
 }

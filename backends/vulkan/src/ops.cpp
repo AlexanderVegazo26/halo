@@ -237,8 +237,18 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
     HALO_CHECK(a.n_v % a.n_k == 0, ErrorCode::Kernel, "{}: n_v={} is not a multiple of n_k={}", op, a.n_v, a.n_k);
     HALO_CHECK(a.d_k <= options_.gdn_max_dk, ErrorCode::Kernel, "{}: d_k={} > gdn_max_dk={}", op, a.d_k,
                options_.gdn_max_dk);
-    HALO_CHECK(a.n_slots == 0 || !a.state_slots.empty(), ErrorCode::Kernel,
-               "{}: n_slots={} without a state_slots view", op, a.n_slots);
+    const bool ring = a.ring.has_value();
+    if (ring) {
+        HALO_CHECK(a.ring->p >= 2 && a.ring->live < a.ring->p, ErrorCode::Kernel,
+                   "{}: state ring p={} live={} is out of range", op, a.ring->p, a.ring->live);
+        HALO_CHECK(a.n_slots <= a.ring->p - 1, ErrorCode::Kernel, "{}: {} slots requested, ring p - 1 = {}", op,
+                   a.n_slots, a.ring->p - 1);
+        HALO_CHECK(!a.state_out.has_value() && a.state_slots.empty(), ErrorCode::Kernel,
+                   "{}: with a state ring, state_out/state_slots are derived from the slab and must be unset", op);
+    } else {
+        HALO_CHECK(a.n_slots == 0 || !a.state_slots.empty(), ErrorCode::Kernel,
+                   "{}: n_slots={} without a state_slots view", op, a.n_slots);
+    }
     const float q_scale = a.q_scale.value_or(1.0f / std::sqrt(static_cast<float>(a.d_k)));
     HALO_CHECK(std::isfinite(q_scale), ErrorCode::Kernel, "{}: q_scale {} is not finite", op, q_scale);
 
@@ -257,11 +267,16 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
     const Operand og = operand(a.g, T, head_row, Access::Floats, align, op, "g");
     const Operand ob = operand(a.beta, T, head_row, Access::Floats, align, op, "beta");
     const Operand oo = operand(a.out, T, v_row, Access::Floats, align, op, "out");
-    const Operand oin = operand(a.state, 1, s_bytes, Access::Floats, align, op, "state (input region)");
-    const Operand osout = operand(a.state_out.value_or(a.state), 1, s_bytes, Access::Floats, align, op,
-                                  "state_out (output region)");
+    // Ring: `state` is the whole slab of p states; the kernel derives the input, output and
+    // slot addresses from ring {p, live} (one binding for all three roles).
+    const Operand oslab = ring ? operand(a.state, a.ring->p, s_bytes, Access::Floats, align, op, "state slab")
+                               : Operand{};
+    const Operand oin = ring ? oslab : operand(a.state, 1, s_bytes, Access::Floats, align, op, "state (input region)");
+    const Operand osout = ring ? oslab
+                               : operand(a.state_out.value_or(a.state), 1, s_bytes, Access::Floats, align, op,
+                                         "state_out (output region)");
     std::optional<Operand> osl;
-    if (used_slots > 0) {
+    if (!ring && used_slots > 0) {
         osl = operand(a.state_slots, 1, checked_mul(used_slots, s_bytes, op), Access::Floats, align, op,
                       "state_slots (written slots)");
     }
@@ -269,39 +284,50 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
     const std::initializer_list<std::pair<const Operand*, std::string_view>> inputs{
         {&oq, "q"}, {&ok, "k"}, {&ov, "v"}, {&og, "g"}, {&ob, "beta"}};
     require_disjoint(oo, "out", inputs, op);
-    require_disjoint(oo, "out", {{&oin, "state"}, {&osout, "state_out"}, {osl ? &*osl : nullptr, "state_slots"}}, op);
-    require_disjoint(osout, "state_out", inputs, op);
-    // The input and output state regions are identical (in place) or disjoint.
-    HALO_CHECK(!overlaps(oin, osout) || oin.begin == osout.begin, ErrorCode::Kernel,
-               "{}: input state bytes [{}, {}) and output state bytes [{}, {}) partially overlap", op, oin.begin,
-               oin.end, osout.begin, osout.end);
-    if (osl) {
-        require_disjoint(*osl, "state_slots", inputs, op);
-        require_disjoint(*osl, "state_slots", {{&oin, "state"}, {&osout, "state_out"}}, op);
+    require_disjoint(oo, "out", {{&oin, "state"}, {ring ? nullptr : &osout, "state_out"}, {osl ? &*osl : nullptr, "state_slots"}}, op);
+    if (ring) {
+        // The slab is one buffer by construction (slots share it); it must only be disjoint
+        // from the inputs and out.
+        require_disjoint(oslab, "state slab", inputs, op);
+    } else {
+        require_disjoint(osout, "state_out", inputs, op);
+        // The input and output state regions are identical (in place) or disjoint.
+        HALO_CHECK(!overlaps(oin, osout) || oin.begin == osout.begin, ErrorCode::Kernel,
+                   "{}: input state bytes [{}, {}) and output state bytes [{}, {}) partially overlap", op, oin.begin,
+                   oin.end, osout.begin, osout.end);
+        if (osl) {
+            require_disjoint(*osl, "state_slots", inputs, op);
+            require_disjoint(*osl, "state_slots", {{&oin, "state"}, {&osout, "state_out"}}, op);
+        }
     }
 
     const DeviceInfo& info = ctx_->info();
     const std::uint32_t wg = options_.gdn_workgroup;
     const GroupCount groups = grid_1d(a.n_v, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+    const std::uint32_t ring_p = ring ? a.ring->p : 0u;
+    const std::uint32_t ring_live = ring ? a.ring->live : 0u;
     if (chunked == nullptr) {
         struct Push {
             std::uint32_t n_v, n_k, d_k, d_v, n_tokens, n_slots, in_off, out_off, slots_off, qk_l2norm;
             float q_scale;
             std::uint32_t q_off, q_stride, k_off, k_stride, v_off, v_stride, g_off, g_stride, b_off, b_stride, o_off,
                 o_stride;
+            std::uint32_t ring_p, ring_live;  // ADR-001 §5.3; ring_p == 0 = the in/off/slots form
         } push{a.n_v,      a.n_k,      a.d_k,          a.d_v,
-               a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, osout.off,
+               a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, ring ? 0u : osout.off,
                osl ? osl->off : 0u, a.qk_l2norm ? 1u : 0u, q_scale,  oq.off,
                oq.stride,  ok.off,     ok.stride,      ov.off,
                ov.stride,  og.off,     og.stride,      ob.off,
-               ob.stride,  oo.off,     oo.stride};
+               ob.stride,  oo.off,     oo.stride,      ring_p,
+               ring_live};
         static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128-byte minimum");
         const Kernel& k = kernel("gated_delta_rule_decode", 9, sizeof(Push), {{0, wg}, {1, options_.gdn_max_dk}},
                                  {wg, 1, 1});
         // Without slots, binding 8 aliases `out` as a placeholder; the shader never writes it.
+        // With a ring, bindings 5/6/8 all name the slab.
         const std::array bindings{oq.binding, ok.binding,    ov.binding, og.binding,
                                   ob.binding, oin.binding,   osout.binding, oo.binding,
-                                  osl ? osl->binding : oo.binding};
+                                  ring ? oslab.binding : (osl ? osl->binding : oo.binding)};
         stream.dispatch(k, bindings, push, groups);
         return;
     }
@@ -324,13 +350,14 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
         float q_scale;
         std::uint32_t q_off, q_stride, k_off, k_stride, v_off, v_stride, g_off, g_stride, b_off, b_stride, o_off,
             o_stride, cs, ws_off, st_off;
+        std::uint32_t ring_p, ring_live;  // ADR-001 §5.3; ring_p == 0 = the in/off/slots form
     } push{a.n_v,      a.n_k,      a.d_k,          a.d_v,
-           a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, osout.off,
+           a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, ring ? 0u : osout.off,
            osl ? osl->off : 0u, a.qk_l2norm ? 1u : 0u, q_scale,  oq.off,
            oq.stride,  ok.off,     ok.stride,      ov.off,
            ov.stride,  og.off,     og.stride,      ob.off,
            ob.stride,  oo.off,     oo.stride,      cs,
-           ows.off,    ost.off};
+           ows.off,    ost.off,    ring_p,        ring_live};
     static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128-byte minimum");
     struct CheckPush {
         std::uint32_t n_tokens, n_v, g_off, g_stride, st_off;
@@ -343,7 +370,7 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
     const std::array check_bindings{og.binding, ost.binding};
     const std::array bindings{oq.binding,  ok.binding,  ov.binding, og.binding,
                               ob.binding,  oin.binding, osout.binding, oo.binding,
-                              osl ? osl->binding : oo.binding, ows.binding, ost.binding};
+                              ring ? oslab.binding : (osl ? osl->binding : oo.binding), ows.binding, ost.binding};
     stream.fill(*chunked->status.buffer, chunked->status.offset, k_status_bytes, 0u);
     stream.dispatch(kc, check_bindings, check, check_groups);
     stream.dispatch(k, bindings, push, groups);

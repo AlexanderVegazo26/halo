@@ -267,15 +267,15 @@ private:
             EXPECT_TRUE(std::ranges::equal(a.mtp_kv.blocks(), c.mtp_kv.blocks())) << s << " MTP block table";
             EXPECT_EQ(a.gdn.slot_rows(), c.gdn.slot_rows()) << s;
             EXPECT_EQ(a.gdn.slots_valid(), c.gdn.slots_valid()) << s;
+            EXPECT_EQ(a.gdn.live(), c.gdn.live()) << s << " ring live";
+            // The whole ring slab (ADR-001 §5.3): live state + every physical slot.
+            EXPECT_TRUE(compare(mode_, a.gdn.slab(), c.gdn.slab(), b, s + " GDN ring slab"));
             for (std::size_t layer = 0; layer < a.gdn.shape().n_layers; ++layer) {
                 const std::string sl = s + " GDN layer " + std::to_string(layer);
                 EXPECT_TRUE(compare(mode_, a.gdn.recurrent(layer), c.gdn.recurrent(layer), b, sl + " live recurrent"));
                 const auto ca = a.gdn.conv(layer);
                 const auto cc = c.gdn.conv(layer);
                 EXPECT_TRUE(compare(mode_, {ca.data(), ca.rows() * ca.cols()}, {cc.data(), cc.rows() * cc.cols()}, b, sl + " live conv"));
-                EXPECT_TRUE(compare(mode_, a.gdn.recurrent_slots(layer, kSlots), c.gdn.recurrent_slots(layer, kSlots), b,
-                                    sl + " recurrent slots"));
-                EXPECT_TRUE(compare(mode_, a.gdn.conv_slots(layer, kSlots), c.gdn.conv_slots(layer, kSlots), b, sl + " conv slots"));
             }
         }
     }

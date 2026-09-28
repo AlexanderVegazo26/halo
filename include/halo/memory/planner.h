@@ -168,7 +168,9 @@ struct PlanRequest {
     bool mtp_enabled = false;
     std::uint32_t mtp_draft_depth = 0;  ///< must be >= 1 when MTP is enabled
     /// Extra full GDN state copies (recurrent + conv) per sequence kept for rolling back
-    /// rejected draft tokens. Default: draft_depth + 1 when MTP is enabled, else 0.
+    /// rejected draft tokens. Default: draft_depth + 1 when MTP is enabled, else 1 — the
+    /// ADR-001 §5.3 state ring needs P = K + 1 >= 2 physical states even without MTP
+    /// (failure atomicity of every decode step).
     std::optional<std::uint32_t> gdn_rollback_copies;
     PrefixCheckpoints prefix_checkpoints;
     std::uint32_t batch = 512;

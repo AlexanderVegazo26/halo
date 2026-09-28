@@ -186,7 +186,14 @@ struct GdnResolved {
     kern::GdnDimsK dims;
     std::uint64_t state_n = 0;
     float q_scale = 1.0f;
+    std::uint32_t ring_p = 0;    ///< ADR-001 §5.3: slab size (0 = the state/state_out/slots form)
+    std::uint32_t ring_live = 0;
 };
+
+/// Element pointer to physical slot `i` of a slab of states of state_n floats.
+inline float* slab_slot(const Rows& slab, std::uint64_t state_n, std::uint32_t i) {
+    return static_cast<float*>(slab.ptr) + static_cast<std::uint64_t>(i) * state_n;
+}
 
 GdnResolved resolve_gdn(const Target& t, const GdnArgs& a, const char* op) {
     HALO_CHECK(a.n_k > 0 && a.n_v > 0 && a.d_k > 0 && a.d_v > 0, ErrorCode::Kernel,
@@ -207,25 +214,44 @@ GdnResolved resolve_gdn(const Target& t, const GdnArgs& a, const char* op) {
     r.g = resolve(t, a.g, T, a.n_v, op, "g");
     r.beta = resolve(t, a.beta, T, a.n_v, op, "beta");
     r.out = resolve(t, a.out, T, v_cols, op, "out");
-    r.state = resolve(t, a.state, 1, r.state_n, op, "state");
-    r.state_out = a.state_out ? resolve(t, *a.state_out, 1, r.state_n, op, "state_out") : r.state;
-    if (r.state_out.ptr != r.state.ptr) {
-        HALO_CHECK(!overlaps(r.state.range, r.state_out.range), ErrorCode::Kernel,
-                   "{}: state_out partially overlaps state (must be identical or disjoint)", op);
-    }
-    if (a.n_slots > 0 || !a.state_slots.empty()) {
-        HALO_CHECK(a.n_slots > 0 && !a.state_slots.empty(), ErrorCode::Kernel,
-                   "{}: n_slots {} but state_slots is {}", op, a.n_slots, a.state_slots.empty() ? "empty" : "set");
-        r.slots = resolve(t, a.state_slots, a.n_slots, r.state_n, op, "state_slots");
-    }
     const std::initializer_list<Named> inputs{{&r.q, "q"}, {&r.k, "k"}, {&r.v, "v"}, {&r.g, "g"}, {&r.beta, "beta"}};
+    if (a.ring) {
+        // ADR-001 §5.3: `state` is the whole slab of p dense states; input/output/slot
+        // regions are derived (the kernels address slots modularly from the slab base).
+        const std::uint32_t rp = a.ring->p, live = a.ring->live;
+        HALO_CHECK(rp >= 2 && live < rp, ErrorCode::Kernel, "{}: state ring p={} live={} is out of range", op, rp, live);
+        HALO_CHECK(a.n_slots <= rp - 1, ErrorCode::Kernel, "{}: {} slots requested, ring p - 1 = {}", op, a.n_slots,
+                   rp - 1);
+        HALO_CHECK(!a.state_out.has_value() && a.state_slots.empty(), ErrorCode::Kernel,
+                   "{}: with a state ring, state_out/state_slots are derived from the slab and must be unset", op);
+        r.state = resolve(t, a.state, rp, r.state_n, op, "state slab");
+        // state_out / slots name the slab: the kernels address their regions modularly.
+        r.state_out = r.state;
+        r.slots = r.state;
+        r.ring_p = rp;
+        r.ring_live = live;
+        check_disjoint(r.state, "state slab", inputs, op);
+        check_disjoint(r.out, "out", {{&r.state, "state slab"}}, op);
+    } else {
+        r.state = resolve(t, a.state, 1, r.state_n, op, "state");
+        r.state_out = a.state_out ? resolve(t, *a.state_out, 1, r.state_n, op, "state_out") : r.state;
+        if (r.state_out.ptr != r.state.ptr) {
+            HALO_CHECK(!overlaps(r.state.range, r.state_out.range), ErrorCode::Kernel,
+                       "{}: state_out partially overlaps state (must be identical or disjoint)", op);
+        }
+        if (a.n_slots > 0 || !a.state_slots.empty()) {
+            HALO_CHECK(a.n_slots > 0 && !a.state_slots.empty(), ErrorCode::Kernel,
+                       "{}: n_slots {} but state_slots is {}", op, a.n_slots, a.state_slots.empty() ? "empty" : "set");
+            r.slots = resolve(t, a.state_slots, a.n_slots, r.state_n, op, "state_slots");
+        }
+        check_disjoint(r.out, "out", {{&r.state, "state"}, {&r.state_out, "state_out"}}, op);
+        check_disjoint(r.state, "state", inputs, op);
+        check_disjoint(r.state_out, "state_out", inputs, op);
+        check_disjoint(r.slots, "state_slots", inputs, op);
+        check_disjoint(r.slots, "state_slots",
+                       {{&r.state, "state"}, {&r.state_out, "state_out"}, {&r.out, "out"}}, op);
+    }
     check_disjoint(r.out, "out", inputs, op);
-    check_disjoint(r.out, "out", {{&r.state, "state"}, {&r.state_out, "state_out"}}, op);
-    check_disjoint(r.state, "state", inputs, op);
-    check_disjoint(r.state_out, "state_out", inputs, op);
-    check_disjoint(r.slots, "state_slots", inputs, op);
-    check_disjoint(r.slots, "state_slots",
-                   {{&r.state, "state"}, {&r.state_out, "state_out"}, {&r.out, "out"}}, op);
     r.q_scale = resolve_q_scale(a);
     r.in = kern::GdnIn{r.q.ptr, r.k.ptr, r.v.ptr, r.g.ptr, r.beta.ptr,
                        r.q.stride, r.k.stride, r.v.stride, r.g.stride, r.beta.stride};
@@ -291,14 +317,20 @@ void Ops::gated_delta_rule_recurrent(const Target& target, const GdnArgs& args) 
     p.in = r.in;
     p.dims = r.dims;
     p.n_tok = args.n_tokens;
-    p.state_in = r.state.ptr;
-    p.state_out = r.state_out.ptr;
+    // Ring (ADR-001 §5.3): state_in = slab[live], state_out = slab[(live+1) mod p], slots
+    // addressed modularly from the slab base by the kernel.
+    const bool ring = r.ring_p != 0;
+    p.state_in = ring ? slab_slot(r.state, r.state_n, r.ring_live) : static_cast<const float*>(r.state.ptr);
+    p.state_out = ring ? slab_slot(r.state, r.state_n, (r.ring_live + 1) % r.ring_p)
+                       : static_cast<float*>(r.state_out.ptr);
     p.slots = r.slots.ptr;
     p.n_slots = r.slots.ptr != nullptr ? args.n_slots : 0;
     p.out = r.out.ptr;
     p.out_stride = r.out.stride;
     p.l2 = args.qk_l2norm ? 1u : 0u;
     p.q_scale = r.q_scale;
+    p.ring_p = r.ring_p;
+    p.ring_live = r.ring_live;
     dispatch(target, &detail::launch_gdn_recurrent, &detail::emulate_gdn_recurrent, p,
              kern::gdn_recurrent_launch(r.dims, gdn_rec_block_), kOp);
 }
@@ -357,7 +389,9 @@ void Ops::gated_delta_rule_chunked(const Target& target, const GdnChunkedArgs& a
     p.dims = r.dims;
     p.n_tok = a.n_tokens;
     p.cs = cs;
-    p.state_out = r.state_out.ptr;
+    const bool ring = r.ring_p != 0;
+    p.state_out = ring ? slab_slot(r.state, r.state_n, (r.ring_live + 1) % r.ring_p)
+                       : static_cast<float*>(r.state_out.ptr);
     p.slots = r.slots.ptr;
     p.n_slots = r.slots.ptr != nullptr ? a.n_slots : 0;
     p.out = r.out.ptr;
@@ -366,11 +400,14 @@ void Ops::gated_delta_rule_chunked(const Target& target, const GdnChunkedArgs& a
     p.q_scale = r.q_scale;
     p.ws = ws.ptr;
     p.status = status_word;
+    p.ring_p = r.ring_p;
+    p.ring_live = r.ring_live;
+    const float* state_in = ring ? slab_slot(r.state, r.state_n, r.ring_live) : static_cast<const float*>(r.state.ptr);
     for (std::uint32_t c0 = 0; c0 < n_chunks; c0 += group) {
         p.chunk0 = c0;
         p.n_chunks = (n_chunks - c0) < group ? (n_chunks - c0) : group;
         // Group 0 continues the caller's state; later groups continue what group 0 wrote.
-        p.state_in = c0 == 0 ? r.state.ptr : r.state_out.ptr;
+        p.state_in = c0 == 0 ? state_in : p.state_out;
         dispatch(target, &detail::launch_gdn_chunk_intra, &detail::emulate_gdn_chunk_intra, p,
                  kern::gdn_intra_launch(r.dims, p.n_chunks, gdn_chunk_block_), kOp);
         dispatch(target, &detail::launch_gdn_chunk_state, &detail::emulate_gdn_chunk_state, p,
@@ -389,31 +426,55 @@ void Ops::causal_conv1d_silu(const Target& target, const Conv1dArgs& a) const {
     const Rows x = resolve(target, a.x, T, C, kOp, "x");
     const Rows w = resolve(target, a.weight, C, a.kernel, kOp, "weight");
     const Rows out = resolve(target, a.out, T, C, kOp, "out");
-    Rows st;
-    if (hist > 0) st = resolve(target, a.conv_state, hist, C, kOp, "conv_state");
-    Rows slots;
-    if (a.n_slots > 0 || !a.state_slots.empty()) {
-        HALO_CHECK(hist > 0, ErrorCode::Kernel, "{}: state_slots need kernel size >= 2", kOp);
-        HALO_CHECK(a.n_slots > 0 && !a.state_slots.empty(), ErrorCode::Kernel, "{}: n_slots / state_slots mismatch",
-                   kOp);
-        slots = resolve(target, BufferView(*a.state_slots.buffer, a.state_slots.offset, a.state_slots.bytes, 0),
-                        a.n_slots, mul_checked(hist, C, kOp), kOp, "state_slots");
-    }
     check_alias_exact_or_disjoint(x, out, kOp, "x");
-    check_disjoint(out, "out", {{&st, "conv_state"}, {&w, "weight"}, {&slots, "state_slots"}}, kOp);
-    check_disjoint(st, "conv_state", {{&x, "x"}, {&w, "weight"}, {&slots, "state_slots"}}, kOp);
-    check_disjoint(slots, "state_slots", {{&x, "x"}, {&w, "weight"}}, kOp);
     kern::ConvParams p;
+    if (a.ring) {
+        // ADR-001 §5.3: conv_state is the whole slab of p dense conv states; the kernel
+        // reads slab[live], writes the final state to slab[(live+1) mod p] and slots
+        // modularly from the slab base.
+        const std::uint32_t rp = a.ring->p, live = a.ring->live;
+        HALO_CHECK(rp >= 2 && live < rp, ErrorCode::Kernel, "{}: state ring p={} live={} is out of range", kOp, rp,
+                   live);
+        HALO_CHECK(a.n_slots <= rp - 1, ErrorCode::Kernel, "{}: {} slots requested, ring p - 1 = {}", kOp, a.n_slots,
+                   rp - 1);
+        HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                   "{}: with a state ring, state_slots is derived from the slab and must be unset", kOp);
+        Rows slab;
+        if (hist > 0) slab = resolve(target, a.conv_state, rp, mul_checked(hist, C, kOp), kOp, "conv state slab");
+        check_disjoint(slab, "conv state slab", {{&x, "x"}, {&w, "weight"}, {&out, "out"}}, kOp);
+        const std::uint64_t slot_n = hist * C;
+        p.state = hist > 0 ? slab_slot(slab, slot_n, live) : nullptr;
+        p.state_stride = C;
+        p.state_out = hist > 0 ? slab_slot(slab, slot_n, (live + 1) % rp) : nullptr;
+        p.slots = slab.ptr;
+        p.n_slots = slab.ptr != nullptr ? a.n_slots : 0;
+        p.ring_p = rp;
+        p.ring_live = live;
+    } else {
+        Rows st;
+        if (hist > 0) st = resolve(target, a.conv_state, hist, C, kOp, "conv_state");
+        Rows slots;
+        if (a.n_slots > 0 || !a.state_slots.empty()) {
+            HALO_CHECK(hist > 0, ErrorCode::Kernel, "{}: state_slots need kernel size >= 2", kOp);
+            HALO_CHECK(a.n_slots > 0 && !a.state_slots.empty(), ErrorCode::Kernel, "{}: n_slots / state_slots mismatch",
+                       kOp);
+            slots = resolve(target, BufferView(*a.state_slots.buffer, a.state_slots.offset, a.state_slots.bytes, 0),
+                            a.n_slots, mul_checked(hist, C, kOp), kOp, "state_slots");
+        }
+        check_disjoint(out, "out", {{&st, "conv_state"}, {&w, "weight"}, {&slots, "state_slots"}}, kOp);
+        check_disjoint(st, "conv_state", {{&x, "x"}, {&w, "weight"}, {&slots, "state_slots"}}, kOp);
+        check_disjoint(slots, "state_slots", {{&x, "x"}, {&w, "weight"}}, kOp);
+        p.state = st.ptr;
+        p.state_stride = st.stride;
+        p.slots = slots.ptr;
+        p.n_slots = slots.ptr != nullptr ? a.n_slots : 0;
+    }
     p.x = x.ptr;
     p.x_stride = x.stride;
     p.w = w.ptr;
     p.w_stride = w.stride;
-    p.state = st.ptr;
-    p.state_stride = st.stride;
     p.out = out.ptr;
     p.out_stride = out.stride;
-    p.slots = slots.ptr;
-    p.n_slots = slots.ptr != nullptr ? a.n_slots : 0;
     p.n_tok = a.n_tokens;
     p.channels = a.channels;
     p.k = a.kernel;

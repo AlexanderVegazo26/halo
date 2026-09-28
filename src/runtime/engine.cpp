@@ -2,10 +2,10 @@
 // queues drained on the caller's thread, prefix cache (KV sharing + GDN checkpoints),
 // MTP speculative decoding with a k = 0 fallback on MTP-KV exhaustion.
 // BI-6: the forward runs on the backend named by EngineConfig::backend (cpu | vulkan |
-// hip; "auto" = cpu until a measured GPU default policy exists, WS-BI-4). KV/GDN state is
-// host memory imported per forward call on every backend today (WS-BI-2 moves it onto
-// backend buffers); a GPU engine is therefore correct but slow, and HIP device mode
-// cannot run a forward at all yet (hip_adapter's import_host raises Unsupported).
+// hip; "auto" = cpu until a measured GPU default policy exists, WS-BI-4). GDN/conv state is
+// device-resident (the WS-BI-2 stage-1 ring); KV pools are still host memory imported per
+// forward call (stage 2), so a GPU engine pays one KV image import per step, and HIP device
+// mode cannot run a forward at all yet (hip_adapter's import_host raises Unsupported).
 
 #include <algorithm>
 #include <atomic>
@@ -75,9 +75,9 @@ std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
 #if defined(HALO_RUNTIME_HIP)
     if (name == "hip") {
         // Device mode. Construction succeeds (weights are read-only imports, copied into
-        // VRAM), but the forward needs WS-BI-2 state placement: the first step raises
-        // Error(Unsupported) from the adapter's import_host until KV/GDN state lives on
-        // backend buffers.
+        // VRAM), but the forward needs WS-BI-2 stage-2 KV placement: the first step raises
+        // Error(Unsupported) from the adapter's import_host until the KV pool lives on a
+        // backend buffer.
         backend::HipBackendOptions o;
         o.mode = backend::HipMode::Device;
         return backend::make_hip_backend(o);
@@ -323,7 +323,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
             throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", cfg.backend);
 #endif
         }
-        HALO_INFO("runtime", "backend '{}' selected; KV/GDN state stays host-resident until WS-BI-2", cfg.backend);
+        HALO_INFO("runtime", "backend '{}' selected; GDN state is device-resident (WS-BI-2 stage 1); KV stays host-resident until stage 2", cfg.backend);
         model_ = std::make_unique<models::Qwen35>(*nm_, *backend_, mo);
     }
     const auto piece = [&](std::optional<std::int32_t> id) { return id ? tok_->token_to_piece(*id) : std::string(); };
@@ -366,7 +366,9 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     // The KV pool is imported as ONE span per forward; a backend with a single-allocation
     // cap (RADV: maxMemoryAllocationSize = 4 GiB) fails the whole run when the pool is
     // larger. Drop the prefix-cache slots first, then halve the context until it fits.
-    if (const std::uint64_t imp_cap = backend_->limits().max_import_bytes; imp_cap != 0 && !opts.kv_blocks) {
+    // (backend_ is set only on the GPU paths; the CPU path's internal backend is the model's.)
+    const backend::Backend& active_backend = backend_ ? *backend_ : model_->backend();
+    if (const std::uint64_t imp_cap = active_backend.limits().max_import_bytes; imp_cap != 0 && !opts.kv_blocks) {
         const std::uint64_t trunk_blk = model_->kv_layout(bt).block_bytes();
         const std::uint64_t mtp_blk = mtp ? model_->mtp_kv_layout(bt).block_bytes() : 0;
         const auto fits = [&](std::size_t seq_blocks, std::size_t cache) {
@@ -400,6 +402,9 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     free_slots_.reserve(cfg.max_sequences);
     for (std::size_t i = 0; i < cfg.max_sequences; ++i) {
         slots_.push_back(std::make_unique<state::SequenceState>(*kv_pool_, mtp_pool_.get(), model_->gdn_shape(), max_draft_ + 1));
+        // ADR-001 §5.2/§5.3: the GDN ring slab is a State-arena buffer of the model's backend
+        // (device-resident on GPU backends; zero-copy host memory on the CPU backend).
+        slots_.back()->gdn.attach(model_->backend());
         free_slots_.push_back(cfg.max_sequences - 1 - i);
     }
     speculative::SpecConfig sc;

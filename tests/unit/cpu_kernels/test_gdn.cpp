@@ -588,4 +588,100 @@ TEST(CpuTraffic, GdnAndConvCompulsoryBytes) {
     EXPECT_EQ(traffic_attention({24, 4, 256}, 1, 99).bytes_read, 4ull * (24 * 256 + 2 * 100 * 4 * 256));
 }
 
+// ------------------------------------------------------------- state ring (ADR-001 §5.3)
+
+/// The ring form over a sentinel-filled slab whose live slot holds s0.
+struct RingResult {
+    std::vector<float> slab, out;
+};
+
+RingResult run_ring(const Data& d, Form f, std::size_t n, std::size_t chunk, std::size_t P, std::size_t live,
+                    std::size_t n_slots, ThreadPool* pool = nullptr) {
+    RingResult r;
+    const std::size_t sn = d.state_n();
+    r.slab.assign(P * sn, 12345.0f);
+    std::copy_n(d.s0.begin(), sn, r.slab.begin() + static_cast<std::ptrdiff_t>(live * sn));
+    r.out.assign(n * d.v_cols(), 0.0f);
+    const StateRingView ring{std::span<float>(r.slab), P, live, n_slots};
+    Rows out(r.out.data(), n, d.v_cols(), d.v_cols());
+    if (f == Form::Recurrent)
+        gated_delta_rule_recurrent(d.dims, d.rows(0, n), ring, out, GdnQkParams{}, pool);
+    else
+        gated_delta_rule_chunked(d.dims, d.rows(0, n), ring, out, GdnQkParams{}, chunk, pool);
+    return r;
+}
+
+TEST(CpuGdn, RingFormMatchesSlotFormBitwise) {
+    for (Form f : {Form::Recurrent, Form::Chunked}) {
+        for (std::size_t T : {1u, 3u, 17u}) {
+            const Data d = make(kR3, T, Regime::Model, true, 2000 + T);
+            for (std::size_t n_slots : {0u, 1u, 4u}) {
+                for (std::size_t P : {2u, 3u, 6u}) {
+                    if (n_slots > P - 1) continue;
+                    for (std::size_t live : {std::size_t{0}, P / 2, P - 1}) {  // covers the wrap
+                        SCOPED_TRACE(testing::Message()
+                                     << (f == Form::Recurrent ? "recurrent" : "chunked") << " T=" << T
+                                     << " n_slots=" << n_slots << " P=" << P << " live=" << live);
+                        const Result old = run(d, f, 0, T, d.s0, 16, nullptr, n_slots);
+                        const RingResult rr = run_ring(d, f, T, 16, P, live, n_slots);
+                        EXPECT_TRUE(bitwise_equal(old.out, rr.out)) << "out differs";
+                        const std::size_t sn = d.state_n();
+                        // The ring always writes the final state (logical slot 0); rollback
+                        // slots are s < min(T, n_slots) (ADR-001 §5.3).
+                        const std::size_t used = std::max<std::size_t>(1, std::min(T, n_slots));
+                        for (std::size_t p = 0; p < P; ++p) {
+                            const auto phys = std::span(rr.slab).subspan(p * sn, sn);
+                            if (p == live) {
+                                EXPECT_TRUE(bitwise_equal(phys, d.s0)) << "the input slot was written";
+                                continue;
+                            }
+                            // Physical slot p holds logical slot s iff p == (live+1+s) mod P.
+                            const std::size_t s = (p + P - ((live + 1) % P)) % P;
+                            if (s >= used) {
+                                for (float e : phys) EXPECT_EQ(e, 12345.0f) << "unwritten physical slot " << p;
+                            } else if (s == 0) {
+                                EXPECT_TRUE(bitwise_equal(phys, old.state)) << "final state";
+                            } else {
+                                EXPECT_TRUE(bitwise_equal(phys, std::span(old.slots).subspan(s * sn, sn)))
+                                    << "ring slot " << s << " (physical " << p << ")";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(CpuGdn, RingFormThreadCountInvarianceBitwise) {
+    const Data d = make(kR3, 9, Regime::Model, true, 2100);
+    for (Form f : {Form::Recurrent, Form::Chunked}) {
+        const RingResult base = run_ring(d, f, d.T, 16, 6, 4, 3);
+        for (std::size_t threads : {1u, 2u, 3u, 7u, 16u, 64u}) {
+            if (threads == 1) continue;
+            ThreadPool pool(threads);
+            const RingResult r = run_ring(d, f, d.T, 16, 6, 4, 3, &pool);
+            EXPECT_TRUE(bitwise_equal(base.slab, r.slab)) << "threads=" << threads;
+            EXPECT_TRUE(bitwise_equal(base.out, r.out)) << "threads=" << threads;
+        }
+    }
+}
+
+TEST(CpuGdn, RingFormValidation) {
+    const Data d = make(kR3, 4, Regime::Model, true, 2200);
+    const std::size_t sn = d.state_n();
+    std::vector<float> slab(6 * sn, 0.0f), out(4 * d.v_cols());
+    const Rows o(out.data(), 4, d.v_cols(), d.v_cols());
+    const auto in = d.rows(0, 4);
+    EXPECT_THROW(gated_delta_rule_recurrent(d.dims, in, StateRingView{slab, 1, 0, 0}, o), halo::Error) << "P < 2";
+    EXPECT_THROW(gated_delta_rule_recurrent(d.dims, in, StateRingView{slab, 6, 6, 0}, o), halo::Error) << "live >= P";
+    EXPECT_THROW(gated_delta_rule_recurrent(d.dims, in, StateRingView{slab, 6, 0, 6}, o), halo::Error) << "slots > P-1";
+    EXPECT_THROW(gated_delta_rule_recurrent(d.dims, in, StateRingView{std::span(slab).first(5 * sn), 6, 0, 0}, o),
+                 halo::Error)
+        << "slab not P states";
+    EXPECT_THROW(gated_delta_rule_chunked(d.dims, in, StateRingView{slab, 1, 0, 0}, o, GdnQkParams{}, 16), halo::Error)
+        << "chunked: P < 2";
+    EXPECT_NO_THROW(gated_delta_rule_chunked(d.dims, in, StateRingView{slab, 6, 0, 0}, o, GdnQkParams{}, 16));
+}
+
 }  // namespace

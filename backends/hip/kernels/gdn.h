@@ -62,12 +62,14 @@ struct GdnRecParams {
     unsigned n_tok = 0;
     const float* state_in = nullptr;
     float* state_out = nullptr;  // may equal state_in (in place)
-    float* slots = nullptr;      // n_slots states back to back, or null
+    float* slots = nullptr;      // n_slots states back to back, or null; ring: the slab base
     unsigned n_slots = 0;
     float* out = nullptr;
     std::uint64_t out_stride = 0;
     unsigned l2 = 1;
     float q_scale = 1.0f;
+    unsigned ring_p = 0;     ///< ADR-001 §5.3: slab size (0 = contiguous slots region)
+    unsigned ring_live = 0;  ///< the slab slot read this call
 };
 
 struct GdnRecRegs {
@@ -164,7 +166,8 @@ HALO_HD void gdn_recurrent_body(Exec& ex, GdnRecShared& sh, const GdnRecParams& 
             }
             p.out[t * p.out_stride + static_cast<std::uint64_t>(j) * dv + c] = o;
             const unsigned slot = p.n_tok - 1u - t;  // slot 0 = most recent row
-            if (slot < p.n_slots) gdn_store_column(r, p.slots + slot * state_n + head + c, dk, dv);
+            if (slot < p.n_slots)
+                gdn_store_column(r, p.slots + ring_slot_off(p.ring_p, p.ring_live, slot, state_n) + head + c, dk, dv);
         });
     }
 
@@ -258,7 +261,7 @@ struct GdnChunkParams {
     unsigned n_chunks = 0;     // chunks in this group
     const float* state_in = nullptr;
     float* state_out = nullptr;
-    float* slots = nullptr;
+    float* slots = nullptr;      // ring: the slab base
     unsigned n_slots = 0;
     float* out = nullptr;
     std::uint64_t out_stride = 0;
@@ -266,6 +269,8 @@ struct GdnChunkParams {
     float q_scale = 1.0f;
     float* ws = nullptr;       // n_chunks * n_v records; record (ci, j) at (ci * n_v + j)
     std::uint32_t* status = nullptr;
+    unsigned ring_p = 0;     ///< ADR-001 §5.3: slab size (0 = contiguous slots region)
+    unsigned ring_live = 0;  ///< the slab slot read this call
 };
 
 struct GdnIntraShared {
@@ -457,7 +462,7 @@ HALO_HD void gdn_chunk_state_body(Exec& ex, GdnStateShared& sh, const GdnChunkPa
             };
             for (unsigned a = 0; a < len; ++a) {
                 const unsigned slot = p.n_tok - 1u - (t0 + a);
-                if (slot < p.n_slots) state_at(a, p.slots + slot * state_n + head + c, dv);
+                if (slot < p.n_slots) state_at(a, p.slots + ring_slot_off(p.ring_p, p.ring_live, slot, state_n) + head + c, dv);
             }
             state_at(len - 1u, s, kB);
         }

@@ -665,13 +665,40 @@ public:
         const std::uint64_t T = a.n_tokens, C = a.channels, K = a.kernel_size;
         const Operand x = r.f32(a.x, T, C, Access::Read, "x");
         const Operand w = r.f32(a.weight, C, K, Access::Read, "weight");
-        const Operand cst = r.f32(a.conv_state, K - 1, C, Access::Write, "conv_state");
         const Operand out = r.f32(a.out, T, C, Access::Write, "out");
+        r.no_overlap(out, x);
+        r.no_overlap(out, w);
+        if (a.ring) {
+            // ADR-001 §5.3: conv_state is the whole slab of P dense conv states.
+            const std::uint64_t state_floats = mul_u64(K - 1, C, r.op(), "conv_state");
+            const Operand slab = r.flat(a.conv_state, mul_u64(mul_u64(a.ring->p, state_floats, r.op(), "slab"), kF32,
+                                                              r.op(), "slab"),
+                                        kF32, Access::Write, "conv_state slab");
+            HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                       "CONV1D_SHORT: with a state ring, state_slots is derived from the slab and must be empty");
+            r.no_overlap(out, slab);
+            r.no_overlap(slab, x);
+            r.no_overlap(slab, w);
+            check_limit(K, kMaxConvK, r.op(), "kernel size");
+            if (T == 0 || C == 0) return;
+            hip::Conv1dArgs h;
+            h.x = x.view();
+            h.weight = w.view();
+            h.conv_state = slab.view();
+            h.out = out.view();
+            h.n_tokens = a.n_tokens;
+            h.channels = a.channels;
+            h.kernel = a.kernel_size;
+            h.n_slots = a.n_slots;
+            h.ring = hip::GdnRing{a.ring->p, a.ring->live};
+            ops.causal_conv1d_silu(st.target(), h);
+            st.op_done();
+            return;
+        }
+        const Operand cst = r.f32(a.conv_state, K - 1, C, Access::Write, "conv_state");
         const std::uint64_t slot_floats = mul_u64(mul_u64(a.n_slots, K - 1, r.op(), "slots"), C, r.op(), "slots");
         const Operand sl = r.flat(a.state_slots, mul_u64(slot_floats, kF32, r.op(), "slots"), kF32, Access::Write, "state_slots");
         HALO_CHECK(cst.extent == 0 || cst.stride == C * kF32, ErrorCode::Kernel, "CONV1D_SHORT: conv_state must be dense");
-        r.no_overlap(out, x);
-        r.no_overlap(out, w);
         r.no_overlap(out, cst);
         r.no_overlap(out, sl);
         r.no_overlap(cst, x);
@@ -711,9 +738,56 @@ public:
         const Operand v = r.f32(a.v, T, v_cols, Access::Read, "v");
         const Operand g = r.f32(a.g, T, a.n_v, Access::Read, "g");
         const Operand beta = r.f32(a.beta, T, a.n_v, Access::Read, "beta");
+        const Operand out = r.f32(a.out, T, v_cols, Access::Write, "out");
+        if (a.ring) {
+            // ADR-001 §5.3: state is the whole slab of P dense states; the kernels derive
+            // input/output/slot regions from the ring.
+            const Operand slab = r.flat(a.state, mul_u64(a.ring->p, state_bytes, r.op(), "slab"), kF32, Access::Write,
+                                        "state slab");
+            HALO_CHECK(a.state_slots.empty(), ErrorCode::Kernel,
+                       "GATED_DELTANET: with a state ring, state_slots is derived from the slab and must be empty");
+            for (const Operand* i : {&q, &k, &v, &g, &beta}) r.no_overlap(slab, *i);
+            r.no_overlap(out, slab);
+            check_limit(a.d_k, kMaxDk, r.op(), "d_k");
+            if (chunked) check_limit(a.chunk_size, kMaxChunk, r.op(), "chunk size");
+            if (T == 0) return;
+            hip::GdnArgs h;
+            h.q = q.view();
+            h.k = k.view();
+            h.v = v.view();
+            h.g = g.view();
+            h.beta = beta.view();
+            h.state = slab.view();  // the whole slab; regions derived from the ring
+            h.out = out.view();
+            h.n_k = a.n_k;
+            h.n_v = a.n_v;
+            h.d_k = a.d_k;
+            h.d_v = a.d_v;
+            h.n_tokens = a.n_tokens;
+            h.n_slots = a.n_slots;
+            h.mapping = hip_mapping(a.mapping);
+            h.qk_l2norm = a.qk_l2norm;
+            h.q_scale = a.q_scale;
+            h.ring = hip::GdnRing{a.ring->p, a.ring->live};
+            if (!chunked) {
+                ops.gated_delta_rule_recurrent(st.target(), h);
+                st.op_done();
+                return;
+            }
+            check_nonzero(a.chunk_size, r.op(), "chunk size");
+            const std::uint32_t n_chunks = static_cast<std::uint32_t>((T + a.chunk_size - 1) / a.chunk_size);
+            hip::GdnChunkedArgs c;
+            c.gdn = h;
+            c.chunk_size = a.chunk_size;
+            c.workspace = st.scratch(hip::gdn_chunked_workspace_bytes(h, a.chunk_size, std::min(n_chunks, kChunksPerGroup)));
+            c.status = st.scratch(4);
+            ops.gated_delta_rule_chunked(st.target(), c);
+            st.expect_status(r.op(), kBatchWide, c.status);
+            st.op_done();
+            return;
+        }
         const Operand sta = r.flat(a.state, state_bytes, kF32, Access::Write, "state");
         const Operand sl = r.flat(a.state_slots, mul_u64(a.n_slots, state_bytes, r.op(), "slots"), kF32, Access::Write, "state_slots");
-        const Operand out = r.f32(a.out, T, v_cols, Access::Write, "out");
         for (const Operand* o : {&sta, &sl, &out}) {
             for (const Operand* i : {&q, &k, &v, &g, &beta}) r.no_overlap(*o, *i);
         }

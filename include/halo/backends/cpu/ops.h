@@ -128,6 +128,24 @@ void partial_rope_neox(Rows x, std::size_t n_heads, std::size_t head_dim,
 void causal_conv1d_silu(ConstRows x, ConstRows weight, Rows conv_state, Rows out,
                         ThreadPool* pool = nullptr, std::span<float> state_slots = {});
 
+/// A GDN/conv state ring (ADR-001 §5.3, WS-BI-2): P physical states, dense and back to
+/// back in `slab`. A call reads slab[live] (never written), always writes its final state
+/// (logical slot 0) to slab[(live+1) mod P], and writes rollback slot s to
+/// slab[(live+1+s) mod P] for s < min(T, n_slots); slots s >= min(T, n_slots) are left
+/// untouched (caller-owned). The constraint is max(1, min(T, n_slots)) <= P - 1.
+struct StateRingView {
+    std::span<float> slab;  ///< P states of the op's state size, contiguous
+    std::size_t P = 0;      ///< physical states (>= 2)
+    std::size_t live = 0;   ///< the slot the call reads (< P)
+    std::size_t n_slots = 0;  ///< logical slots requested (<= P - 1)
+};
+
+/// CONV1D_SHORT over a state ring: identical values to the conv_state/state_slots form
+/// given the same input state — the final state is what that form leaves in conv_state and
+/// ring slot s is what it writes to state_slots s. The input slab[live] is never written.
+void causal_conv1d_silu(ConstRows x, ConstRows weight, const StateRingView& conv_ring, Rows out,
+                        ThreadPool* pool = nullptr);
+
 // ---------------------------------------------------------------------------------------
 // Gated DeltaNet (D-003, D-004 item 5-6)
 // ---------------------------------------------------------------------------------------
@@ -199,6 +217,14 @@ void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in,
                                 std::span<float> state, Rows out, const GdnQkParams& qk = {},
                                 ThreadPool* pool = nullptr, std::span<float> state_slots = {});
 
+/// Ring form (ADR-001 §5.3): reads ring.slab[ring.live] (never written), writes the final
+/// state to slab[(live+1) mod P] and rollback slot s to slab[(live+1+s) mod P] for
+/// s < min(T, ring.n_slots). Bit-identical to the state/state_slots form given the same
+/// input state: the final state equals that form's output state and ring slot s equals its
+/// state_slots[s].
+void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in, const StateRingView& ring, Rows out,
+                                const GdnQkParams& qk = {}, ThreadPool* pool = nullptr);
+
 /// Source-compatible shorthand (pre-D-016 signature): GdnQkParams{qk_l2norm, 1/sqrt(d_k)}.
 /// This is exactly what the old bool form computed, so existing callers keep their results.
 /// A template on exactly `bool` so that a braced `{}` argument can only mean GdnQkParams{}
@@ -225,6 +251,12 @@ void gated_delta_rule_recurrent(const GdnDims& dims, const GdnInputs& in, std::s
 void gated_delta_rule_chunked(const GdnDims& dims, const GdnInputs& in, std::span<float> state,
                               Rows out, const GdnQkParams& qk = {}, std::size_t chunk_size = 64,
                               ThreadPool* pool = nullptr, std::span<float> state_slots = {});
+
+/// Ring form (ADR-001 §5.3): same placement contract as the recurrent ring form.
+/// Bit-identical to the state/state_slots chunked form given the same input state (same
+/// chunk boundaries).
+void gated_delta_rule_chunked(const GdnDims& dims, const GdnInputs& in, const StateRingView& ring, Rows out,
+                              const GdnQkParams& qk = {}, std::size_t chunk_size = 64, ThreadPool* pool = nullptr);
 
 /// Source-compatible shorthand (pre-D-016 signature): GdnQkParams{qk_l2norm, 1/sqrt(d_k)}.
 template <std::same_as<bool> Bool>

@@ -133,6 +133,17 @@ struct OpsOptions {
 ///    receives the state after row T-1-s (slot 0 = most recent = final state) for
 ///    s < min(T, n_slots); slots s >= T are left untouched. Rolling back r rows = using
 ///    slot r as the state. Must not overlap the state regions, `out`, or any input.
+///
+/// Ring form (ADR-001 §5.3, WS-BI-2): when `ring` is set, `state` names the whole slab of
+/// ring->p dense states and `state_out` / `state_slots` must stay unset — they are derived:
+/// the kernel reads slab[ring->live] (never written), writes the final state to
+/// slab[(live+1) mod p] and logical slot s to slab[(live+1+s) mod p], same values as the
+/// state/state_out/state_slots form computes. Requires p >= 2 and n_slots <= p - 1.
+struct GdnRing {
+    std::uint32_t p = 0;     ///< physical states in the slab
+    std::uint32_t live = 0;  ///< the slot the call reads
+};
+
 struct GdnDecodeArgs {
     BufferView q, k, v, g, beta;
     BufferView state;
@@ -147,6 +158,7 @@ struct GdnDecodeArgs {
     std::uint32_t n_slots = 0;
     bool qk_l2norm = true;         ///< D-016
     std::optional<float> q_scale;  ///< D-016; nullopt = 1/sqrt(d_k)
+    std::optional<GdnRing> ring;   ///< ADR-001 §5.3; unset = the state/state_out/slots form
 };
 
 /// Result layout written by argmax(): three 32-bit words
@@ -182,6 +194,9 @@ struct ArgmaxResult {
 ///  - out: n_tokens rows of [channels]; may alias x exactly.
 ///  - state_slots (D-012; empty = none): n_slots dense [kernel-1, channels] states; slot s =
 ///    conv state after row T-1-s for s < min(T, n_slots); slots s >= T are left untouched.
+///  - ring (ADR-001 §5.3): when set, conv_state names the whole slab of ring->p dense conv
+///    states and state_slots must stay empty: the kernel reads slab[live] (never written),
+///    writes the final state to slab[(live+1) mod p] and slot s to slab[(live+1+s) mod p].
 /// The accumulation order is the CPU op's (taps oldest first, then the current input), and
 /// no multiply-add is contracted, so the pre-activation is bit-identical to halo::cpu; the
 /// SiLU uses the device exp. conv_state and the slots are bit-identical copies of inputs.
@@ -192,6 +207,7 @@ struct Conv1dArgs {
     std::uint32_t channels = 0;
     std::uint32_t kernel = 4;
     std::uint32_t n_slots = 0;
+    std::optional<GdnRing> ring{};  ///< ADR-001 §5.3; unset = in-place conv_state + slots
 };
 
 /// [GATED_NORM] (cpu::gated_rms_norm): out[r] = (w * (x[r] * rsqrt(mean(x[r]^2) + eps))) *
