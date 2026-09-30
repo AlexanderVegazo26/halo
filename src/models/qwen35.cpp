@@ -800,7 +800,8 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         // add_rms_norm counted the add and the norm; the 2 adds of the layer are counted there.
     }
     if (I.layers.empty()) I.rms_norm(st, a.x, R, E, I.output_norm, hbuf);
-    st.sync();
+    // No sync here: the hidden download and the head are recorded into the same command
+    // buffer, so one submit and one fence wait (in head() / below) cover the whole forward.
 
     // ---- head ------------------------------------------------------------------------------
     // H1/M1 (ADR-001 WS-BI-2 step 1): KV/GDN commit happens AFTER head() succeeds, not before.
@@ -890,7 +891,7 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     I.gemv(st, cat, R, M.eh_proj, a.x);
     I.rms_norm(st, a.x, R, E, M.block.attn_norm, a.xn);
     I.decoder_layer(st, a, M.block, R, [&] { I.attention(st, a, *M.block.attn, 0, R, seqs, rpos); }, M.head_norm, hbuf);
-    st.sync();
+    // No sync: the head is recorded into the same command buffer (see Qwen35::forward).
 
     // H1/M1: see the matching comment in Qwen35::forward -- commit after head() succeeds.
     std::vector<Impl::HeadReq> reqs;
