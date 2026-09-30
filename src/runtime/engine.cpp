@@ -7,6 +7,7 @@
 // device-resident on GPU backends, zero-copy host memory on the CPU backend.
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -54,6 +55,29 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using Toks = std::vector<std::int32_t>;
+
+/// Prompt-lookup drafts (no model cost): find the most recent earlier occurrence of the last
+/// `min_match`..`max_match` tokens of (prompt ++ generated) and propose the up-to-`k` tokens
+/// that followed it. The trunk verifies every proposed token, so greedy output is unchanged;
+/// a miss only costs the extra verify rows. Empty = no match (MTP drafts instead).
+Toks ngram_draft(std::span<const std::int32_t> prompt, std::span<const std::int32_t> generated, std::size_t k,
+                 std::size_t min_match = 3, std::size_t max_match = 8) {
+    const std::size_t n = prompt.size() + generated.size();
+    if (k == 0 || n < min_match + 1) return {};
+    const auto at = [&](std::size_t i) { return i < prompt.size() ? prompt[i] : generated[i - prompt.size()]; };
+    for (std::size_t m = std::min(max_match, n - 1); m >= min_match; --m) {
+        // Scan back for the latest start p < n - m whose m tokens equal the last m tokens.
+        for (std::size_t p = n - m; p-- > 0;) {
+            std::size_t j = 0;
+            while (j < m && at(p + j) == at(n - m + j)) ++j;
+            if (j < m) continue;
+            Toks out;
+            for (std::size_t i = p + m; i < n && out.size() < k; ++i) out.push_back(at(i));
+            if (!out.empty()) return out;
+        }
+    }
+    return {};
+}
 
 double ms_between(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -240,6 +264,11 @@ private:
     memory::MemoryPlan plan_;
     std::optional<std::int32_t> eos_;
     std::size_t max_draft_ = 0;
+    /// Prompt-lookup drafts ahead of MTP (opt-in: HALO_NGRAM_DRAFT=1). Greedy requests only.
+    bool ngram_draft_ = [] {
+        const char* e = std::getenv("HALO_NGRAM_DRAFT");
+        return e != nullptr && e[0] == '1';
+    }();
     std::size_t threads_ = 1;
     std::size_t gdn_chunk_ = 64;
     std::size_t prefill_chunk_ = 256;
@@ -970,6 +999,10 @@ void CpuEngine::tick() {
             a.forced.clear();
             if (opts_.draft_hook && a.r->fast_greedy && max_draft_ > 0) {
                 a.forced = opts_.draft_hook(a.r->req.prompt, a.generated);
+            } else if (ngram_draft_ && a.r->fast_greedy && max_draft_ > 0) {
+                a.forced = ngram_draft(a.r->req.prompt, a.generated, max_draft_);
+            }
+            if (!a.forced.empty()) {
                 if (a.forced.size() > max_draft_) a.forced.resize(max_draft_);
                 q.forced_drafts = a.forced;
             }
