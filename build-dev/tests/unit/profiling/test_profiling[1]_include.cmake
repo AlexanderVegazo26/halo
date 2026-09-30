@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/profiling/test_profiling[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/profiling/test_profiling[1]_tests.cmake")
-else()
-  add_test(test_profiling_NOT_BUILT test_profiling_NOT_BUILT)
-endif()

@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/models/test_models_gate[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/models/test_models_gate[1]_tests.cmake")
-else()
-  add_test(test_models_gate_NOT_BUILT test_models_gate_NOT_BUILT)
-endif()

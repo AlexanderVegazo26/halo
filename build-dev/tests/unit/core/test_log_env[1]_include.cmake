@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/core/test_log_env[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/core/test_log_env[1]_tests.cmake")
-else()
-  add_test(test_log_env_NOT_BUILT test_log_env_NOT_BUILT)
-endif()

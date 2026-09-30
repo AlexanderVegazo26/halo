@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/backend/test_vulkan_backend[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/backend/test_vulkan_backend[1]_tests.cmake")
-else()
-  add_test(test_vulkan_backend_NOT_BUILT test_vulkan_backend_NOT_BUILT)
-endif()

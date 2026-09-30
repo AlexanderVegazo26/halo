@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/hip/test_hip_kv[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-dev/tests/unit/hip/test_hip_kv[1]_tests.cmake")
-else()
-  add_test(test_hip_kv_NOT_BUILT test_hip_kv_NOT_BUILT)
-endif()
