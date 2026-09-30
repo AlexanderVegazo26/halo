@@ -31,7 +31,7 @@ layout(push_constant) uniform Push {
 layout(constant_id = 1) const uint BATCHED = 1;
 
 shared float red[WG];
-shared float redb[MAX_VEC * WG];  // batched reduction (all vectors at once)
+shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
 
 // Per-type one-time workgroup setup (e.g. the IQ3_S shared grid); empty for most types.
 #ifndef HALO_DEQUANT_SETUP

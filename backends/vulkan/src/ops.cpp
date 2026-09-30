@@ -305,12 +305,14 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
 
     const DeviceInfo& info = ctx_->info();
     const std::uint32_t wg = options_.gdn_workgroup;
-    // Decode: split each head's d_v columns over workgroups of `dv_tile` columns (default 32;
-    // HALO_GDN_DV_TILE overrides, 0 = one group per head). The chunked kernel is one group per head.
+    // Decode: split each head's d_v columns over workgroups of `dv_tile` columns (opt-in:
+    // HALO_GDN_DV_TILE=32, default 0 = one group per head; unmeasured). The chunked kernel is one group per head.
     std::uint32_t dv_tile = a.d_v;
     if (chunked == nullptr) {
-        std::uint32_t want = 32;
-        if (const char* e = std::getenv("HALO_GDN_DV_TILE")) want = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+        static const std::uint32_t want = [] {
+            const char* e = std::getenv("HALO_GDN_DV_TILE");
+            return e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+        }();
         if (want > 0 && want < a.d_v) dv_tile = want;
     }
     const std::uint32_t dv_tiles = (a.d_v + dv_tile - 1) / dv_tile;

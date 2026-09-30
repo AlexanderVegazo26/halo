@@ -148,8 +148,9 @@ struct Qwen35::Impl {
     std::uint64_t head_bytes = 0;
     std::uint64_t trunk_bytes = 0;
     std::optional<MtpW> mtp;
-    /// Rows of the MTP head scored per draft (HALO_MTP_DRAFT_VOCAB; 0 = full vocab).
-    std::size_t draft_vocab = 32768;
+    /// Rows of the MTP head scored per draft (HALO_MTP_DRAFT_VOCAB; 0 = full vocab, default; try 32768 -- a first-N-ids
+    /// prefix is a stand-in for a token-frequency list and is unmeasured).
+    std::size_t draft_vocab = 0;
 
     // ---- loading -----------------------------------------------------------------------
 
@@ -910,7 +911,7 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
         }
     }
     // Drafts only need a good guess (the trunk head verifies every token), so score a
-    // frequent-token prefix of the MTP head unless a request wants full logits.
+    // token-row prefix of the MTP head (HALO_MTP_DRAFT_VOCAB) unless a request wants full logits.
     const bool any_full = std::any_of(reqs.begin(), reqs.end(), [](const Impl::HeadReq& r) { return r.full; });
     I.head(st, M.lm_head, M.lm_head.ref.n_bytes(), hbuf, reqs, any_full ? 0 : I.draft_vocab);
     st.sync();
