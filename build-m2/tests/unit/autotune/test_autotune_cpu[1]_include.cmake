@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/autotune/test_autotune_cpu[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/autotune/test_autotune_cpu[1]_tests.cmake")
-else()
-  add_test(test_autotune_cpu_NOT_BUILT test_autotune_cpu_NOT_BUILT)
-endif()

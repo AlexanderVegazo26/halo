@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/cpu_kernels/test_cpu_thread_pool[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/cpu_kernels/test_cpu_thread_pool[1]_tests.cmake")
-else()
-  add_test(test_cpu_thread_pool_NOT_BUILT test_cpu_thread_pool_NOT_BUILT)
-endif()

@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/hardware/test_hardware[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/hardware/test_hardware[1]_tests.cmake")
-else()
-  add_test(test_hardware_NOT_BUILT test_hardware_NOT_BUILT)
-endif()

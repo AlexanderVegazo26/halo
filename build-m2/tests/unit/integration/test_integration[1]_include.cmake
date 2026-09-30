@@ -1,5 +1,0 @@
-if(EXISTS "/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/integration/test_integration[1]_tests.cmake")
-  include("/home/alexander-vegazo/Documents/repos/halo/build-m2/tests/unit/integration/test_integration[1]_tests.cmake")
-else()
-  add_test(test_integration_NOT_BUILT test_integration_NOT_BUILT)
-endif()

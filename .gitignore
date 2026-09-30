@@ -1,5 +1,6 @@
 build/
 /build-dev/
+/build-m2/
 .venv/
 __pycache__/
 *.gguf

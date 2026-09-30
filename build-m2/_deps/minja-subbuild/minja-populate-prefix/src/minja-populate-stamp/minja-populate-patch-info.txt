@@ -1,6 +1,0 @@
-# This is a generated file and its contents are an internal implementation detail.
-# The update step will be re-executed if anything in this file changes.
-# No other meaning or use of this file is supported.
-
-command=/usr/bin/cmake;-DPATCH_FILE=/home/alexander-vegazo/Documents/repos/halo/cmake/patches/minja-halo-limits.patch;-DPATCH_SHA256=54da3b56abf72b152a15db5ecd308af727ab5b416f84fbdff700f2e720f5e275;-P;/home/alexander-vegazo/Documents/repos/halo/cmake/patches/apply_patch.cmake
-work_dir=/home/alexander-vegazo/Documents/repos/halo/build-m2/_deps/minja-src
