@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -147,6 +148,8 @@ struct Qwen35::Impl {
     std::uint64_t head_bytes = 0;
     std::uint64_t trunk_bytes = 0;
     std::optional<MtpW> mtp;
+    /// Rows of the MTP head scored per draft (HALO_MTP_DRAFT_VOCAB; 0 = full vocab).
+    std::size_t draft_vocab = 32768;
 
     // ---- loading -----------------------------------------------------------------------
 
@@ -483,8 +486,14 @@ struct Qwen35::Impl {
     /// ties resolve to the lowest index. H1: a NaN logit poisons only its own row -- the
     /// engine sees it as argmax.index == -1 (backend::decode_argmax's poisoned sentinel) and
     /// must fail only that request, not every sequence in the tick.
-    void head(Step& st, const Table& head_w, std::uint64_t bytes, TensorRef h, std::span<const HeadReq> reqs) const {
+    ///
+    /// `vocab_rows` < n_vocab scores only the first `vocab_rows` token rows of the head (a
+    /// contiguous prefix of the row-major matrix, so no copy): the FR-Spec-style reduced
+    /// draft head. Only valid when no request wants full logits.
+    void head(Step& st, const Table& head_w, std::uint64_t bytes, TensorRef h, std::span<const HeadReq> reqs,
+              std::size_t vocab_rows = 0) const {
         if (reqs.empty()) return;
+        if (vocab_rows == 0 || vocab_rows > n_vocab) vocab_rows = n_vocab;
         const std::size_t n = reqs.size();
         const TensorRef xs = st.alloc(n * E);
         for (std::size_t i = 0; i < n; ++i) {
@@ -495,10 +504,10 @@ struct Qwen35::Impl {
         st.arena.push_back(be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
         const TensorRef res = TensorRef::of(*st.arena.back());
         const WeightRef& w = head_w.ref;
-        be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{w.type(), TensorRef::of(*head_w.buf), xs, logits, u32(n_vocab),
+        be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{w.type(), TensorRef::of(*head_w.buf), xs, logits, u32(vocab_rows),
                                                                  u32(E), u32(n), {}},
                                                res,
-                                               u32(valid_vocab),
+                                               u32(std::min<std::size_t>(valid_vocab, vocab_rows)),
                                                {},
                                                {}});
         std::vector<std::byte> words(n * backend::kArgmaxResultBytes);
@@ -513,8 +522,8 @@ struct Qwen35::Impl {
             }
         }
         if (any_full) st.sync();
-        st.cost.weight_bytes += bytes;
-        st.cost.activation_bytes += cpu::traffic_matmul(n, E, n_vocab, 0).total();
+        st.cost.weight_bytes += vocab_rows == n_vocab ? bytes : bytes / n_vocab * vocab_rows;
+        st.cost.activation_bytes += cpu::traffic_matmul(n, E, vocab_rows, 0).total();
     }
 
     /// The KV pool storage image is the pool's State-arena buffer (ADR-001 §5.2, WS-BI-2
@@ -617,6 +626,7 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
         t.lm_head = I.make_table(mw->lm_head);
         t.bytes = t.block.bytes + mw->eh_proj.n_bytes() + mw->enorm.n_bytes() + mw->hnorm.n_bytes() +
                   (mw->head_norm_origin == model::MtpTensorOrigin::NextnBlock ? mw->head_norm.n_bytes() : 0);
+        if (const char* e = std::getenv("HALO_MTP_DRAFT_VOCAB")) I.draft_vocab = std::strtoull(e, nullptr, 10);
         I.mtp = std::move(t);
     }
 }
@@ -898,7 +908,10 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
             reqs.push_back({seqs[si].r0 + s.logit_rows[j], &o, j, s.logits == LogitsMode::Full});
         }
     }
-    I.head(st, M.lm_head, M.lm_head.ref.n_bytes(), hbuf, reqs);
+    // Drafts only need a good guess (the trunk head verifies every token), so score a
+    // frequent-token prefix of the MTP head unless a request wants full logits.
+    const bool any_full = std::any_of(reqs.begin(), reqs.end(), [](const Impl::HeadReq& r) { return r.full; });
+    I.head(st, M.lm_head, M.lm_head.ref.n_bytes(), hbuf, reqs, any_full ? 0 : I.draft_vocab);
     st.sync();
     for (const MtpStep& s : steps) s.kv->commit(s.tokens.size());
 }
