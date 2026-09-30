@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <initializer_list>
 #include <utility>
@@ -304,7 +305,17 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
 
     const DeviceInfo& info = ctx_->info();
     const std::uint32_t wg = options_.gdn_workgroup;
-    const GroupCount groups = grid_1d(a.n_v, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+    // Decode: split each head's d_v columns over workgroups of `dv_tile` columns (default 32;
+    // HALO_GDN_DV_TILE overrides, 0 = one group per head). The chunked kernel is one group per head.
+    std::uint32_t dv_tile = a.d_v;
+    if (chunked == nullptr) {
+        std::uint32_t want = 32;
+        if (const char* e = std::getenv("HALO_GDN_DV_TILE")) want = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+        if (want > 0 && want < a.d_v) dv_tile = want;
+    }
+    const std::uint32_t dv_tiles = (a.d_v + dv_tile - 1) / dv_tile;
+    const GroupCount groups = grid_1d(chunked == nullptr ? a.n_v * dv_tiles : a.n_v, info.max_workgroup_count[0],
+                                      info.max_workgroup_count[1]);
     const std::uint32_t ring_p = ring ? a.ring->p : 0u;
     const std::uint32_t ring_live = ring ? a.ring->live : 0u;
     if (chunked == nullptr) {
@@ -314,13 +325,14 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
             std::uint32_t q_off, q_stride, k_off, k_stride, v_off, v_stride, g_off, g_stride, b_off, b_stride, o_off,
                 o_stride;
             std::uint32_t ring_p, ring_live;  // ADR-001 §5.3; ring_p == 0 = the in/off/slots form
+            std::uint32_t dv_tile;            // d_v columns per workgroup
         } push{a.n_v,      a.n_k,      a.d_k,          a.d_v,
                a.n_tokens, static_cast<std::uint32_t>(used_slots), oin.off, ring ? 0u : osout.off,
                osl ? osl->off : 0u, a.qk_l2norm ? 1u : 0u, q_scale,  oq.off,
                oq.stride,  ok.off,     ok.stride,      ov.off,
                ov.stride,  og.off,     og.stride,      ob.off,
                ob.stride,  oo.off,     oo.stride,      ring_p,
-               ring_live};
+               ring_live,  dv_tile};
         static_assert(sizeof(Push) <= 128, "push constants must fit the guaranteed 128-byte minimum");
         const Kernel& k = kernel("gated_delta_rule_decode", 9, sizeof(Push), {{0, wg}, {1, options_.gdn_max_dk}},
                                  {wg, 1, 1});

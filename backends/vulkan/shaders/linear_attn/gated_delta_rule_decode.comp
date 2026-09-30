@@ -55,6 +55,10 @@ layout(push_constant) uniform Push {
     // of ring_p dense states; the input is slab[ring_live], the final state goes to
     // slab[(ring_live+1) mod ring_p], logical slot s to slab[(ring_live+1+s) mod ring_p].
     uint ring_p, ring_live;
+    // Columns of d_v per workgroup: the grid is n_v * ceil(d_v / dv_tile) groups (group
+    // g -> head g / tiles, column tile g % tiles). Columns are independent, so the split is
+    // bitwise-neutral; it only raises the number of workgroups in flight (n_v alone is 48).
+    uint dv_tile;
 } pc;
 
 shared float sq[MAX_DK];
@@ -63,8 +67,12 @@ shared float red_q[WG];
 shared float red_k[WG];
 
 void main() {
-    const uint j = halo_group_id();
+    const uint gid = halo_group_id();
+    const uint n_tiles = (pc.d_v + pc.dv_tile - 1u) / pc.dv_tile;
+    const uint j = gid / n_tiles;
     if (j >= pc.n_v) return;
+    const uint b_lo = (gid % n_tiles) * pc.dv_tile;
+    const uint b_hi = min(b_lo + pc.dv_tile, pc.d_v);
     const uint tid = gl_LocalInvocationID.x;
     const uint kh = j % pc.n_k;
     const uint head = j * pc.d_k * pc.d_v;              // head offset inside one state
@@ -119,7 +127,7 @@ void main() {
         const uint slot_base = (ring ? pc.in_off + ((pc.ring_live + 1u + slot) % pc.ring_p) * state_elems
                                      : pc.slots_off + slot * state_elems) + head;
 
-        for (uint b = tid; b < pc.d_v; b += WG) {
+        for (uint b = b_lo + tid; b < b_hi; b += WG) {
             float kv = 0.0;
             for (uint a = 0u; a < pc.d_k; ++a) {
                 const uint e = head + a * pc.d_v + b;
