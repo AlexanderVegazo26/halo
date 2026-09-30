@@ -42,7 +42,7 @@ TEST(VkSha256, Fips180KnownAnswers) {
 TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
     const std::set<std::string> expected{"rms_norm",        "matvec_f32",           "matvec_q8_0",
                                          "matvec_q4_k",     "matvec_q5_k",          "matvec_q6_k",
-                                         "matvec_iq4_xs",   "gated_delta_rule_decode",
+                                         "matvec_iq4_xs",   "gated_delta_rule_decode", "gated_delta_rule_decode_reg",
                                          "argmax_partial", "argmax_final",   "conv1d_silu",
                                          "gated_rms_norm", "add_rms_norm",   "eltwise",
                                          "gdn_gates",      "rope_neox",      "get_rows_f32",
@@ -53,8 +53,10 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
                                          "get_rows_iq3_s", "topk",          "gated_delta_rule_chunked",
                                          "gdn_gcheck",     "matmul_cm_q4_k", "matmul_cm_q5_k",
                                          "matmul_cm_q6_k", "matvec_q5_k_rp", "matvec_q6_k_rp",
-                                         "matvec_iq4_xs_rp", "kv_write_f16",  "kv_write_q8",    "attention_f16",
-                                         "attention_q8"};
+                                         "matvec_q4_k_sg", "matvec_q5_k_sg", "matvec_q6_k_sg", "matvec_iq4_xs_sg", "argmax_ids",
+                                         "matvec_iq4_xs_rp", "matvec_q4_k_normed", "matvec_q5_k_normed",
+                                         "matvec_q6_k_normed", "matvec_iq4_xs_normed", "kv_write_f16", "kv_write_q8",    "attention_f16",
+                                         "attention_q8", "attention_tree"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
         ASSERT_NE(s, nullptr);

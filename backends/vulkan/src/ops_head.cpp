@@ -66,10 +66,16 @@ void Ops::lm_head(Stream& stream, const LmHeadArgs& a) {
         operand(a.result, 1, std::uint64_t{g.n_vec} * k_argmax_result_bytes, Access::Floats, align, op, "result");
     require_disjoint(ows, "workspace", {{&ow, "W"}, {&ox, "x"}, {&ores, "result"}}, op);
     require_disjoint(ores, "result", {{&ow, "W"}, {&ox, "x"}}, op);
+    Operand oids{};
+    if (!a.ids.empty()) {
+        oids = operand(a.ids, 1, std::uint64_t{g.n_vec} * 4, Access::Floats, align, op, "ids");
+        require_disjoint(oids, "ids", {{&ow, "W"}, {&ox, "x"}, {&ows, "workspace"}, {&ores, "result"}}, op);
+    }
     BufferView logits = in_ws ? BufferView(*a.workspace.buffer, a.workspace.offset, g.n_vec * logit_row) : g.y;
     if (!in_ws) {
         const Operand oy = operand(g.y, g.n_vec, logit_row, Access::Floats, align, op, "y (logits)");
         require_disjoint(oy, "y (logits)", {{&ow, "W"}, {&ox, "x"}, {&ows, "workspace"}, {&ores, "result"}}, op);
+        if (!a.ids.empty()) require_disjoint(oids, "ids", {{&oy, "y (logits)"}}, op);
     }
     const std::uint64_t l_stride = in_ws ? logit_row : vec_stride(g.y, g.n_vec, logit_row);
     const std::uint64_t scratch_base = a.workspace.offset + (in_ws ? g.n_vec * logit_row : 0);
@@ -83,6 +89,20 @@ void Ops::lm_head(Stream& stream, const LmHeadArgs& a) {
                BufferView(*a.result.buffer, a.result.offset + std::uint64_t{t} * k_argmax_result_bytes,
                           k_argmax_result_bytes),
                a.valid_rows);
+    }
+    if (!a.ids.empty()) {
+        // Winning ids as dense int32 for device-side consumers (HALO_MTP_CHAIN). Stream order makes the
+        // argmax results visible to this dispatch.
+        constexpr std::uint32_t wg = 64;
+        struct IdsPush {
+            std::uint32_t count, w_off, i_off;
+        } ip{g.n_vec, ores.off, oids.off};
+        const Kernel& kids = kernel("argmax_ids", 2, sizeof(IdsPush), {{0, wg}}, {wg, 1, 1});
+        const DeviceInfo& info = ctx_->info();
+        const std::array bids{ores.binding, oids.binding};
+        stream.dispatch(kids, bids, ip,
+                        grid_1d(ceil_div(g.n_vec, wg), info.max_workgroup_count[0], info.max_workgroup_count[1]),
+                        0b10);  // ids written
     }
 }
 

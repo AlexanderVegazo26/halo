@@ -130,6 +130,17 @@ public:
     void commit_rows_kept(std::size_t rows, std::size_t kept);
     /// Ends a pending verify keeping all rows (live stays at base + 1).
     void drop_slots() noexcept;
+    /// Tree verify (HALO_MTP_TREE): the last forward ran a chain of `rows` rows with n_slots >=
+    /// rows, plus one extra leaf row whose parent is chain row 0. The forward ran the leaf as a
+    /// one-row step reading the ring slot that holds the state after row 0 (physical
+    /// (base + rows) mod P) and wrote its state to (base + rows + 1) mod P. This makes that state
+    /// the live one (the sequence continues [x, leaf]): live = (base + rows + 1) mod P, one
+    /// integer. Requires a pending verify with rows == slot_rows(), slots_valid() >= rows and
+    /// P >= rows + 2 (so that slot is distinct from live and every chain slot). Error(Api)
+    /// otherwise, nothing changes. Ends the pending verify.
+    void commit_tree_leaf(std::size_t rows);
+    /// True when a tree verify of a `rows`-row chain fits the ring (P >= rows + 2).
+    [[nodiscard]] bool fits_tree_leaf(std::size_t rows) const noexcept { return p_ >= rows + 2; }
 
     void reset() noexcept;  ///< live = slot 0, zeroed; drops a pending verify
     [[nodiscard]] GdnSnapshot snapshot() const;

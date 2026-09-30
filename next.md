@@ -142,3 +142,23 @@ What exllamav2 does, and whether each idea transfers to HALO:
    `build-dev/tools/halo/halo run <model> -p "<13-tok prompt>" --raw --temperature 0 --backend vulkan -n 128 --ctx 4096 --parallel 1`, with and without `--mtp-draft 0`. Baseline: 16.79 / 10.97 tok/s.
 3. **Attribution:** re-profile with `HALO_VK_OP_TIMINGS` and aggregate by kernel, as in the table above. Also confirm the per-tick wall time and fence count drop.
 4. Commit each step separately, with the before and after tok/s in the message, matching the repo's existing convention.
+
+## Implementation status (2026-09-29, compile-checked only; nothing benchmarked or tested)
+All new paths are opt-in (env flag, default off) except the `stream.cpp` per-dispatch allocation removal and the fused batched reduction (bitwise-neutral by construction).
+
+| Step | Flag / state |
+|---|---|
+| 1 batched matvec | shared-tree fusion (default); `HALO_SUBGROUP_REDUCE=1` subgroupAdd + unrolled NV variants (q4_k/q5_k/q6_k/iq4_xs) |
+| 2 draft head | `HALO_MTP_DRAFT_VOCAB=32768` (first-N-ids prefix; not a frequency list) |
+| 3 GDN decode | `HALO_GDN_DV_TILE=32`; `HALO_GDN_REG=1` register-resident state kernel (d_k <= 128) |
+| 4 host round-trips | mid-forward sync removed; `HALO_STREAM_REUSE=1`; `HALO_MTP_DEVICE_HIDDEN=1`; `HALO_MTP_CHAIN=1` (chained drafts, one submit for the draft phase; verify still its own forward) |
+| 5 tokens/tick | `HALO_MTP_TREE=1` (chain + one runner-up leaf); `--mtp-draft 3` needs no code |
+| 6 fusion | `HALO_FUSE_GEMV=1\|all\|ffn,ba,qkv` (gemv-level; SwiGLU/gates not folded into the epilogue) |
+| 7 prefill | `HALO_COOPMAT=1` cooperative-matrix GEMM (q4_k/q5_k/q6_k), chunked-GDN step-6 speedup |
+| 8 repack | `HALO_REPACK=1` |
+| 9 KV | `HALO_KV_FP16=1` / `HALO_KV_TYPE=q8`; per-layer pool segments (next2.md 2a) |
+| 10 norm fusion | `HALO_FUSE_NORM=1` (FFN gate/up at R==1 only) |
+| 11 n-gram | `HALO_NGRAM_DRAFT=1` |
+| 12 mixed-bitrate | not implemented: owner decision (conflicts with D-014) |
+
+Verify on the EVO-X2 in this order: full test suite (differential + VkHead/VkViews bitwise gates), baseline tok/s, then each flag alone.

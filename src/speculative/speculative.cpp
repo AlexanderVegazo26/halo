@@ -3,6 +3,7 @@
 #include "halo/speculative/speculative.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <string_view>
 #include <utility>
@@ -23,6 +24,19 @@ namespace {
 bool device_hidden_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("HALO_MTP_DEVICE_HIDDEN");
+        return e != nullptr && *e != '\0' && std::string_view(e) != "0";
+    }();
+    return on;
+}
+
+/// HALO_MTP_CHAIN=1 (default off): record every draft depth of a tick into ONE command stream (one submit /
+/// fence, Qwen35::mtp_draft_chain) instead of one mtp_forward per depth: the winning token of depth d feeds
+/// depth d + 1's embedding lookup from device memory and the MTP hidden stays on the device (so
+/// HALO_MTP_DEVICE_HIDDEN is moot in this mode). Needs a backend with Limits::lm_head_ids (CPU, Vulkan);
+/// otherwise the per-depth path runs. The trunk verify is still its own forward().
+bool chain_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("HALO_MTP_CHAIN");
         return e != nullptr && *e != '\0' && std::string_view(e) != "0";
     }();
     return on;
@@ -91,10 +105,44 @@ void push_pair(state::SequenceState& s, std::int32_t tok, const float* h, std::s
     s.mtp_queue_hidden.insert(s.mtp_queue_hidden.end(), h, h + E);
 }
 
+/// Index of the largest logit other than `best` (ties to the lowest index, like the head's argmax); NaN entries
+/// are never picked. -1 if `logits` is empty, `best` is invalid or nothing qualifies.
+std::int32_t runner_up(std::span<const float> logits, std::int32_t best) {
+    if (logits.empty() || best < 0) return -1;
+    std::int32_t arg = -1;
+    float top = 0.0f;
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        if (static_cast<std::int32_t>(i) == best) continue;
+        const float v = logits[i];
+        if (arg < 0 ? !std::isnan(v) : v > top) {
+            arg = static_cast<std::int32_t>(i);
+            top = v;
+        }
+    }
+    return arg;
+}
+
 }  // namespace
 
 Speculator::Speculator(const models::Qwen35& model, SpecConfig cfg)
     : model_(&model), cfg_(cfg), cost_(CostModel::from(model)), gate_(cfg.gate, cost_.plain_step()) {}
+
+bool tree_env_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("HALO_MTP_TREE");
+        return e != nullptr && *e != '\0' && std::string_view(e) != "0";
+    }();
+    return on;
+}
+
+bool Speculator::tree_ok(const StepRequest& r, std::size_t k) const {
+    if (!cfg_.tree || k == 0 || !is_decode(r) || !r.greedy || !r.forced_drafts.empty() || r.max_emit < 2) return false;
+    if (chain_enabled()) return false;  // HALO_MTP_CHAIN drafts through mtp_draft_chain, which yields no runner-up
+    if (k + 2 > cpu::kMaxTreeRows || !r.seq->gdn.fits_tree_leaf(k + 1)) return false;
+    if (r.seq->kv.pool().layout().type != backend::KvType::F32) return false;  // attention_tree.comp is fp32-only
+    const backend::Kind kind = model_->backend().kind();
+    return kind == backend::Kind::Cpu || kind == backend::Kind::Vulkan;  // the HIP adapters reject tree attention
+}
 
 std::size_t Speculator::effective_k(const StepRequest& r) const {
     if (!is_decode(r) || !r.greedy) {
@@ -128,6 +176,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         check_mtp_invariant(*model_, *r.seq, i);
         Tick::Seq& s = tick.seqs[i];
         s.k = effective_k(r);
+        s.tree = tree_ok(r, s.k);  // provisional: confirmed below once the runner-up draft exists
         s.mtp_len0 = r.seq->mtp_kv ? r.seq->mtp_kv->length() : 0;
     }
 
@@ -149,6 +198,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         hid.push_back(std::move(h));
     }
     const bool dev_hidden = device_hidden_enabled();
+    const bool chained = chain_enabled() && model_->backend().limits().lm_head_ids;
     try {
         if (!idx.empty()) {
             std::vector<MtpStep> steps(idx.size());
@@ -161,21 +211,37 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 m.kv = &*r.seq->mtp_kv;
                 m.first_position = static_cast<std::int32_t>(tick.seqs[idx[j]].mtp_len0 + 1);
                 m.logit_rows = std::span(&last_row[j], forced ? 0 : 1);
-                m.logits = forced ? LogitsMode::None : LogitsMode::Argmax;
+                // Tree sequences need the whole depth-1 logit row for the runner-up d1' (host scan below).
+                m.logits = forced ? LogitsMode::None : tick.seqs[idx[j]].tree ? LogitsMode::Full : LogitsMode::Argmax;
                 const bool keep = !forced && tick.seqs[idx[j]].k > 1;  // a deeper draft will need this hidden
                 m.want_hidden = keep && !dev_hidden;
                 m.want_hidden_device = keep && dev_hidden;
             }
             models::StepResult res;
-            model_->mtp_forward(steps, res);
+            if (chained) {
+                // Every depth of every sequence in one submit (HALO_MTP_CHAIN): forced-draft sequences only
+                // flush their rows (k = 0); the others get all s.k drafts back, in depth order.
+                std::vector<std::size_t> ks(idx.size());
+                for (std::size_t j = 0; j < idx.size(); ++j) {
+                    ks[j] = reqs[idx[j]].forced_drafts.empty() ? tick.seqs[idx[j]].k : 0;
+                }
+                model_->mtp_draft_chain(steps, ks, res);
+            } else {
+                model_->mtp_forward(steps, res);
+            }
             metrics_.last_cost += res.cost;
             metrics_.last_weight_passes += res.cost.weight_passes;
-    metrics_.weight_passes += res.cost.weight_passes;
+            metrics_.weight_passes += res.cost.weight_passes;
             for (std::size_t j = 0; j < idx.size(); ++j) {
                 Tick::Seq& s = tick.seqs[idx[j]];
                 s.mtp_flushed = true;
                 if (!reqs[idx[j]].forced_drafts.empty()) continue;
+                if (chained) {
+                    for (const cpu::TopKEntry& a : res.seqs[j].argmax) tick.out[idx[j]].drafts.push_back(a.index);
+                    continue;
+                }
                 tick.out[idx[j]].drafts.push_back(res.seqs[j].argmax.at(0).index);
+                if (s.tree) s.alt = runner_up(res.seqs[j].logits, res.seqs[j].argmax.at(0).index);
                 if (s.k > 1) {
                     if (dev_hidden) {
                         s.mtp_hidden_dev = std::move(res.seqs[j].hidden_device);
@@ -188,6 +254,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         // ---- depth i >= 2: the MTP's own hidden (D-005 amendment) --------------------------
         std::size_t max_k = 0;
         for (const auto& s : tick.seqs) max_k = std::max(max_k, s.k);
+        if (chained) max_k = 0;  // mtp_draft_chain already produced every depth
         const std::size_t row0 = 0;
         for (std::size_t depth = 2; depth <= max_k; ++depth) {
             std::vector<std::size_t> at;
@@ -242,6 +309,15 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         if (!r.forced_drafts.empty()) tick.out[i].drafts.assign(r.forced_drafts.begin(), r.forced_drafts.end());
         // An MTP sequence without an MTP depth-1 call (length 0) cannot draft; forced drafts keep k.
         if (r.forced_drafts.empty()) tick.seqs[i].k = tick.out[i].drafts.size();
+        // A tree needs a real chain (k >= 1), a valid d1 and a runner-up token; otherwise: a plain chain.
+        Tick::Seq& s = tick.seqs[i];
+        s.tree = s.tree && s.k >= 1 && s.alt >= 0 && tick.out[i].drafts.front() >= 0 && s.alt != tick.out[i].drafts.front() &&
+                 tree_ok(r, s.k);
+        if (s.tree) {
+            s.parents = cpu::chain_plus_root_leaf_parents(s.k + 2);
+        } else {
+            s.alt = -1;
+        }
     }
     tick.phase = Tick::Phase::Drafted;
 }
@@ -267,13 +343,16 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
         if (is_decode(r)) {
             s.fed.assign(1, r.token);
             s.fed.insert(s.fed.end(), tick.out[i].drafts.begin(), tick.out[i].drafts.end());
+            if (s.tree) s.fed.push_back(s.alt);  // the leaf row: d1' as a second child of x
         } else {
             s.fed.assign(r.prefill.begin(), r.prefill.end());
         }
+        s.alt_win = false;
         SeqStep& st = steps[i];
         st.tokens = s.fed;
         st.kv = &r.seq->kv;
         st.gdn = &r.seq->gdn;
+        if (s.tree) st.tree_parents = s.parents;
         st.want_hidden = mtp_on(*model_, *r.seq);
         if (is_decode(r)) {
             rows[i].resize(r.greedy ? s.fed.size() : 1);
@@ -325,9 +404,39 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
             o.n_keep = s.fed.size();
             continue;
         }
+        std::int32_t leaf_target = -1;
+        if (s.tree) {
+            // Rows were [x, d1..dk, d1']: the last target belongs to the leaf; the rest is the chain, exactly
+            // as without a tree.
+            leaf_target = o.targets.back();
+            o.targets.pop_back();
+        }
         std::size_t acc = 0;
         while (acc < o.drafts.size() && o.drafts[acc] == o.targets[acc]) ++acc;
         o.accepted = acc;
+        const auto is_stop = [&](std::int32_t t) {
+            return std::find(r.stop_tokens.begin(), r.stop_tokens.end(), t) != r.stop_tokens.end();
+        };
+        if (s.tree && acc == 0 && s.alt == o.targets[0] && r.max_emit >= 2 && !is_stop(o.targets[0])) {
+            // d1 was wrong but the runner-up d1' is the trunk's token after x: keep [x, d1'] and emit
+            // [argmax(row 0), argmax(leaf row)] (two tokens instead of one). The leaf's rows are rewritten
+            // as the committed 2-row step: fed = [x, d1'], hidden = rows {0, leaf}.
+            s.alt_win = true;
+            o.accepted = 1;
+            o.n_keep = 2;
+            o.tokens = {o.targets[0], leaf_target};
+            o.targets = o.tokens;
+            const std::size_t E = model_->n_embd();
+            if (!s.hidden.empty()) {
+                const std::size_t leaf_row = s.fed.size() - 1;
+                std::vector<float> h2(2 * E);
+                std::copy_n(s.hidden.begin(), E, h2.begin());
+                std::copy_n(s.hidden.begin() + static_cast<std::ptrdiff_t>(leaf_row * E), E, h2.begin() + static_cast<std::ptrdiff_t>(E));
+                s.hidden = std::move(h2);
+            }
+            s.fed = {s.fed[0], s.alt};
+            continue;
+        }
         std::size_t keep = std::min(acc + 1, r.max_emit);
         for (std::size_t j = 0; j < keep; ++j) {
             if (std::find(r.stop_tokens.begin(), r.stop_tokens.end(), o.targets[j]) != r.stop_tokens.end()) {
@@ -359,12 +468,30 @@ void Speculator::commit(std::span<const StepRequest> reqs, Tick& tick, std::span
         Tick::Seq& s = tick.seqs[i];
         StepOutput& o = tick.out[i];
         std::size_t nk = o.n_keep;
+        bool leaf = false;  // the tree's runner-up branch [x, d1'] was kept
         if (is_decode(r)) {
             if (!n_keep.empty()) nk = n_keep[i];
             o.n_keep = nk;
             if (o.tokens.size() > nk) o.tokens.resize(nk);
+            leaf = s.alt_win && nk == 2;
+            if (leaf) {
+                // The leaf's KV row sits at L+k+1 (row order [x, d1..dk, d1']); it belongs at L+1. If the move
+                // fails, fall back to keeping only x: a valid state (chain slot k of the GDN ring is x's).
+                try {
+                    model_->kv_move_row(seq.kv, s.len0 + s.k + 1, s.len0 + 1);
+                } catch (const std::exception& e) {
+                    HALO_WARN("speculative", "tree commit: KV row move failed ({}); keeping only the pending token", e.what());
+                    leaf = false;
+                    nk = 1;
+                    o.n_keep = 1;
+                    o.accepted = 0;
+                    o.tokens.resize(1);
+                }
+            }
             seq.kv.truncate(s.len0 + nk);
-            if (s.k > 0) {
+            if (leaf) {
+                seq.gdn.commit_tree_leaf(s.k + 1);
+            } else if (s.k > 0) {
                 seq.gdn.commit_rows_kept(s.k + 1, nk);
             } else {
                 seq.gdn.drop_slots();
@@ -388,6 +515,8 @@ void Speculator::commit(std::span<const StepRequest> reqs, Tick& tick, std::span
         // ---- metrics + gate (decode only) -----------------------------------------------
         if (!is_decode(r)) continue;
         ++metrics_.decode_steps;
+        if (s.tree) ++metrics_.tree_steps;
+        if (leaf) ++metrics_.tree_leaf_kept;
         metrics_.emitted += o.tokens.size();
         metrics_.predicted_bytes += cost_.spec_step(s.k);
         if (s.k > 0) {

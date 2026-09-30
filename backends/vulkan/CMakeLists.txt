@@ -31,6 +31,14 @@ set(HALO_VK_SHADERS
   matmul/matvec_q5_k_rp  # planar-repacked weights (opt-in HALO_REPACK=1; gemv variant kGemvRepacked)
   matmul/matvec_q6_k_rp
   matmul/matvec_iq4_xs_rp
+  matmul/matvec_q4_k_sg  # subgroupAdd batched variants (opt-in HALO_SUBGROUP_REDUCE=1; batched n_vec > 1 only)
+  matmul/matvec_q5_k_sg
+  matmul/matvec_q6_k_sg
+  matmul/matvec_iq4_xs_sg
+  matmul/matvec_q4_k_normed  # rms_norm fused into the decode matvec prologue (opt-in HALO_FUSE_NORM=1)
+  matmul/matvec_q5_k_normed
+  matmul/matvec_q6_k_normed
+  matmul/matvec_iq4_xs_normed
   matmul/matvec_iq4_nl
   matmul/matvec_q3_k
   matmul/matvec_iq3_s
@@ -38,6 +46,7 @@ set(HALO_VK_SHADERS
   matmul/matmul_cm_q5_k
   matmul/matmul_cm_q6_k
   linear_attn/gated_delta_rule_decode
+  linear_attn/gated_delta_rule_decode_reg  # register-resident state variant (opt-in HALO_GDN_REG=1)
   linear_attn/gated_delta_rule_chunked
   linear_attn/gdn_gcheck
   linear_attn/conv1d_silu
@@ -62,8 +71,10 @@ set(HALO_VK_SHADERS
   attention/kv_write_q8
   attention/attention_f16
   attention/attention_q8
+  attention/attention_tree  # tree-masked fp32 attention (opt-in HALO_MTP_TREE=1)
   reduce/argmax_partial
   reduce/argmax_final
+  reduce/argmax_ids  # dense int32 winning ids of the argmax results (LmHeadArgs::ids, HALO_MTP_CHAIN)
 )
 
 set(_shader_dir ${CMAKE_CURRENT_SOURCE_DIR}/shaders)

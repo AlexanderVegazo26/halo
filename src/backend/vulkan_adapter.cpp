@@ -356,6 +356,7 @@ public:
         l.max_top_k = kMaxTopK;
         l.max_rope_dims = std::numeric_limits<std::uint32_t>::max();  // host cos/sin table; rot <= head_dim
         l.gdn_chunked = true;
+        l.lm_head_ids = true;
         l.max_import_bytes = ctx_->info().max_memory_allocation_size;  // RADV: 4 GiB
         // A KV pool buffer is bound whole as one storage-buffer descriptor (ops_paged.cpp
         // pool_operand): it must fit both the allocation cap and maxStorageBufferRange.
@@ -494,7 +495,14 @@ public:
         const bool repacked = a.kernel.variant_id == kGemvRepacked;
         if (!repacked) check_kernel(a.kernel, OpId::Gemv);
         const Resolver r(this, "MATMUL", st);
-        const hv::GemvArgs g = resolve_gemv(r, a, true);
+        hv::GemvArgs g = resolve_gemv(r, a, true);
+        if (!a.norm_w.empty()) {
+            HALO_CHECK(!repacked, ErrorCode::Unsupported, "MATMUL: a fused norm cannot be combined with the repacked variant");
+            const Ref nw = r.f32(a.norm_w, 1, a.cols, Access::Read, "norm_w");
+            r.no_overlap(r.f32(a.y, a.n_vec, a.rows, Access::Write, "y"), nw);
+            g.norm_w = nw.view;
+            g.norm_eps = a.norm_eps;
+        }
         if (a.n_vec == 0 || a.rows == 0) return;
         if (repacked)
             ops_.gemv_repacked(st.s(), g);
@@ -790,8 +798,14 @@ public:
         r.no_overlap(out, q);
         r.no_overlap(out, p.pool);
         r.no_overlap(out, p.table);
+        Ref tree_parent;
+        if (!a.tree_parent.empty()) {
+            tree_parent = r.get(a.tree_parent, 1, mul_u64(T, 4, r.op(), "tree_parent"), 4, Access::Read, "tree_parent");
+            r.no_overlap(out, tree_parent);
+        }
         if (T == 0) return;
         hv::AttentionArgs at;
+        at.tree_parent = tree_parent.view;
         at.q = q.view;
         at.q_head_stride = a.q_head_stride;
         at.kv_pool = p.pool.view;
@@ -823,6 +837,7 @@ public:
         check_status(a.status, OpId::LmHead);
         const Resolver r(this, "LM_HEAD", st);
         const GemvArgs& g = a.gemv;
+        HALO_CHECK(g.norm_w.empty(), ErrorCode::Unsupported, "LM_HEAD: a fused norm is not supported");
         const hv::GemvArgs hg = resolve_gemv(r, g, !g.y.empty());
         const Ref w = r.get(g.w, g.rows, weight_row_bytes(g.wtype, g.cols), g.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
         const Ref x = r.f32(g.x, g.n_vec, g.cols, Access::Read, "x");
@@ -834,12 +849,18 @@ public:
             r.no_overlap(*o, w);
         }
         r.no_overlap(res, y);
+        Ref ids{};
+        if (!a.ids.empty()) {
+            ids = r.get(a.ids, 1, mul_u64(g.n_vec, 4, r.op(), "ids"), 4, Access::Write, "ids");
+            for (const Ref* o : {&x, &w, &y, &res}) r.no_overlap(ids, *o);
+        }
         if (g.n_vec == 0 || g.rows == 0) return;
         hv::LmHeadArgs l;
         l.gemv = hg;
         l.workspace = st.scratch(ops_.lm_head_workspace_bytes(g.rows, g.n_vec, g.y.empty()));
         l.result = res.view;
         l.valid_rows = a.valid_rows;
+        if (!a.ids.empty()) l.ids = ids.view;
         ops_.lm_head(st.s(), l);
     }
 

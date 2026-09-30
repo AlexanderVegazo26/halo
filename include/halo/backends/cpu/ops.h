@@ -289,6 +289,37 @@ void attention_gqa(const AttentionDims& dims, ConstRows q, const PagedRows& k,
                    const PagedRows& v, std::size_t q_offset, float scale, Rows out,
                    ThreadPool* pool = nullptr);
 
+// ---- tree attention (opt-in HALO_MTP_TREE speculative verification) ----------------------
+// A tree over the T new rows of a step: parents[i] is the row index of row i's parent
+// (-1 for the single root, row 0; otherwise 0 <= parents[i] < i). Row i's RoPE position is
+// q_offset + tree_depth(i) and it attends the whole history [0, q_offset) plus its ancestors
+// (root .. itself), in that order -- exactly the keys of a plain decode of the root-to-row
+// path, in the same order, which is what keeps every row bit-identical to plain decoding.
+
+inline constexpr std::size_t kMaxTreeRows = 32;
+
+/// Error(Kernel) unless `parents` is a valid tree (see above) of 1..kMaxTreeRows rows.
+void check_tree_parents(std::span<const std::int32_t> parents);
+/// Number of ancestors of `row` (0 for the root).
+[[nodiscard]] std::size_t tree_depth(std::span<const std::int32_t> parents, std::size_t row);
+/// Rows root .. `row` (inclusive), root first.
+[[nodiscard]] std::vector<std::size_t> tree_path(std::span<const std::int32_t> parents, std::size_t row);
+/// The one tree shape the qwen35 forward supports: a chain [x, d1 .. dk] (parents -1, 0, 1, ..,
+/// k-1) plus ONE extra leaf, the last row, whose parent is the root (the alternate depth-1
+/// draft). Requires >= 3 rows. Why only this shape: see Qwen35::forward (GDN state ring).
+[[nodiscard]] bool is_chain_plus_root_leaf(std::span<const std::int32_t> parents) noexcept;
+/// The parents array of that shape for `n_rows` >= 3 rows.
+[[nodiscard]] std::vector<std::int32_t> chain_plus_root_leaf_parents(std::size_t n_rows);
+
+/// attention_gqa over a tree of the T query rows: query t attends history rows [0, q_offset)
+/// then the rows of tree_path(parents, t), as virtual keys 0 .. q_offset + depth(t). The
+/// arithmetic per key and its order are attention_gqa's, so for a chain (parents[i] = i - 1)
+/// the result is bitwise attention_gqa's. k / v must hold q_offset + T rows (the T new rows
+/// stored at history rows q_offset .. q_offset + T - 1 in row order).
+void attention_gqa_tree(const AttentionDims& dims, ConstRows q, const PagedRows& k, const PagedRows& v,
+                        std::size_t q_offset, float scale, std::span<const std::int32_t> parents, Rows out,
+                        ThreadPool* pool = nullptr);
+
 // ---------------------------------------------------------------------------------------
 // Element-wise (all operands the same [R, D] shape; out may alias any input)
 // ---------------------------------------------------------------------------------------

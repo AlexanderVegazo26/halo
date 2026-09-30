@@ -22,6 +22,27 @@
 // matmuls are bit-identical however rows are split, so greedy output with MTP on equals
 // greedy output with MTP off token for token (tested) — whatever the drafts are.
 //
+// Tree verification (opt-in: SpecConfig::tree / HALO_MTP_TREE=1, default OFF, greedy only):
+//   Depth 1 also keeps the runner-up of the MTP head (d1'). The verify forward then feeds the
+//   rows [x, d1 .. dk, d1'] with tree parents [-1, 0, 1 .. k-1, 0]: the chain as before, plus d1'
+//   as a second child of x. Design (why this shape, see also SeqStep::tree_parents):
+//    - attention: row i sits at RoPE position L + depth(i) and attends the prefix plus its root
+//      path, as virtual keys in plain-decode order (cpu::attention_gqa_tree, attention_tree.comp),
+//      so every row is bit-identical to plain decoding of its path.
+//    - GDN is a recurrent chain, so the leaf is its own one-row chain: it starts from the state
+//      after x, which the chain call already wrote as rollback slot k (physical (live+k+1)), and
+//      writes one more ring state. No kernel change, no state copy; costs ONE extra ring state
+//      (max_slots >= k + 2; the engine allocates it when the flag is on). Any other tree shape
+//      would overwrite a chain rollback slot and is rejected by Qwen35::forward.
+//    - Acceptance: chain as before; if d1 != t0 but d1' == t0 (t0 = argmax(row 0)) the leaf is
+//      accepted and 2 tokens [t0, argmax(leaf row)] are emitted instead of 1. Committing it moves
+//      the leaf's KV row (L+k+1) to L+1 (Qwen35::kv_move_row), truncates to L+2, and makes the leaf's
+//      GDN state live (GdnState::commit_tree_leaf). If that fails the commit falls back to keeping
+//      only x. Emitted tokens are trunk argmaxes of plain-decode-equivalent rows, so greedy output
+//      still equals plain greedy decoding.
+//   Sequences with forced drafts, a non-F32 KV cache, too few GDN slots, max_emit < 2 or a
+//   backend without tree attention (HIP) silently verify a plain chain.
+//
 // Cancellation / failure (RR-006):
 //   - after draft():  abort_draft() restores the MTP KV exactly (the queue is only
 //                     consumed at commit), leaving the pre-tick state bit for bit;
@@ -138,7 +159,15 @@ struct SpecConfig {
     std::size_t max_draft = 2;        ///< k cap (also capped by gdn.max_slots() - 1)
     GateConfig gate;
     std::size_t mtp_flush_rows = 64;  ///< flush a sequence's MTP queue at this many rows
+    /// Opt-in tree verification (HALO_MTP_TREE=1; the engine sets this from tree_env_enabled()):
+    /// verify the top-2 depth-1 candidates in ONE trunk forward. See "Tree verification" above.
+    bool tree = false;
 };
+
+/// True when the environment variable HALO_MTP_TREE is set to something other than "" / "0"
+/// (read once). The engine uses it to set SpecConfig::tree and to give every sequence's GDN
+/// ring the one extra state a tree verify needs.
+[[nodiscard]] bool tree_env_enabled();
 
 /// One sequence of a tick: either a decode step (feed the pending token `token`) or a
 /// prefill chunk (`prefill` non-empty).
@@ -173,6 +202,8 @@ struct Metrics {
     std::uint64_t accepted = 0;
     std::vector<std::uint64_t> accepted_at;  ///< [i]: steps where draft i+1 was accepted
     std::uint64_t emitted = 0;
+    std::uint64_t tree_steps = 0;       ///< sequence-steps that verified a tree (SpecConfig::tree)
+    std::uint64_t tree_leaf_kept = 0;   ///< of those, steps that kept the runner-up branch [x, d1']
     std::uint64_t mtp_flush_rows = 0;
     std::uint64_t mtp_dropped = 0;      ///< sequences whose MTP was dropped after a failed flush (N-1)
     std::uint64_t predicted_bytes = 0;  ///< sum of CostModel predictions over sequence-steps
@@ -198,6 +229,11 @@ struct Tick {
         /// empty). Only lives between two draft depths of one draft() call.
         std::shared_ptr<backend::Buffer> mtp_hidden_dev;
         std::vector<std::int32_t> fed; ///< rows fed to the trunk
+        // ---- tree verification (SpecConfig::tree) ----
+        bool tree = false;             ///< this sequence verifies [x, d1..dk, alt] as a tree this tick
+        std::int32_t alt = -1;         ///< the second-best depth-1 candidate d1' (a sibling of d1)
+        std::vector<std::int32_t> parents;  ///< SeqStep::tree_parents storage (must outlive the forward)
+        bool alt_win = false;          ///< verify: d1 rejected, d1' == argmax(row 0), and 2 rows are kept
     };
     std::vector<Seq> seqs;
     enum class Phase : std::uint8_t { Empty, Drafted, Verified, Committed } phase = Phase::Empty;
@@ -231,6 +267,10 @@ public:
 
 private:
     [[nodiscard]] std::size_t effective_k(const StepRequest& r) const;
+    /// Whether `r` (with k drafts) verifies a tree this tick: cfg.tree, a greedy MTP decode without
+    /// forced drafts, max_emit >= 2, an fp32 KV cache, a CPU/Vulkan backend, a GDN ring with room
+    /// for the leaf's state (max_slots >= k + 2) and k + 2 <= cpu::kMaxTreeRows.
+    [[nodiscard]] bool tree_ok(const StepRequest& r, std::size_t k) const;
 
     const models::Qwen35* model_;
     SpecConfig cfg_;

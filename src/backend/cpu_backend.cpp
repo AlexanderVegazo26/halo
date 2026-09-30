@@ -236,7 +236,9 @@ public:
     [[nodiscard]] Limits limits() const noexcept override {
         constexpr auto kMax = std::numeric_limits<std::uint32_t>::max();
         // chunk: cpu::gated_delta_rule_chunked accepts [1, 1024].
-        return Limits{kMax, 1024, kMax, kMax, kMax, kMax, true};
+        Limits l{kMax, 1024, kMax, kMax, kMax, kMax, true};
+        l.lm_head_ids = true;
+        return l;
     }
 
     std::unique_ptr<Buffer> allocate(std::uint64_t bytes, Tier /*tier: host memory only*/) override {
@@ -335,6 +337,7 @@ public:
     void gemv(Stream& s, const GemvArgs& a) override {
         check_stream(s, "MATMUL");
         check_kernel(a.kernel, OpId::Gemv);
+        HALO_CHECK(a.norm_w.empty(), ErrorCode::Unsupported, "MATMUL: a fused norm (GemvArgs::norm_w) is Vulkan-only");
         const Resolver r(this, "MATMUL");
         const std::uint64_t rb = weight_row_bytes(a.wtype, a.cols, r.op());
         const Operand w = r.get(a.w, a.rows, rb, a.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
@@ -602,6 +605,18 @@ public:
             kt[b] = blk + (a.layer * 2 + 0) * bt * kvd;
             vt[b] = blk + (a.layer * 2 + 1) * bt * kvd;
         }
+        if (!a.tree_parent.empty()) {
+            // Tree attention (HALO_MTP_TREE): T parents; the row order of the T new rows is the history order.
+            HALO_CHECK(qhs == hd, ErrorCode::Unsupported, "ATTENTION: tree attention needs a dense q (q_head_stride 0)");
+            const Operand par = r.get(a.tree_parent, 1, mul_u64(T, 4, r.op(), "tree_parent"), 4, Access::Read, "tree_parent");
+            r.no_overlap(out, par);
+            const std::span<const std::int32_t> parents(static_cast<const std::int32_t*>(static_cast<const void*>(par.base)), T);
+            const cpu::PagedRows keys = cpu::PagedRows::paged(kt, bt, rows, kvd, kvd);
+            const cpu::PagedRows vals = cpu::PagedRows::paged(vt, bt, rows, kvd, kvd);
+            cpu::attention_gqa_tree(cpu::AttentionDims{a.n_head, a.n_kv_head, hd}, crows(q, T, q_cols), keys, vals, a.q_offset,
+                                    a.scale, parents, wrows(out, T, static_cast<std::size_t>(a.n_head) * hd), pool_);
+            return;
+        }
         if (qhs == hd) {
             const cpu::PagedRows keys = cpu::PagedRows::paged(kt, bt, rows, kvd, kvd);
             const cpu::PagedRows vals = cpu::PagedRows::paged(vt, bt, rows, kvd, kvd);
@@ -666,6 +681,11 @@ public:
             r.no_overlap(*o, w);
         }
         r.no_overlap(res, y);
+        Operand ids_out{};
+        if (!a.ids.empty()) {
+            ids_out = r.get(a.ids, 1, mul_u64(g.n_vec, 4, r.op(), "ids"), 4, Access::Write, "ids");
+            for (const Operand* o : {&x, &w, &y, &res}) r.no_overlap(ids_out, *o);
+        }
         const std::size_t n = g.n_vec, E = g.cols, n_vocab = g.rows;
         if (n == 0) return;
         // M2: rows at/after valid_rows (GGUF LM-head padding past the tokenizer's real
@@ -705,6 +725,11 @@ public:
             if (poisoned[i] != 0) best[i] = {-1, std::numeric_limits<float>::quiet_NaN()};
         }
         write_results(res, best, std::span<const std::uint8_t>(poisoned));
+        if (ids_out.wbase != nullptr) {
+            // LmHeadArgs::ids: dense winning ids; a poisoned vector (index -1) writes 0, a valid row.
+            auto* out = static_cast<std::int32_t*>(static_cast<void*>(ids_out.wbase));
+            for (std::size_t i = 0; i < n; ++i) out[i] = best[i].index < 0 ? 0 : best[i].index;
+        }
     }
 
     void argmax(Stream& s, const ArgmaxArgs& a) override {

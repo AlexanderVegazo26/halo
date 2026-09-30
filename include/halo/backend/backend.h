@@ -221,6 +221,8 @@ struct Limits {
     /// min(maxMemoryAllocationSize, maxStorageBufferRange)); 0 = unlimited. The engine splits
     /// a KV pool over per-layer buffers (kv_cache::Placement::PerLayer) to stay under it.
     std::uint64_t max_pool_buffer_bytes = 0;
+    /// LmHeadArgs::ids is implemented (dense int32 winning ids written in stream order; CPU, Vulkan).
+    bool lm_head_ids = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -266,6 +268,14 @@ struct GemvArgs {
     TensorRef w{}, x{}, y{};
     std::uint32_t rows = 0, cols = 0, n_vec = 1;
     KernelChoice kernel{};
+    /// Fused input norm (Vulkan only, HALO_FUSE_NORM): when non-empty the gemv computes
+    /// y = W (rms_norm(x) * norm_w) with eps = norm_eps, and `x` is the RAW row. Requires
+    /// n_vec == 1, a non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS weight and not the LM head; the CPU and
+    /// HIP backends and every other case throw (never silently ignore it). norm_w: [cols] fp32.
+    /// The numerics differ from the separate rms_norm + gemv only in the reduction order's
+    /// dependence on the reduce workgroup (see shaders matmul/matvec_*_normed.comp).
+    TensorRef norm_w{};
+    float norm_eps = 1e-6f;
 };
 
 /// GDN gates (= the qwen35 sequence: beta_out = cpu::sigmoid(beta); t = alpha + dt_bias;
@@ -366,6 +376,12 @@ struct AttentionArgs {
     KernelChoice kernel{};
     StatusRef status{};
     KvType kv_type = KvType::F32;  ///< format of the pool image (see KvType)
+    /// Tree attention (opt-in, HALO_MTP_TREE): n_tokens int32 parents, cpu::check_tree_parents
+    /// semantics (row 0 = root with parent -1, 0 <= parent[i] < i, at most cpu::kMaxTreeRows rows).
+    /// Query t then attends history rows [0, q_offset) followed by the rows of its root path
+    /// (cpu::attention_gqa_tree). Empty (default) = the ordinary causal attention, unchanged.
+    /// CPU and Vulkan backends with an fp32 KV pool only; others throw Error(Unsupported).
+    TensorRef tree_parent{};
 };
 
 /// SWIGLU out = silu(a) * b; MUL_SIGMOID out = a * sigmoid(b); ADD out = a + b.
@@ -393,6 +409,12 @@ struct LmHeadArgs {
     std::uint32_t valid_rows = 0;
     KernelChoice kernel{};
     StatusRef status{};
+    /// Optional (Limits::lm_head_ids; Error(Unsupported) elsewhere): n_vec dense int32 winning token ids
+    /// (the index word of each result triple), written in stream order after the argmax so a following
+    /// op (GET_ROWS ids) can consume them from device memory with no host round trip. A poisoned vector
+    /// (NaN logit / no result) writes id 0 -- always a valid row -- while its result triple still carries
+    /// the poison for the host to reject. Empty = not written.
+    TensorRef ids{};
 };
 
 /// ARGMAX (cpu::argmax per vector): logits n_vec rows of [n]; result as LmHeadArgs.

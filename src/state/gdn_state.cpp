@@ -185,6 +185,17 @@ void GdnState::commit_rows_kept(std::size_t rows, std::size_t kept) {
     drop_slots();
 }
 
+void GdnState::commit_tree_leaf(std::size_t rows) {
+    HALO_CHECK(pending_, ErrorCode::Api, "GdnState::commit_tree_leaf({}): no pending verify", rows);
+    HALO_CHECK(rows >= 1 && rows == pend_rows_ && pend_slots_ >= rows, ErrorCode::Api,
+               "GdnState::commit_tree_leaf({}): last slot-writing call had {} rows / {} valid slots", rows, pend_rows_,
+               pend_slots_);
+    HALO_CHECK(fits_tree_leaf(rows), ErrorCode::Api, "GdnState::commit_tree_leaf({}): ring of {} states is too small", rows,
+               p_);
+    live_ = static_cast<std::uint32_t>((base_ + rows + 1) % p_);
+    drop_slots();
+}
+
 void GdnState::drop_slots() noexcept {
     pend_rows_ = 0;
     pend_slots_ = 0;

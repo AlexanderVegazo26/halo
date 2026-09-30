@@ -114,6 +114,20 @@ struct SeqStep {
     bool want_hidden = false;          ///< final output-normed hidden of every row (for MTP)
     std::size_t n_state_slots = 0;     ///< D-012 rollback slots to write (<= gdn->max_slots())
     GdnPath gdn_path = GdnPath::Auto;
+    /// Tree verification (opt-in, HALO_MTP_TREE): parents of the rows of `tokens` (cpu::tree_*
+    /// semantics; empty = an ordinary linear step). The one accepted shape is
+    /// cpu::is_chain_plus_root_leaf: tokens = [x, d1 .. dk, d1'] with parents [-1, 0, 1 .. k-1, 0],
+    /// i.e. the draft chain plus ONE alternate depth-1 token d1' (a sibling of d1). Requirements
+    /// (Error(Api) otherwise): k >= 1, gdn_path Recurrent (or Auto), n_state_slots == k + 1,
+    /// gdn->fits_tree_leaf(k + 1) (ring >= k + 3 states), `positions` empty, fp32 KV.
+    /// Rows are appended in the given order (KV rows L .. L+k+1; the leaf's KV row is L+k+1)
+    /// but row i sits at RoPE position L + depth(i) and attends its root path only.
+    /// The GDN state is begun/committed as a (k+1)-row step: after the forward the sequence is in
+    /// the "pending verify" state of the k+1 chain rows, and the leaf's state waits in the ring
+    /// (GdnState::commit_tree_leaf). KV length grows by ALL k+2 rows; the caller must then either
+    /// truncate to L + m (chain rows kept, commit_rows_kept(k+1, m)) or, to keep [x, d1'], call
+    /// Qwen35::kv_move_row(kv, L+k+1, L+1), truncate to L+2 and GdnState::commit_tree_leaf(k+1).
+    std::span<const std::int32_t> tree_parents{};
 };
 
 /// One sequence of an MTP step (D-005): row i = MTP(embed(tokens[i]), hidden[i]) at RoPE
@@ -220,6 +234,29 @@ public:
 
     /// MTP block step (D-005). Error(Unsupported) if the model has no MTP block.
     void mtp_forward(std::span<const MtpStep> steps, StepResult& out) const;
+
+    /// Chained MTP drafting (HALO_MTP_CHAIN): the depth-1 step of every sequence (`steps`, as for
+    /// mtp_forward: teacher-forced rows, host `hidden` or one-row `hidden_device`) followed by
+    /// k[i] - 1 further one-row draft depths, recorded into ONE command stream with ONE submit / wait.
+    /// The winning token of depth d feeds depth d + 1's embedding lookup straight from device memory
+    /// (LmHeadArgs::ids -> GET_ROWS) and its hidden row stays on the device, so nothing crosses to the
+    /// host until the end. k[i] == 0: the sequence only runs its depth-1 rows (teacher-forced flush,
+    /// no logits). out.seqs[i].argmax holds the k[i] drafts in depth order (empty for k[i] == 0);
+    /// out.cost sums every depth (weight_passes = depths run). steps[i].logits / logit_rows /
+    /// want_hidden* are ignored. Requires Limits::lm_head_ids (Error(Unsupported) otherwise).
+    /// Greedy drafts are identical to the equivalent mtp_forward sequence (same ops, same order).
+    /// KV: on success each MTP KV grew by tokens.size() + k[i] - 1 rows (as the unchained sequence
+    /// leaves it); on Error every touched MTP KV is truncated back to its length on entry. A poisoned
+    /// (NaN) draft is reported as Error(Api) after the sync, like the unchained path's next-depth
+    /// token check.
+    void mtp_draft_chain(std::span<const MtpStep> steps, std::span<const std::size_t> k, StepResult& out) const;
+
+    /// Copies KV row `from` to row `to` (both < kv.length()) of every trunk attention layer, K and
+    /// V, on the model's backend (synchronous). The tree-verify commit of the alternate branch
+    /// (SeqStep::tree_parents). fp32 KV pools only (Error(Unsupported) otherwise); the destination
+    /// block must be exclusively owned (rows written by a forward always are). `kv` must be a
+    /// trunk sequence KV.
+    void kv_move_row(kv_cache::SequenceKv& kv, std::size_t from, std::size_t to) const;
 
     // ---- cost model inputs (stored bytes) ------------------------------------------------
     [[nodiscard]] std::uint64_t trunk_weight_bytes() const noexcept;  ///< all trunk layers + output_norm, no head/embedding

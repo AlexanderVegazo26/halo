@@ -256,6 +256,30 @@ void Ops::attention(Stream& stream, const AttentionArgs& a) {
     const Operand os = status_operand(a.status, align, op);
     require_disjoint(oo, "out", {{&oq, "q"}, {&op_pool, "kv_pool"}, {&ot, "block_table"}, {&os, "status"}}, op);
     require_disjoint(os, "status", {{&oq, "q"}, {&op_pool, "kv_pool"}, {&ot, "block_table"}}, op);
+    if (!a.tree_parent.empty()) {
+        // Tree attention (opt-in HALO_MTP_TREE): its own shader, fp32 pool only.
+        HALO_CHECK(a.kv_type == KvType::F32, ErrorCode::Unsupported,
+                   "{}: tree attention needs an fp32 KV pool (the fp16 / Q8 pools have no tree shader)", op);
+        HALO_CHECK(a.n_tokens <= 32, ErrorCode::Unsupported, "{}: tree attention supports at most 32 rows, got {}", op,
+                   a.n_tokens);
+        const Operand opar = operand(a.tree_parent, 1, std::uint64_t{a.n_tokens} * 4, Access::Floats, align, op, "tree_parent");
+        require_disjoint(oo, "out", {{&opar, "tree_parent"}}, op);
+        struct TPush {
+            std::uint32_t n_head, n_kv_head, head_dim, n_tokens, q_offset;
+            float scale;
+            std::uint32_t n_pool_blocks, block_floats, layer_off, bt, kv_dim, q_off, q_stride, q_head_stride, pool_off,
+                tab_off, o_off, o_stride, st_off, par_off;
+        } tpush{a.n_head,       a.n_kv_head,     a.head_dim,  a.n_tokens,      a.q_offset,
+                a.scale,        a.n_pool_blocks, g.block_floats, g.layer_off,  a.block_tokens,
+                static_cast<std::uint32_t>(kv_dim), oq.off,  oq.stride,       qhs,          op_pool.off,
+                ot.off,         oo.off,          oo.stride,   os.off,          opar.off};
+        const Kernel& tk = kernel("attention_tree", 6, sizeof(TPush), {{0, wg}}, {wg, 1, 1});
+        const std::array tbindings{oq.binding, op_pool.binding, ot.binding, oo.binding, os.binding, opar.binding};
+        const GroupCount tgroups = grid_1d(items, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+        zero_status(stream, a.status);
+        stream.dispatch(tk, tbindings, tpush, tgroups, 0b11000);  // out + status written
+        return;
+    }
     if (a.kv_type != KvType::F32) {
         // Quantized pool (fp16 / Q8): its own shader; kv_dim is replaced by row_words in the push block.
         struct QPush {

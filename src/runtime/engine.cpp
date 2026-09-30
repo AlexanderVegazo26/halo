@@ -293,6 +293,9 @@ private:
     memory::MemoryPlan plan_;
     std::optional<std::int32_t> eos_;
     std::size_t max_draft_ = 0;
+    /// HALO_MTP_TREE=1 (opt-in): one extra trunk row per decode step (the runner-up leaf) and one extra
+    /// GDN ring state per sequence; 0 when off or without MTP drafting.
+    std::size_t tree_extra_ = 0;
     /// Prompt-lookup drafts ahead of MTP (opt-in: HALO_NGRAM_DRAFT=1). Greedy requests only.
     bool ngram_draft_ = [] {
         const char* e = std::getenv("HALO_NGRAM_DRAFT");
@@ -400,6 +403,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     info_.has_mtp = model_->has_mtp();
     const bool mtp = cfg.mtp_enabled && model_->has_mtp() && cfg.mtp_max_draft > 0;
     max_draft_ = mtp ? static_cast<std::size_t>(cfg.mtp_max_draft) : 0;
+    tree_extra_ = max_draft_ > 0 && speculative::tree_env_enabled() ? 1 : 0;
 
     // ---- memory plan (D-002: tier discovery, never assumption) --------------------------
     hardware::DiscoveryOptions dopts;
@@ -429,6 +433,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
                                                    : memory::DtypeSize::f32();  // the CPU reference stores fp32 KV
     pr.mtp_enabled = mtp;
     pr.mtp_draft_depth = static_cast<std::uint32_t>(max_draft_);
+    if (tree_extra_ != 0) pr.gdn_rollback_copies = static_cast<std::uint32_t>(max_draft_ + 1 + tree_extra_);  // the tree leaf's state
     pr.prefix_checkpoints.enabled = cfg.prefix_cache;
     if (opts.checkpoint_spacing > 0) pr.prefix_checkpoints.spacing_tokens = static_cast<std::uint32_t>(opts.checkpoint_spacing);
     pr.max_memory = cfg.max_memory_bytes;
@@ -455,7 +460,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     trunk_layout.type = kv_type;
     kv_cache::KvLayout mtp_layout = model_->mtp_kv_layout(bt);
     mtp_layout.type = kv_type;
-    const auto blocks_for = [&](std::size_t ctx) { return ceil_div(ctx + max_draft_ + 1, bt) + 1; };  // +1: one COW copy
+    const auto blocks_for = [&](std::size_t ctx) { return ceil_div(ctx + max_draft_ + tree_extra_ + 1, bt) + 1; };  // +1: one COW copy
     std::size_t per_seq = blocks_for(info_.context_length);
     cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
     // ---- KV pool sizing (large contexts) -------------------------------------------------
@@ -568,7 +573,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     }
     free_slots_.reserve(cfg.max_sequences);
     for (std::size_t i = 0; i < cfg.max_sequences; ++i) {
-        slots_.push_back(std::make_unique<state::SequenceState>(*kv_pool_, mtp_pool_.get(), model_->gdn_shape(), max_draft_ + 1));
+        slots_.push_back(std::make_unique<state::SequenceState>(*kv_pool_, mtp_pool_.get(), model_->gdn_shape(), max_draft_ + 1 + tree_extra_));
         // ADR-001 §5.2/§5.3: the GDN ring slab is a State-arena buffer of the model's backend
         // (device-resident on GPU backends; zero-copy host memory on the CPU backend).
         slots_.back()->gdn.attach(model_->backend());
@@ -576,6 +581,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     }
     speculative::SpecConfig sc;
     sc.max_draft = max_draft_;
+    sc.tree = tree_extra_ != 0;
     sc.gate.mode = mtp ? opts.gate_mode : speculative::GateMode::Off;
     sc.gate.window = opts.gate_window;
     sc.gate.probe_interval = opts.gate_probe_interval;
@@ -1144,7 +1150,7 @@ void CpuEngine::tick() {
             }
             q.max_emit = a.r->max_new - a.generated.size();
             q.stop_tokens = eos_span;
-            trunk_rows += 1 + q.max_draft;
+            trunk_rows += 1 + q.max_draft + tree_extra_;
             mtp_rows += 1 + q.max_draft + seq.mtp_queue_size();
         }
     }

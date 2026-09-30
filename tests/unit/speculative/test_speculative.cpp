@@ -59,6 +59,14 @@ protected:
         c.gate.mode = mode;
         return Speculator(model(), c);
     }
+    /// Tree verification on (SpecConfig::tree); the sequence needs max_draft + 2 GDN slots for the leaf.
+    static Speculator spec_tree(std::size_t max_draft) {
+        SpecConfig c;
+        c.max_draft = max_draft;
+        c.gate.mode = GateMode::Always;
+        c.tree = true;
+        return Speculator(model(), c);
+    }
     static Toks prompt(const char* p) { return golden_->i32(std::string(p) + ".tokens"); }
 
     static inline std::optional<Golden> golden_;
@@ -238,6 +246,123 @@ TEST_F(Spec, OracleDraftsAcceptEveryDepthAndStayIdenticalToPlain) {
     (void)prefill(off2, *plain, pr);
     (void)feed_plain(off2, *plain, std::span(out).first(out.size() - 1));
     expect_same_state(sp, *s, *plain);
+}
+
+// ---- tree verification (SpecConfig::tree, opt-in HALO_MTP_TREE) ---------------------------
+
+// Greedy generation with trees on (real MTP drafts + runner-up leaves) equals plain greedy decoding, token for
+// token and state for state. The ring needs k + 2 slots for the leaf (k + 1 without a tree).
+TEST_F(Spec, TreeGreedyEqualsPlainGreedy) {
+    constexpr std::size_t kN = 16;
+    const Toks pr = prompt("p1");
+    auto off = spec(GateMode::Off);
+    auto so = seq();
+    const Toks plain = generate(off, *so, pr, kN, 0);
+    for (std::size_t k = 1; k <= 3; ++k) {
+        SCOPED_TRACE(k);
+        auto on = spec_tree(k);
+        auto s = seq(k + 2);
+        EXPECT_EQ(generate(on, *s, pr, kN, k), plain);
+        EXPECT_GT(on.metrics().tree_steps, 0u) << "no step verified a tree";
+        expect_same_state(on, *s, *so);
+    }
+    // Too small a ring: silently a plain chain (no tree step), still identical.
+    auto on = spec_tree(2);
+    auto s = seq(3);  // max_slots 3 = k + 1: no room for the leaf state
+    EXPECT_EQ(generate(on, *s, pr, kN, 2), plain);
+    EXPECT_EQ(on.metrics().tree_steps, 0u);
+}
+
+// The runner-up branch: force d1 wrong and d1' == the trunk's true next token. verify must accept the leaf, emit
+// [t0, argmax(leaf row)], and commit must leave the sequence bit-identical to plain decoding [x, d1'] (KV row moved
+// from L+k+1 to L+1, GDN state = the leaf's ring slot, hidden of the leaf row). Committing only x (cancellation,
+// n_keep = 1) is decode-1.
+TEST_F(Spec, TreeRunnerUpBranchIsKeptAndEqualsPlainDecode) {
+    constexpr std::size_t kK = 2;
+    const Toks pr = prompt("p0");  // 150 tokens: history crosses KV blocks
+    auto off = spec(GateMode::Off);
+    auto gs = seq();
+    const Toks g = generate(off, *gs, pr, 12, 0);
+    const std::size_t m = 3;  // pending token g[m], history = prompt + g[0..m)
+    for (const std::size_t keep : {std::size_t{2}, std::size_t{1}}) {
+        SCOPED_TRACE(keep);
+        auto sp = spec_tree(kK);
+        auto s = seq(kK + 2);
+        (void)prefill(sp, *s, pr);
+        (void)feed_plain(sp, *s, std::span(g).first(m));
+        StepRequest q;
+        q.seq = s.get();
+        q.token = g[m];
+        q.max_draft = kK;
+        const std::span<const StepRequest> reqs(&q, 1);
+        Tick t;
+        sp.draft(reqs, t);
+        ASSERT_TRUE(t.seqs[0].tree) << "the tree was not armed";
+        ASSERT_EQ(t.out[0].drafts.size(), kK);
+        const std::int32_t truth = g[m + 1];
+        t.out[0].drafts[0] = static_cast<std::int32_t>((static_cast<std::size_t>(truth) + 1) % model().n_vocab());  // d1 wrong
+        t.seqs[0].alt = truth;                                                                                    // d1' right
+        sp.verify(reqs, t);
+        ASSERT_TRUE(t.seqs[0].alt_win);
+        EXPECT_EQ(t.out[0].accepted, 1u);
+        EXPECT_EQ(t.out[0].n_keep, 2u);
+        EXPECT_EQ(t.out[0].tokens, (Toks{g[m + 1], g[m + 2]}));
+        const std::array<std::size_t, 1> nk = {keep};
+        sp.commit(reqs, t, keep == 2 ? std::span<const std::size_t>() : std::span<const std::size_t>(nk));
+        EXPECT_EQ(s->length(), pr.size() + m + keep);
+        EXPECT_EQ(sp.metrics().tree_leaf_kept, keep == 2 ? 1u : 0u);
+        auto ref = seq();
+        auto off2 = spec(GateMode::Off);
+        (void)prefill(off2, *ref, pr);
+        (void)feed_plain(off2, *ref, std::span(g).first(m + keep));  // x, and d1' == g[m+1] when kept
+        expect_same_state(sp, *s, *ref);
+        // The next tick continues correctly from the committed state.
+        StepRequest q2;
+        q2.seq = s.get();
+        q2.token = keep == 2 ? g[m + 2] : g[m + 1];
+        q2.max_draft = kK;
+        const Tick t2 = step1(sp, q2);
+        EXPECT_EQ(t2.out[0].tokens.at(0), keep == 2 ? g[m + 3] : g[m + 2]);
+    }
+}
+
+// The alternative is never kept when it would be wrong: d1 right (chain wins), or both wrong (plain 1 token).
+TEST_F(Spec, TreeChainWinsOrBothWrongEqualsPlainDecode) {
+    constexpr std::size_t kK = 2;
+    const Toks pr = prompt("p1");
+    auto off = spec(GateMode::Off);
+    auto gs = seq();
+    const Toks g = generate(off, *gs, pr, 16, 0);
+    const std::size_t m = 4;
+    for (const bool chain_right : {true, false}) {
+        SCOPED_TRACE(chain_right);
+        auto sp = spec_tree(kK);
+        auto s = seq(kK + 2);
+        (void)prefill(sp, *s, pr);
+        (void)feed_plain(sp, *s, std::span(g).first(m));
+        StepRequest q;
+        q.seq = s.get();
+        q.token = g[m];
+        q.max_draft = kK;
+        const std::span<const StepRequest> reqs(&q, 1);
+        Tick t;
+        sp.draft(reqs, t);
+        ASSERT_TRUE(t.seqs[0].tree);
+        const std::size_t V = model().n_vocab();
+        const Toks d = oracle(g, m, kK, chain_right ? kK : 0, V);  // all correct / d1 wrong
+        t.out[0].drafts = d;
+        t.seqs[0].alt = static_cast<std::int32_t>((static_cast<std::size_t>(g[m + 1]) + 2) % V);  // wrong runner-up, distinct from the forged d1
+        sp.verify(reqs, t);
+        EXPECT_FALSE(t.seqs[0].alt_win);
+        sp.commit(reqs, t);
+        const std::size_t kept = chain_right ? kK + 1 : 1;
+        EXPECT_EQ(t.out[0].tokens.size(), kept);
+        auto ref = seq();
+        auto off2 = spec(GateMode::Off);
+        (void)prefill(off2, *ref, pr);
+        (void)feed_plain(off2, *ref, std::span(g).first(m + kept));
+        expect_same_state(sp, *s, *ref);
+    }
 }
 
 // ---- D-012: verify + rollback to r == decode r ------------------------------------------

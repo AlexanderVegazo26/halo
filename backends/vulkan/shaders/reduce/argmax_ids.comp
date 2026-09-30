@@ -1,0 +1,27 @@
+#version 450
+// ARGMAX ids: densifies the winning token ids of `count` argmax result triples (index, value bits,
+// nan) into ids[i] (int32), so the ids can feed get_rows (or any int32-id consumer) straight from
+// device memory (HALO_MTP_CHAIN). A poisoned or empty vector (nan word set / index 0xFFFFFFFF)
+// writes id 0 -- a valid row -- so a downstream get_rows never faults; the triple itself still
+// carries the poison and the host, which downloads the words at the end of the tick, rejects it.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Words { uint words[]; };
+layout(std430, binding = 1) writeonly buffer Ids { int ids[]; };
+
+layout(push_constant) uniform Push {
+    uint count;
+    uint w_off;  // word remainder of the result view
+    uint i_off;  // element remainder of the ids view
+} pc;
+
+void main() {
+    const uint i = halo_group_id() * WG + gl_LocalInvocationID.x;
+    if (i >= pc.count) return;
+    const uint idx = words[pc.w_off + 3u * i];
+    const uint nan = words[pc.w_off + 3u * i + 2u];
+    ids[pc.i_off + i] = (nan != 0u || idx == 0xFFFFFFFFu) ? 0 : int(idx);
+}

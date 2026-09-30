@@ -142,6 +142,37 @@ TEST(GdnState, RingCommitIsOneIntegerFromTheRecordedBase) {
     EXPECT_EQ(s.live(), 1u);
 }
 
+TEST(GdnState, TreeLeafCommitIsOneIntegerAndNeedsTheExtraRingState) {
+    // Tree verify (HALO_MTP_TREE): a T-row chain with T slots, then the leaf state lives at
+    // (base + T + 1) mod P. commit_tree_leaf makes it live: one integer, P >= T + 2 required.
+    const Inputs a = make_inputs(8, 11), b = make_inputs(8, 12);
+    GdnState s(kShape, 4);  // P = 5
+    EXPECT_EQ(s.ring_size(), 5u);
+    EXPECT_TRUE(s.fits_tree_leaf(3));
+    EXPECT_FALSE(s.fits_tree_leaf(4));
+    EXPECT_THROW(s.commit_tree_leaf(3), halo::Error) << "no pending verify";
+    run_all_layers(s, a, b, 0, 3, 3);
+    EXPECT_EQ(s.live(), 1u) << "after the chain's clean status";
+    s.commit_tree_leaf(3);
+    EXPECT_EQ(s.live(), 4u) << "live = base(0) + T(3) + 1";
+    EXPECT_EQ(s.slots_valid(), 0u) << "the verify is over";
+    run_all_layers(s, a, b, 0, 3, 3);
+    EXPECT_EQ(s.live(), 0u) << "next chain from base 4: live = 5 mod 5";
+    s.commit_tree_leaf(3);
+    EXPECT_EQ(s.live(), 3u) << "the leaf state wraps: (4 + 3 + 1) mod 5";
+    // Wrong rows / too few written slots / too small a ring are Error(Api) and change nothing.
+    run_all_layers(s, a, b, 0, 3, 2);
+    const std::uint32_t before = s.live();
+    EXPECT_THROW(s.commit_tree_leaf(3), halo::Error) << "slot 2 (the state after row 0) was not written";
+    EXPECT_THROW(s.commit_tree_leaf(2), halo::Error) << "row count mismatch";
+    EXPECT_EQ(s.live(), before);
+    s.drop_slots();
+    GdnState small(kShape, 3);  // P = 4: a 3-row chain leaves no free slot for the leaf
+    run_all_layers(small, a, b, 0, 3, 3);
+    EXPECT_THROW(small.commit_tree_leaf(3), halo::Error);
+    small.commit_rows_kept(3, 3);
+}
+
 TEST(GdnState, FewerSlotsThanRowsLimitsRollbackDepth) {
     const Inputs a = make_inputs(6, 3), b = make_inputs(6, 4);
     GdnState s(kShape, 4);

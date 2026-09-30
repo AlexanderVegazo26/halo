@@ -127,6 +127,8 @@ struct SeqRows {
     kv_cache::SequenceKv* kv = nullptr;
     std::int32_t pos0 = 0;
     TensorRef table{};  // the block table (uint32); the pool image comes from KvPool::layer_image()
+    // Tree verification (SeqStep::tree_parents): n int32 parents, imported per forward; empty = linear rows.
+    TensorRef tree_parent{};
 };
 
 std::uint64_t vec_bytes(const WeightRef& w) { return w.present() ? w.n_bytes() : 0; }
@@ -177,6 +179,13 @@ struct Qwen35::Impl {
     // Only the engine worker thread drives a model, the mutex is defensive.
     static constexpr std::size_t kMaxPooledStreams = 4;
     bool reuse_streams = false;
+// HALO_FUSE_NORM=1 (default off, read once in the constructor; Vulkan only): the post-attention
+// add + rms_norm feeding the FFN gate/up gemvs becomes a plain add, and those gemvs (R == 1,
+// unfused non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS Mats) compute rms_norm(x) * post_norm themselves in
+// their prologue (GemvArgs::norm_w). The row RMS is the separate kernel's (same tree) but each
+// gemv recomputes it; results match the separate path up to what the gemv's own reduction does
+// with an input that may differ in the last ulp (none expected at reduce_workgroup == 256).
+bool fuse_norm = false;
     mutable std::mutex stream_mu;
     mutable std::vector<std::unique_ptr<backend::Stream>> stream_pool;
 
@@ -442,8 +451,14 @@ struct Qwen35::Impl {
 
     // ---- blocks ------------------------------------------------------------------------
 
-    void gemv(Step& st, TensorRef x, std::size_t R, const Mat& w, TensorRef y) const {
-        be->gemv(*st.s, backend::GemvArgs{w.type, w.ref(), x, y, w.rows, w.cols, u32(R), {w.variant}});
+    /// `norm` != nullptr: x is the RAW row and the gemv applies rms_norm(x) * norm itself (see fuse_norm).
+    void gemv(Step& st, TensorRef x, std::size_t R, const Mat& w, TensorRef y, const Vec* norm = nullptr) const {
+        backend::GemvArgs g{w.type, w.ref(), x, y, w.rows, w.cols, u32(R), {w.variant}};
+        if (norm != nullptr) {
+            g.norm_w = norm->ref();
+            g.norm_eps = eps;
+        }
+        be->gemv(*st.s, g);
         st.cost.weight_bytes += w.bytes;
         st.cost.activation_bytes += cpu::traffic_matmul(R, w.cols, w.rows, 0).total();
     }
@@ -459,10 +474,19 @@ struct Qwen35::Impl {
         st.cost.activation_bytes += cpu::traffic_binary(R * E).total() + cpu::traffic_rms_norm(R, E).total();
     }
 
+    /// Can `w` run the fused-norm gemv (see fuse_norm)? Not for repacked or row-fused Mats.
+    [[nodiscard]] bool norm_fusable(const Mat& w) const {
+        return w.present() && w.variant == 0 && w.stride == 0 &&
+               (w.type == DType::Q4_K || w.type == DType::Q5_K || w.type == DType::Q6_K || w.type == DType::IQ4_XS) &&
+               w.cols <= 16384;
+    }
+
     /// Scratch activations of one call, sized for R rows and reused by every layer (stream
     /// order makes the reuse safe on any backend).
     struct Acts {
         TensorRef x, xn, y;
+        // Set (by decoder_layer) when xn was NOT computed: the FFN gemvs read x and apply this norm.
+        const Vec* fnorm = nullptr;
         // attention
         TensorRef qg, q, k, kn, v, att, gated;
         // GDN
@@ -588,6 +612,7 @@ struct Qwen35::Impl {
             at.q_offset = u32(len);
             at.scale = scale;
             at.kv_type = l.type;
+            at.tree_parent = s.tree_parent;
             be->attention(*st.s, at);
             const cpu::OpTraffic t = cpu::traffic_attention(dims, s.n, len);
             cost.kv_bytes += 2ULL * 4 * (len + s.n) * kvd;
@@ -604,6 +629,7 @@ struct Qwen35::Impl {
         state::GdnState* gdn = nullptr;
         std::size_t n_slots = 0;
         bool chunked = false;
+        bool tree = false;  ///< SeqStep::tree_parents (chain + root leaf): the last row is a separate 1-row chain
     };
 
     /// Gated DeltaNet mixer (D-004 items 1-7).
@@ -635,48 +661,65 @@ struct Qwen35::Impl {
             const SeqRows& s = seqs[si];
             const GdnSeq& g = gseqs[si];
             state::GdnState& gdn_st = *g.gdn;
-            // ADR-001 §5.3: the conv and recurrent state are one device-resident ring slab
+            // One recurrent chain of `nrows` rows starting at batch row `row0`, reading ring state
+            // ring.live. ADR-001 §5.3: the conv and recurrent state are one device-resident ring slab
             // per sequence; the kernels read slab[live] and write the final state plus the
             // rollback slots to other physical slots (no host import/export per forward).
-            const backend::StateRing ring{u32(gdn_st.ring_size()), gdn_st.live()};
-            const TensorRef xs = rows_at(a.conv, s.r0, conv_c);
-            be->conv1d_silu(*st.s, backend::Conv1dArgs{rows_at(a.qkv, s.r0, conv_c), w.conv.ref(),
-                                                       gdn_st.conv_ref(gdn_layer), xs, {},
-                                                       u32(s.n), u32(conv_c), u32(conv_k), u32(g.n_slots), ring, {}});
-            const cpu::OpTraffic tc = cpu::traffic_causal_conv1d(s.n, conv_c, conv_k, g.n_slots);
-            const std::uint64_t conv_state_bytes = 4ULL * (conv_k - 1) * conv_c;
-            const std::uint64_t conv_slot_bytes = std::min(s.n, g.n_slots) * conv_state_bytes;
-            cost.state_bytes += 2 * conv_state_bytes + conv_slot_bytes;
-            cost.activation_bytes += tc.total() - 2 * conv_state_bytes - conv_slot_bytes;
+            const auto chain = [&](std::size_t row0, std::size_t nrows, std::size_t nslots, const backend::StateRing& ring) {
+                const TensorRef xs = rows_at(a.conv, row0, conv_c);
+                be->conv1d_silu(*st.s, backend::Conv1dArgs{rows_at(a.qkv, row0, conv_c), w.conv.ref(),
+                                                           gdn_st.conv_ref(gdn_layer), xs, {},
+                                                           u32(nrows), u32(conv_c), u32(conv_k), u32(nslots), ring, {}});
+                const cpu::OpTraffic tc = cpu::traffic_causal_conv1d(nrows, conv_c, conv_k, nslots);
+                const std::uint64_t conv_state_bytes = 4ULL * (conv_k - 1) * conv_c;
+                const std::uint64_t conv_slot_bytes = std::min(nrows, nslots) * conv_state_bytes;
+                cost.state_bytes += 2 * conv_state_bytes + conv_slot_bytes;
+                cost.activation_bytes += tc.total() - 2 * conv_state_bytes - conv_slot_bytes;
 
-            backend::GdnArgs ga{};
-            ga.form = g.chunked ? backend::GdnForm::Chunked : backend::GdnForm::Recurrent;
-            ga.q = xs.with_stride(cstride);
-            ga.k = xs.shifted(key_dim * kF32).with_stride(cstride);
-            ga.v = xs.shifted(2 * key_dim * kF32).with_stride(cstride);
-            ga.g = rows_at(a.g, s.r0, nv);
-            ga.beta = rows_at(a.bs, s.r0, nv);
-            ga.state = gdn_st.recurrent_ref(gdn_layer);
-            ga.out = rows_at(a.o, s.r0, value_dim);
-            ga.n_k = u32(n_k);
-            ga.n_v = u32(n_v);
-            ga.d_k = u32(d_k);
-            ga.d_v = u32(d_v);
-            ga.n_tokens = u32(s.n);
-            ga.n_slots = u32(g.n_slots);
-            ga.mapping = backend::GdnHeadMapping::Tiled;  // D-004 item 5: GGUF tiled V-head order
-            // D-016: raw q/k after conv+SiLU; the kernel L2-normalizes q and k per head and
-            // scales q by 1/sqrt(d_k) because we say so here.
-            ga.qk_l2norm = true;
-            ga.q_scale = 1.0f / std::sqrt(static_cast<float>(d_k));
-            ga.chunk_size = u32(gdn_chunk);
-            ga.ring = ring;
-            be->gated_delta_rule(*st.s, ga);
-            const cpu::OpTraffic tg = cpu::traffic_gated_delta_rule(dims, s.n, g.n_slots);
-            const std::uint64_t stb = 4ULL * nv * d_k * dv;
-            const std::uint64_t slots = std::min(s.n, g.n_slots) * stb;
-            cost.state_bytes += 2 * stb + slots;
-            cost.activation_bytes += tg.total() - 2 * stb - slots;
+                backend::GdnArgs ga{};
+                ga.form = g.chunked ? backend::GdnForm::Chunked : backend::GdnForm::Recurrent;
+                ga.q = xs.with_stride(cstride);
+                ga.k = xs.shifted(key_dim * kF32).with_stride(cstride);
+                ga.v = xs.shifted(2 * key_dim * kF32).with_stride(cstride);
+                ga.g = rows_at(a.g, row0, nv);
+                ga.beta = rows_at(a.bs, row0, nv);
+                ga.state = gdn_st.recurrent_ref(gdn_layer);
+                ga.out = rows_at(a.o, row0, value_dim);
+                ga.n_k = u32(n_k);
+                ga.n_v = u32(n_v);
+                ga.d_k = u32(d_k);
+                ga.d_v = u32(d_v);
+                ga.n_tokens = u32(nrows);
+                ga.n_slots = u32(nslots);
+                ga.mapping = backend::GdnHeadMapping::Tiled;  // D-004 item 5: GGUF tiled V-head order
+                // D-016: raw q/k after conv+SiLU; the kernel L2-normalizes q and k per head and
+                // scales q by 1/sqrt(d_k) because we say so here.
+                ga.qk_l2norm = true;
+                ga.q_scale = 1.0f / std::sqrt(static_cast<float>(d_k));
+                ga.chunk_size = u32(gdn_chunk);
+                ga.ring = ring;
+                be->gated_delta_rule(*st.s, ga);
+                const cpu::OpTraffic tg = cpu::traffic_gated_delta_rule(dims, nrows, nslots);
+                const std::uint64_t stb = 4ULL * nv * d_k * dv;
+                const std::uint64_t slots = std::min(nrows, nslots) * stb;
+                cost.state_bytes += 2 * stb + slots;
+                cost.activation_bytes += tg.total() - 2 * stb - slots;
+            };
+            const std::uint32_t ring_p = u32(gdn_st.ring_size());
+            if (!g.tree) {
+                chain(s.r0, s.n, g.n_slots, backend::StateRing{ring_p, gdn_st.live()});
+                continue;
+            }
+            // Tree step (SeqStep::tree_parents, chain + one root leaf): rows [x, d1..dk] are the chain of
+            // T = s.n - 1 rows with T rollback slots; the leaf d1' (last row, parent = x) is then a
+            // ONE-row chain that starts from the state after x. That state is rollback slot T-1 of the
+            // chain call, physical slot (live + 1 + (T-1)) = (live + T) mod P, in both the recurrent and
+            // the conv ring; the leaf reads it as its "live" and writes its own final state to
+            // (live + T + 1) mod P, which forward() verified is free (P >= T + 2). The conv/GDN ops are
+            // per-row identical to a plain decode of [x, d1'], so the leaf is bit-identical to it.
+            const std::size_t T = s.n - 1;
+            chain(s.r0, T, g.n_slots, backend::StateRing{ring_p, gdn_st.live()});
+            chain(s.r0 + T, 1, 0, backend::StateRing{ring_p, static_cast<std::uint32_t>((gdn_st.live() + T) % ring_p)});
         }
         be->gated_rms_norm(*st.s, backend::GatedNormArgs{a.o, a.z, w.norm.ref(), a.on, u32(R * nv), u32(dv), eps, {}});
         cost.activation_bytes += cpu::traffic_gated_rms_norm(R * nv, dv).total();
@@ -693,8 +736,8 @@ struct Qwen35::Impl {
             fg = a.gu.with_stride(2 * ff * kF32);
             fu = a.gu.shifted(ff * kF32).with_stride(2 * ff * kF32);
         } else {
-            gemv(st, a.xn, R, w.gate, fg);
-            gemv(st, a.xn, R, w.up, fu);
+            gemv(st, a.fnorm != nullptr ? a.x : a.xn, R, w.gate, fg, a.fnorm);
+            gemv(st, a.fnorm != nullptr ? a.x : a.xn, R, w.up, fu, a.fnorm);
         }
         be->swiglu(*st.s, backend::EltwiseArgs{fg, fu, a.fs, u32(R), u32(hp->n_ff), {}});
         st.cost.activation_bytes += cpu::traffic_binary(R * hp->n_ff).total();
@@ -709,8 +752,18 @@ struct Qwen35::Impl {
     void decoder_layer(Step& st, const Acts& a, const LayerW& l, std::size_t R, Mixer&& mixer, const Vec& next_norm,
                        TensorRef next_out) const {
         mixer();
-        add_rms_norm(st, a.x, a.y, R, l.post_norm, a.xn);
-        ffn(st, a, *l.ffn, R);
+        if (fuse_norm && R == 1 && l.ffn->gate.present() && !l.ffn->gu.present() && norm_fusable(l.ffn->gate) &&
+            norm_fusable(l.ffn->up)) {
+            // x += y only; the FFN gate/up gemvs normalize x in their prologue (no xn write / norm dispatch).
+            be->add(*st.s, backend::EltwiseArgs{a.x, a.y, a.x, u32(R), u32(E), {}});
+            st.cost.activation_bytes += cpu::traffic_binary(R * E).total();
+            Acts f = a;
+            f.fnorm = &l.post_norm;
+            ffn(st, f, *l.ffn, R);
+        } else {
+            add_rms_norm(st, a.x, a.y, R, l.post_norm, a.xn);
+            ffn(st, a, *l.ffn, R);
+        }
         add_rms_norm(st, a.x, a.y, R, next_norm, next_out);
     }
 
@@ -796,6 +849,8 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     I.limits = I.be->limits();
     I.gdn_chunk = options.gdn_chunk;
     if (const char* e = std::getenv("HALO_STREAM_REUSE")) I.reuse_streams = *e != '\0' && std::string_view(e) != "0";
+    if (const char* e = std::getenv("HALO_FUSE_NORM"))
+        I.fuse_norm = *e != 0 && std::string_view(e) != "0" && I.be->kind() == backend::Kind::Vulkan;
     I.parse_fuse_env(std::getenv("HALO_FUSE_GEMV"));  // before the layers load: it picks the weight layout
     const auto& hp = m.hparams();
     I.hp = &hp;
@@ -981,9 +1036,26 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         HALO_CHECK(s.gdn_path != GdnPath::Chunked || I.limits.gdn_chunked, ErrorCode::Unsupported,
                    "forward step {}: the {} backend has no chunked GDN form", si, backend::to_string(I.be->kind()));
         seqs[si] = {R, s.tokens.size(), s.kv, static_cast<std::int32_t>(len), {}};
-        const bool chunked = s.gdn_path == GdnPath::Chunked ||
-                             (s.gdn_path == GdnPath::Auto && I.limits.gdn_chunked && s.tokens.size() > 1 && s.n_state_slots == 0);
-        gseqs[si] = {s.gdn, s.n_state_slots, chunked};
+        const bool tree = !s.tree_parents.empty();
+        if (tree) {
+            // The one supported tree: chain [x, d1..dk] + a root-leaf d1' (see SeqStep::tree_parents). Only that
+            // shape is implementable without touching the GDN kernels: the leaf reads the ring slot holding the
+            // state after x (chain rollback slot k, needing all k+1 slots) and writes one more ring state.
+            const std::size_t T = s.tokens.size() - 1;  // chain rows
+            HALO_CHECK(s.tree_parents.size() == s.tokens.size() && cpu::is_chain_plus_root_leaf(s.tree_parents), ErrorCode::Api,
+                       "forward step {}: tree_parents must be [-1, 0, 1 .. k-1, 0] (a chain plus one root leaf), {} rows", si,
+                       s.tokens.size());
+            HALO_CHECK(s.positions.empty(), ErrorCode::Api, "forward step {}: a tree step cannot carry explicit positions", si);
+            HALO_CHECK(s.gdn_path != GdnPath::Chunked && s.n_state_slots == T && s.gdn->fits_tree_leaf(T), ErrorCode::Api,
+                       "forward step {}: a tree step needs the recurrent GDN path, exactly {} state slots and a ring of at "
+                       "least {} states (state has {} slots)",
+                       si, T, T + 2, s.gdn->max_slots());
+            HALO_CHECK(s.kv->pool().layout().type == backend::KvType::F32, ErrorCode::Unsupported,
+                       "forward step {}: tree verification needs an fp32 KV cache", si);
+        }
+        const bool chunked = !tree && (s.gdn_path == GdnPath::Chunked ||
+                             (s.gdn_path == GdnPath::Auto && I.limits.gdn_chunked && s.tokens.size() > 1 && s.n_state_slots == 0));
+        gseqs[si] = {s.gdn, s.n_state_slots, chunked, tree};
         R += s.tokens.size();
     }
     check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "forward", "KV cache");
@@ -993,7 +1065,8 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     // after the distinctness check so a duplicated state is never begun twice.
     for (const SeqStep& s : steps) {
         if (!s.gdn->attached()) s.gdn->attach(*I.be);
-        s.gdn->begin_step(s.tokens.size(), s.n_state_slots);
+        // A tree step's GDN state advances over its T = rows - 1 chain rows only (the leaf's state waits in the ring).
+        s.gdn->begin_step(s.tree_parents.empty() ? s.tokens.size() : s.tokens.size() - 1, s.n_state_slots);
     }
     out.seqs.assign(steps.size(), {});
     out.cost = {};
@@ -1009,13 +1082,24 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     const std::size_t E = I.E;
     Impl::Step st(I, cost);
     std::vector<std::int32_t> ids(R), pos(R);
+    std::vector<std::vector<std::int32_t>> tree_par(steps.size());  // per-step copies of tree_parents (imported below)
     for (std::size_t si = 0; si < steps.size(); ++si) {
         std::copy(steps[si].tokens.begin(), steps[si].tokens.end(), &ids[seqs[si].r0]);
         for (std::size_t i = 0; i < seqs[si].n; ++i) pos[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(i);
+        if (!steps[si].tree_parents.empty()) {
+            // RoPE position of a tree row = L + its depth (the leaf sits next to d1, not after dk).
+            tree_par[si].assign(steps[si].tree_parents.begin(), steps[si].tree_parents.end());
+            for (std::size_t i = 0; i < seqs[si].n; ++i) {
+                pos[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(cpu::tree_depth(tree_par[si], i));
+            }
+        }
     }
     const TensorRef rids = st.import_ro(std::as_bytes(std::span(ids)));
     const TensorRef rpos = st.import_ro(std::as_bytes(std::span(pos)));
     for (SeqRows& s : seqs) I.import_kv(st, s);
+    for (std::size_t si = 0; si < steps.size(); ++si) {
+        if (!tree_par[si].empty()) seqs[si].tree_parent = st.import_ro(std::as_bytes(std::span(tree_par[si])));
+    }
     const bool any_gdn = std::any_of(I.layers.begin(), I.layers.end(), [](const LayerW& l) { return l.gdn.has_value(); });
     const Impl::Acts a = I.make_acts(st, R, any_gdn);
     const TensorRef hbuf = st.alloc(R * E);
@@ -1071,7 +1155,8 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
 
     for (std::size_t si = 0; si < steps.size(); ++si) {
         steps[si].kv->commit(steps[si].tokens.size());
-        steps[si].gdn->mark_slots_written(steps[si].tokens.size(), steps[si].n_state_slots);
+        steps[si].gdn->mark_slots_written(steps[si].tree_parents.empty() ? steps[si].tokens.size() : steps[si].tokens.size() - 1,
+                                          steps[si].n_state_slots);
     }
 }
 
@@ -1178,6 +1263,243 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     I.head(st, M.lm_head, M.lm_head.ref.n_bytes(), hbuf, reqs, any_full ? 0 : I.draft_vocab);
     st.sync();
     for (const MtpStep& s : steps) s.kv->commit(s.tokens.size());
+}
+
+void Qwen35::mtp_draft_chain(std::span<const MtpStep> steps, std::span<const std::size_t> k, StepResult& out) const {
+    const Impl& I = *impl_;
+    HALO_CHECK(I.mtp.has_value(), ErrorCode::Unsupported, "mtp_draft_chain: the model has no MTP block");
+    HALO_CHECK(I.limits.lm_head_ids, ErrorCode::Unsupported,
+               "mtp_draft_chain: the {} backend cannot write device-side winning ids (Limits::lm_head_ids)",
+               backend::to_string(I.be->kind()));
+    HALO_CHECK(k.size() == steps.size(), ErrorCode::Api, "mtp_draft_chain: {} draft counts for {} steps", k.size(), steps.size());
+    const MtpW& M = *I.mtp;
+    const kv_cache::KvLayout want_kv = mtp_kv_layout();
+    const std::size_t E = I.E;
+    const std::size_t n_seq = steps.size();
+    std::vector<SeqRows> seqs(n_seq);  // the depth-1 rows of every sequence
+    std::vector<kv_cache::SequenceKv*> kv_ptrs(n_seq);
+    std::size_t R1 = 0, max_k = 0;
+    for (std::size_t si = 0; si < n_seq; ++si) {
+        const MtpStep& s = steps[si];
+        check_tokens(s.tokens, I.n_vocab, "mtp_draft_chain", si);
+        check_kv(s.kv, want_kv, "mtp_draft_chain", si);
+        if (s.hidden_device) {
+            HALO_CHECK(s.hidden.empty() && s.tokens.size() == 1 && s.hidden_device->bytes() >= E * kF32 &&
+                           s.hidden_device->backend() == I.be,
+                       ErrorCode::Api,
+                       "mtp_draft_chain step {}: hidden_device needs a one-row step with no host hidden and a {}-byte buffer of "
+                       "this backend",
+                       si, E * kF32);
+        } else {
+            HALO_CHECK(s.hidden.size() == s.tokens.size() * E, ErrorCode::Api,
+                       "mtp_draft_chain step {}: {} hidden floats for {} rows", si, s.hidden.size(), s.tokens.size());
+        }
+        HALO_CHECK(s.first_position >= 0 &&
+                       static_cast<std::size_t>(s.first_position) + s.tokens.size() + k[si] <=
+                           static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
+                   ErrorCode::Api, "mtp_draft_chain step {}: bad first position {}", si, s.first_position);
+        kv_ptrs[si] = s.kv;
+        seqs[si] = {R1, s.tokens.size(), s.kv, s.first_position, {}};
+        R1 += s.tokens.size();
+        max_k = std::max(max_k, k[si]);
+    }
+    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "mtp_draft_chain", "KV cache");
+    out.seqs.assign(n_seq, {});
+    out.cost = {};
+    out.layer_inputs.clear();
+    out.gdn_paths.clear();
+    if (steps.empty()) return;
+    std::vector<std::size_t> len0(n_seq);
+    for (std::size_t si = 0; si < n_seq; ++si) len0[si] = steps[si].kv->length();
+    try {
+        // Rows of every depth are reserved up front: the block table imported once below stays valid for
+        // the whole chain, while the host-side length is advanced per depth as the ops are recorded
+        // (attention / kv_write read kv->length() at record time).
+        for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->reserve(steps[si].tokens.size() + (k[si] > 1 ? k[si] - 1 : 0));
+
+        StepCost& cost = out.cost;
+        Impl::Step st(I, cost);
+        // Host data read by recorded ops at submit time: alive until st.sync() returns.
+        std::vector<std::int32_t> ids1(R1), pos1(R1);
+        std::vector<std::vector<std::int32_t>> pos_d(max_k + 1);
+        for (std::size_t si = 0; si < n_seq; ++si) {
+            std::copy(steps[si].tokens.begin(), steps[si].tokens.end(), &ids1[seqs[si].r0]);
+            for (std::size_t i = 0; i < seqs[si].n; ++i) pos1[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(i);
+        }
+        for (SeqRows& s : seqs) I.import_kv(st, s);
+        const TensorRef rids = st.import_ro(std::as_bytes(std::span(ids1)));
+        const TensorRef rpos1 = st.import_ro(std::as_bytes(std::span(pos1)));
+        const std::uint64_t emb_row_bytes = tensor::row_bytes(M.embedding.ref.type(), static_cast<std::int64_t>(E));
+        const TensorRef emb_table = TensorRef::of(*M.embedding.buf);
+
+        // One MTP layer pass over Rd rows (mtp_forward's body); returns the post-head-norm hidden rows.
+        const auto layer_pass = [&](std::size_t Rd, std::span<const SeqRows> sd, TensorRef rpos, const auto& fill_embed,
+                                    const auto& fill_hidden) {
+            cost.weight_passes += 1;
+            const Impl::Acts a = I.make_acts(st, Rd, false);
+            const TensorRef e = st.alloc(Rd * E), hh = st.alloc(Rd * E), cat = st.alloc(Rd * 2 * E), hbuf = st.alloc(Rd * E);
+            fill_embed(e);
+            fill_hidden(hh);
+            cost.embedding_bytes += Rd * emb_row_bytes;
+            I.rms_norm(st, e, Rd, E, M.enorm, cat.with_stride(2 * E * kF32));
+            I.rms_norm(st, hh, Rd, E, M.hnorm, cat.shifted(E * kF32).with_stride(2 * E * kF32));
+            I.gemv(st, cat, Rd, M.eh_proj, a.x);
+            I.rms_norm(st, a.x, Rd, E, M.block.attn_norm, a.xn);
+            I.decoder_layer(st, a, M.block, Rd, [&] { I.attention(st, a, *M.block.attn, 0, Rd, sd, rpos); }, M.head_norm, hbuf);
+            return hbuf;
+        };
+
+        // What each depth leaves behind for the next one and for the final decode.
+        struct Depth {
+            std::vector<std::size_t> at;        // sequences drafting at this depth (ascending)
+            std::vector<std::size_t> last_row;  // per participant: its row in `hbuf` (head input / next hidden)
+            TensorRef hbuf{}, ids{};
+            std::vector<std::byte> words;       // argmax result words, downloaded at the sync
+        };
+        std::vector<Depth> depths(std::max<std::size_t>(max_k, 1));
+
+        // Head over one row per participant: no host round trip. Winning ids stay on the device (`want_ids`)
+        // for the next depth's GET_ROWS; the result words are downloaded at the single sync.
+        const std::size_t vocab_rows = (I.draft_vocab == 0 || I.draft_vocab > I.n_vocab) ? I.n_vocab : I.draft_vocab;
+        const auto head_rows = [&](Depth& D, bool want_ids) {
+            const std::size_t n = D.at.size();
+            const TensorRef xs = st.alloc(n * E);
+            for (std::size_t i = 0; i < n; ++i) {
+                I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(D.hbuf, D.last_row[i], E), Impl::rows_at(xs, i, E), E * kF32, {}});
+            }
+            st.arena.push_back(I.be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
+            const TensorRef res = TensorRef::of(*st.arena.back());
+            if (want_ids) {
+                st.arena.push_back(I.be->allocate(n * sizeof(std::int32_t), backend::Tier::Vram));
+                D.ids = TensorRef::of(*st.arena.back());
+            }
+            I.be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{M.lm_head.ref.type(), TensorRef::of(*M.lm_head.buf), xs,
+                                                                       TensorRef{}, u32(vocab_rows), u32(E), u32(n), {}},
+                                                     res,
+                                                     u32(std::min<std::size_t>(I.valid_vocab, vocab_rows)),
+                                                     {},
+                                                     {},
+                                                     D.ids});
+            D.words.resize(n * backend::kArgmaxResultBytes);
+            I.be->download(*st.s, res, std::span(D.words));
+            const std::uint64_t bytes = M.lm_head.ref.n_bytes();
+            cost.weight_bytes += vocab_rows == I.n_vocab ? bytes : bytes / I.n_vocab * vocab_rows;
+            cost.activation_bytes += cpu::traffic_matmul(n, E, vocab_rows, 0).total();
+        };
+
+        // ---- depth 1: teacher-forced rows (+ the first draft) ---------------------------------
+        {
+            const TensorRef hbuf = layer_pass(
+                R1, seqs, rpos1,
+                [&](TensorRef e) {
+                    I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table, rids, e,
+                                                               u32(M.embedding.ref.ne(1)), u32(E), u32(R1), {}, {}});
+                },
+                [&](TensorRef hh) {
+                    for (std::size_t si = 0; si < n_seq; ++si) {
+                        if (steps[si].hidden_device) {
+                            I.be->copy(*st.s, backend::CopyArgs{TensorRef::of(*steps[si].hidden_device),
+                                                                Impl::rows_at(hh, seqs[si].r0, E), E * kF32, {}});
+                        } else {
+                            I.be->upload(*st.s, Impl::rows_at(hh, seqs[si].r0, E), std::as_bytes(steps[si].hidden));
+                        }
+                    }
+                });
+            for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->commit(seqs[si].n);
+            Depth& D = depths[0];
+            D.hbuf = hbuf;
+            for (std::size_t si = 0; si < n_seq; ++si) {
+                if (k[si] == 0) continue;
+                D.at.push_back(si);
+                D.last_row.push_back(seqs[si].r0 + seqs[si].n - 1);
+            }
+            if (!D.at.empty()) head_rows(D, max_k > 1);
+        }
+
+        // ---- depth d >= 2: one row per sequence still drafting; token and hidden come from depth d-1
+        // on the device (ids -> GET_ROWS, D2D copy of the hidden row) ------------------------------
+        for (std::size_t d = 2; d <= max_k; ++d) {
+            const Depth& P = depths[d - 2];
+            Depth& D = depths[d - 1];
+            for (std::size_t si = 0; si < n_seq; ++si) {
+                if (k[si] >= d) D.at.push_back(si);
+            }
+            const std::size_t Rd = D.at.size();
+            std::vector<std::size_t> prev(Rd);  // index of each participant among P.at
+            std::vector<SeqRows> sd(Rd);
+            pos_d[d].resize(Rd);
+            for (std::size_t i = 0; i < Rd; ++i) {
+                const std::size_t si = D.at[i];
+                prev[i] = static_cast<std::size_t>(std::lower_bound(P.at.begin(), P.at.end(), si) - P.at.begin());
+                const std::int32_t pos = seqs[si].pos0 + static_cast<std::int32_t>(seqs[si].n + d - 2);
+                sd[i] = {i, 1, steps[si].kv, pos, seqs[si].table};
+                pos_d[d][i] = pos;
+                D.last_row.push_back(i);
+            }
+            const TensorRef rpos = st.import_ro(std::as_bytes(std::span(pos_d[d])));
+            D.hbuf = layer_pass(
+                Rd, sd, rpos,
+                [&](TensorRef e) {
+                    for (std::size_t i = 0; i < Rd; ++i) {
+                        I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table,
+                                                                   P.ids.shifted(prev[i] * sizeof(std::int32_t)),
+                                                                   Impl::rows_at(e, i, E), u32(M.embedding.ref.ne(1)), u32(E), 1, {}, {}});
+                    }
+                },
+                [&](TensorRef hh) {
+                    for (std::size_t i = 0; i < Rd; ++i) {
+                        I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(P.hbuf, P.last_row[prev[i]], E), Impl::rows_at(hh, i, E),
+                                                            E * kF32, {}});
+                    }
+                });
+            for (std::size_t i = 0; i < Rd; ++i) steps[D.at[i]].kv->commit(1);
+            head_rows(D, d < max_k);
+        }
+
+        // ---- the one submit / fence of the chain, then decode every depth's winners ----------------
+        st.sync();
+        for (std::size_t d = 1; d <= max_k; ++d) {
+            const Depth& D = depths[d - 1];
+            const std::vector<backend::ArgmaxResult> best = backend::decode_argmax(D.words);
+            for (std::size_t i = 0; i < D.at.size(); ++i) {
+                HALO_CHECK(best[i].index >= 0, ErrorCode::Api,
+                           "mtp_draft_chain step {}: draft depth {} is poisoned (NaN logit / no result), token id {}", D.at[i], d,
+                           best[i].index);
+                out.seqs[D.at[i]].argmax.push_back(cpu::TopKEntry{best[i].index, best[i].value});
+            }
+        }
+    } catch (...) {
+        for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->truncate(len0[si]);
+        throw;
+    }
+}
+
+void Qwen35::kv_move_row(kv_cache::SequenceKv& kv, std::size_t from, std::size_t to) const {
+    const Impl& I = *impl_;
+    check_kv(&kv, kv_layout(), "kv_move_row", 0);
+    kv_cache::KvPool& pool = kv.pool();
+    const kv_cache::KvLayout& l = pool.layout();
+    HALO_CHECK(l.type == backend::KvType::F32, ErrorCode::Unsupported, "kv_move_row: needs an fp32 KV cache");
+    HALO_CHECK(from < kv.length() && to < kv.length() && from != to, ErrorCode::Api,
+               "kv_move_row: rows {} -> {} of a {}-row KV cache", from, to, kv.length());
+    if (!pool.attached()) pool.attach(*I.be);
+    const std::uint64_t bt = l.block_tokens, row_bytes = l.kv_dim * kF32;
+    const std::span<const kv_cache::BlockId> blocks = kv.blocks();
+    const std::unique_ptr<backend::Stream> s = I.be->create_stream();
+    for (std::size_t layer = 0; layer < l.n_layers; ++layer) {
+        const kv_cache::KvPool::LayerImage img = pool.layer_image(layer);
+        // block[layer][K|V][token][kv_dim] within the image (PerLayer segments: n_layers = 1, layer = 0).
+        const std::uint64_t block_bytes = std::uint64_t{img.n_layers} * 2 * bt * row_bytes;
+        for (std::uint64_t kvsel = 0; kvsel < 2; ++kvsel) {
+            const auto at = [&](std::size_t row) {
+                return std::uint64_t{blocks[row / bt]} * block_bytes + (std::uint64_t{img.layer} * 2 + kvsel) * bt * row_bytes +
+                       (row % bt) * row_bytes;
+            };
+            I.be->copy(*s, backend::CopyArgs{img.ref.shifted(at(from)), img.ref.shifted(at(to)), row_bytes, {}});
+        }
+    }
+    s->submit();
+    s->wait();
 }
 
 }  // namespace halo::models

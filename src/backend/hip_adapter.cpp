@@ -612,6 +612,7 @@ public:
     void gemv(Stream& s, const GemvArgs& a) override {
         HipStream& st = stream(s, "MATMUL");
         const hip::Ops& ops = select(OpId::Gemv, a.kernel);
+        HALO_CHECK(a.norm_w.empty(), ErrorCode::Unsupported, "MATMUL: a fused norm (GemvArgs::norm_w) is Vulkan-only");
         const Resolver r(this, "MATMUL");
         const std::uint64_t rb = weight_row_bytes(a.wtype, a.cols, r.op());
         const Operand w = r.get(a.w, a.rows, rb, a.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
@@ -948,6 +949,8 @@ public:
         HALO_CHECK(a.kv_type == KvType::F32, ErrorCode::Unsupported,
                    "ATTENTION: KV type {} is implemented only on the Vulkan backend (the HIP backend stores fp32)",
                    to_string(a.kv_type));
+        HALO_CHECK(a.tree_parent.empty(), ErrorCode::Unsupported,
+                   "ATTENTION: tree attention (HALO_MTP_TREE) is implemented only on the CPU and Vulkan backends");
         const Resolver r(this, "ATTENTION");
         check_nonzero(a.n_head, r.op(), "n_head");
         check_nonzero(a.n_kv_head, r.op(), "n_kv_head");
@@ -1017,6 +1020,7 @@ public:
 
     void lm_head(Stream& s, const LmHeadArgs& a) override {
         HipStream& st = stream(s, "LM_HEAD");
+        HALO_CHECK(a.ids.empty(), ErrorCode::Unsupported, "LM_HEAD: device-side winning ids are not supported on the hip backend");
         const hip::Ops& ops = select_lm_head(a.gemv.kernel, a.kernel);
         check_status_ref(a.status, OpId::LmHead);
         const Resolver r(this, "LM_HEAD");

@@ -653,6 +653,56 @@ TEST(CpuGdn, RingFormMatchesSlotFormBitwise) {
     }
 }
 
+// Tree verification (HALO_MTP_TREE): the leaf d1' of [x, d1 .. dk, d1'] is a one-row chain that starts from the
+// chain call's rollback slot for "state after x" (logical slot T-1, physical (live + T) mod P) and writes its
+// final state to (live + T + 1) mod P. It must equal a plain recurrent decode of [x, d1'] bitwise, and must not
+// disturb the live slot or any chain slot (P >= T + 2).
+TEST(CpuGdn, TreeLeafFromRollbackSlotEqualsPlainDecodeBitwise) {
+    const std::size_t TA = 3;                                   // chain rows [x, d1, d2]
+    const Data d = make(kR3, TA + 1, Regime::Model, true, 2200);  // row TA = the leaf d1'
+    const std::size_t nk = d.qk_cols(), nvc = d.v_cols(), nv = d.dims.n_v_heads, sn = d.state_n();
+    // Plain decode input: rows {0, TA}.
+    const auto pick = [&](const std::vector<float>& src, std::size_t cols) {
+        std::vector<float> o(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(cols));
+        o.insert(o.end(), src.begin() + static_cast<std::ptrdiff_t>(TA * cols),
+                 src.begin() + static_cast<std::ptrdiff_t>((TA + 1) * cols));
+        return o;
+    };
+    Data plain_in = d;
+    plain_in.T = 2;
+    plain_in.q = pick(d.q, nk);
+    plain_in.k = pick(d.k, nk);
+    plain_in.v = pick(d.v, nvc);
+    plain_in.g = pick(d.g, nv);
+    plain_in.beta = pick(d.beta, nv);
+    const Result plain = run(plain_in, Form::Recurrent, 0, 2, d.s0);
+    for (const std::size_t P : {TA + 2, TA + 3, TA + 5}) {
+        for (const std::size_t live : {std::size_t{0}, P - 1, P / 2}) {
+            SCOPED_TRACE(testing::Message() << "P=" << P << " live=" << live);
+            RingResult rr = run_ring(d, Form::Recurrent, TA, 16, P, live, TA);  // the chain: T rows, T slots
+            const std::vector<float> before = rr.slab;
+            const std::size_t live_leaf = (live + TA) % P;  // slot holding the state after x
+            const std::size_t dst = (live_leaf + 1) % P;
+            std::vector<float> leaf_out(nvc, 0.0f);
+            const StateRingView ring{std::span<float>(rr.slab), P, live_leaf, 0};
+            Rows out(leaf_out.data(), 1, nvc, nvc);
+            gated_delta_rule_recurrent(d.dims, d.rows(TA, 1), ring, out, GdnQkParams{}, nullptr);
+            EXPECT_TRUE(bitwise_equal(leaf_out, std::span<const float>(plain.out).subspan(nvc, nvc))) << "leaf output";
+            EXPECT_TRUE(bitwise_equal(std::span<const float>(rr.slab).subspan(dst * sn, sn), plain.state)) << "leaf state";
+            for (std::size_t p = 0; p < P; ++p) {
+                if (p == dst) continue;  // the only slot the leaf may write
+                EXPECT_TRUE(bitwise_equal(std::span<const float>(rr.slab).subspan(p * sn, sn),
+                                          std::span<const float>(before).subspan(p * sn, sn)))
+                    << "the leaf disturbed physical slot " << p;
+            }
+            // The destination was not a chain slot: with the chain's slots 0..T-1 at live+1..live+T, it is the first
+            // free slot (P >= T + 2 keeps it distinct from live too).
+            EXPECT_NE(dst, live);
+            for (std::size_t s = 0; s < TA; ++s) EXPECT_NE(dst, (live + 1 + s) % P);
+        }
+    }
+}
+
 TEST(CpuGdn, RingFormThreadCountInvarianceBitwise) {
     const Data d = make(kR3, 9, Regime::Model, true, 2100);
     for (Form f : {Form::Recurrent, Form::Chunked}) {

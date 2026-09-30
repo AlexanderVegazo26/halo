@@ -1,0 +1,178 @@
+#version 450
+// [ATTENTION, tree variant] (cpu::attention_gqa_tree; opt-in HALO_MTP_TREE speculative verify).
+// attention.comp with a parent array (binding 5, int32, one entry per query row t of this call):
+// query t attends history rows [0, q_offset) and then the rows of its root path
+// (t's ancestors, root first, then t itself) as VIRTUAL keys q_offset .. q_offset + depth(t).
+// Virtual key v maps to physical history row v for v < q_offset and q_offset + path[v - q_offset]
+// after. A chain row (parent[t] = t - 1) maps v to v, so it runs exactly the arithmetic of
+// attention.comp (same tiles, same reduction order): bit-identical to plain causal decoding, and a
+// branch row gets the very key layout of a plain decode of its root path. attention.comp,
+// attention_f16 and attention_q8 are untouched; this file is selected only when a tree is given
+// (fp32 pool only). n_tokens <= 32 (host-validated). A malformed parent entry (>= its row index)
+// ends the path walk, it never reads out of bounds.
+//
+// One workgroup per (token t, query head h); KV head h / (n_head / n_kv_head).
+// Online softmax over key tiles of WG keys (thread i scores key tile*WG + i):
+//   x_s = dot(q, k_s) * scale      (the CPU's 8-lane fixed-order dot, uncontracted)
+//   m' = max(m, max_tile x);  alpha = exp(m - m');  p_s = exp(x_s - m')
+//   l = l * alpha + sum_tile p;    o[d] = o[d] * alpha + sum_tile p_s v_s[d]  (keys in order)
+//   out[d] = o[d] / l
+// Each thread owns output dims d = tid + j*WG (j < 4; the host checks head_dim <= 4*WG).
+// A table entry >= n_pool_blocks sets status bit 4 (k_status_bad_block); that key is skipped
+// (neither K nor V is read through it) and out is then undefined.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 128;  // power of two (host-validated)
+layout(local_size_x_id = 0) in;
+
+const uint MAX_HD = 256u;
+const uint DIMS = 4u;
+const uint STATUS_BAD_BLOCK = 4u;
+const uint NO_ROW = 0xFFFFFFFFu;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer Pool { float pool[]; };
+layout(std430, binding = 2) readonly buffer Tab { uint tab[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+layout(std430, binding = 4) buffer St { uint st[]; };
+layout(std430, binding = 5) readonly buffer Par { int par[]; };
+
+layout(push_constant) uniform Push {
+    uint n_head;
+    uint n_kv_head;
+    uint head_dim;
+    uint n_tokens;
+    uint q_offset;
+    float scale;
+    uint n_pool_blocks;
+    uint block_floats;  // n_layers * 2 * bt * kv_dim
+    uint layer_off;     // layer * 2 * bt * kv_dim
+    uint bt;
+    uint kv_dim;
+    uint q_off, q_stride, q_head_stride, pool_off, tab_off, o_off, o_stride, st_off;
+    uint par_off;  // element offset of parent[0] in binding 5
+} pc;
+
+const uint MAX_TREE = 32u;
+shared uint spath[MAX_TREE];  // rows root .. t of this query's path
+shared uint sdepth;
+
+shared float qs[MAX_HD];
+shared float sc[WG];
+shared float red[WG];
+shared uint rowb[WG];
+
+// cpu::detail::dot: 8 interleaved partial sums, pairwise combine, sequential tail.
+float dot8(uint kb, uint n) {
+    precise float acc[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    uint i = 0u;
+    for (; i + 8u <= n; i += 8u) {
+        for (uint j = 0u; j < 8u; ++j) {
+            precise float p = qs[i + j] * pool[kb + i + j];
+            acc[j] = acc[j] + p;
+        }
+    }
+    precise float tail = 0.0;
+    for (; i < n; ++i) {
+        precise float p = qs[i] * pool[kb + i];
+        tail = tail + p;
+    }
+    precise float s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    precise float r = s + tail;
+    return r;
+}
+
+void main() {
+    const uint item = halo_group_id();
+    if (item >= pc.n_tokens * pc.n_head) return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t = item / pc.n_head;
+    const uint h = item % pc.n_head;
+    const uint kvh = h / (pc.n_head / pc.n_kv_head);
+    const uint hd = pc.head_dim;
+    const uint qb = pc.q_off + t * pc.q_stride + h * pc.q_head_stride;
+    for (uint d = tid; d < hd; d += WG) qs[d] = q[qb + d];
+    if (tid == 0u) {
+        // Root path of row t: walk to the root (parents strictly decrease, so this terminates and
+        // stays < MAX_TREE rows), then fill it root first.
+        uint depth = 0u;
+        uint cur = t;
+        while (depth + 1u < MAX_TREE && par[pc.par_off + cur] >= 0 && uint(par[pc.par_off + cur]) < cur) {
+            cur = uint(par[pc.par_off + cur]);
+            ++depth;
+        }
+        cur = t;
+        for (uint i = depth;; --i) {
+            spath[i] = cur;
+            if (i == 0u) break;
+            cur = uint(par[pc.par_off + cur]);
+        }
+        sdepth = depth;
+    }
+    barrier();
+
+    const uint n_keys = pc.q_offset + sdepth + 1u;
+    const uint v_delta = pc.bt * pc.kv_dim;
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+    float m = NEG_INF;
+    float l = 0.0;
+    float acc[DIMS] = float[DIMS](0.0, 0.0, 0.0, 0.0);
+    for (uint base = 0u; base < n_keys; base += WG) {
+        const uint s = base + tid;
+        float x = NEG_INF;
+        uint rb = NO_ROW;
+        if (s < n_keys) {
+            const uint ps = s < pc.q_offset ? s : pc.q_offset + spath[s - pc.q_offset];  // physical history row
+            const uint id = tab[pc.tab_off + ps / pc.bt];
+            if (id >= pc.n_pool_blocks) {
+                atomicOr(st[pc.st_off], STATUS_BAD_BLOCK);
+            } else {
+                rb = pc.pool_off + id * pc.block_floats + pc.layer_off + (ps % pc.bt) * pc.kv_dim + kvh * hd;
+                precise float xs = dot8(rb, hd) * pc.scale;
+                x = xs;
+            }
+        }
+        rowb[tid] = rb;
+        red[tid] = x;
+        barrier();
+        for (uint w = WG / 2u; w > 0u; w >>= 1) {
+            if (tid < w) red[tid] = max(red[tid], red[tid + w]);
+            barrier();
+        }
+        const float m_new = max(m, red[0]);
+        barrier();
+        if (m_new == NEG_INF) continue;  // uniform: every key so far was skipped
+        precise float alpha = m == NEG_INF ? 0.0 : exp(m - m_new);
+        precise float p = rb == NO_ROW ? 0.0 : exp(x - m_new);
+        sc[tid] = p;
+        red[tid] = p;
+        barrier();
+        for (uint w = WG / 2u; w > 0u; w >>= 1) {
+            if (tid < w) red[tid] += red[tid + w];
+            barrier();
+        }
+        precise float ls = l * alpha;
+        l = ls + red[0];
+        m = m_new;
+        const uint tile_n = min(WG, n_keys - base);
+        for (uint j = 0u; j < DIMS; ++j) {
+            const uint d = tid + j * WG;
+            if (d >= hd) break;
+            precise float a = acc[j] * alpha;
+            for (uint i = 0u; i < tile_n; ++i) {
+                const uint r = rowb[i];
+                if (r == NO_ROW) continue;
+                precise float pv = sc[i] * pool[r + v_delta + d];
+                a = a + pv;
+            }
+            acc[j] = a;
+        }
+        barrier();
+    }
+    const uint ob = pc.o_off + t * pc.o_stride + h * hd;
+    for (uint j = 0u; j < DIMS; ++j) {
+        const uint d = tid + j * WG;
+        if (d >= hd) break;
+        o[ob + d] = l > 0.0 ? acc[j] / l : 0.0;
+    }
+}

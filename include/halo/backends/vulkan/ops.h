@@ -383,6 +383,12 @@ struct AttentionArgs {
     BufferView out{};
     BufferView status{};
     KvType kv_type = KvType::F32;  ///< pool element format
+    /// Tree attention (opt-in, HALO_MTP_TREE): n_tokens int32 parents (row 0 = -1, 0 <= parent[i]
+    /// < i, n_tokens <= 32). Query t attends history rows [0, q_offset) then the rows of its root
+    /// path, as virtual keys in that order, so a chain row is bit-identical to the plain shader.
+    /// Runs the separate `attention_tree` shader (fp32 pool only; Error(Unsupported) otherwise).
+    /// Empty (default) = the ordinary attention, unchanged.
+    BufferView tree_parent{};
 };
 
 // ---------------------------------------------------------------- chunked GATED_DELTANET (WS-F2 V4)
@@ -436,6 +442,12 @@ struct GemvArgs {
     std::uint32_t rows = 0;
     std::uint32_t cols = 0;
     std::uint32_t n_vec = 1;
+    /// HALO_FUSE_NORM (opt-in): when set, the gemv computes y = W * (rms_norm(x) * norm_w) itself: `x` is then
+    /// the RAW input row and norm_w a [cols] fp32 view. Only n_vec == 1, wtype in {Q4_K, Q5_K, Q6_K, IQ4_XS},
+    /// cols <= 16384, never gemv_repacked / lm_head (all throw otherwise). Runs matvec_<type>_normed; the
+    /// row RMS is bitwise the separate rms_norm kernel's when reduce_workgroup == 256 (see the shader).
+    BufferView norm_w{};
+    float norm_eps = 1e-6f;
 };
 
 /// [LOGITS_MATMUL + ARGMAX] (cpu::matmul then cpu::argmax per vector; = cpu::matmul_argmax):
@@ -454,6 +466,10 @@ struct LmHeadArgs {
     BufferView workspace{};
     BufferView result{};
     std::uint32_t valid_rows = 0;
+    /// Optional (HALO_MTP_CHAIN): n_vec dense int32 winning token ids (argmax_ids.comp), written on the
+    /// device after the argmax so they can feed get_rows without a host round trip. A poisoned (NaN)
+    /// vector writes id 0; its result triple still carries the poison. Empty = not written.
+    BufferView ids{};
 };
 
 /// [TOP_K] (cpu::top_k, per vector): the k largest logits, value descending, ties by lower

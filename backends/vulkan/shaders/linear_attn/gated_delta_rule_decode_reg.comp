@@ -1,0 +1,153 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// GATED_DELTANET recurrent decode, register-resident state variant (next.md step 3).
+// Opt-in via HALO_GDN_REG=1; same bindings and push-constant block as
+// gated_delta_rule_decode.comp (which stays the reference), same ring/slot semantics.
+//
+// Difference: thread tid owns ONE column b = b_lo + tid (dv_tile <= WG, host-enforced) and
+// keeps that column's d_k = DK state rows in registers for all T tokens. The state is read
+// ONCE (before token 0) and the final state written ONCE (after token T-1); per token only
+// the rollback slots s = T-1-t < n_slots are written (in ring mode slot 0 is the final
+// state's own address, so it is not written twice). q/k/v/g/beta are read once per token
+// (q/k through shared memory). Column b of S depends only on column b, so no cross-thread
+// reduction is needed for the state update; consecutive threads touch consecutive b, so
+// state loads/stores are coalesced.
+//
+// DK is a specialization constant equal to push d_k (host guarantees d_k == DK <= 128), so
+// every loop over rows has a compile-time bound and the register array is statically
+// indexed after unrolling (no scratch spill). Register cost is ~DK VGPRs of state + temps.
+//
+// Numerics: per-element float operation order is identical to the reference kernel
+// (kv accumulated over a = 0..DK-1 of (s*decay)*k; s = s*decay + k*delta; acc over a of
+// s*q; the q/k L2 reduction uses the same strided partials + fixed-order tree over WG).
+// The only possible difference is FMA contraction chosen by the compiler.
+//
+// state_in and state_out may alias: each thread reads all of its own elements before it
+// writes any of them, and no other thread touches its column.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 2) const uint DK = 128;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer K { float k[]; };
+layout(std430, binding = 2) readonly buffer V { float v[]; };
+layout(std430, binding = 3) readonly buffer G { float g[]; };
+layout(std430, binding = 4) readonly buffer Beta { float beta[]; };
+layout(std430, binding = 5) readonly buffer StateIn { float state_in[]; };
+layout(std430, binding = 6) buffer StateOut { float state_out[]; };
+layout(std430, binding = 7) writeonly buffer Out { float o[]; };
+layout(std430, binding = 8) writeonly buffer Slots { float slots[]; };
+
+layout(push_constant) uniform Push {
+    uint n_v;
+    uint n_k;
+    uint d_k;
+    uint d_v;
+    uint n_tokens;
+    uint n_slots;
+    uint in_off;
+    uint out_off;
+    uint slots_off;
+    uint qk_l2norm;
+    float q_scale;
+    uint q_off, q_stride, k_off, k_stride, v_off, v_stride;
+    uint g_off, g_stride, b_off, b_stride, o_off, o_stride;
+    uint ring_p, ring_live;
+    uint dv_tile;
+} pc;
+
+shared float sq[DK];
+shared float sk[DK];
+shared float red_q[WG];
+shared float red_k[WG];
+
+void main() {
+    const uint gid = halo_group_id();
+    const uint n_tiles = (pc.d_v + pc.dv_tile - 1u) / pc.dv_tile;
+    const uint j = gid / n_tiles;
+    if (j >= pc.n_v) return;
+    const uint b_lo = (gid % n_tiles) * pc.dv_tile;
+    const uint b_hi = min(b_lo + pc.dv_tile, pc.d_v);
+    const uint tid = gl_LocalInvocationID.x;
+    const uint b = b_lo + tid;
+    const bool live_col = b < b_hi;  // inactive threads still take part in barriers/reductions
+    const uint kh = j % pc.n_k;
+    const uint head = j * DK * pc.d_v;
+    const uint state_elems = pc.n_v * DK * pc.d_v;
+    const bool ring = pc.ring_p != 0u;
+    const uint sin_off = ring ? pc.in_off + pc.ring_live * state_elems : pc.in_off;
+    const uint sout_off = ring ? pc.in_off + ((pc.ring_live + 1u) % pc.ring_p) * state_elems : pc.out_off;
+    uint p2 = 1u;  // smallest power of two >= WG
+    while (p2 < WG) p2 <<= 1;
+
+    float s[DK];
+    if (live_col) {
+        [[unroll]] for (uint a = 0u; a < DK; ++a) s[a] = state_in[sin_off + head + a * pc.d_v + b];
+    }
+
+    for (uint t = 0u; t < pc.n_tokens; ++t) {
+        barrier();  // previous token finished with sq/sk/red_*
+        const uint q_row = pc.q_off + t * pc.q_stride + kh * DK;
+        const uint k_row = pc.k_off + t * pc.k_stride + kh * DK;
+        float pq = 0.0;
+        float pk = 0.0;
+        for (uint a = tid; a < DK; a += WG) {
+            const float qa = q[q_row + a];
+            const float ka = k[k_row + a];
+            sq[a] = qa;
+            sk[a] = ka;
+            pq += qa * qa;
+            pk += ka * ka;
+        }
+        red_q[tid] = pq;
+        red_k[tid] = pk;
+        barrier();
+        // Fixed-order tree over WG partials (WG need not be a power of two).
+        for (uint st = p2 / 2u; st > 0u; st >>= 1) {
+            if (tid < st && tid + st < WG) {
+                red_q[tid] += red_q[tid + st];
+                red_k[tid] += red_k[tid + st];
+            }
+            barrier();
+        }
+        const bool l2 = pc.qk_l2norm != 0u;
+        const float inv_q = l2 ? 1.0 / sqrt(red_q[0] + 1e-6) : 1.0;
+        const float inv_k = l2 ? 1.0 / sqrt(red_k[0] + 1e-6) : 1.0;
+        for (uint a = tid; a < DK; a += WG) {
+            sq[a] = (sq[a] * inv_q) * pc.q_scale;
+            sk[a] = sk[a] * inv_k;
+        }
+        barrier();
+
+        if (live_col) {
+            const float decay = exp(g[pc.g_off + t * pc.g_stride + j]);
+            const float bt = beta[pc.b_off + t * pc.b_stride + j];
+            float kv = 0.0;
+            [[unroll]] for (uint a = 0u; a < DK; ++a) {
+                s[a] *= decay;
+                kv += s[a] * sk[a];
+            }
+            const float delta = (v[pc.v_off + t * pc.v_stride + j * pc.d_v + b] - kv) * bt;
+            float acc = 0.0;
+            [[unroll]] for (uint a = 0u; a < DK; ++a) {
+                s[a] += sk[a] * delta;
+                acc += s[a] * sq[a];
+            }
+            o[pc.o_off + t * pc.o_stride + j * pc.d_v + b] = acc;
+
+            const uint slot = pc.n_tokens - 1u - t;  // slot this token's state belongs to
+            // Ring slot 0 is the final state's address (written after the loop).
+            if (slot < pc.n_slots && !(ring && slot == 0u)) {
+                const uint slot_base = (ring ? pc.in_off + ((pc.ring_live + 1u + slot) % pc.ring_p) * state_elems
+                                             : pc.slots_off + slot * state_elems) + head;
+                [[unroll]] for (uint a = 0u; a < DK; ++a) slots[slot_base + a * pc.d_v + b] = s[a];
+            }
+        }
+    }
+
+    if (live_col) {
+        [[unroll]] for (uint a = 0u; a < DK; ++a) state_out[sout_off + head + a * pc.d_v + b] = s[a];
+    }
+}

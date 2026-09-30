@@ -1,0 +1,103 @@
+#version 450
+// QUANT_GEMV / MATMUL, ggml Q4_K weights: y[t][r] = sum_c W[r,c] * x[t][c]. Per-type main:
+// common/matvec_q4_k_main.glsl (llama.cpp mul_mat_vec_q4_k port: 16 threads/block, SWAR
+// dequant, sub-block scale application; shared with neither the other matvec types nor
+// get_rows_q4_k, which keep common/dequant_q4_k.glsl). The body is instantiated twice:
+// FAST reads the (4-aligned) weight words directly; SLOW handles arbitrary byte offsets
+// (VkViews arena gate) via HALO_DEFINE_BYTE_READERS with identical integer content, so
+// both produce bitwise-identical results.
+// NORMED variant (opt-in HALO_FUSE_NORM=1, decode n_vec == 1 only): y = W * (rms_norm(x) * nw).
+// Wraps the unmodified per-type main; see the prologue below. Copy of matvec_q4_k.comp otherwise.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 1) readonly buffer XR { float xr[]; };  // raw (un-normed) input
+layout(std430, binding = 3) readonly buffer NW { float nw[]; };  // norm weight
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint n_vec;     // 1..MAX_VEC
+    uint w_off;     // sub-alignment remainder of the W view (bytes)
+    uint w_stride;  // row stride of W (bytes)
+    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+    uint xr_off;    // element remainder of the raw x view
+    uint nw_off;    // element remainder of the norm-weight view
+    float eps;
+} pc;
+
+// Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
+layout(constant_id = 1) const uint BATCHED = 1;
+const uint MAX_VEC = 8u;
+
+// HALO_FUSE_NORM: the row RMS is computed here and the normalized input
+// x[c] = (xr[c] * inv_rms) * nw[c] is staged once per workgroup in shared memory under the name
+// `x`, so the included main (which indexes x[pc.x_off + ...]) runs unmodified; the host sends
+// x_off = 0. XCOLS = cols (specialization constant 2; cols x 4 bytes of LDS).
+layout(constant_id = 2) const uint XCOLS = 5120;
+shared float x[XCOLS];
+shared float rn[256];
+
+shared float red[WG];
+shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
+
+HALO_DEFINE_BYTE_READERS(wq)
+
+struct Q4KBlock {
+    vec4 qA, qB, qC, qD;  // q nibbles: elements y_off+{0..3}, +32, and +128/+160
+    vec2 dm;              // (d, dmin)
+    vec4 sc_lo;           // sc0, sc1, m0, m1 (sub-blocks 2*v_im, 2*v_im+1)
+    vec4 sc_hi;           // sc4, sc5, m4, m5 (sub-blocks 2*v_im+4, 2*v_im+5)
+};
+
+#define LD32(bo) (wq[(bo) >> 2])
+#define Q4K_FN fast
+#include "matvec_q4_k_main.glsl"
+#undef LD32
+#undef Q4K_FN
+
+#define LD32(bo) \
+    (read_u8(bo) | (read_u8((bo) + 1u) << 8) | (read_u8((bo) + 2u) << 16) | (read_u8((bo) + 3u) << 24))
+#define Q4K_FN slow
+#include "matvec_q4_k_main.glsl"
+#undef LD32
+#undef Q4K_FN
+
+// Same arithmetic as rms_norm.comp with its default WG = 256: 256 virtual lanes (lane l sums
+// elements l, l+256, ...) reduced by the same fixed tree, so inv_rms is bitwise equal to the
+// separate norm's when the host's reduce_workgroup is 256; x*inv then *w is the same op order.
+void norm_prologue() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint l = tid; l < 256u; l += WG) {
+        float a = 0.0;
+        for (uint i = l; i < pc.cols; i += 256u) {
+            const float v = xr[pc.xr_off + i];
+            a += v * v;
+        }
+        rn[l] = a;
+    }
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        for (uint l = tid; l < s; l += WG) rn[l] += rn[l + s];
+        barrier();
+    }
+    const float inv = 1.0 / sqrt(rn[0] / float(pc.cols) + pc.eps);
+    for (uint i = tid; i < pc.cols; i += WG) x[i] = (xr[pc.xr_off + i] * inv) * nw[pc.nw_off + i];
+    barrier();
+}
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    norm_prologue();
+    const uint row_off = pc.w_off + row * pc.w_stride;
+    // Uniform branch: 144-byte blocks keep every row at the same alignment as w_off.
+    if ((row_off & 3u) == 0u)
+        q4k_fast(row, row_off);
+    else
+        q4k_slow(row, row_off);
+}
