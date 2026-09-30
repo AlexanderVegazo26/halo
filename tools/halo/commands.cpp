@@ -562,6 +562,13 @@ int cmd_serve(const std::vector<std::string>& args, Context& ctx) {
     *ctx.out << std::format("halo: serving {} on http://{}:{}{}\n", engine->model().id, sc.host, port,
                             sc.api_key ? " (API key required)" : "")
              << std::flush;
+    if (engine->model().kv_pool_bytes > 0) {
+        *ctx.out << std::format("halo: context {} tokens x {} sequence(s); KV pool {:.2f} GiB in {} segment(s)\n",
+                                engine->model().context_length, ec.max_sequences,
+                                static_cast<double>(engine->model().kv_pool_bytes) / (1024.0 * 1024.0 * 1024.0),
+                                engine->model().kv_segments)
+                 << std::flush;
+    }
     if (ctx.on_serving) {
         server.start();
         ctx.on_serving(server, [&server] { server.stop(); });

@@ -55,6 +55,65 @@ bool extension_available(const char* name) {
     return false;
 }
 
+bool device_extension_available(VkPhysicalDevice pd, const char* name) {
+    std::uint32_t n = 0;
+    if (vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> exts(n);
+    if (vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, exts.data()) != VK_SUCCESS) return false;
+    for (const VkExtensionProperties& e : exts) {
+        if (std::strcmp(e.extensionName, name) == 0) return true;
+    }
+    return false;
+}
+
+// Can the matmul_cm_* prefill GEMMs (shaders/common/matmul_cm_main.glsl) run on `pd`? They
+// need, all at once: VK_KHR_cooperative_matrix with the feature bit and compute-stage support,
+// an f16 x f16 -> f32 16x16x16 subgroup-scope matrix shape, shaderFloat16 (OpCapability
+// Float16) and vulkanMemoryModel (OpCapability VulkanMemoryModel, implied by
+// GL_KHR_memory_scope_semantics), and subgroupSize >= 32 (the shader's shared-memory slices).
+// Never throws: any failed query means "not supported".
+bool coopmat_supported(VkInstance instance, VkPhysicalDevice pd, const DeviceInfo& info) {
+    if (info.subgroup_size < 32) return false;
+    if (!device_extension_available(pd, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) return false;
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{};
+    cm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceVulkan12Features f12{};
+    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    f12.pNext = &cm;
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &f12;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    if (cm.cooperativeMatrix != VK_TRUE || f12.shaderFloat16 != VK_TRUE || f12.vulkanMemoryModel != VK_TRUE)
+        return false;
+
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR cmp{};
+    cmp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    VkPhysicalDeviceProperties2 p2{};
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &cmp;
+    vkGetPhysicalDeviceProperties2(pd, &p2);
+    if ((cmp.cooperativeMatrixSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) return false;
+
+    const auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+        vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+    if (fn == nullptr) return false;
+    std::uint32_t n = 0;
+    if (fn(pd, &n, nullptr) != VK_SUCCESS || n == 0) return false;
+    std::vector<VkCooperativeMatrixPropertiesKHR> props(n);
+    for (VkCooperativeMatrixPropertiesKHR& p : props) p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    if (fn(pd, &n, props.data()) != VK_SUCCESS) return false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const VkCooperativeMatrixPropertiesKHR& p = props[i];
+        if (p.MSize == 16 && p.NSize == 16 && p.KSize == 16 && p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+            p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.scope == VK_SCOPE_SUBGROUP_KHR)
+            return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- Instance
@@ -202,6 +261,29 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    // Opt-in cooperative matrices (HALO_COOPMAT=1; prefill GEMMs matmul_cm_*). Without the env
+    // var, or on a device that cannot do it, nothing is chained: device creation is unchanged.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_features{};
+    cm_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    cm_features.cooperativeMatrix = VK_TRUE;
+    VkPhysicalDeviceVulkan12Features cm_v12{};
+    cm_v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    cm_v12.pNext = &cm_features;
+    cm_v12.shaderFloat16 = VK_TRUE;
+    cm_v12.vulkanMemoryModel = VK_TRUE;
+    const char* cm_extensions[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+    if (const auto cm_env = detail::getenv_str("HALO_COOPMAT"); cm_env && *cm_env == "1") {
+        if (coopmat_supported(ctx->instance_->handle(), ctx->physical_, ctx->info_)) {
+            dci.pNext = &cm_v12;
+            dci.enabledExtensionCount = 1;
+            dci.ppEnabledExtensionNames = cm_extensions;
+            ctx->coopmat_enabled_ = true;
+            HALO_INFO("vulkan", "HALO_COOPMAT=1: VK_KHR_cooperative_matrix enabled (fp16 tiles, fp32 accumulate)");
+        } else {
+            HALO_WARN("vulkan", "HALO_COOPMAT=1 ignored: device lacks VK_KHR_cooperative_matrix f16/f32 16x16x16 "
+                                "subgroup matrices (or shaderFloat16 / vulkanMemoryModel / subgroupSize >= 32)");
+        }
+    }
     detail::vk_check(vkCreateDevice(ctx->physical_, &dci, nullptr, &ctx->device_), "vkCreateDevice");
     vkGetDeviceQueue(ctx->device_, ctx->queue_family_, 0, &ctx->queue_);
 

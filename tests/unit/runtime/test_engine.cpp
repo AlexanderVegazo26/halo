@@ -397,6 +397,72 @@ TEST_F(EngineTest, CancellationDeliversExactlyTheAcceptedTokensAndLeavesTheEngin
     EXPECT_EQ(engine_->stats().active_sequences, 0u);
 }
 
+// ---- KV pool limits: fail loudly, split per layer ----------------------------------------------
+
+TEST_F(EngineTest, ExplicitContextThatCannotBeHonouredIsATypedConfigError) {
+    const auto expect_config = [](EngineConfig c, CpuEngineOptions o, const char* contains) {
+        try {
+            (void)make(o, c);
+            ADD_FAILURE() << "expected Error(Config) (" << contains << ")";
+        } catch (const halo::Error& e) {
+            EXPECT_EQ(e.code(), halo::ErrorCode::Config) << e.what();
+            EXPECT_NE(std::string(e.what()).find(contains), std::string::npos) << e.what();
+        }
+    };
+    // Larger than the model's trained context: refused, not silently reduced (a defaulted value is
+    // reduced -- the same request without the explicit flag is not an error on this check).
+    EngineConfig c = base_cfg();
+    c.max_context = std::size_t{1} << 33;  // > the 2^31 ceiling model.cpp accepts for a trained context
+    c.max_context_explicit = true;
+    expect_config(c, {}, "trained context");
+    // The KV pool cannot hold the requested sequences x context under the backend's per-buffer
+    // cap even split per layer (test seam: a 1-byte cap): an explicit --ctx is an error ...
+    c = base_cfg();
+    c.max_context_explicit = true;
+    CpuEngineOptions o;
+    o.kv_buffer_cap_bytes = 1;
+    expect_config(c, o, "--ctx");
+    // ... and so is a defaulted one that cannot be reduced any further (here already <= 1024).
+    c.max_context_explicit = false;
+    expect_config(c, o, "KV blocks");
+}
+
+TEST_F(EngineTest, PerLayerKvPoolGivesTheSameTokensAsTheContiguousPool) {
+    EngineConfig c = base_cfg();
+    c.max_sequences = 1;
+    c.mtp_enabled = false;  // one pool, so its byte size is exactly the contiguous image's
+    CpuEngineOptions o;
+    o.kv_blocks = 64;
+    const auto plain = make(o, c);
+    ASSERT_EQ(plain->model().kv_segments, 1u);
+    const std::uint64_t pool_bytes = plain->model().kv_pool_bytes;
+    ASSERT_GT(pool_bytes, 0u);
+    // One byte below the contiguous image: it must be split per layer to be allowed at all.
+    o.kv_buffer_cap_bytes = pool_bytes - 1;
+    std::unique_ptr<Engine> split;
+    try {
+        split = make(o, c);
+    } catch (const halo::Error& e) {
+        // A model with a single attention layer cannot be split: still a typed, explicit refusal.
+        EXPECT_EQ(e.code(), halo::ErrorCode::Config) << e.what();
+        GTEST_SKIP() << "the tiny model has one attention layer, so a per-layer split does not shrink the buffer: " << e.what();
+    }
+    ASSERT_GT(split->model().kv_segments, 1u) << "the cap forced a split, so the pool must have several segments";
+    EXPECT_EQ(split->model().kv_pool_bytes, pool_bytes) << "splitting changes the buffers, not the pool size";
+    const Toks g = gold("p1");
+    const Toks expect(g.begin(), g.begin() + 10);
+    EXPECT_EQ(run(*plain, greedy(prompt("p1"), 10)).tokens, expect);
+    EXPECT_EQ(run(*split, greedy(prompt("p1"), 10)).tokens, expect);
+    // A prefix-cache re-submit exercises copy-on-write on the split pool too.
+    EngineConfig cc = c;
+    cc.prefix_cache = true;
+    const auto cached = make(o, cc);
+    ASSERT_GT(cached->model().kv_segments, 1u);
+    EXPECT_EQ(run(*cached, greedy(prompt("p1"), 10)).tokens, expect);
+    const GenerateResult again = run(*cached, greedy(prompt("p1"), 10));
+    EXPECT_EQ(again.tokens, expect);
+}
+
 // ---- prefix cache (D-013) ------------------------------------------------------------------
 
 TEST_F(EngineTest, PrefixCacheReusesCheckpointsAndMatchesRecompute) {

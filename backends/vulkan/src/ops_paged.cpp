@@ -44,23 +44,53 @@ void zero_status(Stream& stream, const BufferView& v) { stream.fill(*v.buffer, v
 constexpr std::uint32_t k_max_head_dim = 256;       // attention.comp MAX_HD
 constexpr std::uint32_t k_attn_dims_per_thread = 4;  // attention.comp DIMS
 
-/// Pool geometry shared by kv_write and attention (ops.h "The paged KV pool").
+/// Pool geometry shared by kv_write and attention (ops.h "The paged KV pool"). All sizes are in
+/// 32-bit words; for the fp32 pool a word is one float, so block_floats == block_words.
 struct PoolGeometry {
-    std::uint32_t block_floats = 0;
-    std::uint32_t layer_off = 0;
+    std::uint32_t block_floats = 0;  ///< words per block (n_layers * 2 * block_tokens * row_words)
+    std::uint32_t layer_off = 0;     ///< words before `layer` inside a block
+    std::uint32_t row_words = 0;     ///< words of one K (or V) row in the pool's format
 };
 
+/// Words of one K (or V) row of kv_dim elements. F16 needs an even kv_dim, Q8 a multiple of 32
+/// (ops.h); attention additionally needs whole heads on those boundaries (checked there).
+std::uint64_t kv_row_words(KvType type, std::uint64_t kv_dim, std::string_view op) {
+    switch (type) {
+        case KvType::F32: return kv_dim;
+        case KvType::F16:
+            HALO_CHECK(kv_dim % 2 == 0, ErrorCode::Unsupported, "{}: an fp16 KV pool needs an even kv_dim, got {}", op, kv_dim);
+            return kv_dim / 2;
+        case KvType::Q8:
+            HALO_CHECK(kv_dim % 32 == 0, ErrorCode::Unsupported,
+                       "{}: a Q8 KV pool needs a kv_dim that is a multiple of 32, got {}", op, kv_dim);
+            return kv_dim / 32 * 9;
+    }
+    throw_error(ErrorCode::Kernel, "{}: unknown KV type {}", op, static_cast<std::uint32_t>(type));
+}
+
 PoolGeometry pool_geometry(std::uint32_t n_layers, std::uint32_t layer, std::uint32_t block_tokens,
-                           std::uint64_t kv_dim, std::string_view op) {
+                           std::uint64_t kv_dim, KvType type, std::string_view op) {
     HALO_CHECK(n_layers > 0 && layer < n_layers, ErrorCode::Kernel, "{}: layer {} outside [0, {})", op, layer,
                n_layers);
     HALO_CHECK(block_tokens > 0 && kv_dim > 0, ErrorCode::Kernel, "{}: block_tokens {} / kv_dim {} must be > 0", op,
                block_tokens, kv_dim);
-    const std::uint64_t kv_block = checked_mul(checked_mul(2, std::uint64_t{block_tokens}, op), kv_dim, op);
+    const std::uint64_t row_words = kv_row_words(type, kv_dim, op);
+    const std::uint64_t kv_block = checked_mul(checked_mul(2, std::uint64_t{block_tokens}, op), row_words, op);
     PoolGeometry g;
-    g.block_floats = to_u32(checked_mul(kv_block, n_layers, op), std::format("{} block floats", op));
+    g.block_floats = to_u32(checked_mul(kv_block, n_layers, op), std::format("{} block words", op));
     g.layer_off = static_cast<std::uint32_t>(kv_block * layer);  // < block_floats
+    g.row_words = static_cast<std::uint32_t>(row_words);
     return g;
+}
+
+/// Shader name of a kv_write / attention variant for a pool format.
+std::string kv_shader(std::string_view op, KvType type) {
+    switch (type) {
+        case KvType::F32: return std::string(op);
+        case KvType::F16: return std::string(op) + "_f16";
+        case KvType::Q8: return std::string(op) + "_q8";
+    }
+    throw_error(ErrorCode::Kernel, "{}: unknown KV type {}", op, static_cast<std::uint32_t>(type));
 }
 
 /// The whole pool is bound as one descriptor with 32-bit float indices; a larger pool is a
@@ -154,7 +184,7 @@ void Ops::get_rows(Stream& stream, const GetRowsArgs& a) {
 void Ops::kv_write(Stream& stream, const KvWriteArgs& a) {
     constexpr std::string_view op = "kv_write";
     HALO_CHECK(a.n_tokens > 0, ErrorCode::Kernel, "{}: n_tokens is 0", op);
-    const PoolGeometry g = pool_geometry(a.n_layers, a.layer, a.block_tokens, a.kv_dim, op);
+    const PoolGeometry g = pool_geometry(a.n_layers, a.layer, a.block_tokens, a.kv_dim, a.kv_type, op);
     const DeviceInfo& info = ctx_->info();
     const std::uint64_t align = info.min_storage_buffer_offset_alignment;
     const std::uint64_t rows_end = checked_add(std::uint64_t{a.start}, a.n_tokens, op);
@@ -167,6 +197,20 @@ void Ops::kv_write(Stream& stream, const KvWriteArgs& a) {
     const Operand os = status_operand(a.status, align, op);
     require_disjoint(op_pool, "kv_pool", {{&ot, "block_table"}, {&ok, "k"}, {&ov, "v"}, {&os, "status"}}, op);
     require_disjoint(os, "status", {{&ot, "block_table"}, {&ok, "k"}, {&ov, "v"}}, op);
+    if (a.kv_type != KvType::F32) {
+        // Quantized pool (fp16 / Q8): its own shader; the push block carries row_words.
+        struct QPush {
+            std::uint32_t n_pool_blocks, block_words, layer_off, bt, kv_dim, row_words, start, n_tokens, pool_off, tab_off,
+                k_off, k_stride, v_off, v_stride, st_off;
+        } qpush{a.n_pool_blocks, g.block_floats, g.layer_off, a.block_tokens, a.kv_dim,   g.row_words, a.start, a.n_tokens,
+                op_pool.off,     ot.off,         ok.off,      ok.stride,      ov.off,     ov.stride,   os.off};
+        const Kernel& qk = kernel(kv_shader("kv_write", a.kv_type), 5, sizeof(QPush), {{0, k_rows_wg}}, {k_rows_wg, 1, 1});
+        const std::array qbindings{op_pool.binding, ot.binding, ok.binding, ov.binding, os.binding};
+        const GroupCount qgroups = grid_1d(a.n_tokens, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+        zero_status(stream, a.status);
+        stream.dispatch(qk, qbindings, qpush, qgroups, 0b10001);  // pool + status written
+        return;
+    }
     struct Push {
         std::uint32_t n_pool_blocks, block_floats, layer_off, bt, kv_dim, start, n_tokens, pool_off, tab_off, k_off,
             k_stride, v_off, v_stride, st_off;
@@ -192,7 +236,12 @@ void Ops::attention(Stream& stream, const AttentionArgs& a) {
     const std::uint32_t qhs = a.q_head_stride == 0 ? a.head_dim : a.q_head_stride;
     HALO_CHECK(qhs >= a.head_dim, ErrorCode::Kernel, "{}: q_head_stride {} < head_dim {}", op, qhs, a.head_dim);
     const std::uint64_t kv_dim = checked_mul(std::uint64_t{a.n_kv_head}, a.head_dim, op);
-    const PoolGeometry g = pool_geometry(a.n_layers, a.layer, a.block_tokens, kv_dim, op);
+    // A quantized head must start on a word (fp16) / 32-element group (Q8) boundary in its row.
+    HALO_CHECK(a.kv_type != KvType::F16 || a.head_dim % 2 == 0, ErrorCode::Unsupported,
+               "{}: an fp16 KV pool needs an even head_dim, got {}", op, a.head_dim);
+    HALO_CHECK(a.kv_type != KvType::Q8 || a.head_dim % 32 == 0, ErrorCode::Unsupported,
+               "{}: a Q8 KV pool needs a head_dim that is a multiple of 32, got {}", op, a.head_dim);
+    const PoolGeometry g = pool_geometry(a.n_layers, a.layer, a.block_tokens, kv_dim, a.kv_type, op);
     const DeviceInfo& info = ctx_->info();
     const std::uint64_t align = info.min_storage_buffer_offset_alignment;
     const std::uint64_t rows_end = checked_add(std::uint64_t{a.q_offset}, a.n_tokens, op);
@@ -207,6 +256,24 @@ void Ops::attention(Stream& stream, const AttentionArgs& a) {
     const Operand os = status_operand(a.status, align, op);
     require_disjoint(oo, "out", {{&oq, "q"}, {&op_pool, "kv_pool"}, {&ot, "block_table"}, {&os, "status"}}, op);
     require_disjoint(os, "status", {{&oq, "q"}, {&op_pool, "kv_pool"}, {&ot, "block_table"}}, op);
+    if (a.kv_type != KvType::F32) {
+        // Quantized pool (fp16 / Q8): its own shader; kv_dim is replaced by row_words in the push block.
+        struct QPush {
+            std::uint32_t n_head, n_kv_head, head_dim, n_tokens, q_offset;
+            float scale;
+            std::uint32_t n_pool_blocks, block_words, layer_off, bt, row_words, q_off, q_stride, q_head_stride, pool_off,
+                tab_off, o_off, o_stride, st_off;
+        } qpush{a.n_head,        a.n_kv_head,     a.head_dim,   a.n_tokens,   a.q_offset,  a.scale,
+                a.n_pool_blocks, g.block_floats,  g.layer_off,  a.block_tokens, g.row_words, oq.off,
+                oq.stride,       qhs,             op_pool.off,  ot.off,       oo.off,      oo.stride,
+                os.off};
+        const Kernel& qk = kernel(kv_shader("attention", a.kv_type), 5, sizeof(QPush), {{0, wg}}, {wg, 1, 1});
+        const std::array qbindings{oq.binding, op_pool.binding, ot.binding, oo.binding, os.binding};
+        const GroupCount qgroups = grid_1d(items, info.max_workgroup_count[0], info.max_workgroup_count[1]);
+        zero_status(stream, a.status);
+        stream.dispatch(qk, qbindings, qpush, qgroups, 0b11000);  // out + status written
+        return;
+    }
     struct Push {
         std::uint32_t n_head, n_kv_head, head_dim, n_tokens, q_offset;
         float scale;

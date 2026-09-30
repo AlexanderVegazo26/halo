@@ -61,6 +61,12 @@ shared float sq[MAX_DK];
 shared float sk[MAX_DK];
 shared float red_q[WG];
 shared float red_k[WG];
+// exp(gc_a - gc_b) for b <= a of the current chunk, written once in step 2 and read by step 6
+// (which used to recompute the identical exp per state element). Same dg expression, same exp
+// call, so the values are bit-identical to the recomputation. Host cap: chunk_size <= 64
+// (Ops k_gdn_max_chunk; the host also checks the shared-memory budget).
+const uint MAX_CS = 64u;
+shared float sdec[MAX_CS * MAX_CS];
 
 // Per-head scratch layout (elements, relative to the head base); host: gdn_chunked_workspace_bytes.
 uint oQ() { return 0u; }
@@ -200,6 +206,7 @@ void main() {
             if (b > a) continue;
             precise float dg = ws[W + oGC() + a] - ws[W + oGC() + b];
             const float dec = exp(dg);
+            sdec[a * cs + b] = dec;
             if (b < a) {
                 precise float u = dot8(W + oKB() + a * dk, W + oK() + b * dk, dk) * dec;
                 ws[W + oUT() + a * cs + b] = u;
@@ -263,20 +270,33 @@ void main() {
                 if (slot >= pc.n_slots && !last) continue;
                 const float ga = ws[W + oGC() + a];
                 const float decay = exp(ga);
-                for (uint i = 0u; i < dk; ++i) {
-                    precise float upd = 0.0;
+                // State rows in tiles of 8: the decay weight exp(ga - gc_b) (sdec) and the
+                // v_new value of column c depend on b only, so each is loaded once per (tile, b)
+                // instead of once per (i, b). Every state element still accumulates its b = 0..a
+                // products in the same order with the same rounding: bit-identical results.
+                for (uint i0 = 0u; i0 < dk; i0 += 8u) {
+                    const uint nb = min(8u, dk - i0);
+                    precise float upd[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
                     for (uint b = 0u; b <= a; ++b) {
-                        precise float dg = ga - ws[W + oGC() + b];
-                        const float w = exp(dg);
-                        precise float ki = ws[W + oK() + b * dk + i] * w;
-                        precise float p = ki * ws[W + oVN() + b * dv + c];
-                        upd = upd + p;
+                        const float w = sdec[a * cs + b];
+                        const float vnb = ws[W + oVN() + b * dv + c];
+                        for (uint l = 0u; l < 8u; ++l) {
+                            if (l < nb) {
+                                precise float ki = ws[W + oK() + b * dk + i0 + l] * w;
+                                precise float p = ki * vnb;
+                                upd[l] = upd[l] + p;
+                            }
+                        }
                     }
-                    const uint e = head + i * dv + c;
-                    precise float sd = state_at(first, e) * decay;
-                    precise float r = sd + upd;
-                    if (slot < pc.n_slots) slots[slot_at(slot, e)] = r;
-                    if (last) state_out[out_at(e)] = r;
+                    for (uint l = 0u; l < 8u; ++l) {
+                        if (l < nb) {
+                            const uint e = head + (i0 + l) * dv + c;
+                            precise float sd = state_at(first, e) * decay;
+                            precise float r = sd + upd[l];
+                            if (slot < pc.n_slots) slots[slot_at(slot, e)] = r;
+                            if (last) state_out[out_at(e)] = r;
+                        }
+                    }
                 }
             }
         }

@@ -1,0 +1,4 @@
+#version 450
+// [KV write] into a Q8 pool (KvType::Q8, per-32 group fp32 scale). Body: common/kv_write_quant_main.glsl.
+#define KV_TYPE 2
+#include "kv_write_quant_main.glsl"

@@ -162,11 +162,18 @@ void Ops::matvec(Stream& stream, DType wtype, const BufferView& w, const BufferV
 
 void Ops::gemv(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "gemv"); }
 
-void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
+void Ops::gemv_repacked(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "gemv(repacked)", true); }
+
+void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool repacked) {
     HALO_CHECK(a.rows > 0 && a.cols > 0 && a.n_vec > 0, ErrorCode::Kernel, "{}: empty shape {}x{} n_vec={}", op,
                a.rows, a.cols, a.n_vec);
+    // The repacked layout (halo/tensor/repack.h) keeps the row footprint of the GGUF layout, so
+    // row_bytes and every extent check below are unchanged; only the shader differs ("_rp").
+    HALO_CHECK(!repacked || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K || a.wtype == DType::IQ4_XS,
+               ErrorCode::Unsupported, "{}: no repacked matvec for weight type id {} (Q5_K, Q6_K, IQ4_XS)", op,
+               static_cast<std::uint32_t>(a.wtype));
     const std::uint64_t row_bytes = matvec_row_bytes(a.wtype, a.cols);
-    const std::string shader = detail::weight_shader("matvec", a.wtype);
+    const std::string shader = detail::weight_shader("matvec", a.wtype) + (repacked ? "_rp" : "");
     const std::uint64_t align = ctx_->info().min_storage_buffer_offset_alignment;
     // F32 weights are indexed by element, quantized ones by byte (read as 32-bit words).
     const Operand ow =
@@ -174,6 +181,10 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
     const Operand ox = operand(a.x, a.n_vec, std::uint64_t{a.cols} * k_f32, Access::Floats, align, op, "x");
     const Operand oy = operand(a.y, a.n_vec, std::uint64_t{a.rows} * k_f32, Access::Floats, align, op, "y");
     require_disjoint(oy, "y", {{&ow, "W"}, {&ox, "x"}}, op);
+    // The _rp shaders load uvec4 / uvec2 at plane offsets relative to each row start: every
+    // row (binding remainder + r * stride) must be 16-byte aligned. A single row has no stride.
+    HALO_CHECK(!repacked || (ow.off % 16 == 0 && (a.rows == 1 || ow.stride % 16 == 0)), ErrorCode::Kernel,
+               "{}: repacked W needs a 16-byte aligned view offset ({}) and row stride ({})", op, ow.off, ow.stride);
 
     // A W larger than one binding (e.g. the 248320-row embedding / LM head on a device with
     // a small maxStorageBufferRange) runs as row slabs; every slab writes its own rows of y.
@@ -188,8 +199,32 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op) {
             s.rows = n;
             s.w = BufferView(*a.w.buffer, a.w.offset + r0 * ws, (n - 1) * ws + row_bytes, ws);
             s.y = BufferView(*a.y.buffer, a.y.offset + r0 * k_f32, (a.n_vec - 1) * ys + std::uint64_t{n} * k_f32, ys);
-            gemv_impl(stream, s, op);
+            gemv_impl(stream, s, op, repacked);
         }
+        return;
+    }
+
+    // Prefill: more than one matvec dispatch's worth of vectors on a K-quant weight runs as a
+    // tiled cooperative-matrix GEMM (fp16 tiles, fp32 accumulate; shaders/common/matmul_cm_main.glsl).
+    // Opt-in (HALO_COOPMAT=1, and the device must have enabled the extension at context creation:
+    // Context::coopmat_enabled()); numerics differ from the fp32 matvec, so never the default.
+    // (Never on repacked weights: matmul_cm reads the raw GGUF blocks; those run the _rp matvec.)
+    if (!repacked && a.n_vec > k_gemv_max_vec && ctx_->coopmat_enabled() &&
+        (a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K)) {
+        struct CmPush {
+            std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
+        };
+        constexpr std::uint32_t cm_wg = 64;  // matmul_cm_main.glsl WG (constant_id 0)
+        constexpr std::uint32_t cm_tile = 32;  // TM = TN in matmul_cm_main.glsl: one tile per subgroup
+        const Kernel& kcm = kernel(detail::weight_shader("matmul_cm", a.wtype), 3, sizeof(CmPush), {{0, cm_wg}},
+                                   {cm_wg, 1, 1});
+        const std::uint64_t tiles = std::uint64_t{(a.n_vec + cm_tile - 1) / cm_tile} * ((a.rows + cm_tile - 1) / cm_tile);
+        const DeviceInfo& cm_info = ctx_->info();
+        // One workgroup per tile; a workgroup with several subgroups just runs extra ones past the grid.
+        const GroupCount cm_groups = grid_1d(tiles, cm_info.max_workgroup_count[0], cm_info.max_workgroup_count[1]);
+        const std::array cm_bindings{ow.binding, ox.binding, oy.binding};
+        const CmPush cm_push{a.rows, a.cols, a.n_vec, ow.off, ow.stride, ox.off, ox.stride, oy.off, oy.stride};
+        stream.dispatch(kcm, cm_bindings, cm_push, cm_groups, 0b100);  // y written
         return;
     }
 
@@ -351,6 +386,12 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
     const std::uint32_t cs = chunked->chunk_size;
     HALO_CHECK(cs >= 1 && cs <= k_gdn_max_chunk, ErrorCode::Kernel, "{}: chunk_size {} not in [1, {}]", op, cs,
                k_gdn_max_chunk);
+    // gated_delta_rule_chunked.comp shared memory: q/k tiles (2 * MAX_DK), two WG-wide reduction
+    // arrays and the 64 x 64 decay table (MAX_CS^2, sized for the host cap k_gdn_max_chunk).
+    HALO_CHECK((2 * std::uint64_t{options_.gdn_max_dk} + 2 * std::uint64_t{wg} +
+                std::uint64_t{k_gdn_max_chunk} * k_gdn_max_chunk) * k_f32 <= info.max_shared_memory,
+               ErrorCode::Kernel, "{}: shared memory ({} bytes) too small for the decay table", op,
+               info.max_shared_memory);
     const std::uint64_t ws_bytes = gdn_chunked_workspace_bytes(a, cs);
     const Operand ows = operand(chunked->workspace, 1, ws_bytes, Access::Floats, align, op, "workspace");
     const Operand ost = operand(chunked->status, 1, k_status_bytes, Access::Floats, align, op, "status");

@@ -172,8 +172,17 @@ private:
     std::vector<VkDescriptorPool> desc_pools_;
     std::size_t current_pool_ = 0;
     State state_ = State::Idle;
-    // Barrier elision: per-buffer {read, written} marks since the last barrier.
-    std::unordered_map<const Buffer*, std::pair<bool, bool>> touched_;
+    // Barrier elision: per-buffer {read, written} marks since the last barrier. A flat array
+    // with linear lookup (a handful of entries between barriers): no per-dispatch hashing or
+    // allocation. barrier_for() forces a barrier -- always sound -- before it could overflow.
+    struct Touch {
+        const Buffer* buf = nullptr;
+        bool read = false;
+        bool written = false;
+    };
+    static constexpr std::size_t kMaxTouched = 64;
+    std::array<Touch, kMaxTouched> touched_{};
+    std::size_t n_touched_ = 0;
     std::uint32_t dispatches_ = 0;
     // HALO_VK_OP_TIMINGS=<path>: per-dispatch GPU timestamps, appended to <path> at wait()
     // as "<kernel> <ns>" lines (diagnostics; off by default, one branch per dispatch).

@@ -3,6 +3,8 @@
 #include "halo/speculative/speculative.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 
 #include "halo/core/error.h"
@@ -13,6 +15,19 @@ namespace halo::speculative {
 using models::LogitsMode;
 using models::MtpStep;
 using models::SeqStep;
+
+namespace {
+/// HALO_MTP_DEVICE_HIDDEN=1 (default off): chain the MTP hidden between draft depths on the device
+/// (MtpStep::hidden_device / want_hidden_device) instead of a download + upload per depth. The trunk
+/// hidden still round-trips through the host (it persists in the sequence / checkpoints).
+bool device_hidden_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("HALO_MTP_DEVICE_HIDDEN");
+        return e != nullptr && *e != '\0' && std::string_view(e) != "0";
+    }();
+    return on;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------------------
 // ProfitGate
@@ -133,6 +148,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         toks.push_back(std::move(t));
         hid.push_back(std::move(h));
     }
+    const bool dev_hidden = device_hidden_enabled();
     try {
         if (!idx.empty()) {
             std::vector<MtpStep> steps(idx.size());
@@ -146,7 +162,9 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 m.first_position = static_cast<std::int32_t>(tick.seqs[idx[j]].mtp_len0 + 1);
                 m.logit_rows = std::span(&last_row[j], forced ? 0 : 1);
                 m.logits = forced ? LogitsMode::None : LogitsMode::Argmax;
-                m.want_hidden = !forced && tick.seqs[idx[j]].k > 1;
+                const bool keep = !forced && tick.seqs[idx[j]].k > 1;  // a deeper draft will need this hidden
+                m.want_hidden = keep && !dev_hidden;
+                m.want_hidden_device = keep && dev_hidden;
             }
             models::StepResult res;
             model_->mtp_forward(steps, res);
@@ -158,7 +176,13 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 s.mtp_flushed = true;
                 if (!reqs[idx[j]].forced_drafts.empty()) continue;
                 tick.out[idx[j]].drafts.push_back(res.seqs[j].argmax.at(0).index);
-                if (s.k > 1) s.mtp_hidden.assign(res.seqs[j].hidden.end() - static_cast<std::ptrdiff_t>(E), res.seqs[j].hidden.end());
+                if (s.k > 1) {
+                    if (dev_hidden) {
+                        s.mtp_hidden_dev = std::move(res.seqs[j].hidden_device);
+                    } else {
+                        s.mtp_hidden.assign(res.seqs[j].hidden.end() - static_cast<std::ptrdiff_t>(E), res.seqs[j].hidden.end());
+                    }
+                }
             }
         }
         // ---- depth i >= 2: the MTP's own hidden (D-005 amendment) --------------------------
@@ -174,14 +198,20 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 at.push_back(i);
                 MtpStep m;
                 m.tokens = std::span(&tick.out[i].drafts.back(), 1);
-                m.hidden = s.mtp_hidden;
+                const bool from_device = s.mtp_hidden_dev != nullptr;
+                if (from_device) {
+                    m.hidden_device = s.mtp_hidden_dev;
+                } else {
+                    m.hidden = s.mtp_hidden;
+                }
                 m.kv = &*reqs[i].seq->mtp_kv;
                 m.first_position = static_cast<std::int32_t>(reqs[i].seq->length() + depth - 1);
                 HALO_CHECK(static_cast<std::size_t>(m.first_position) == m.kv->length() + 1, ErrorCode::Kernel,
                            "draft depth {}: MTP position {} but MTP KV length {}", depth, m.first_position, m.kv->length());
                 m.logit_rows = std::span(&row0, 1);
                 m.logits = LogitsMode::Argmax;
-                m.want_hidden = depth < s.k;
+                m.want_hidden = depth < s.k && !dev_hidden;
+                m.want_hidden_device = depth < s.k && dev_hidden;
                 steps.push_back(m);
             }
             if (steps.empty()) break;
@@ -192,10 +222,18 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
     metrics_.weight_passes += res.cost.weight_passes;
             for (std::size_t j = 0; j < at.size(); ++j) {
                 tick.out[at[j]].drafts.push_back(res.seqs[j].argmax.at(0).index);
-                if (depth < tick.seqs[at[j]].k) tick.seqs[at[j]].mtp_hidden = std::move(res.seqs[j].hidden);
+                if (depth < tick.seqs[at[j]].k) {
+                    if (dev_hidden) {
+                        tick.seqs[at[j]].mtp_hidden_dev = std::move(res.seqs[j].hidden_device);
+                    } else {
+                        tick.seqs[at[j]].mtp_hidden = std::move(res.seqs[j].hidden);
+                    }
+                }
             }
         }
+        for (Tick::Seq& s : tick.seqs) s.mtp_hidden_dev.reset();  // device buffers never outlive the draft phase
     } catch (...) {
+        for (Tick::Seq& s : tick.seqs) s.mtp_hidden_dev.reset();
         abort_draft(reqs, tick);
         throw;
     }

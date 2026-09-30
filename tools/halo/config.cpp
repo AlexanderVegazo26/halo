@@ -332,6 +332,7 @@ runtime::EngineConfig engine_config(const ResolvedConfig& c, const std::filesyst
                ErrorCode::Config, "runtime.backend must be auto, cpu, vulkan or hip (got '{}')", e.backend);
     e.threads = static_cast<int>(c.u64("runtime.threads"));
     e.max_context = c.u64("runtime.ctx");
+    e.max_context_explicit = c.has("runtime.ctx") && c.source("runtime.ctx") != "default";  // flag, env or config file
     e.max_sequences = c.u64("runtime.parallel");
     const auto draft = c.u64("runtime.mtp_draft");
     e.mtp_enabled = draft > 0;

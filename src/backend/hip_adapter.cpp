@@ -910,6 +910,9 @@ public:
         HipStream& st = stream(s, "KV_WRITE");
         const hip::Ops& ops = select(OpId::KvWrite, a.kernel);
         check_status_ref(a.status, OpId::KvWrite);
+        HALO_CHECK(a.kv_type == KvType::F32, ErrorCode::Unsupported,
+                   "KV_WRITE: KV type {} is implemented only on the Vulkan backend (the HIP backend stores fp32)",
+                   to_string(a.kv_type));
         const Resolver r(this, "KV_WRITE");
         const std::uint64_t end = static_cast<std::uint64_t>(a.start) + a.n_tokens;
         const PoolView p = pool_view(r, a.kv_pool, a.block_table, a.n_pool_blocks, a.n_layers, a.layer, a.block_tokens, a.kv_dim,
@@ -942,6 +945,9 @@ public:
         HipStream& st = stream(s, "ATTENTION");
         const hip::Ops& ops = select(OpId::Attention, a.kernel);
         check_status_ref(a.status, OpId::Attention);
+        HALO_CHECK(a.kv_type == KvType::F32, ErrorCode::Unsupported,
+                   "ATTENTION: KV type {} is implemented only on the Vulkan backend (the HIP backend stores fp32)",
+                   to_string(a.kv_type));
         const Resolver r(this, "ATTENTION");
         check_nonzero(a.n_head, r.op(), "n_head");
         check_nonzero(a.n_kv_head, r.op(), "n_kv_head");

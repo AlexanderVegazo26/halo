@@ -311,14 +311,23 @@ struct GetRowsArgs {
 };
 
 /// The paged KV pool (a halo::kv_cache::KvPool's storage, byte for byte): n_pool_blocks
-/// blocks of n_layers * 2 * block_tokens * kv_dim fp32, block[layer][K|V][token][kv_dim]
-/// (kv_dim = n_kv_head * head_dim). History row s of a sequence lives in block
+/// blocks of n_layers * 2 * block_tokens rows of kv_dim elements, block[layer][K|V][token]
+/// [kv_dim] (kv_dim = n_kv_head * head_dim). History row s of a sequence lives in block
 /// block_table[s / block_tokens] (uint32 ids), token s % block_tokens.
 ///
+/// Element format (KvType, opt-in): F32 is the default. F16 stores two halves per 32-bit word
+/// (kv_dim even). Q8 stores each 32-element group as 9 words [fp32 scale | 32 x int8 packed 4
+/// per word], value = scale * q, scale = max|x| / 127 (kv_dim a multiple of 32; 1.125 B per
+/// element; a whole row is kv_dim/32*9 words). F16 / Q8 run separate shaders (kv_write_f16 /
+/// kv_write_q8, attention_f16 / attention_q8); the F32 shaders are untouched.
+///
 /// Limit of this backend: the whole pool is bound as one storage-buffer descriptor, so it
-/// must fit maxStorageBufferRange and 2^32 fp32 elements; a larger pool is rejected with
+/// must fit maxStorageBufferRange and 2^32 32-bit words; a larger pool is rejected with
 /// Error(Unsupported). (At fp32, the 27B model's 16 attention layers take 128 KiB per token,
-/// so a 4 GiB pool holds about 32k tokens in total.)
+/// so a 4 GiB pool holds about 32k tokens in total; fp16 doubles that, Q8 gives ~3.6x.) Larger
+/// pools are split by kv_cache::KvPool (Placement::PerLayer, one buffer per layer): the caller
+/// passes one layer's buffer with n_layers = 1, layer = 0, and n_pool_blocks unchanged.
+enum class KvType : std::uint32_t { F32 = 0, F16 = 1, Q8 = 2 };
 
 /// [KV write] Writes n_tokens K and V rows at history rows start .. start+n_tokens-1 of
 /// `layer` through the block table — exactly kv_cache::SequenceKv::write. Every block the
@@ -338,6 +347,7 @@ struct KvWriteArgs {
     std::uint32_t n_tokens = 1;
     BufferView k{}, v{};
     BufferView status{};
+    KvType kv_type = KvType::F32;  ///< pool element format; k and v are always fp32
 };
 
 /// [ATTENTION] causal GQA softmax attention over the paged K/V history (cpu::attention_gqa).
@@ -372,6 +382,7 @@ struct AttentionArgs {
     float scale = 1.0f;
     BufferView out{};
     BufferView status{};
+    KvType kv_type = KvType::F32;  ///< pool element format
 };
 
 // ---------------------------------------------------------------- chunked GATED_DELTANET (WS-F2 V4)
@@ -530,6 +541,11 @@ public:
 
     /// [QUANT_GEMV / MATMUL] batched; see GemvArgs. matvec() is gemv with n_vec = 1.
     void gemv(Stream& stream, const GemvArgs& args);
+    /// [QUANT_GEMV / MATMUL] over W in the planar layout of tensor::gemv_repack (halo/tensor/repack.h):
+    /// wtype in {Q5_K, Q6_K, IQ4_XS}, W rows args.w.row_stride bytes apart (a multiple of 16; the
+    /// view offset must be 16-aligned too), runs matvec_<type>_rp. Bitwise equal to gemv() on the
+    /// original blocks. Never falls back to the raw-layout kernels: bad alignment or type throws.
+    void gemv_repacked(Stream& stream, const GemvArgs& args);
     /// [LOGITS_MATMUL + ARGMAX] see LmHeadArgs.
     void lm_head(Stream& stream, const LmHeadArgs& args);
     [[nodiscard]] std::uint64_t lm_head_workspace_bytes(std::uint32_t rows, std::uint32_t n_vec,
@@ -539,7 +555,7 @@ public:
 
 private:
     void eltwise(Stream& stream, const EltwiseArgs& args, std::uint32_t op_code, std::string_view name);
-    void gemv_impl(Stream& stream, const GemvArgs& args, std::string_view op);
+    void gemv_impl(Stream& stream, const GemvArgs& args, std::string_view op, bool repacked = false);
     void gdn_impl(Stream& stream, const GdnDecodeArgs& args, const GdnChunkedArgs* chunked);
     const Kernel& kernel(const std::string& shader, std::uint32_t num_buffers,
                          std::uint32_t push_bytes, std::vector<SpecConstant> spec,

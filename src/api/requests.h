@@ -29,7 +29,16 @@ struct ChatJob {
     bool add_generation_prompt = true;  // /apply-template only
     bool tokenize = false;              // /apply-template only
     std::vector<std::string> warnings;  // request-level notes for the response
+    /// Anthropic adaptive thinking (thinking.type "adaptive", or no thinking field): when no
+    /// explicit budget is given the reasoning budget is min(adaptive_budget_cap, max_tokens / 2)
+    /// instead of max_tokens minus the output reserve. 0 = not adaptive (docs/api.md).
+    std::size_t adaptive_budget_cap = 0;
+    /// Anthropic thinking.display "omitted": thinking blocks are returned empty (signature only).
+    bool omit_thinking = false;
 };
+
+/// Upper bound of the adaptive reasoning budget (Anthropic routes), see ChatJob.
+inline constexpr std::size_t kAdaptiveReasoningBudgetCap = 8192;
 
 struct CompletionJob {
     std::string prompt;
@@ -42,8 +51,9 @@ struct CompletionJob {
 
 /// POST /v1/chat/completions
 [[nodiscard]] ChatJob parse_openai_chat(const Json& body, const ServerConfig& cfg);
-/// POST /v1/messages
-[[nodiscard]] ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg);
+/// POST /v1/messages, and (with `count_only`) POST /v1/messages/count_tokens: max_tokens is
+/// then neither required nor read, and a final assistant message is not rejected.
+[[nodiscard]] ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg, bool count_only = false);
 /// POST /v1/completions
 [[nodiscard]] CompletionJob parse_openai_completion(const Json& body, const ServerConfig& cfg);
 /// POST /apply-template: OpenAI-form messages/tools plus add_generation_prompt, tokenize,

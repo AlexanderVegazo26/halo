@@ -55,6 +55,7 @@
 
 namespace halo::backend {
 class Backend;
+class Buffer;
 }
 
 namespace halo::models {
@@ -125,12 +126,22 @@ struct MtpStep {
     std::span<const std::size_t> logit_rows;
     LogitsMode logits = LogitsMode::Argmax;
     bool want_hidden = false;              ///< post shared_head_norm hidden of every row
+    /// Device-resident hidden for a ONE-row step: a Buffer of >= n_embd fp32 that an earlier
+    /// mtp_forward on this same backend returned in SeqOutput::hidden_device. When set, `hidden`
+    /// must be empty and nothing is uploaded (the row is copied device-side, in stream order).
+    /// Additive: null (the default) is the host path, unchanged; the CPU backend accepts it too.
+    std::shared_ptr<const backend::Buffer> hidden_device{};
+    /// Keep the LAST row of the post-head-norm hidden in a fresh device Buffer
+    /// (SeqOutput::hidden_device); independent of want_hidden (the host download).
+    bool want_hidden_device = false;
 };
 
 struct SeqOutput {
     std::vector<cpu::TopKEntry> argmax;  ///< one per logit row (Argmax and Full)
     std::vector<float> logits;           ///< logit_rows.size() x n_vocab (Full only)
     std::vector<float> hidden;           ///< rows x n_embd (want_hidden only)
+    /// Last hidden row as an n_embd-float device Buffer (MtpStep::want_hidden_device only).
+    std::shared_ptr<backend::Buffer> hidden_device{};
 };
 
 /// Compulsory-traffic cost of one call (cpu/traffic.h model, review §3.3 / D-011):

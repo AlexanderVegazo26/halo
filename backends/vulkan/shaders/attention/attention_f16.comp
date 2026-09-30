@@ -1,0 +1,4 @@
+#version 450
+// [ATTENTION] over an fp16 pool (KvType::F16). Body: common/attention_kv_main.glsl.
+#define KV_TYPE 1
+#include "attention_kv_main.glsl"

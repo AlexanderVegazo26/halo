@@ -66,6 +66,35 @@ enum class Tier : std::uint8_t { Vram, Gtt, Host };
 
 [[nodiscard]] std::string_view to_string(Kind k) noexcept;
 
+/// Element format of a KV pool image (opt-in; F32 is the default and the only format the CPU
+/// and HIP backends implement). One K (or V) row of `kv_dim` elements is stored as:
+///   F32: kv_dim floats.
+///   F16: kv_dim IEEE half values, two per 32-bit word (kv_dim even).
+///   Q8:  kv_dim/32 groups of 9 words = [fp32 scale | 32 x int8, 4 per word], value =
+///        scale * q with scale = max|x| / 127 (kv_dim a multiple of 32; 1.125 B/element).
+/// Only the Vulkan backend implements F16 and Q8 (kv_write quantizes, attention dequantizes).
+enum class KvType : std::uint8_t { F32, F16, Q8 };
+
+[[nodiscard]] constexpr std::string_view to_string(KvType t) noexcept {
+    return t == KvType::F32 ? "f32" : t == KvType::F16 ? "f16" : "q8";
+}
+
+/// Bytes of one K (or V) row of `kv_dim` elements in format `t`. Error(Config) if `kv_dim` is
+/// not representable in that format (F16 needs an even kv_dim, Q8 a multiple of 32).
+[[nodiscard]] inline std::uint64_t kv_row_bytes(KvType t, std::uint64_t kv_dim) {
+    switch (t) {
+        case KvType::F32: return kv_dim * 4;
+        case KvType::F16:
+            HALO_CHECK(kv_dim % 2 == 0, ErrorCode::Config, "KV type f16 needs an even kv_dim, got {}", kv_dim);
+            return kv_dim * 2;
+        case KvType::Q8:
+            HALO_CHECK(kv_dim % 32 == 0, ErrorCode::Config, "KV type q8 needs a kv_dim that is a multiple of 32, got {}",
+                       kv_dim);
+            return kv_dim / 32 * 36;
+    }
+    return kv_dim * 4;
+}
+
 /// Memory owned (or imported) by one Backend.
 class Buffer {
 public:
@@ -135,6 +164,13 @@ struct KernelChoice {
     std::uint32_t variant_id = 0;
 };
 
+/// Gemv variant id 1 (Vulkan only): the W operand is in the planar layout produced by
+/// tensor::gemv_repack (halo/tensor/repack.h; Q5_K, Q6_K, IQ4_XS), rows `row_stride` bytes
+/// apart (a multiple of 16). Opt-in (HALO_REPACK=1 in the qwen35 loader, which only repacks
+/// when the backend Kind is Vulkan). Not implemented by the CPU and HIP backends (ids are
+/// per backend; do not send it there), and the Vulkan lm_head never accepts it.
+inline constexpr std::uint32_t kGemvRepacked = 1;
+
 /// TRD §9 operators of the interface. Values are stable (append only).
 enum class OpId : std::uint16_t {
     GetRows = 0,
@@ -178,8 +214,13 @@ struct Limits {
     std::uint32_t max_rope_dims = 0;
     bool gdn_chunked = false;  ///< the chunked GATED_DELTANET form exists
     /// Largest single host import the backend accepts (one Buffer::create per imported
-    /// span); 0 = unlimited. The engine clamps the context so a KV pool import fits.
+    /// span); 0 = unlimited. (The engine no longer clamps the context to it: the KV pool is sized
+    /// by max_pool_buffer_bytes below and split per layer.)
     std::uint64_t max_import_bytes = 0;
+    /// Largest single buffer the attention / kv-write ops can bind as the KV pool (Vulkan:
+    /// min(maxMemoryAllocationSize, maxStorageBufferRange)); 0 = unlimited. The engine splits
+    /// a KV pool over per-layer buffers (kv_cache::Placement::PerLayer) to stay under it.
+    std::uint64_t max_pool_buffer_bytes = 0;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -300,7 +341,8 @@ struct RopeArgs {
 
 /// KV write: n_tokens K and V rows at history rows start .. start + n_tokens - 1 of `layer`
 /// through the block table, into a kv_cache::KvPool storage image (block[layer][K|V][token]
-/// [kv_dim] fp32, n_pool_blocks blocks). Rows must lie in blocks the caller reserved.
+/// [kv_dim] fp32 unless kv_type says otherwise, n_pool_blocks blocks). Rows must lie in blocks
+/// the caller reserved. k and v are always fp32; kv_type is the pool's format (KvType).
 struct KvWriteArgs {
     TensorRef kv_pool{}, block_table{}, k{}, v{};
     std::uint32_t n_pool_blocks = 0, n_layers = 1, layer = 0, block_tokens = 16, kv_dim = 0;
@@ -308,6 +350,7 @@ struct KvWriteArgs {
     std::uint32_t start = 0, n_tokens = 1;
     KernelChoice kernel{};
     StatusRef status{};
+    KvType kv_type = KvType::F32;
 };
 
 /// ATTENTION (cpu::attention_gqa) over the same pool image and block table. q: n_tokens
@@ -322,6 +365,7 @@ struct AttentionArgs {
     float scale = 1.0f;
     KernelChoice kernel{};
     StatusRef status{};
+    KvType kv_type = KvType::F32;  ///< format of the pool image (see KvType)
 };
 
 /// SWIGLU out = silu(a) * b; MUL_SIGMOID out = a * sigmoid(b); ADD out = a + b.

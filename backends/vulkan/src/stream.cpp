@@ -16,6 +16,8 @@ namespace halo::vulkan {
 namespace {
 constexpr std::uint32_t k_sets_per_pool = 256;
 constexpr std::uint32_t k_descriptors_per_pool = 256 * 16;
+// Most buffer bindings one dispatch may have (descriptors per pool / sets per pool).
+constexpr std::size_t kMaxBindings = k_descriptors_per_pool / k_sets_per_pool;
 // See Stream::dispatch: command buffers are capped at this many dispatches.
 constexpr std::uint32_t kMaxDispatchesPerSubmit = 512;
 }  // namespace
@@ -100,7 +102,7 @@ void Stream::ensure_recording() {
     used_timestamps_ = 0;
     op_marks_.clear();
     dispatches_ = 0;
-    touched_.clear();
+    n_touched_ = 0;
     state_ = State::Recording;
 }
 
@@ -112,24 +114,36 @@ void Stream::barrier() {
                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     const VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     vkCmdPipelineBarrier(cmd_, stages, stages, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    touched_.clear();
+    n_touched_ = 0;
 }
 
 void Stream::mark_touched(const Buffer* buf, bool write) {
-    auto& m = touched_[buf];
-    m.first = true;
-    m.second = m.second || write;
+    // Callers (barrier_for) guarantee room: n_touched_ + bindings <= kMaxTouched.
+    for (std::size_t i = 0; i < n_touched_; ++i) {
+        Touch& t = touched_[i];
+        if (t.buf == buf) {
+            t.read = true;
+            t.written = t.written || write;
+            return;
+        }
+    }
+    touched_[n_touched_++] = Touch{buf, true, write};
 }
 
 void Stream::barrier_for(std::span<const BufferBinding> buffers, std::uint64_t write_mask) {
+    // Keep room for every binding of this op as a new entry. A barrier is always sound (it only
+    // orders more), so overflow is handled by emitting one early rather than by a fallback map.
+    if (n_touched_ + buffers.size() > kMaxTouched) barrier();
     // A barrier is needed iff some binding was written since the last barrier (RAW if we
     // read it, WAW if we write it), or is written now and was read since (WAR).
     bool hazard = false;
     for (std::size_t i = 0; i < buffers.size() && !hazard; ++i) {
-        const auto it = touched_.find(buffers[i].buffer);
-        if (it == touched_.end()) continue;
-        const auto& [read, written] = it->second;
-        hazard = written || (read && ((write_mask >> i) & 1));
+        for (std::size_t j = 0; j < n_touched_; ++j) {
+            const Touch& t = touched_[j];
+            if (t.buf != buffers[i].buffer) continue;
+            hazard = t.written || (t.read && ((write_mask >> i) & 1));
+            break;
+        }
     }
     if (hazard) barrier();
     for (std::size_t i = 0; i < buffers.size(); ++i) mark_touched(buffers[i].buffer, (write_mask >> i) & 1);
@@ -193,7 +207,11 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
                    "kernel {}: group count[{}]={} outside [1, {}]", name, i, groups[i],
                    info.max_workgroup_count[i]);
     }
-    std::vector<VkDescriptorBufferInfo> infos(buffers.size());
+    // Fixed-size scratch instead of per-dispatch heap vectors (the bound is also what the
+    // descriptor pools are sized for, see allocate_set).
+    HALO_CHECK(buffers.size() <= kMaxBindings, ErrorCode::Kernel, "kernel {}: {} buffers bound, stream supports at most {}",
+               name, buffers.size(), kMaxBindings);
+    std::array<VkDescriptorBufferInfo, kMaxBindings> infos;
     for (std::size_t i = 0; i < buffers.size(); ++i) {
         const BufferBinding& b = buffers[i];
         HALO_CHECK(b.buffer != nullptr && b.buffer->valid(), ErrorCode::Kernel,
@@ -215,7 +233,7 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
 
     ensure_recording();
     const VkDescriptorSet set = allocate_set(kernel.set_layout(), d.num_buffers);
-    std::vector<VkWriteDescriptorSet> writes(buffers.size());
+    std::array<VkWriteDescriptorSet, kMaxBindings> writes{};  // zero-init: pNext/pImageInfo/... stay null
     for (std::size_t i = 0; i < buffers.size(); ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = set;
@@ -224,7 +242,7 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(ctx_->device(), static_cast<std::uint32_t>(writes.size()), writes.data(), 0,
+    vkUpdateDescriptorSets(ctx_->device(), static_cast<std::uint32_t>(buffers.size()), writes.data(), 0,
                            nullptr);
 
     barrier_for(buffers, write_mask);

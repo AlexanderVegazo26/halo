@@ -48,6 +48,7 @@ checked against the hosted OpenAI or Anthropic services. The response-shape fixt
 | `POST /v1/chat/completions` | OpenAI chat, non-streaming or SSE | yes, if a key is configured |
 | `POST /v1/completions` | OpenAI legacy completions on a raw prompt | yes, if a key is configured |
 | `POST /v1/messages` | Anthropic Messages, non-streaming or SSE | yes, if a key is configured |
+| `POST /v1/messages/count_tokens` | Anthropic token counting: `{"input_tokens": N}` for the prompt `/v1/messages` would send, without generating | yes, if a key is configured |
 | `POST /tokenize` | Tokenize a string | yes, if a key is configured |
 | `POST /apply-template` | Render (and optionally tokenize) a chat with the model's template | yes, if a key is configured |
 | `OPTIONS *` | CORS preflight, answered only for configured origins | no |
@@ -178,7 +179,7 @@ with `--http-queue`, `--max-header-connections-per-peer` and `--header-shed-grac
 | `max_concurrent` | 4 | Generations holding a slot at once. |
 | `max_queue` | 16 | Generations waiting for a slot. When the queue is full: **429** plus `Retry-After: 1`. |
 | `queue_timeout` | 30 s | A queued request that waits longer gets **503** plus `Retry-After: 1`. |
-| `request_timeout` | 600 s | Wall-clock limit for one generation, checked each time the engine delivers a token. The generation then ends like `max_tokens`, with a warning. Time spent in engine prefill before the first token is not interrupted (see "Cancellation"). |
+| `request_timeout` | 600 s | Wall-clock limit for one generation, checked each time the engine delivers a token and at every engine tick. The generation then ends like `max_tokens`, with a warning. A long prefill is interrupted too, at the next prefill-chunk boundary (one chunk of `prefill_chunk` = 256 rows per tick; see "Cancellation"). |
 | `default_max_tokens` | 8192 | Used when a request gives none. It is clamped to the context. |
 | `max_tokens_cap` | 32768 | A request asking for more gets 400. |
 | `reasoning_output_reserve` | 512 | Output headroom kept free of reasoning. See "Reasoning". |
@@ -221,7 +222,7 @@ the engine calls once per generated token.
 | `model` | Accepted and ignored. The response reports the served name. |
 | `messages` | Roles `system`, `developer` (rendered as `system`), `user`, `assistant`, `tool`. Content is a string, null, or an array of `text` / `refusal` parts. Parts of type `image_url`, `input_audio`, `file` or `image` get 400 `unsupported_parameter`. An assistant message may carry `reasoning_content` and `tool_calls`; `arguments` is a JSON string, which is parsed under the depth cap, or an object. A tool message may carry `tool_call_id`. |
 | `tools` | `type: "function"` only, with `name`, `description` and `parameters`. Names are 1–128 characters from `[A-Za-z0-9_.:-]`, because they are rendered into template markup. |
-| `tool_choice` | `auto` (the default) and `none`. `required` and a named function get 400 `unsupported_parameter`. |
+| `tool_choice` | `auto` (the default) and `none`. `required` and a named function are **not enforced**: the request runs as `auto` with a `warnings[]` entry, never a 400 (forcing a call would need a grammar for the template's `<tool_call>` markup; the constrained decoder compiles JSON Schema only). |
 | `parallel_tool_calls` | Accepted, not enforced. |
 | `reasoning_effort` | `none` turns thinking off. `minimal`/`low` map to `low`, `medium` to `medium`, and `high`/`xhigh`/`max` to `xhigh` (the Qwen3.8 template values). Anything else gets 400. |
 | `chat_template_kwargs` | Allowlist: `enable_thinking`, `preserve_thinking`, `reasoning_effort`. Any other key gets 400. That includes `messages`, `tools`, `bos_token` and `add_generation_prompt` (review S-8, A-4). |
@@ -261,16 +262,17 @@ the engine calls once per generated token.
 | `model` | Accepted and ignored. |
 | `max_tokens` | Required, at most `max_tokens_cap`. |
 | `system` | A string, or an array of text blocks. |
+| `messages[].role` `system` / `developer` | Accepted in any position (Claude Code sends one last). The text (string, or text blocks joined with `\n`) is **hoisted**: it is appended to the top-level `system` in message order, separated by a blank line, and rendered as one leading `system` turn, because the chat template wants system content first. Empty or missing content adds nothing. The hoisted text is escaped like any system string (see "Special-token handling", review S-8, A-4). A request whose messages are all system messages gets 400. |
 | `messages` | Roles `user` and `assistant`. Content is a string or blocks. Users: `text`, and `tool_result` (`tool_use_id`; string or text-block content; `is_error` prefixes `Error: `). Assistants: `text`, `thinking` (rendered as `reasoning_content`), `redacted_thinking` (dropped) and `tool_use`. `image` and `document` get 400. A final assistant message (prefill) gets 400 (unsupported). |
 | `tools` | Custom tools: `name`, `description`, `input_schema`. Server tools (any other `type`) get 400. |
-| `tool_choice` | `auto` and `none`. `any` and `tool` get 400 (unsupported). `disable_parallel_tool_use` is accepted, not enforced. |
-| `thinking` | `enabled` with `budget_tokens` < `max_tokens` (an explicit reasoning budget); `disabled` (thinking off); `adaptive` (the default behaviour). |
+| `tool_choice` | `auto` and `none`. `any` and `tool` are **not enforced**: the request runs as `auto` with a `warnings[]` entry, never a 400 (same reason as OpenAI `required`). An unknown `type` gets 400. `disable_parallel_tool_use` is accepted, not enforced. |
+| `thinking` | `enabled` with `budget_tokens` < `max_tokens` (an explicit reasoning budget); `disabled` (thinking off); `adaptive`, or no `thinking` field (the default behaviour; the budget scales with `max_tokens`, see "Reasoning"). `display`: `omitted` returns the thinking block empty (with its empty signature) instead of the reasoning text; `summarized` returns it. Neither changes generation. Any other `display` value gets a warning and is treated as `summarized`. |
 | `output_config.effort` | `low`, `medium`, `high`, `xhigh` or `max`, mapped as for OpenAI. `none` gets 400. |
 | `output_config.format`, or the deprecated `output_format` | `{"type":"json_schema","schema":{…}}` goes to `SamplingParams::json_schema`. |
 | `temperature` (0–1), `top_p`, `top_k` | Passed to `SamplingParams`. |
 | `stop_sequences` | As OpenAI `stop`. |
 | `stream` | SSE. |
-| Other fields (`metadata`, `service_tier`, …) | Ignored. The `anthropic-version` / `anthropic-beta` headers are accepted and ignored. |
+| Other top-level fields (`metadata`, `context_management`, `service_tier`, …) | Ignored, with one `warnings[]` entry naming them (at most 8 names, each cut to 64 bytes): they have no effect on generation. The rule: a field is only rejected when silently ignoring it would change the result: `image` / `document` blocks, server tools, a final assistant message (prefill), and `mcp_servers` get 400. The `anthropic-version` / `anthropic-beta` headers are accepted and ignored. |
 
 **Response** (`message`):
 - `content` blocks come in this order: `thinking` (with `signature: ""`), `text`, then
@@ -284,12 +286,34 @@ the engine calls once per generated token.
 - `message_start`;
 - then, for each block, `content_block_start`, `content_block_delta` and
   `content_block_stop`. The deltas are `thinking_delta`, `text_delta`, or one complete
-  `input_json_delta` per tool call;
+  `input_json_delta` per tool call. A thinking block always ends with a `signature_delta`
+  (the signature is empty: HALO signs nothing) before its `content_block_stop`, and with
+  `thinking.display: "omitted"` it carries no `thinking_delta` at all;
 - then `message_delta`, carrying `stop_reason`, `stop_sequence` and `usage.output_tokens`;
 - then `message_stop`.
 
 Each SSE `event:` name equals the `type` in its data. An error after the headers were sent
 arrives as `event: error`.
+
+**Context overflow.** A prompt that leaves no room for one generated token is refused before
+anything is streamed, with status 400 and Anthropic's shape:
+`{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: N tokens > M maximum"}}`.
+`N` is the rendered prompt length, `M` is the context minus one (the longest accepted prompt), and
+Claude Code parses this wording to start compaction. The OpenAI routes keep their own
+`context_length_exceeded` error. A `max_tokens` that does not fit next to an accepted prompt is
+clamped to the remaining room, with a `max_tokens reduced from X to Y` warning (e.g. a 32000
+`max_tokens` with a 25k-token prompt in a 32k context runs with about 7k).
+
+### Anthropic `POST /v1/messages/count_tokens`
+
+Takes the `/v1/messages` body (`system`, `messages`, `tools`, `tool_choice`, `thinking`,
+`output_config`; `max_tokens` is optional and ignored) and answers `{"input_tokens": N}`. `N` is
+the length of the prompt `/v1/messages` would give the model for the same body: same parsing
+(system hoisting included), same chat template with the generation prompt, same special-token
+escaping (`N` equals the `input_tokens` of a run, before cached tokens are subtracted). Nothing is
+generated. A prompt longer than the context is still counted (no overflow error), so a harness can
+measure before it compacts. It is admitted through the utility lane (`utility_concurrency` /
+`utility_queue`), so a busy generation lane does not starve it. Errors use the Anthropic shape.
 
 ### OpenAI `POST /v1/completions`
 
@@ -358,6 +382,12 @@ Hardware and kernel metrics (PRD §13) are not exposed in v0.2.
 - **Budget.** Reasoning may use `reasoning_budget` tokens. For Anthropic this is
   `thinking.budget_tokens`. Otherwise it is `max_tokens - min(reasoning_output_reserve,
   max_tokens / 2)`, so even a small `max_tokens` leaves at least half of it for the answer.
+  **Anthropic adaptive thinking** (`thinking.type: "adaptive"`, or no `thinking` field) scales
+  the budget with the request instead: `min(8192, max_tokens / 2)`, at least 1, where
+  `max_tokens` is the value after the context clamp. So `max_tokens` 100 gives 50, 3000 gives
+  1500 and 32000 gives 8192, and the answer always keeps at least half. An explicit
+  `thinking.budget_tokens` is used as given. The cap is `kAdaptiveReasoningBudgetCap`
+  (`src/api/requests.h`); it is not a `ServerConfig` setting.
   When the budget runs out while the model is still thinking:
   1. HALO cancels that engine call.
   2. It appends `\n</think>\n\n` to the context.

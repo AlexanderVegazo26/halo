@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -193,6 +194,9 @@ struct Tick {
         std::size_t len0 = 0;          ///< trunk length before verify
         std::vector<float> hidden;     ///< verify rows' trunk hidden
         std::vector<float> mtp_hidden; ///< last MTP hidden (draft chain)
+        /// Same hidden kept on the device instead (HALO_MTP_DEVICE_HIDDEN=1; then mtp_hidden stays
+        /// empty). Only lives between two draft depths of one draft() call.
+        std::shared_ptr<backend::Buffer> mtp_hidden_dev;
         std::vector<std::int32_t> fed; ///< rows fed to the trunk
     };
     std::vector<Seq> seqs;

@@ -30,6 +30,15 @@ namespace {
 namespace hv = halo::vulkan;
 
 constexpr std::uint64_t kF32 = 4;
+
+hv::KvType to_vk_kv_type(KvType t) {
+    switch (t) {
+        case KvType::F32: return hv::KvType::F32;
+        case KvType::F16: return hv::KvType::F16;
+        case KvType::Q8: return hv::KvType::Q8;
+    }
+    throw_error(ErrorCode::Kernel, "unknown KV type {}", static_cast<unsigned>(t));
+}
 constexpr std::uint32_t kStatusChunkWords = 256;
 constexpr std::uint32_t kMaxGdnChunk = 64;   // vulkan gated_delta_rule_chunked
 constexpr std::uint32_t kMaxConvK = 8;       // vulkan causal_conv1d_silu
@@ -302,6 +311,13 @@ void check_status(const StatusRef& s, OpId op) {
 
 std::uint64_t weight_row_bytes(DType t, std::uint32_t cols) { return hv::matvec_row_bytes(t, cols); }
 
+// Gemv: id 0 = the raw GGUF block layout; id kGemvRepacked = the planar layout of
+// tensor::gemv_repack (Q5_K / Q6_K / IQ4_XS only; opt-in, see halo/tensor/repack.h).
+constexpr std::array<VariantInfo, 2> kGemvVariants{{
+    {0, "vulkan", OpId::Gemv, {}},
+    {kGemvRepacked, "vulkan_repacked", OpId::Gemv, {}},
+}};
+
 constexpr std::array<VariantInfo, kOpCount> kVariants{{
     {0, "vulkan", OpId::GetRows, {}},        {0, "vulkan", OpId::RmsNorm, {}},
     {0, "vulkan", OpId::AddRmsNorm, {}},     {0, "vulkan", OpId::Gemv, {}},
@@ -341,6 +357,13 @@ public:
         l.max_rope_dims = std::numeric_limits<std::uint32_t>::max();  // host cos/sin table; rot <= head_dim
         l.gdn_chunked = true;
         l.max_import_bytes = ctx_->info().max_memory_allocation_size;  // RADV: 4 GiB
+        // A KV pool buffer is bound whole as one storage-buffer descriptor (ops_paged.cpp
+        // pool_operand): it must fit both the allocation cap and maxStorageBufferRange.
+        {
+            const std::uint64_t alloc = ctx_->info().max_memory_allocation_size;
+            const std::uint64_t range = ctx_->info().max_storage_buffer_range;
+            l.max_pool_buffer_bytes = alloc == 0 ? range : range == 0 ? alloc : std::min(alloc, range);
+        }
         return l;
     }
 
@@ -411,6 +434,7 @@ public:
     [[nodiscard]] std::span<const VariantInfo> variants(OpId op, std::string_view /*form*/) const override {
         const auto i = static_cast<std::size_t>(op);
         HALO_CHECK(i < kVariants.size(), ErrorCode::Api, "variants: unknown op id {}", i);
+        if (op == OpId::Gemv) return kGemvVariants;  // default + the opt-in repacked-weights variant
         return std::span<const VariantInfo>(&kVariants[i], 1);
     }
 
@@ -467,11 +491,15 @@ public:
 
     void gemv(Stream& s, const GemvArgs& a) override {
         VkStream& st = stream(s, "MATMUL");
-        check_kernel(a.kernel, OpId::Gemv);
+        const bool repacked = a.kernel.variant_id == kGemvRepacked;
+        if (!repacked) check_kernel(a.kernel, OpId::Gemv);
         const Resolver r(this, "MATMUL", st);
         const hv::GemvArgs g = resolve_gemv(r, a, true);
         if (a.n_vec == 0 || a.rows == 0) return;
-        ops_.gemv(st.s(), g);
+        if (repacked)
+            ops_.gemv_repacked(st.s(), g);
+        else
+            ops_.gemv(st.s(), g);
     }
 
     void gdn_gates(Stream& s, const GdnGateArgs& a) override {
@@ -716,7 +744,7 @@ public:
         const Resolver r(this, "KV_WRITE", st);
         const std::uint64_t end = std::uint64_t{a.start} + a.n_tokens;
         const PoolRefs p = pool_refs(r, a.kv_pool, a.block_table, a.n_pool_blocks, a.n_layers, a.layer, a.block_tokens, a.kv_dim,
-                                     a.n_block_table, end, Access::Write);
+                                     a.n_block_table, end, Access::Write, a.kv_type);
         const Ref k = r.f32(a.k, a.n_tokens, a.kv_dim, Access::Read, "k");
         const Ref v = r.f32(a.v, a.n_tokens, a.kv_dim, Access::Read, "v");
         r.no_overlap(p.pool, k);
@@ -737,6 +765,7 @@ public:
         w.k = k.view;
         w.v = v.view;
         w.status = st.status_word("KV_WRITE");
+        w.kv_type = to_vk_kv_type(a.kv_type);
         ops_.kv_write(st.s(), w);
     }
 
@@ -755,7 +784,7 @@ public:
         const std::uint64_t rows = std::uint64_t{a.q_offset} + T;
         HALO_CHECK(kvd <= std::numeric_limits<std::uint32_t>::max(), ErrorCode::Kernel, "ATTENTION: kv_dim overflows");
         const PoolRefs p = pool_refs(r, a.kv_pool, a.block_table, a.n_pool_blocks, a.n_layers, a.layer, a.block_tokens,
-                                     static_cast<std::uint32_t>(kvd), a.n_block_table, rows, Access::Read);
+                                     static_cast<std::uint32_t>(kvd), a.n_block_table, rows, Access::Read, a.kv_type);
         const Ref q = r.f32(a.q, T, q_cols, Access::Read, "q");
         const Ref out = r.f32(a.out, T, std::uint64_t{a.n_head} * hd, Access::Write, "out");
         r.no_overlap(out, q);
@@ -779,6 +808,7 @@ public:
         at.scale = a.scale;
         at.out = out.view;
         at.status = st.status_word("ATTENTION");
+        at.kv_type = to_vk_kv_type(a.kv_type);
         ops_.attention(st.s(), at);
     }
 
@@ -910,16 +940,18 @@ private:
     };
     PoolRefs pool_refs(const Resolver& r, const TensorRef& pool, const TensorRef& table, std::uint32_t n_pool_blocks,
                        std::uint32_t n_layers, std::uint32_t layer, std::uint32_t block_tokens, std::uint32_t kv_dim,
-                       std::uint32_t n_table, std::uint64_t rows_needed, Access access) const {
+                       std::uint32_t n_table, std::uint64_t rows_needed, Access access, KvType kv_type) const {
         HALO_CHECK(block_tokens > 0 && n_layers > 0 && layer < n_layers, ErrorCode::Kernel,
                    "{}: block_tokens {} / layer {} of {}", r.op(), block_tokens, layer, n_layers);
         PoolRefs p;
-        const std::uint64_t block_floats =
-            mul_u64(mul_u64(mul_u64(n_layers, 2, r.op(), "pool"), block_tokens, r.op(), "pool"), kv_dim, r.op(), "pool");
+        // Bytes per K (or V) row in the pool's format (fp32: kv_dim floats; see backend::KvType).
+        const std::uint64_t row_bytes = kv_row_bytes(kv_type, kv_dim);
+        const std::uint64_t block_bytes =
+            mul_u64(mul_u64(mul_u64(n_layers, 2, r.op(), "pool"), block_tokens, r.op(), "pool"), row_bytes, r.op(), "pool");
         // Not dirty-tracked: the pool is a device-resident State-arena buffer (ADR-001 §5.2,
         // WS-BI-2 stage 2), so its writes never mirror back to host memory.
-        p.pool = r.f32(pool, n_pool_blocks, block_floats, access, "kv_pool", /*track=*/false);
-        HALO_CHECK(p.pool.extent == 0 || p.pool.stride == block_floats * kF32, ErrorCode::Kernel, "{}: kv_pool must be dense",
+        p.pool = r.get(pool, n_pool_blocks, block_bytes, kF32, access, "kv_pool", /*track=*/false);
+        HALO_CHECK(p.pool.extent == 0 || p.pool.stride == block_bytes, ErrorCode::Kernel, "{}: kv_pool must be dense",
                    r.op());
         p.table = r.get(table, 1, mul_u64(n_table, 4, r.op(), "block_table"), 4, Access::Read, "block_table");
         const std::uint64_t needed = (rows_needed + block_tokens - 1) / block_tokens;

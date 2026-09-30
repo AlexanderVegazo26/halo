@@ -1,0 +1,4 @@
+#version 450
+// [ATTENTION] over a Q8 pool (KvType::Q8, per-32 group fp32 scale). Body: common/attention_kv_main.glsl.
+#define KV_TYPE 2
+#include "attention_kv_main.glsl"

@@ -1,0 +1,50 @@
+#version 450
+// QUANT_GEMV / MATMUL, ggml Q6_K weights REPACKED into planar 16-byte-aligned rows
+// (halo/tensor/repack.h; gemv variant kGemvRepacked, opt-in HALO_REPACK=1). Body:
+// common/matvec_q6_k_rp_main.glsl -- the matvec_q6_k.comp arithmetic without the 210-byte
+// block funnel shifts. Only valid for weights produced by tensor::gemv_repack; the host
+// never routes raw GGUF blocks here and every row start (binding remainder + row * stride)
+// is 16-byte aligned.
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+// One storage buffer, three views (same binding, as llama.cpp's *_packed aliases).
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 0) readonly buffer Wq2 { uvec2 wq2[]; };
+layout(std430, binding = 0) readonly buffer Wq4 { uvec4 wq4[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint n_vec;     // 1..MAX_VEC
+    uint w_off;     // sub-alignment remainder of the W view (bytes; multiple of 16)
+    uint w_stride;  // row stride of W (bytes; multiple of 16)
+    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+} pc;
+
+// Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
+layout(constant_id = 1) const uint BATCHED = 1;
+const uint MAX_VEC = 8u;
+
+shared float red[WG];
+shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
+
+struct Q6KBlock {
+    vec4 qA, qB, qC, qD;  // signed q values: elements y_off+{0..3}, +32, +64, +96
+    vec4 sc;              // int8 scales of sub-blocks s_offset+{0,2,4,6}
+    float d;
+};
+
+#define Q6K_FN rp
+#include "matvec_q6_k_rp_main.glsl"
+#undef Q6K_FN
+
+void main() {
+    const uint row = halo_group_id();
+    if (row >= pc.rows) return;
+    q6k_rp(row, pc.w_off + row * pc.w_stride);
+}

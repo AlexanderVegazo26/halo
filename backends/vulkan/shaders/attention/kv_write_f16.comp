@@ -1,0 +1,4 @@
+#version 450
+// [KV write] into an fp16 pool (KvType::F16). Body: common/kv_write_quant_main.glsl.
+#define KV_TYPE 1
+#include "kv_write_quant_main.glsl"

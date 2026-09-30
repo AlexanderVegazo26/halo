@@ -44,7 +44,7 @@ ApiFamily family_of(const std::string& path) {
 
 std::string route_label(const std::string& path) {
     for (const char* r : {"/health", "/v1/models", "/metrics", "/v1/chat/completions", "/v1/completions",
-                          "/v1/messages", "/tokenize", "/apply-template"}) {
+                          "/v1/messages", "/v1/messages/count_tokens", "/tokenize", "/apply-template"}) {
         if (path == r) return r;
     }
     return "other";
@@ -130,6 +130,7 @@ struct ResponseMeta {
     std::int64_t created = 0;
     bool include_usage = false;
     std::vector<std::string> warnings;  // request-level (e.g. clamped max_tokens)
+    bool omit_thinking = false;         // Anthropic thinking.display "omitted"
 };
 
 Json warnings_json(const ResponseMeta& m, const GenerationOutcome& o) {
@@ -277,6 +278,7 @@ public:
     }
     bool reasoning(std::string_view t) override {
         if (!open(Block::Thinking, Json{{"type", "thinking"}, {"thinking", ""}})) return false;
+        if (m_.omit_thinking) return true;  // display "omitted": the block stays empty
         return delta(Json{{"type", "thinking_delta"}, {"thinking", t}});
     }
     bool content(std::string_view t) override {
@@ -319,6 +321,12 @@ private:
     }
     bool close() {
         if (cur_ == Block::None) return true;
+        // A thinking block ends with its signature (HALO signs nothing: always empty), as the
+        // hosted API does; clients replaying the block expect the signature_delta event.
+        if (cur_ == Block::Thinking && !delta(Json{{"type", "signature_delta"}, {"signature", ""}})) {
+            cur_ = Block::None;
+            return false;
+        }
         cur_ = Block::None;
         const bool ok = w_.event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index_}});
         ++index_;
@@ -493,10 +501,18 @@ struct ApiServer::Impl {
                              const SamplingParams& sampling, std::optional<std::size_t> max_tokens,
                              std::optional<std::size_t> explicit_budget, std::vector<std::string> stop,
                              bool parse_output, ResponseMeta& m,
-                             std::vector<std::size_t> checkpoint_hints = {}) const {
+                             std::vector<std::size_t> checkpoint_hints = {}, ApiFamily fam = ApiFamily::OpenAI,
+                             std::size_t adaptive_budget_cap = 0) const {
         const std::size_t ctx = engine.model().context_length;
         const std::size_t n = tokens.size();
         if (n == 0) throw RequestError(ErrorKind::InvalidRequest, "the prompt is empty");
+        if (ctx != 0 && n >= ctx && fam == ApiFamily::Anthropic) {
+            // Claude Code parses this exact wording ("prompt is too long: N tokens > M maximum")
+            // to start compaction. M is the longest prompt this server accepts: one token
+            // must stay free for the answer. No `param`: the Anthropic error body would prefix it.
+            throw RequestError(ErrorKind::InvalidRequest,
+                               std::format("prompt is too long: {} tokens > {} maximum", n, ctx - 1));
+        }
         if (ctx != 0 && n >= ctx) {
             throw RequestError(ErrorKind::InvalidRequest,
                                std::format("the prompt is {} tokens; the model context is {}", n, ctx), "messages",
@@ -529,6 +545,10 @@ struct ApiServer::Impl {
         if (parse_output) {
             if (explicit_budget) {
                 s.reasoning_budget = std::min(*explicit_budget, max);
+            } else if (adaptive_budget_cap != 0) {
+                // Anthropic adaptive thinking: scales with the room left (max_tokens after the
+                // context clamp), up to the cap, and always leaves half for the answer.
+                s.reasoning_budget = std::max<std::size_t>(1, std::min(adaptive_budget_cap, max / 2));
             } else {
                 const std::size_t reserve = std::min(cfg.reasoning_output_reserve, max / 2);
                 s.reasoning_budget = max - reserve;
@@ -581,12 +601,14 @@ struct ApiServer::Impl {
         ResponseMeta m = fam == ApiFamily::OpenAI ? meta("chatcmpl-", "call_", job.include_usage)
                                                   : meta("msg_", "toolu_", true);
         m.warnings = job.warnings;
+        m.omit_thinking = job.omit_thinking;
         if (prompt.neutralized_literals > 0) {
             HALO_INFO(kLog, "neutralized {} special-token literal(s) in client strings", prompt.neutralized_literals);
         }
         auto spec = std::make_shared<GenerationSpec>(make_spec(prompt.tokens, prompt.starts_in_reasoning, job.tools,
                                                                job.sampling, job.max_tokens, job.reasoning_budget,
-                                                               job.stop, true, m, prompt.checkpoint_hints));
+                                                               job.stop, true, m, prompt.checkpoint_hints, fam,
+                                                               job.adaptive_budget_cap));
 
         if (!job.stream) {
             CollectSink sink(req);
@@ -711,7 +733,9 @@ struct ApiServer::Impl {
         Json content = Json::array();
         const auto& pm = o.message;
         if (!pm.reasoning_content.empty()) {
-            content.push_back(Json{{"type", "thinking"}, {"thinking", pm.reasoning_content}, {"signature", ""}});
+            content.push_back(Json{{"type", "thinking"},
+                                   {"thinking", m.omit_thinking ? std::string() : pm.reasoning_content},
+                                   {"signature", ""}});
         }
         if (!pm.content.empty()) content.push_back(Json{{"type", "text"}, {"text", pm.content}});
         for (std::size_t i = 0; i < pm.tool_calls.size(); ++i) {
@@ -761,6 +785,20 @@ struct ApiServer::Impl {
         if (job.tokenize) j["tokens"] = p.tokens;
         j["neutralized_literals"] = p.neutralized_literals;
         res.set_content(dump(j), "application/json");
+    }
+
+    /// POST /v1/messages/count_tokens: the token count of the prompt POST /v1/messages would
+    /// send to the model (same parsing, same template, same special-token escaping, generation
+    /// prompt included), without generating. Behind the utility admission so a busy
+    /// generation lane never starves the harness's context accounting.
+    void count_tokens(const httplib::Request& req, httplib::Response& res) {
+        const Json body = parse_request_body(req.body, cfg.max_json_depth);
+        ChatJob job = parse_anthropic_messages(body, cfg, /*count_only=*/true);
+        job.render.add_generation_prompt = true;
+        const AdmissionSlot slot = admit_utility();
+        const ChatPrompt p = build_chat_prompt(engine.tokenizer(), specials, engine.chat_template(), job.messages,
+                                               job.tools, job.render);
+        res.set_content(dump(Json{{"input_tokens", p.tokens.size()}}), "application/json");
     }
 
     void models(httplib::Response& res) const {
@@ -959,6 +997,9 @@ struct ApiServer::Impl {
         }));
         svr.Post("/v1/messages", guarded([this](const httplib::Request& q, httplib::Response& r) {
             chat(q, r, ApiFamily::Anthropic);
+        }));
+        svr.Post("/v1/messages/count_tokens", guarded([this](const httplib::Request& q, httplib::Response& r) {
+            count_tokens(q, r);
         }));
         svr.Post("/v1/completions", guarded([this](const httplib::Request& q, httplib::Response& r) { completion(q, r); }));
         svr.Post("/tokenize", guarded([this](const httplib::Request& q, httplib::Response& r) { tokenize(q, r); }));

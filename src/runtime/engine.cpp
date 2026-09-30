@@ -56,6 +56,35 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Toks = std::vector<std::int32_t>;
 
+/// KV pool element format from the environment (opt-in; default fp32, so behaviour and goldens
+/// are unchanged): HALO_KV_FP16=1 stores fp16, HALO_KV_TYPE=q8 stores 8-bit values with a
+/// per-32-group scale (HALO_KV_TYPE also accepts f32 / f16). Vulkan backend only -- the caller
+/// rejects it elsewhere. An unknown value or a contradictory pair is Error(Config), never a
+/// silent fallback.
+backend::KvType kv_type_from_env() {
+    const char* fp16 = std::getenv("HALO_KV_FP16");
+    const char* type = std::getenv("HALO_KV_TYPE");
+    const std::string_view f = fp16 ? fp16 : "";
+    const std::string_view t = type ? type : "";
+    HALO_CHECK(f.empty() || f == "0" || f == "1", ErrorCode::Config, "HALO_KV_FP16 must be 0 or 1, got '{}'", f);
+    backend::KvType out = backend::KvType::F32;
+    if (t.empty() || t == "f32" || t == "fp32") {
+        out = backend::KvType::F32;
+    } else if (t == "f16" || t == "fp16") {
+        out = backend::KvType::F16;
+    } else if (t == "q8") {
+        out = backend::KvType::Q8;
+    } else {
+        throw_error(ErrorCode::Config, "HALO_KV_TYPE must be f32, f16 or q8, got '{}'", t);
+    }
+    if (f == "1") {
+        HALO_CHECK(t.empty() || out == backend::KvType::F16, ErrorCode::Config,
+                   "HALO_KV_FP16=1 contradicts HALO_KV_TYPE={}", t);
+        out = backend::KvType::F16;
+    }
+    return out;
+}
+
 /// Prompt-lookup drafts (no model cost): find the most recent earlier occurrence of the last
 /// `min_match`..`max_match` tokens of (prompt ++ generated) and propose the up-to-`k` tokens
 /// that followed it. The trunk verifies every proposed token, so greedy output is unchanged;
@@ -361,6 +390,11 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     const std::string* gname = nm_->gguf().get_string("general.name");
     info_.id = gname != nullptr && !gname->empty() ? *gname : std::filesystem::path(cfg.model_path).stem().string();
     info_.architecture = "qwen35";
+    // An explicit --ctx above the model's trained context is refused, not silently reduced (the
+    // /v1/models context_length would otherwise disagree with what the user asked for).
+    HALO_CHECK(!cfg.max_context_explicit || hp.context_length == 0 || cfg.max_context <= hp.context_length, ErrorCode::Config,
+               "--ctx {} exceeds the model's trained context length {}; lower --ctx (or leave it unset for the default)",
+               cfg.max_context, hp.context_length);
     info_.context_length = hp.context_length > 0 ? std::min<std::size_t>(cfg.max_context, hp.context_length) : cfg.max_context;
     info_.vocab_size = model_->n_vocab();
     info_.has_mtp = model_->has_mtp();
@@ -374,13 +408,42 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     memory::PlanRequest pr;
     pr.max_context = info_.context_length;
     pr.max_sequences = static_cast<std::uint32_t>(cfg.max_sequences);
-    pr.kv_dtype = memory::DtypeSize::f32();  // the CPU reference stores fp32 KV
+    // Activations / workspace scale with the rows of one forward, i.e. the prefill chunk (and
+    // NOT with the context: the CPU and Vulkan attention are one-pass / online-softmax with no
+    // per-context scratch, hence the planner's default flash_attention = true -- no
+    // ubatch x n_head x ctx score buffer). Plan for the chunk the engine will actually run.
+    pr.ubatch = static_cast<std::uint32_t>(std::max(gdn_chunk_, opts.prefill_chunk / gdn_chunk_ * gdn_chunk_));
+    pr.batch = std::max(pr.batch, pr.ubatch);
+    // KV element format: fp32 unless HALO_KV_FP16=1 / HALO_KV_TYPE=q8 (Vulkan only).
+    const backend::KvType kv_type = kv_type_from_env();
+    if (kv_type != backend::KvType::F32) {
+        const backend::Backend& kvbe = backend_ ? *backend_ : model_->backend();
+        HALO_CHECK(kvbe.kind() == backend::Kind::Vulkan, ErrorCode::Config,
+                   "KV cache type {} (HALO_KV_FP16 / HALO_KV_TYPE) is implemented only on the Vulkan backend; this run uses "
+                   "the {} backend (unset the variable or select --backend vulkan)",
+                   backend::to_string(kv_type), backend::to_string(kvbe.kind()));
+        HALO_INFO("runtime", "KV cache stored as {} (opt-in)", backend::to_string(kv_type));
+    }
+    pr.kv_dtype = kv_type == backend::KvType::F16 ? memory::DtypeSize::f16()
+                  : kv_type == backend::KvType::Q8 ? memory::DtypeSize{"q8_kv", 32, 36}  // [fp32 scale | 32 x int8]
+                                                   : memory::DtypeSize::f32();  // the CPU reference stores fp32 KV
     pr.mtp_enabled = mtp;
     pr.mtp_draft_depth = static_cast<std::uint32_t>(max_draft_);
     pr.prefix_checkpoints.enabled = cfg.prefix_cache;
     if (opts.checkpoint_spacing > 0) pr.prefix_checkpoints.spacing_tokens = static_cast<std::uint32_t>(opts.checkpoint_spacing);
     pr.max_memory = cfg.max_memory_bytes;
-    plan_ = memory::plan_memory_or_throw(model_shape(*nm_, *model_), pr, hw.tiers);
+    try {
+        plan_ = memory::plan_memory_or_throw(model_shape(*nm_, *model_), pr, hw.tiers);
+    } catch (const Error& e) {
+        // An explicit --ctx (with --parallel sequences of it) the memory tiers cannot hold is a
+        // configuration error naming the request, not a bare planner refusal. A user max_memory
+        // cap keeps its own Memory error.
+        if (!cfg.max_context_explicit || cfg.max_memory_bytes || e.code() != ErrorCode::Memory) throw;
+        throw_error(ErrorCode::Config,
+                    "--ctx {} x --parallel {} cannot be honoured, lower --ctx or --parallel (or store KV as fp16/q8, "
+                    "HALO_KV_FP16=1 / HALO_KV_TYPE=q8): {}",
+                    info_.context_length, cfg.max_sequences, e.what());
+    }
     for (const auto& n : plan_.notes) HALO_INFO("runtime", "memory plan: {}", n);
     ckpt_spacing_ = pr.prefix_checkpoints.spacing_tokens;
 
@@ -388,47 +451,120 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     // Prefill chunks stay a multiple of the GDN chunk (chunk boundaries line up).
     prefill_chunk_ = std::max(gdn_chunk_, opts.prefill_chunk / gdn_chunk_ * gdn_chunk_);
     const std::size_t bt = opts.kv_block_tokens;
-    std::size_t per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;  // +1: one COW copy
+    kv_cache::KvLayout trunk_layout = model_->kv_layout(bt);
+    trunk_layout.type = kv_type;
+    kv_cache::KvLayout mtp_layout = model_->mtp_kv_layout(bt);
+    mtp_layout.type = kv_type;
+    const auto blocks_for = [&](std::size_t ctx) { return ceil_div(ctx + max_draft_ + 1, bt) + 1; };  // +1: one COW copy
+    std::size_t per_seq = blocks_for(info_.context_length);
     cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
-    // The KV pool is ONE backend allocation; a backend with a single-allocation
-    // cap (RADV: maxMemoryAllocationSize = 4 GiB) fails the whole run when the pool is
-    // larger. Drop the prefix-cache slots first, then halve the context until it fits.
-    // (backend_ is set only on the GPU paths; the CPU path's internal backend is the model's.)
+    // ---- KV pool sizing (large contexts) -------------------------------------------------
+    // A backend caps ONE buffer (RADV: min(maxMemoryAllocationSize, maxStorageBufferRange) = 4 GiB)
+    // and the attention / kv-write kernels bind one pool buffer. The pool is therefore split
+    // per layer (kv_cache::Placement::PerLayer) when its contiguous image would not fit, which
+    // lifts the limit by n_layers (16x for the 27B model: 128k tokens x 2 sequences = 32 GiB in fp32
+    // is 2 GiB per layer; x 4 sequences is 4 GiB + the COW/draft slack per layer, which does NOT fit
+    // under a 4 GiB cap in fp32 -- refused below -- but does in fp16/q8). The pool is sized for every
+    // sequence at the full context; the prefix-cache
+    // share (cache_cap_ extra sequences' worth of blocks, opportunistic: cached prefixes are
+    // evicted under pressure) is what shrinks first, so the cache stays enabled. If the
+    // sequences themselves do not fit (per-buffer cap, or the pools would exceed the VRAM the plan
+    // leaves), an explicit --ctx is refused (Error(Config)) and a defaulted one is halved with a
+    // warning. (backend_ is set only on the GPU paths; the CPU path's internal backend is the model's.)
     const backend::Backend& active_backend = backend_ ? *backend_ : model_->backend();
-    if (const std::uint64_t imp_cap = active_backend.limits().max_import_bytes; imp_cap != 0 && !opts.kv_blocks) {
-        const std::uint64_t trunk_blk = model_->kv_layout(bt).block_bytes();
-        const std::uint64_t mtp_blk = mtp ? model_->mtp_kv_layout(bt).block_bytes() : 0;
-        const auto fits = [&](std::size_t seq_blocks, std::size_t cache) {
-            const std::uint64_t n = seq_blocks * (cfg.max_sequences + cache);
-            return n * trunk_blk < imp_cap && (mtp_blk == 0 || n * mtp_blk < imp_cap);
-        };
-        if (!fits(per_seq, cache_cap_)) {
-            if (cache_cap_ != 0) {
-                HALO_WARN("runtime", "KV pool exceeds the backend's {}-byte single-allocation cap; disabling prefix-cache slots",
-                          imp_cap);
-                cache_cap_ = 0;
-            }
-            while (!fits(per_seq, cache_cap_) && info_.context_length > 1024) {
-                info_.context_length = std::max<std::size_t>(1024, info_.context_length / 2);
-                per_seq = ceil_div(info_.context_length + max_draft_ + 1, bt) + 1;
-            }
-            HALO_CHECK(fits(per_seq, cache_cap_), ErrorCode::Memory,
-                       "KV pool import exceeds the backend's {}-byte single-allocation cap even at context {}: lower --ctx "
-                       "or --parallel",
-                       imp_cap, info_.context_length);
-            HALO_WARN("runtime", "context clamped to {} tokens so the KV pool import fits the backend's {}-byte cap",
-                      info_.context_length, imp_cap);
+    const std::uint64_t buf_cap = opts.kv_buffer_cap_bytes.value_or(active_backend.limits().max_pool_buffer_bytes);
+    const std::uint64_t trunk_blk = trunk_layout.block_bytes();
+    const std::uint64_t mtp_blk = mtp ? mtp_layout.block_bytes() : 0;
+    // Free-VRAM guard: the plan counts max_sequences x context of KV, not the cache share nor the
+    // per-sequence COW/draft slack. The sequences' blocks may use the plan's KV budget plus all
+    // FREE VRAM the plan leaves (hard limit: beyond it the allocation would fail); the prefix-cache
+    // share only the plan's safety-reduced budget, so the reserve for the activation / workspace
+    // estimate (formula, not measured) is not eaten by cache blocks.
+    std::uint64_t vram_hard = 0, vram_soft = 0;  // bytes for both pools; 0 = no guard (KV not planned into VRAM)
+    if (plan_.tier_of(memory::Component::KvCache) == hardware::MemoryTier::Vram) {
+        for (const auto& t : plan_.tiers) {
+            if (t.tier != hardware::MemoryTier::Vram) continue;
+            vram_hard = plan_.sizes.kv + plan_.sizes.mtp_kv + (t.available > t.planned ? t.available - t.planned : 0);
+            vram_soft = plan_.sizes.kv + plan_.sizes.mtp_kv + (t.budget > t.planned ? t.budget - t.planned : 0);
         }
     }
-    const std::size_t blocks = opts.kv_blocks.value_or(per_seq * (cfg.max_sequences + cache_cap_));
-    kv_pool_ = std::make_unique<kv_cache::KvPool>(model_->kv_layout(bt), blocks);
+    std::size_t default_blocks = per_seq * (cfg.max_sequences + cache_cap_);
+    if (!opts.kv_blocks) {
+        std::size_t cap_blocks = kv_cache::KvPool::max_blocks(trunk_layout, kv_cache::Placement::PerLayer, buf_cap);
+        if (mtp) cap_blocks = std::min(cap_blocks, kv_cache::KvPool::max_blocks(mtp_layout, kv_cache::Placement::PerLayer, buf_cap));
+        bool ctx_reduced = false;
+        for (;;) {
+            std::size_t limit = cap_blocks;  // hard: the sequences' blocks
+            std::size_t soft = cap_blocks;   // the sequences' blocks + the cache share
+            std::string bound = buf_cap != 0 ? std::format("per-buffer cap {} bytes, split per layer", buf_cap) : "block id range";
+            if (vram_hard != 0) {
+                const std::size_t hard_blocks = static_cast<std::size_t>(vram_hard / (trunk_blk + mtp_blk));
+                if (hard_blocks < limit) {
+                    limit = hard_blocks;
+                    bound = std::format("{} bytes of free VRAM for KV pools", vram_hard);
+                }
+                soft = std::min(soft, static_cast<std::size_t>(vram_soft / (trunk_blk + mtp_blk)));
+            }
+            const std::size_t need = per_seq * cfg.max_sequences;
+            if (need <= limit) {
+                default_blocks = std::min(per_seq * (cfg.max_sequences + cache_cap_), std::max(std::min(soft, limit), need));
+                break;
+            }
+            HALO_CHECK(!cfg.max_context_explicit && info_.context_length > 1024, ErrorCode::Config,
+                       "context {} x {} sequence(s) needs {} KV blocks ({} bytes per block) but only {} fit ({}): lower "
+                       "--ctx or --parallel, or store KV as fp16/q8 (HALO_KV_FP16=1 / HALO_KV_TYPE=q8, Vulkan)",
+                       info_.context_length, cfg.max_sequences, need, trunk_blk + mtp_blk, limit, bound);
+            info_.context_length = std::max<std::size_t>(1024, info_.context_length / 2);
+            per_seq = blocks_for(info_.context_length);
+            ctx_reduced = true;
+        }
+        if (ctx_reduced) {
+            HALO_WARN("runtime",
+                      "context reduced to {} tokens (default --ctx): {} sequence(s) at the requested context do not fit the KV "
+                      "pool limits; pass --ctx explicitly to make this an error",
+                      info_.context_length, cfg.max_sequences);
+        }
+        if (default_blocks < per_seq * (cfg.max_sequences + cache_cap_)) {
+            HALO_INFO("runtime", "prefix-cache share of the KV pool reduced to {} of {} blocks (pool limit); the cache stays on",
+                      default_blocks - per_seq * cfg.max_sequences, per_seq * cache_cap_);
+        }
+    }
+    const std::size_t blocks = opts.kv_blocks.value_or(default_blocks);
+    const std::size_t mtp_blocks = opts.mtp_kv_blocks.value_or(default_blocks);
+    const auto placement_for = [&](const kv_cache::KvLayout& l, std::size_t n, const char* what) {
+        if (buf_cap == 0 || kv_cache::KvPool::segment_bytes_for(l, kv_cache::Placement::Single, n) <= buf_cap) {
+            return kv_cache::Placement::Single;
+        }
+        HALO_CHECK(kv_cache::KvPool::segment_bytes_for(l, kv_cache::Placement::PerLayer, n) <= buf_cap, ErrorCode::Config,
+                   "{} KV pool of {} blocks needs {}-byte buffers even when split per layer; the backend's per-buffer cap is {} "
+                   "bytes: lower --ctx or --parallel, or store KV as fp16/q8",
+                   what, n, kv_cache::KvPool::segment_bytes_for(l, kv_cache::Placement::PerLayer, n), buf_cap);
+        return kv_cache::Placement::PerLayer;
+    };
+    kv_pool_ = std::make_unique<kv_cache::KvPool>(trunk_layout, blocks, placement_for(trunk_layout, blocks, "trunk"));
     // ADR-001 §5.2 (WS-BI-2 stage 2): the pool image is a State-arena buffer of the model's
     // backend — device-resident on GPU backends, zero-copy host memory on the CPU backend.
     kv_pool_->attach(model_->backend());
     if (mtp) {
-        mtp_pool_ = std::make_unique<kv_cache::KvPool>(model_->mtp_kv_layout(bt),
-                                                       opts.mtp_kv_blocks.value_or(per_seq * (cfg.max_sequences + cache_cap_)));
+        mtp_pool_ = std::make_unique<kv_cache::KvPool>(mtp_layout, mtp_blocks, placement_for(mtp_layout, mtp_blocks, "MTP"));
         mtp_pool_->attach(model_->backend());
+    }
+    {
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const std::uint64_t pool_bytes = kv_pool_->total_bytes() + (mtp_pool_ ? mtp_pool_->total_bytes() : 0);
+        info_.kv_pool_bytes = pool_bytes;
+        info_.kv_segments = kv_pool_->segment_count();
+        HALO_INFO("runtime",
+                  "KV pool: trunk {} blocks x {} B = {:.2f} GiB in {} {} segment(s) of {:.2f} GiB{}; context {} x {} sequence(s) "
+                  "+ {} prefix-cache slot(s); {} B per token; per-buffer cap {}",
+                  kv_pool_->total_blocks(), trunk_blk, static_cast<double>(kv_pool_->total_bytes()) / kGiB,
+                  kv_pool_->segment_count(), kv_cache::to_string(kv_pool_->placement()),
+                  static_cast<double>(kv_pool_->segment_bytes()) / kGiB,
+                  mtp_pool_ ? std::format("; MTP {} blocks = {:.2f} GiB in {} segment(s)", mtp_pool_->total_blocks(),
+                                          static_cast<double>(mtp_pool_->total_bytes()) / kGiB, mtp_pool_->segment_count())
+                            : std::string(),
+                  info_.context_length, cfg.max_sequences, cache_cap_, trunk_blk / bt,
+                  buf_cap != 0 ? std::format("{} B", buf_cap) : std::string("none"));
     }
     free_slots_.reserve(cfg.max_sequences);
     for (std::size_t i = 0; i < cfg.max_sequences; ++i) {

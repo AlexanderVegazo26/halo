@@ -95,6 +95,7 @@ What exllamav2 does, and whether each idea transfers to HALO:
   - This removes the funnel-shift path Q6_K currently needs for its 210 B blocks.
 - **Target:** take the matvecs from ~200 GB/s toward llama.cpp's ~244 GB/s ceiling on this machine.
 - **Pairs with step 1:** repack while rewriting the batched path.
+- **Implemented (opt-in, unmeasured):** `HALO_REPACK=1` repacks the `make_mat` Mats (Q5_K/Q6_K/IQ4_XS, Vulkan only) with `tensor::gemv_repack` (`include/halo/tensor/repack.h` documents the plane layouts) and gemv runs them as Vulkan gemv variant `backend::kGemvRepacked` (shaders `matvec_{q5_k,q6_k,iq4_xs}_rp`; same apply/reduction expression as the raw kernels). Fused-projection buffers (`HALO_FUSE_GEMV`) and tables stay raw. Not yet run on a device: needs a bitwise gate vs the raw kernels, then a decode measurement.
 
 ### 9. Quantized KV cache: fp16, then Q8 or Q4 with group scales
 - HALO stores KV in **fp32**, 64 KiB per token.

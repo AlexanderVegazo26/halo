@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -27,6 +28,7 @@
 #include "halo/backends/cpu/traffic.h"
 #include "halo/core/error.h"
 #include "halo/tensor/quant.h"
+#include "halo/tensor/repack.h"
 
 namespace halo::models {
 
@@ -51,7 +53,16 @@ struct Mat {
     std::unique_ptr<Buffer> buf;
     std::uint32_t rows = 0, cols = 0;
     std::uint64_t bytes = 0;  // stored bytes (cost model)
-    [[nodiscard]] TensorRef ref() const { return TensorRef::of(*buf); }
+    // HALO_REPACK=1: the buffer holds tensor::gemv_repack rows (Vulkan gemv only), `stride` bytes
+    // apart, and every gemv over this Mat must pass KernelChoice{variant} (= backend::kGemvRepacked).
+    // Default 0/0 = the raw GGUF layout, dense.
+    std::uint32_t variant = 0;
+    std::uint64_t stride = 0;
+    [[nodiscard]] TensorRef ref() const {
+        const TensorRef t = TensorRef::of(*buf);
+        return stride != 0 ? t.with_stride(stride) : t;
+    }
+    [[nodiscard]] bool present() const noexcept { return buf != nullptr; }
 };
 
 /// A small fp32 vector (norm weights, dt_bias, ssm_a, conv taps), dequantized once.
@@ -61,19 +72,27 @@ struct Vec {
     [[nodiscard]] TensorRef ref() const { return TensorRef::of(*buf); }
 };
 
+// HALO_FUSE_GEMV (Vulkan only, default off): projections that read the same input and share a
+// quant type are stored row-concatenated in ONE device Buffer (`qkv` / `ba` / `gu`), and the
+// separate Mats (q,k,v / beta,alpha / gate,up) are then left empty. Every W row is computed by
+// its own workgroup with a fixed reduction order, so a fused gemv's rows are bitwise identical
+// to the separate gemvs'. Only the fused Mat is resident (the originals are never imported).
 struct AttnW {
     Mat q, k, v, o;
     Vec q_norm, k_norm;
+    Mat qkv;  // q | k | v rows (2*nh*hd, nkv*hd, nkv*hd) when fused
 };
 
 struct GdnW {
     Mat qkv, gate, beta, alpha, out;
     Vec conv;  // [C, K]
     Vec dt_bias, a, norm;
+    Mat ba;  // beta | alpha rows (n_v each) when fused
 };
 
 struct FfnW {
     Mat gate, up, down;
+    Mat gu;  // gate | up rows (n_ff each) when fused
 };
 
 struct LayerW {
@@ -107,8 +126,7 @@ struct SeqRows {
     std::size_t n = 0;
     kv_cache::SequenceKv* kv = nullptr;
     std::int32_t pos0 = 0;
-    TensorRef pool{};   // the KV pool storage image
-    TensorRef table{};  // the block table (uint32)
+    TensorRef table{};  // the block table (uint32); the pool image comes from KvPool::layer_image()
 };
 
 std::uint64_t vec_bytes(const WeightRef& w) { return w.present() ? w.n_bytes() : 0; }
@@ -152,6 +170,111 @@ struct Qwen35::Impl {
     /// prefix is a stand-in for a token-frequency list and is unmeasured).
     std::size_t draft_vocab = 0;
 
+    // ---- stream reuse (HALO_STREAM_REUSE=1; default off) -----------------------------------------
+    // A backend Stream owns a command pool, fence and descriptor pools; creating one per forward is
+    // pure host cost. With reuse on, a Step takes a pooled stream and gives it back after a fully
+    // successful call. The pool is declared after `owned` so it is destroyed before the backend.
+    // Only the engine worker thread drives a model, the mutex is defensive.
+    static constexpr std::size_t kMaxPooledStreams = 4;
+    bool reuse_streams = false;
+    mutable std::mutex stream_mu;
+    mutable std::vector<std::unique_ptr<backend::Stream>> stream_pool;
+
+    std::unique_ptr<backend::Stream> acquire_stream() const {
+        if (reuse_streams) {
+            const std::lock_guard<std::mutex> lk(stream_mu);
+            if (!stream_pool.empty()) {
+                std::unique_ptr<backend::Stream> s = std::move(stream_pool.back());
+                stream_pool.pop_back();
+                return s;
+            }
+        }
+        return be->create_stream();
+    }
+    /// `s` must be idle (aborted or waited). Dropped (destroyed) if reuse is off or the pool is full.
+    void release_stream(std::unique_ptr<backend::Stream> s) const noexcept {
+        if (!reuse_streams || !s) return;
+        try {
+            const std::lock_guard<std::mutex> lk(stream_mu);
+            if (stream_pool.size() < kMaxPooledStreams) stream_pool.push_back(std::move(s));
+        } catch (...) {
+        }
+    }
+
+    // ---- fused projections (HALO_FUSE_GEMV; default off; Vulkan backend only) ---------------------
+    // HALO_FUSE_GEMV=1|all enables every fusion; otherwise a comma list of: ffn (gate+up, then a
+    // strided SwiGLU), ba (GDN beta+alpha, then a strided gdn_gates), qkv (attention q+k+v; one
+    // dispatch at R == 1, row-slices of the same buffer otherwise).
+    bool fuse_ffn = false, fuse_ba = false, fuse_qkv = false;
+    // Which forms the loaded model actually contains (decides the scratch make_acts allocates).
+    bool has_plain_ffn = false, has_fused_ffn = false, has_plain_ba = false, has_fused_ba = false, has_fused_qkv = false;
+
+    void parse_fuse_env(const char* e) {
+        if (e == nullptr || *e == '\0') return;
+        const std::string v(e);
+        if (v == "0") return;
+        const bool all = v == "1" || v == "all";
+        const auto has = [&](const char* tok) {
+            for (std::size_t pos = 0; pos <= v.size();) {
+                std::size_t end = v.find(',', pos);
+                if (end == std::string::npos) end = v.size();
+                if (v.compare(pos, end - pos, tok) == 0) return true;
+                pos = end + 1;
+            }
+            return false;
+        };
+        fuse_ffn = all || has("ffn");
+        fuse_ba = all || has("ba");
+        fuse_qkv = all || has("qkv");
+    }
+
+    /// Row-concatenation of `parts` (equal type and cols; `rows[i]` rows each) as one device Buffer,
+    /// or nullopt when the backend or the parts do not qualify (the caller then loads them
+    /// separately). Uploaded chunk-wise through the backend; no host copy is retained, so the
+    /// "imported memory must outlive its Buffer" rule does not apply.
+    std::optional<Mat> try_make_fused(const std::vector<WeightRef>& parts, const std::vector<std::size_t>& rows,
+                                      std::size_t cols) const {
+        if (be->kind() != backend::Kind::Vulkan || parts.empty() || parts.size() != rows.size()) return std::nullopt;
+        Mat r;
+        r.type = parts[0].type();
+        r.cols = u32(cols);
+        std::size_t total_rows = 0;
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (!parts[i].present() || parts[i].type() != r.type) return std::nullopt;
+            const cpu::WeightMatrix m = weight_matrix(parts[i]);  // validates type, shape, size, alignment
+            HALO_CHECK(m.rows() == rows[i] && m.cols() == cols, ErrorCode::Model, "tensor {}: {}x{}, expected {}x{}",
+                       parts[i].name(), m.rows(), m.cols(), rows[i], cols);
+            // Concatenation is only byte-exact for dense rows; keep every part word-sized so chunk
+            // and part offsets stay 4-byte aligned.
+            if (parts[i].n_bytes() % 4 != 0 || parts[i].n_bytes() != rows[i] * tensor::row_bytes(r.type, static_cast<std::int64_t>(cols)))
+                return std::nullopt;
+            r.bytes += parts[i].n_bytes();
+            total_rows += rows[i];
+        }
+        r.rows = u32(total_rows);
+        r.buf = be->allocate(r.bytes, backend::Tier::Vram);
+        const auto s = be->create_stream();
+        constexpr std::uint64_t kChunk = 16ull << 20;
+        std::uint64_t off = 0;
+        for (const WeightRef& w : parts) {
+            const std::span<const std::byte> data = w.data();
+            for (std::uint64_t pos = 0; pos < data.size(); pos += kChunk) {
+                const std::uint64_t n = std::min<std::uint64_t>(kChunk, data.size() - pos);
+                be->upload(*s, r.ref().shifted(off + pos), data.subspan(pos, n));
+                s->submit();
+                s->wait();
+            }
+            off += data.size();
+        }
+        return r;
+    }
+
+    void note_forms(const LayerW& l) {
+        if (l.ffn) (l.ffn->gu.present() ? has_fused_ffn : has_plain_ffn) = true;
+        if (l.gdn) (l.gdn->ba.present() ? has_fused_ba : has_plain_ba) = true;
+        if (l.attn && l.attn->qkv.present()) has_fused_qkv = true;
+    }
+
     // ---- loading -----------------------------------------------------------------------
 
     Mat make_mat(const WeightRef& w, std::size_t expect_rows, std::size_t expect_cols) const {
@@ -161,11 +284,47 @@ struct Qwen35::Impl {
                    w.name(), m.rows(), m.cols(), expect_rows, expect_cols);
         Mat r;
         r.type = w.type();
-        r.buf = be->import_host_readonly(w.data());
         r.rows = u32(m.rows());
         r.cols = u32(m.cols());
         r.bytes = w.n_bytes();
+        if (!try_repack(r, w)) r.buf = be->import_host_readonly(w.data());
         return r;
+    }
+
+    /// HALO_REPACK=1 (default off): only Mats consumed by gemv reach here (make_mat; embedding /
+    /// LM-head tables and the fused-projection buffers keep the raw GGUF layout). Vulkan backend and
+    /// Q5_K / Q6_K / IQ4_XS only; anything else returns false and the caller imports the raw bytes.
+    static bool repack_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("HALO_REPACK");
+            return e != nullptr && *e != '\0' && std::string(e) != "0";
+        }();
+        return on;
+    }
+
+    /// Uploads `w` in the tensor::gemv_repack layout into r.buf and sets r.variant / r.stride.
+    /// r.rows, r.cols and r.type must be set. No host copy is retained (allocate + upload).
+    bool try_repack(Mat& r, const WeightRef& w) const {
+        if (!repack_enabled() || be->kind() != backend::Kind::Vulkan || !tensor::gemv_repack_supported(r.type) ||
+            r.cols % 256 != 0)
+            return false;
+        const std::size_t row_bytes = tensor::row_bytes(r.type, static_cast<std::int64_t>(r.cols));
+        if (w.n_bytes() != std::size_t{r.rows} * row_bytes) return false;  // not dense rows
+        const std::size_t stride = tensor::gemv_repack_row_stride(r.type, r.cols);
+        std::vector<std::byte> packed(std::size_t{r.rows} * stride);
+        tensor::gemv_repack(r.type, w.data(), r.rows, r.cols, packed);
+        r.buf = be->allocate(packed.size(), backend::Tier::Vram);
+        const auto s = be->create_stream();
+        constexpr std::uint64_t kChunk = 16ull << 20;
+        for (std::uint64_t pos = 0; pos < packed.size(); pos += kChunk) {
+            const std::uint64_t n = std::min<std::uint64_t>(kChunk, packed.size() - pos);
+            be->upload(*s, TensorRef::of(*r.buf).shifted(pos), std::span<const std::byte>(packed).subspan(pos, n));
+            s->submit();
+            s->wait();
+        }
+        r.variant = backend::kGemvRepacked;
+        r.stride = stride;
+        return true;
     }
 
     Vec upload_vec(const std::vector<float>& v) const {
@@ -189,8 +348,13 @@ struct Qwen35::Impl {
     Table make_table(const WeightRef& w) const { return Table{w, be->import_host_readonly(w.data())}; }
 
     AttnW load_attn(const model::AttentionWeights& w) const {
+        if (fuse_qkv) {
+            if (std::optional<Mat> f = try_make_fused({w.q, w.k, w.v}, {2 * nh * hd, nkv * hd, nkv * hd}, E)) {
+                return AttnW{{}, {}, {}, make_mat(w.output, E, nh * hd), make_vec(w.q_norm, hd), make_vec(w.k_norm, hd), std::move(*f)};
+            }
+        }
         return AttnW{make_mat(w.q, 2 * nh * hd, E), make_mat(w.k, nkv * hd, E), make_mat(w.v, nkv * hd, E),
-                     make_mat(w.output, E, nh * hd), make_vec(w.q_norm, hd), make_vec(w.k_norm, hd)};
+                     make_mat(w.output, E, nh * hd), make_vec(w.q_norm, hd), make_vec(w.k_norm, hd), {}};
     }
 
     LayerW load_layer(const model::LayerWeights& w, std::size_t kind_index) const {
@@ -207,15 +371,18 @@ struct Qwen35::Impl {
                        a.k_norm.n_bytes();
         } else {
             const auto& g = w.gdn;
+            std::optional<Mat> ba;
+            if (fuse_ba) ba = try_make_fused({g.beta, g.alpha}, {n_v, n_v}, E);
             GdnW gw{make_mat(g.qkv, conv_c, E),
                     make_mat(g.gate, value_dim, E),
-                    make_mat(g.beta, n_v, E),
-                    make_mat(g.alpha, n_v, E),
+                    ba ? Mat{} : make_mat(g.beta, n_v, E),
+                    ba ? Mat{} : make_mat(g.alpha, n_v, E),
                     make_mat(g.out, E, value_dim),
                     make_vec(g.conv1d, conv_c * conv_k),
                     make_vec(g.dt_bias, n_v),
                     make_vec(g.a, n_v),
-                    make_vec(g.norm, d_v)};
+                    make_vec(g.norm, d_v),
+                    ba ? std::move(*ba) : Mat{}};
             HALO_CHECK(g.conv1d.ne(0) == static_cast<std::int64_t>(conv_k), ErrorCode::Model, "tensor {}: kernel {}, expected {}",
                        g.conv1d.name(), g.conv1d.ne(0), conv_k);
             for (const float v : weight_vector(g.a)) {
@@ -225,7 +392,10 @@ struct Qwen35::Impl {
             l.bytes += g.qkv.n_bytes() + g.gate.n_bytes() + g.beta.n_bytes() + g.alpha.n_bytes() + g.out.n_bytes() +
                        g.conv1d.n_bytes() + g.dt_bias.n_bytes() + g.a.n_bytes() + g.norm.n_bytes();
         }
-        l.ffn = FfnW{make_mat(w.ffn_gate, hp->n_ff, E), make_mat(w.ffn_up, hp->n_ff, E), make_mat(w.ffn_down, E, hp->n_ff)};
+        std::optional<Mat> gu;
+        if (fuse_ffn) gu = try_make_fused({w.ffn_gate, w.ffn_up}, {hp->n_ff, hp->n_ff}, E);
+        l.ffn = FfnW{gu ? Mat{} : make_mat(w.ffn_gate, hp->n_ff, E), gu ? Mat{} : make_mat(w.ffn_up, hp->n_ff, E),
+                     make_mat(w.ffn_down, E, hp->n_ff), gu ? std::move(*gu) : Mat{}};
         l.bytes += w.ffn_gate.n_bytes() + w.ffn_up.n_bytes() + w.ffn_down.n_bytes();
         return l;
     }
@@ -237,12 +407,17 @@ struct Qwen35::Impl {
         std::unique_ptr<backend::Stream> s;
         std::vector<std::unique_ptr<Buffer>> arena;  // lives until the call returns (after wait)
         StepCost& cost;
+        /// The last sync() completed (fence waited without throwing). Only then may the stream be
+        /// pooled: after a failed submit/wait (e.g. device lost) it is destroyed instead.
+        bool clean = false;
 
-        Step(const Impl& impl, StepCost& c) : I(impl), s(impl.be->create_stream()), cost(c) {}
+        Step(const Impl& impl, StepCost& c) : I(impl), s(impl.acquire_stream()), cost(c) {}
         Step(const Step&) = delete;
         Step& operator=(const Step&) = delete;
         ~Step() {
-            if (s) s->abort();
+            if (!s) return;
+            s->abort();  // drops any unsubmitted recording; the stream is idle afterwards
+            if (clean) I.release_stream(std::move(s));
         }
 
         TensorRef alloc(std::size_t floats) {
@@ -254,8 +429,10 @@ struct Qwen35::Impl {
             return TensorRef::of(*arena.back());
         }
         void sync() {
+            clean = false;
             s->submit();
             s->wait();
+            clean = true;
         }
         void download(TensorRef src, std::span<float> dst) { I.be->download(*s, src, std::as_writable_bytes(dst)); }
     };
@@ -266,7 +443,7 @@ struct Qwen35::Impl {
     // ---- blocks ------------------------------------------------------------------------
 
     void gemv(Step& st, TensorRef x, std::size_t R, const Mat& w, TensorRef y) const {
-        be->gemv(*st.s, backend::GemvArgs{w.type, w.ref(), x, y, w.rows, w.cols, u32(R), {}});
+        be->gemv(*st.s, backend::GemvArgs{w.type, w.ref(), x, y, w.rows, w.cols, u32(R), {w.variant}});
         st.cost.weight_bytes += w.bytes;
         st.cost.activation_bytes += cpu::traffic_matmul(R, w.cols, w.rows, 0).total();
     }
@@ -292,6 +469,9 @@ struct Qwen35::Impl {
         TensorRef qkv, conv, z, beta, alpha, g, bs, o, on;
         // FFN
         TensorRef fg, fu, fs;
+        // HALO_FUSE_GEMV outputs (empty unless the model has fused layers): [R, 2 ff] gate|up,
+        // [R, 2 n_v] beta|alpha, and (R == 1 only) [2 qd + 2 kvd] q|gate, k, v.
+        TensorRef gu, ba, qkvf;
     };
 
     Acts make_acts(Step& st, std::size_t R, bool with_gdn) const {
@@ -311,17 +491,36 @@ struct Qwen35::Impl {
             a.qkv = st.alloc(R * conv_c);
             a.conv = st.alloc(R * conv_c);
             a.z = st.alloc(R * value_dim);
-            a.beta = st.alloc(R * n_v);
-            a.alpha = st.alloc(R * n_v);
+            if (has_plain_ba) {
+                a.beta = st.alloc(R * n_v);
+                a.alpha = st.alloc(R * n_v);
+            }
+            if (has_fused_ba) a.ba = st.alloc(R * 2 * n_v);
             a.g = st.alloc(R * n_v);
             a.bs = st.alloc(R * n_v);
             a.o = st.alloc(R * value_dim);
             a.on = st.alloc(R * value_dim);
         }
-        a.fg = st.alloc(R * ff);
-        a.fu = st.alloc(R * ff);
+        if (has_plain_ffn) {
+            a.fg = st.alloc(R * ff);
+            a.fu = st.alloc(R * ff);
+        }
+        if (has_fused_ffn) a.gu = st.alloc(R * 2 * ff);
         a.fs = st.alloc(R * ff);
+        if (has_fused_qkv && R == 1) a.qkvf = st.alloc(2 * qd + 2 * kvd);
         return a;
+    }
+
+    /// y = W[row0, row0 + nrows) x for a row range of a (row-concatenated) Mat: the range is a
+    /// byte window of the same Buffer, every row is computed exactly as in the whole-matrix gemv.
+    void gemv_rows(Step& st, TensorRef x, std::size_t R, const Mat& w, std::size_t row0, std::size_t nrows, TensorRef y) const {
+        const std::uint64_t rb = tensor::row_bytes(w.type, static_cast<std::int64_t>(w.cols));
+        const std::uint64_t ws = w.stride != 0 ? w.stride : rb;  // repacked rows are `stride` apart
+        TensorRef wr = w.ref().shifted(row0 * ws);
+        wr.bytes = nrows == 0 ? 0 : (nrows - 1) * ws + rb;
+        be->gemv(*st.s, backend::GemvArgs{w.type, wr, x, y, u32(nrows), w.cols, u32(R), {w.variant}});
+        st.cost.weight_bytes += nrows * rb;
+        st.cost.activation_bytes += cpu::traffic_matmul(R, w.cols, nrows, 0).total();
     }
 
     /// Full-attention mixer (D-004): y[R, E] from normed input xn[R, E]. Writes the K/V
@@ -331,13 +530,29 @@ struct Qwen35::Impl {
         StepCost& cost = st.cost;
         const std::size_t qd = nh * hd;
         const std::size_t kvd = nkv * hd;
-        gemv(st, a.xn, R, w.q, a.qg);
-        gemv(st, a.xn, R, w.k, a.k);
-        gemv(st, a.xn, R, w.v, a.v);
+        // qg = [Q | gate] rows, k, v: three gemvs, or (HALO_FUSE_GEMV=qkv) one fused matrix. With one
+        // token the fused output row is dense per slice (q|gate, k, v back to back), so a single
+        // dispatch serves all three; for R > 1 the fused row has a token stride the per-head norms
+        // and the KV write cannot express, so the three row ranges of the fused matrix are used.
+        TensorRef qg = a.qg, k = a.k, v = a.v;
+        if (w.qkv.present() && R == 1) {
+            gemv(st, a.xn, R, w.qkv, a.qkvf);
+            qg = a.qkvf;
+            k = a.qkvf.shifted(2 * qd * kF32);
+            v = a.qkvf.shifted((2 * qd + kvd) * kF32);
+        } else if (w.qkv.present()) {
+            gemv_rows(st, a.xn, R, w.qkv, 0, 2 * qd, qg);
+            gemv_rows(st, a.xn, R, w.qkv, 2 * qd, kvd, k);
+            gemv_rows(st, a.xn, R, w.qkv, 2 * qd + kvd, kvd, v);
+        } else {
+            gemv(st, a.xn, R, w.q, qg);
+            gemv(st, a.xn, R, w.k, k);
+            gemv(st, a.xn, R, w.v, v);
+        }
         // Per-head q norm straight out of the interleaved [Q_h | gate_h] rows (head stride
         // 2 * hd) into a dense q: row r of [R * nh, hd] is token r / nh, head r % nh.
-        rms_norm(st, a.qg.with_stride(2 * hd * kF32), R * nh, hd, w.q_norm, a.q);
-        rms_norm(st, a.k, R * nkv, hd, w.k_norm, a.kn);
+        rms_norm(st, qg.with_stride(2 * hd * kF32), R * nh, hd, w.q_norm, a.q);
+        rms_norm(st, k, R * nkv, hd, w.k_norm, a.kn);
         be->partial_rope(*st.s, backend::RopeArgs{a.q, pos, u32(R), u32(nh), u32(hd), u32(rot), theta, 0, {}});
         be->partial_rope(*st.s, backend::RopeArgs{a.kn, pos, u32(R), u32(nkv), u32(hd), u32(rot), theta, 0, {}});
         cost.activation_bytes += cpu::traffic_partial_rope(R, nh, rot).total() + cpu::traffic_partial_rope(R, nkv, rot).total();
@@ -349,18 +564,21 @@ struct Qwen35::Impl {
             const kv_cache::KvLayout& l = s.kv->pool().layout();
             const auto n_pool_blocks = u32(s.kv->pool().total_blocks());
             const auto n_table = u32(s.kv->blocks().size());
-            be->kv_write(*st.s, backend::KvWriteArgs{s.pool, s.table, rows_at(a.kn, s.r0, kvd), rows_at(a.v, s.r0, kvd),
-                                                     n_pool_blocks, u32(l.n_layers), u32(kv_layer), u32(l.block_tokens),
-                                                     u32(kvd), n_table, u32(len), u32(s.n), {}, {}});
+            // The buffer holding this layer and the (n_layers, layer) pair to address it with:
+            // the whole pool image for a Single pool, the layer's own segment (1, 0) for a PerLayer one.
+            const kv_cache::KvPool::LayerImage img = s.kv->pool().layer_image(kv_layer);
+            be->kv_write(*st.s, backend::KvWriteArgs{img.ref, s.table, rows_at(a.kn, s.r0, kvd), rows_at(v, s.r0, kvd),
+                                                     n_pool_blocks, img.n_layers, img.layer, u32(l.block_tokens),
+                                                     u32(kvd), n_table, u32(len), u32(s.n), {}, {}, l.type});
             cost.kv_bytes += 2ULL * 4 * s.n * kvd;
             backend::AttentionArgs at{};
             at.q = rows_at(a.q, s.r0, qd);
-            at.kv_pool = s.pool;
+            at.kv_pool = img.ref;
             at.block_table = s.table;
             at.out = rows_at(a.att, s.r0, qd);
             at.n_pool_blocks = n_pool_blocks;
-            at.n_layers = u32(l.n_layers);
-            at.layer = u32(kv_layer);
+            at.n_layers = img.n_layers;
+            at.layer = img.layer;
             at.block_tokens = u32(l.block_tokens);
             at.n_block_table = n_table;
             at.n_head = u32(nh);
@@ -369,13 +587,14 @@ struct Qwen35::Impl {
             at.n_tokens = u32(s.n);
             at.q_offset = u32(len);
             at.scale = scale;
+            at.kv_type = l.type;
             be->attention(*st.s, at);
             const cpu::OpTraffic t = cpu::traffic_attention(dims, s.n, len);
             cost.kv_bytes += 2ULL * 4 * (len + s.n) * kvd;
             cost.activation_bytes += t.total() - 2ULL * 4 * (len + s.n) * kvd;
         }
         // out = att * sigmoid(gate): the gate halves read in place with the head stride.
-        be->mul_sigmoid(*st.s, backend::EltwiseArgs{a.att, a.qg.shifted(hd * kF32).with_stride(2 * hd * kF32), a.gated,
+        be->mul_sigmoid(*st.s, backend::EltwiseArgs{a.att, qg.shifted(hd * kF32).with_stride(2 * hd * kF32), a.gated,
                                                     u32(R * nh), u32(hd), {}});
         cost.activation_bytes += cpu::traffic_binary(R * qd).total();
         gemv(st, a.gated, R, w.o, a.y);
@@ -395,10 +614,19 @@ struct Qwen35::Impl {
         const std::size_t dv = d_v;
         gemv(st, a.xn, R, w.qkv, a.qkv);
         gemv(st, a.xn, R, w.gate, a.z);
-        gemv(st, a.xn, R, w.beta, a.beta);
-        gemv(st, a.xn, R, w.alpha, a.alpha);
+        // beta / alpha: two small latency-bound gemvs, or (HALO_FUSE_GEMV=ba) one over the beta|alpha
+        // rows; the fused [R, 2 n_v] output is read as two strided [R, n_v] views.
+        TensorRef beta = a.beta, alpha = a.alpha;
+        if (w.ba.present()) {
+            gemv(st, a.xn, R, w.ba, a.ba);
+            beta = a.ba.with_stride(2 * nv * kF32);
+            alpha = a.ba.shifted(nv * kF32).with_stride(2 * nv * kF32);
+        } else {
+            gemv(st, a.xn, R, w.beta, beta);
+            gemv(st, a.xn, R, w.alpha, alpha);
+        }
         // beta = sigmoid(beta); g = ssm_a * softplus(alpha + dt_bias), ssm_a = -exp(A_log) (GGUF).
-        be->gdn_gates(*st.s, backend::GdnGateArgs{a.alpha, a.beta, w.dt_bias.ref(), w.a.ref(), a.g, a.bs, u32(R), u32(nv), {}});
+        be->gdn_gates(*st.s, backend::GdnGateArgs{alpha, beta, w.dt_bias.ref(), w.a.ref(), a.g, a.bs, u32(R), u32(nv), {}});
         cost.activation_bytes += 4 * cpu::traffic_unary(R * nv).total();
 
         const cpu::GdnDims dims{n_k, n_v, d_k, d_v, cpu::GdnHeadMapping::Tiled};
@@ -456,9 +684,19 @@ struct Qwen35::Impl {
     }
 
     void ffn(Step& st, const Acts& a, const FfnW& w, std::size_t R) const {
-        gemv(st, a.xn, R, w.gate, a.fg);
-        gemv(st, a.xn, R, w.up, a.fu);
-        be->swiglu(*st.s, backend::EltwiseArgs{a.fg, a.fu, a.fs, u32(R), u32(hp->n_ff), {}});
+        // gate / up: two gemvs + SwiGLU, or (HALO_FUSE_GEMV=ffn) one gemv over the gate|up rows and
+        // a SwiGLU reading the two halves of the [R, 2 ff] output with a row stride of 2 ff.
+        TensorRef fg = a.fg, fu = a.fu;
+        if (w.gu.present()) {
+            const std::uint64_t ff = hp->n_ff;
+            gemv(st, a.xn, R, w.gu, a.gu);
+            fg = a.gu.with_stride(2 * ff * kF32);
+            fu = a.gu.shifted(ff * kF32).with_stride(2 * ff * kF32);
+        } else {
+            gemv(st, a.xn, R, w.gate, fg);
+            gemv(st, a.xn, R, w.up, fu);
+        }
+        be->swiglu(*st.s, backend::EltwiseArgs{fg, fu, a.fs, u32(R), u32(hp->n_ff), {}});
         st.cost.activation_bytes += cpu::traffic_binary(R * hp->n_ff).total();
         gemv(st, a.fs, R, w.down, a.y);
     }
@@ -533,7 +771,6 @@ struct Qwen35::Impl {
     void import_kv(Step& st, SeqRows& s) const {
         kv_cache::KvPool& pool = s.kv->pool();
         if (!pool.attached()) pool.attach(*be);  // tests build pools by hand; the engine attaches up front
-        s.pool = pool.storage_ref();
         s.table = st.import_ro(std::as_bytes(s.kv->blocks()));
     }
 };
@@ -558,6 +795,8 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     I.be = borrowed != nullptr ? borrowed : I.owned.get();
     I.limits = I.be->limits();
     I.gdn_chunk = options.gdn_chunk;
+    if (const char* e = std::getenv("HALO_STREAM_REUSE")) I.reuse_streams = *e != '\0' && std::string_view(e) != "0";
+    I.parse_fuse_env(std::getenv("HALO_FUSE_GEMV"));  // before the layers load: it picks the weight layout
     const auto& hp = m.hparams();
     I.hp = &hp;
     I.E = hp.n_embd;
@@ -603,6 +842,7 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     for (const auto& lw : m.layers()) {
         const std::size_t idx = lw.kind == LayerKind::FullAttention ? n_attn++ : n_gdn++;
         I.layers.push_back(I.load_layer(lw, idx));
+        I.note_forms(I.layers.back());
         I.trunk_bytes += I.layers.back().bytes;
     }
     I.output_norm = I.make_vec(m.output_norm(), I.E);
@@ -629,6 +869,7 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
                   (mw->head_norm_origin == model::MtpTensorOrigin::NextnBlock ? mw->head_norm.n_bytes() : 0);
         if (const char* e = std::getenv("HALO_MTP_DRAFT_VOCAB")) I.draft_vocab = std::strtoull(e, nullptr, 10);
         I.mtp = std::move(t);
+        I.note_forms(I.mtp->block);
     }
 }
 
@@ -739,7 +980,7 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         check_rows(s.logit_rows, s.tokens.size(), "forward", si);
         HALO_CHECK(s.gdn_path != GdnPath::Chunked || I.limits.gdn_chunked, ErrorCode::Unsupported,
                    "forward step {}: the {} backend has no chunked GDN form", si, backend::to_string(I.be->kind()));
-        seqs[si] = {R, s.tokens.size(), s.kv, static_cast<std::int32_t>(len), {}, {}};
+        seqs[si] = {R, s.tokens.size(), s.kv, static_cast<std::int32_t>(len), {}};
         const bool chunked = s.gdn_path == GdnPath::Chunked ||
                              (s.gdn_path == GdnPath::Auto && I.limits.gdn_chunked && s.tokens.size() > 1 && s.n_state_slots == 0);
         gseqs[si] = {s.gdn, s.n_state_slots, chunked};
@@ -847,15 +1088,25 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
         const MtpStep& s = steps[si];
         check_tokens(s.tokens, I.n_vocab, "mtp_forward", si);
         check_kv(s.kv, want_kv, "mtp_forward", si);
-        HALO_CHECK(s.hidden.size() == s.tokens.size() * E, ErrorCode::Api, "mtp_forward step {}: {} hidden floats for {} rows",
-                   si, s.hidden.size(), s.tokens.size());
+        if (s.hidden_device) {
+            // Device-resident hidden of one row (see MtpStep::hidden_device): no host copy exists.
+            HALO_CHECK(s.hidden.empty() && s.tokens.size() == 1 && s.hidden_device->bytes() >= E * kF32 &&
+                           s.hidden_device->backend() == I.be,
+                       ErrorCode::Api,
+                       "mtp_forward step {}: hidden_device needs a one-row step with no host hidden and a {}-byte buffer of "
+                       "this backend",
+                       si, E * kF32);
+        } else {
+            HALO_CHECK(s.hidden.size() == s.tokens.size() * E, ErrorCode::Api, "mtp_forward step {}: {} hidden floats for {} rows",
+                       si, s.hidden.size(), s.tokens.size());
+        }
         HALO_CHECK(s.first_position >= 0 &&
                        static_cast<std::size_t>(s.first_position) + s.tokens.size() <=
                            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
                    ErrorCode::Api, "mtp_forward step {}: bad first position {}", si, s.first_position);
         kv_ptrs[si] = s.kv;
         check_rows(s.logit_rows, s.tokens.size(), "mtp_forward", si);
-        seqs[si] = {R, s.tokens.size(), s.kv, s.first_position, {}, {}};
+        seqs[si] = {R, s.tokens.size(), s.kv, s.first_position, {}};
         R += s.tokens.size();
     }
     check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "mtp_forward", "KV cache");
@@ -884,7 +1135,11 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
     I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), TensorRef::of(*M.embedding.buf), rids, e,
                                                u32(M.embedding.ref.ne(1)), u32(E), u32(R), {}, {}});
     for (std::size_t si = 0; si < steps.size(); ++si) {
-        I.be->upload(*st.s, Impl::rows_at(hh, seqs[si].r0, E), std::as_bytes(steps[si].hidden));
+        if (steps[si].hidden_device) {
+            I.be->copy(*st.s, backend::CopyArgs{TensorRef::of(*steps[si].hidden_device), Impl::rows_at(hh, seqs[si].r0, E), E * kF32, {}});
+        } else {
+            I.be->upload(*st.s, Impl::rows_at(hh, seqs[si].r0, E), std::as_bytes(steps[si].hidden));
+        }
     }
     cost.embedding_bytes += R * tensor::row_bytes(M.embedding.ref.type(), static_cast<std::int64_t>(E));
     I.rms_norm(st, e, R, E, M.enorm, cat.with_stride(2 * E * kF32));
@@ -902,6 +1157,13 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
         if (s.want_hidden) {
             o.hidden.resize(s.tokens.size() * E);
             st.download(Impl::rows_at(hbuf, seqs[si].r0, E), o.hidden);
+        }
+        if (s.want_hidden_device) {
+            // The last row stays on the device for the next MTP depth: one D2D copy into a Buffer that
+            // outlives this call, instead of a download here and an upload there.
+            o.hidden_device = std::shared_ptr<Buffer>(I.be->allocate(E * kF32, backend::Tier::Vram));
+            I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(hbuf, seqs[si].r0 + seqs[si].n - 1, E),
+                                                TensorRef::of(*o.hidden_device), E * kF32, {}});
         }
         if (s.logits == LogitsMode::None) continue;
         o.argmax.resize(s.logit_rows.size());

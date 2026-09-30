@@ -84,6 +84,11 @@ struct CpuEngineOptions {
     std::size_t kv_block_tokens = 16;
     std::optional<std::size_t> kv_blocks;       ///< trunk KV pool size override (default: planned)
     std::optional<std::size_t> mtp_kv_blocks;   ///< MTP KV pool size override
+    /// Test seam: the largest single KV pool buffer in bytes, replacing the backend's own limit
+    /// (Limits::max_pool_buffer_bytes; 0 = unlimited). A pool whose contiguous image exceeds it is
+    /// split per layer (kv_cache::Placement::PerLayer); one that cannot fit even so is Error(Config)
+    /// for an explicit max_context, else the context is halved (>= 1024) with a warning.
+    std::optional<std::uint64_t> kv_buffer_cap_bytes;
     speculative::GateMode gate_mode = speculative::GateMode::Auto;
     std::size_t gate_window = 16;
     std::size_t gate_probe_interval = 256;

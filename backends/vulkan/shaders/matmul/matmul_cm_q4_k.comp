@@ -1,0 +1,18 @@
+#version 450
+// [PREFILL GEMM, opt-in HALO_COOPMAT=1] ggml Q4_K weights on VK_KHR_cooperative_matrix:
+// y[t][r] = sum_c W[r,c] * x[t][c], fp16 tiles (dequantized W, x), fp32 accumulate. Host contract
+// = matvec_q4_k. Body: common/matmul_cm_main.glsl; dequantization: common/dequant_q4_k.glsl.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "halo_common.glsl"
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+
+HALO_DEFINE_BYTE_READERS(wq)
+#include "dequant_q4_k.glsl"
+#include "matmul_cm_main.glsl"

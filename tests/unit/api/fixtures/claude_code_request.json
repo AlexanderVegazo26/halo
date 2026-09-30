@@ -1,0 +1,56 @@
+{
+  "model": "Qwen3.8-27B",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context.\n</system-reminder>"},
+        {"type": "text", "text": "Read /x and tell me what it says.", "cache_control": {"type": "ephemeral"}}
+      ]
+    },
+    {
+      "role": "system",
+      "content": [
+        {"type": "text", "text": "You are Claude Code, an agent harness.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "Work in the current directory."}
+      ]
+    }
+  ],
+  "system": [
+    {"type": "text", "text": "x-anthropic-billing-header: cc_version=0.0.0;"}
+  ],
+  "tools": [
+    {
+      "name": "Read",
+      "description": "Reads a file from the local filesystem.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string", "description": "The absolute path to the file to read"},
+          "limit": {"type": "number"}
+        },
+        "required": ["file_path"],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "Bash",
+      "description": "Executes a bash command.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}, "timeout": {"type": "number"}},
+        "required": ["command"],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "cache_control": {"type": "ephemeral"}
+    }
+  ],
+  "metadata": {"user_id": "user_0000_account__session_0000"},
+  "max_tokens": 32000,
+  "thinking": {"type": "adaptive", "display": "omitted"},
+  "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+  "output_config": {"effort": "high"},
+  "stream": true
+}

@@ -64,6 +64,16 @@ The model is ~17 GB, and a 128k context needs the KV for 16 GQA layers only (the
 Rough KV size: 16 layers × 2 (K,V) × kv_heads × head_dim × 2 B × tokens. Compute it exactly from `model_->kv_layout(bt).block_bytes()`
 before designing, and record the number here.
 
+**Recorded (from `KvLayout`, 27B shape in `memory::qwen38_27b_shape`: 16 attention layers, 4 KV heads x 256 = kv_dim 1024):**
+`n_layers x 2 x kv_row_bytes(type, kv_dim)` = **128 KiB/token fp32** (2 MiB per 16-token block), 64 KiB fp16, 36 KiB q8; MTP pool
+(1 layer) 8 KiB/token fp32. 128k tokens = 16 GiB per sequence in fp32. (`next.md`/`halo inspect` quote "64 KiB per token": that is
+the planner's fp16 default, not what the fp32 pool stores.) The layout is block-major (`block[layer][K|V][token][kv_dim]`).
+**Implemented (2a):** `kv_cache::Placement::PerLayer` (one buffer per layer, layer-major slabs; the caller binds
+`KvPool::layer_image(l)` with n_layers = 1, layer = 0, so no shader changed). 4 GiB per layer = 512Ki fp32 tokens in total. Not done: a
+block-range segment table (descriptor array), so fp32 256k x 2 sequences (32772 blocks needed, 32768 fit) is refused with a Config error;
+fp16/q8 KV or a lower `--ctx`/`--parallel` fits. 2c was already implemented (`CpuEngine::expired` polls cancel/deadline every tick,
+one prefill chunk per tick; test in test_engine_faults.cpp).
+
 ### 2a. Segmented KV pool (the real fix)
 - **Change:** make `kv_cache::KvPool` (`include/halo/kv_cache/paged_kv.h`) own N buffers ("segments"), each below the cap,
   with a block id mapped to (segment, offset). A block never straddles segments.

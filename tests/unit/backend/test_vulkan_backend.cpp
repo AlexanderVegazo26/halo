@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "backend/vulkan_adapter.h"
@@ -730,4 +731,112 @@ TEST(VulkanBackend, KvPoolDeviceResidentCopyOnWrite) {
     // Layer 1 (not written this step) was copied whole.
     EXPECT_TRUE(bitwise(std::span<const float>(img).subspan(a1 + 64, 64),
                         std::span<const float>(img).subspan(b1 + 64, 64), "layer 1 copied whole"));
+}
+
+// Segmented KV pool on the device: a Placement::PerLayer pool (one device buffer per attention layer,
+// addressed with the layer's own buffer and (n_layers = 1, layer = 0)) behaves like the contiguous
+// pool through prefix sharing, the device-side copy-on-write (one copy per segment) and kv_write.
+// Also pins the limit the engine sizes pools against.
+TEST(VulkanBackend, PerLayerKvPoolMatchesTheContiguousPoolOnTheDevice) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    Pair p = make_pair(ctx);
+    namespace kvc = halo::kv_cache;
+    const hb::Limits lim = p.vk->limits();
+    EXPECT_GT(lim.max_pool_buffer_bytes, 0u) << "the Vulkan backend must report its per-buffer pool cap";
+    EXPECT_LE(lim.max_pool_buffer_bytes, lim.max_import_bytes == 0 ? lim.max_pool_buffer_bytes : lim.max_import_bytes);
+    const std::size_t layers = 3, kvd = 8, bt = 4, n_blocks = 6;
+    const auto build = [&](kvc::Placement placement) {
+        kvc::KvPool pool({layers, kvd, bt}, n_blocks, placement);
+        kvc::SequenceKv a(pool), b(pool);
+        a.reserve(6);  // host writes before attach carry over to the device buffers
+        for (std::size_t l = 0; l < layers; ++l)
+            for (std::size_t i = 0; i < 6; ++i) {
+                const std::vector<float> k(kvd, static_cast<float>(i + l)), v(kvd, -static_cast<float>(i + l));
+                a.write(l, i, k, v);
+            }
+        a.commit(6);
+        b.share_prefix(a, 5);  // b shares blocks 0 and 1 (row 4 sits in block 1)
+        pool.attach(*p.vk);
+        b.reserve(1);          // the shared block 1 is copied on the device, in every segment
+        b.commit(1);
+        EXPECT_EQ(pool.refcount(a.blocks()[1]), 1u) << "the COW dropped the sharing";
+        // kv_write through each layer's own image: B's row 5, then four more rows of A.
+        a.reserve(4);
+        for (std::size_t l = 0; l < layers; ++l) {
+            const kvc::KvPool::LayerImage img = pool.layer_image(l);
+            const auto kb = randn(kvd, static_cast<std::uint32_t>(70 + l)), vb = randn(kvd, static_cast<std::uint32_t>(80 + l));
+            const auto ka = randn(4 * kvd, static_cast<std::uint32_t>(90 + l)), va = randn(4 * kvd, static_cast<std::uint32_t>(100 + l));
+            Dev d(*p.vk);
+            const hb::TensorRef rtb = d.import_ro(std::as_bytes(b.blocks())), rta = d.import_ro(std::as_bytes(a.blocks()));
+            hb::KvWriteArgs wb{};
+            wb.kv_pool = img.ref;
+            wb.block_table = rtb;
+            wb.k = d.put(kb);
+            wb.v = d.put(vb);
+            wb.n_pool_blocks = n_blocks;
+            wb.n_layers = img.n_layers;
+            wb.layer = img.layer;
+            wb.block_tokens = bt;
+            wb.kv_dim = kvd;
+            wb.n_block_table = static_cast<std::uint32_t>(b.blocks().size());
+            wb.start = 5;
+            wb.n_tokens = 1;
+            p.vk->kv_write(*d.s, wb);
+            hb::KvWriteArgs wa = wb;
+            wa.block_table = rta;
+            wa.k = d.put(ka);
+            wa.v = d.put(va);
+            wa.n_block_table = static_cast<std::uint32_t>(a.blocks().size());
+            wa.start = 6;
+            wa.n_tokens = 4;
+            p.vk->kv_write(*d.s, wa);
+            d.sync();
+        }
+        a.commit(4);
+        // Vulkan ATTENTION per layer through the layer's own buffer ((n_layers, layer) = (1, 0) on a
+        // per-layer pool): the production shape of a segmented pool. Two queries at the end of each sequence.
+        constexpr std::uint32_t nh = 4, nkv = 2, hd = 4, T = 2;  // nkv * hd == kvd
+        std::vector<std::vector<float>> att;
+        const kvc::SequenceKv* seqs[2] = {&a, &b};
+        for (std::size_t si = 0; si < 2; ++si) {
+            const kvc::SequenceKv& s = *seqs[si];
+            for (std::size_t l = 0; l < layers; ++l) {
+                const kvc::KvPool::LayerImage img = pool.layer_image(l);
+                Dev d(*p.vk);
+                const hb::TensorRef rt = d.import_ro(std::as_bytes(s.blocks()));
+                hb::AttentionArgs at{};
+                at.q = d.put(randn(T * nh * hd, static_cast<std::uint32_t>(110 + si * 10 + l)));
+                at.kv_pool = img.ref;
+                at.block_table = rt;
+                at.out = d.zeros(T * nh * hd * sizeof(float));
+                at.n_pool_blocks = n_blocks;
+                at.n_layers = img.n_layers;
+                at.layer = img.layer;
+                at.block_tokens = bt;
+                at.n_block_table = static_cast<std::uint32_t>(s.blocks().size());
+                at.n_head = nh;
+                at.n_kv_head = nkv;
+                at.head_dim = hd;
+                at.n_tokens = T;
+                at.q_offset = static_cast<std::uint32_t>(s.length() - T);
+                at.scale = 0.5f;
+                p.vk->attention(*d.s, at);
+                d.sync();
+                att.push_back(d.get<float>(at.out, T * nh * hd));
+            }
+        }
+        return std::tuple{pool.read_all(),
+                          std::pair{std::vector<kvc::BlockId>(a.blocks().begin(), a.blocks().end()),
+                                    std::vector<kvc::BlockId>(b.blocks().begin(), b.blocks().end())},
+                          att};
+    };
+    const auto single = build(kvc::Placement::Single);
+    const auto per = build(kvc::Placement::PerLayer);
+    EXPECT_EQ(std::get<1>(per), std::get<1>(single)) << "same allocation order, same block tables";
+    EXPECT_TRUE(bitwise(std::get<0>(per), std::get<0>(single), "the logical pool image, per-layer vs contiguous"));
+    ASSERT_EQ(std::get<2>(per).size(), 2 * layers);
+    for (std::size_t i = 0; i < std::get<2>(per).size(); ++i) {
+        // Same shader, same bytes: attention through a layer's own buffer is bitwise the contiguous result.
+        EXPECT_TRUE(bitwise(std::get<2>(per)[i], std::get<2>(single)[i], "attention per (sequence, layer)")) << "index " << i;
+    }
 }

@@ -115,6 +115,30 @@ Example config file:
 - **API key.** Prefer `HALO_API_KEY` to `--api-key`: other local users can read a process's
   command line.
 
+### Context, parallelism and KV memory
+
+KV bytes per token are exact from the model's KV layout: `attention layers x 2 x kv_dim x element size`.
+For the 27B model (16 attention layers, 4 KV heads x 256 = kv_dim 1024) that is **128 KiB per token in fp32**
+(the default), 64 KiB in fp16 and 36 KiB in q8 (`HALO_KV_FP16=1`, `HALO_KV_TYPE=q8`; Vulkan only). One sequence
+at 128k tokens is 16 GiB in fp32, so `--ctx 131072 --parallel 4` needs 64 GiB of KV plus the prefix-cache
+share. In fp32 that is also over the 4 GiB per-layer-buffer cap by the per-sequence copy-on-write / draft
+slack (8 blocks), so it is refused; fp16/q8 KV fits. The suggested agent profile is `--ctx 131072 --parallel 2`
+(32 GiB in 16 segments of 2 GiB, plus the prefix-cache share up to the cap).
+
+- **A backend's single-buffer cap no longer limits the context.** On Vulkan/RADV one buffer is capped at 4 GiB
+  (`maxMemoryAllocationSize`). The KV pool is split into one buffer per attention layer when it would exceed the
+  cap, which raises the limit by the layer count (about 512Ki tokens of fp32 in total, 1Mi fp16). The halving
+  loop that used to end at 8192 tokens is gone. `halo serve` prints `KV pool ... GiB in N segment(s)` at startup.
+- **Prefix cache stays on.** The pool is sized for every sequence at the full context; the prefix-cache share
+  (extra blocks for cached prefixes, evicted under pressure) is what shrinks first when the pool limit or the
+  free VRAM is reached.
+- **An explicit `--ctx` is honoured or refused.** When `--ctx` (or `HALO_CTX`, or `runtime.ctx`) is set and the
+  model's trained context, the per-buffer cap or the free VRAM cannot honour it with `--parallel` sequences,
+  the engine fails with a `CONFIG_ERROR` that names the limit (lower `--ctx` or `--parallel`, or use fp16/q8 KV).
+  With the built-in default (32768) the context is instead reduced (halved, minimum 1024) with a warning.
+- **Clients.** `/v1/models` reports the served `context_length`; set the client's context window to it (Claude
+  Code assumes 200k for an unknown model unless `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set).
+
 ## Commands
 
 ### `halo inspect <model.gguf> [--mtp F] [--json] [--ctx N] [--parallel N] [--mtp-draft N]`

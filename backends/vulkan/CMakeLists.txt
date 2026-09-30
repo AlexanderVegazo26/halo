@@ -28,9 +28,15 @@ set(HALO_VK_SHADERS
   matmul/matvec_q5_k
   matmul/matvec_q6_k
   matmul/matvec_iq4_xs
+  matmul/matvec_q5_k_rp  # planar-repacked weights (opt-in HALO_REPACK=1; gemv variant kGemvRepacked)
+  matmul/matvec_q6_k_rp
+  matmul/matvec_iq4_xs_rp
   matmul/matvec_iq4_nl
   matmul/matvec_q3_k
   matmul/matvec_iq3_s
+  matmul/matmul_cm_q4_k  # cooperative-matrix prefill GEMMs (opt-in HALO_COOPMAT=1)
+  matmul/matmul_cm_q5_k
+  matmul/matmul_cm_q6_k
   linear_attn/gated_delta_rule_decode
   linear_attn/gated_delta_rule_chunked
   linear_attn/gdn_gcheck
@@ -52,6 +58,10 @@ set(HALO_VK_SHADERS
   sample/topk
   attention/kv_write
   attention/attention
+  attention/kv_write_f16
+  attention/kv_write_q8
+  attention/attention_f16
+  attention/attention_q8
   reduce/argmax_partial
   reduce/argmax_final
 )

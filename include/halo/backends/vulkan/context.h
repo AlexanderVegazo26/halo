@@ -115,6 +115,10 @@ public:
     [[nodiscard]] std::uint32_t queue_family() const noexcept { return queue_family_; }
     [[nodiscard]] VkPipelineCache pipeline_cache() const noexcept { return pipeline_cache_; }
     [[nodiscard]] bool force_staging() const noexcept { return force_staging_; }
+    /// VK_KHR_cooperative_matrix (+ shaderFloat16, vulkanMemoryModel) was enabled on this device:
+    /// HALO_COOPMAT=1 was set AND the device offers f16 x f16 -> f32 16x16x16 subgroup matrices.
+    /// False by default (device creation is then unchanged); gates the matmul_cm_* prefill GEMMs.
+    [[nodiscard]] bool coopmat_enabled() const noexcept { return coopmat_enabled_; }
 
     /// Thread-safe vkQueueSubmit of one command buffer signalling `fence`.
     void submit(VkCommandBuffer cmd, VkFence fence);
@@ -184,6 +188,7 @@ private:
     std::uint32_t queue_family_ = 0;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     bool force_staging_ = false;
+    bool coopmat_enabled_ = false;
 
     std::mutex queue_mutex_;
     mutable std::mutex transfer_mutex_;

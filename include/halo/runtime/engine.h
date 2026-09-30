@@ -26,6 +26,11 @@ struct EngineConfig {
     std::optional<std::string> mtp_path;    // separate MTP GGUF (D-006)
     std::string backend = "cpu";            // cpu | vulkan | hip | auto
     std::size_t max_context = 32768;
+    /// True when the caller asked for max_context (--ctx / HALO_CTX / config file), false for
+    /// the built-in default. An explicit value that cannot be honoured (larger than the model's
+    /// trained context, or than the KV pool the backend / free VRAM allows) is Error(Config) at
+    /// creation; a defaulted one is reduced with a warning.
+    bool max_context_explicit = false;
     std::size_t max_sequences = 4;
     int threads = 0;                        // 0 = auto
     bool mtp_enabled = true;                // profit-gated at runtime (FR-009)
@@ -47,6 +52,8 @@ struct ModelInfo {
     std::size_t context_length = 0;
     std::size_t vocab_size = 0;
     bool has_mtp = false;
+    std::uint64_t kv_pool_bytes = 0;  // trunk + MTP KV pools actually allocated (0 = not reported)
+    std::size_t kv_segments = 0;      // backend buffers of the trunk KV pool (1 = contiguous)
 };
 
 // Per-token callback during generation. Return false to cancel.

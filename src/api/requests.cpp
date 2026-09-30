@@ -1,6 +1,7 @@
 #include "requests.h"
 
 #include <algorithm>
+#include <array>
 #include <format>
 #include <limits>
 
@@ -20,6 +21,16 @@ constexpr std::size_t kMaxStopBytes = 256;
 }
 [[noreturn]] void unsupported(const std::string& where, const std::string& msg) {
     throw RequestError(ErrorKind::Unsupported, msg, where);
+}
+
+/// A client-supplied name as it may appear in a response warning: cut to 64 bytes on a
+/// UTF-8 boundary (the JSON writer escapes the rest).
+std::string display_name(const std::string& s) {
+    constexpr std::size_t kMax = 64;
+    if (s.size() <= kMax) return s;
+    std::size_t cut = kMax;
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0u) == 0x80u) --cut;
+    return s.substr(0, cut) + "...";
 }
 
 const Json& require_object(const Json& v, const std::string& where) {
@@ -325,17 +336,30 @@ Json parse_openai_tools(const Json& body, const ServerConfig& cfg) {
 }
 
 /// Returns false when tool_choice disables tools.
-bool parse_openai_tool_choice(const Json& body) {
+bool parse_openai_tool_choice(const Json& body, ChatJob& job) {
     const Json* tc = field(body, "tool_choice");
     if (tc == nullptr) return true;
+    // Forced calls need a grammar for the template's <tool_call> markup, which the JSON-Schema
+    // constrained decoder cannot express: degrade to auto with a warning instead of a 400.
+    const auto degrade = [&](const std::string& what) {
+        job.warnings.push_back("tool_choice " + what + " is not enforced (forced tool calls are not supported); "
+                               "treated as \"auto\"");
+        return true;
+    };
     if (tc->is_string()) {
         const auto s = tc->get<std::string>();
         if (s == "auto") return true;
         if (s == "none") return false;
-        if (s == "required") unsupported("tool_choice", "tool_choice \"required\" is not supported (no forced tool calls)");
+        if (s == "required") return degrade("\"required\"");
         bad("tool_choice", "must be auto, none, required, or a function object");
     }
-    if (tc->is_object()) unsupported("tool_choice", "forcing a specific tool is not supported");
+    if (tc->is_object()) {
+        std::string what = "(named function)";
+        if (const Json* fn = field(*tc, "function"); fn != nullptr && fn->is_object()) {
+            if (const auto n = opt_string(*fn, "name", "tool_choice.function.name")) what = "(" + display_name(*n) + ")";
+        }
+        return degrade(what);
+    }
     bad("tool_choice", "must be a string or an object");
 }
 
@@ -399,10 +423,48 @@ std::string anthropic_text_blocks(const Json& v, const std::string& where) {
     return out;
 }
 
-void append_anthropic_message(const Json& m, const std::string& w, Json& out) {
+/// Top-level Anthropic fields this server reads. Anything else is ignored with a warning
+/// (1b): metadata, context_management, service_tier, ... have no effect on generation.
+/// Fields whose silent removal would change the result stay errors (images, server tools and
+/// prefill are rejected where they occur; MCP connector servers here).
+void warn_ignored_fields(const Json& body, ChatJob& job) {
+    static constexpr std::array<std::string_view, 14> known = {
+        "model",       "max_tokens", "system",   "messages",       "tools", "tool_choice", "thinking", "output_config",
+        "output_format", "temperature", "top_p", "top_k", "stop_sequences", "stream"};
+    std::vector<std::string> names;
+    std::size_t total = 0;
+    for (auto it = body.begin(); it != body.end(); ++it) {
+        const std::string& k = it.key();
+        if (std::ranges::find(known, std::string_view(k)) != known.end()) continue;
+        if (k == "mcp_servers") unsupported(display_name(k), "MCP connector servers are not supported by this server");
+        ++total;
+        if (names.size() < 8) names.push_back(display_name(k));
+    }
+    if (total == 0) return;
+    std::string list;
+    for (const auto& n : names) list += (list.empty() ? "" : ", ") + n;
+    if (total > names.size()) list += std::format(" and {} more", total - names.size());
+    job.warnings.push_back("ignored request field(s) with no effect on generation: " + list);
+}
+
+bool is_system_role(std::string_view r) { return r == "system" || r == "developer"; }
+
+/// `hoisted` collects the text of system/developer messages found inside messages[]: agent
+/// harnesses (Claude Code) send them in any position, but the chat template wants system
+/// content first, so the caller merges them into the leading system message. The text stays
+/// a plain string here; build_chat_prompt escapes special-token literals in every system
+/// string, hoisted ones included (S-8 / A-4).
+void append_anthropic_message(const Json& m, const std::string& w, Json& out, std::vector<std::string>& hoisted) {
     const auto role = opt_string(m, "role", join_path(w, "role"));
     if (!role) bad(join_path(w, "role"), "is required");
-    if (*role != "user" && *role != "assistant") bad(join_path(w, "role"), "must be user or assistant");
+    if (is_system_role(*role)) {
+        if (const Json* sc = field(m, "content")) {
+            std::string t = anthropic_text_blocks(*sc, join_path(w, "content"));
+            if (!t.empty()) hoisted.push_back(std::move(t));
+        }
+        return;
+    }
+    if (*role != "user" && *role != "assistant") bad(join_path(w, "role"), "must be user, assistant, system or developer");
     const Json* c = field(m, "content");
     if (c == nullptr) bad(join_path(w, "content"), "is required");
     const std::string cw = join_path(w, "content");
@@ -543,7 +605,7 @@ ChatJob parse_openai_chat(const Json& body, const ServerConfig& cfg) {
     job.messages = parse_openai_messages(body, cfg);
     job.tools = parse_openai_tools(body, cfg);
     check_bytes(string_bytes(job.messages) + string_bytes(job.tools), cfg, "messages");  // tools count (S-17)
-    if (!parse_openai_tool_choice(body)) job.tools = nullptr;
+    if (!parse_openai_tool_choice(body, job)) job.tools = nullptr;
     (void)opt_bool(body, "parallel_tool_calls", "parallel_tool_calls");  // accepted, not enforced (docs/api.md)
     parse_openai_thinking(body, job);
     parse_openai_sampling(body, job.sampling);
@@ -566,20 +628,40 @@ ChatJob parse_apply_template(const Json& body, const ServerConfig& cfg) {
     return job;
 }
 
-ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
+ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg, bool count_only) {
     ChatJob job;
     (void)opt_string(body, "model", "model");
-    job.max_tokens = parse_max_tokens(body, cfg, "max_tokens", nullptr);
-    if (!job.max_tokens) bad("max_tokens", "is required");
+    if (!count_only) {
+        job.max_tokens = parse_max_tokens(body, cfg, "max_tokens", nullptr);
+        if (!job.max_tokens) bad("max_tokens", "is required");
+    }
+    warn_ignored_fields(body, job);
 
+    // System text: the top-level `system`, then system/developer messages found inside
+    // messages[] in order (1a), as one leading system message.
+    std::vector<std::string> sys_parts;
+    bool have_system = false;
     if (const Json* sys = field(body, "system")) {
-        job.messages.push_back(Json{{"role", "system"}, {"content", anthropic_text_blocks(*sys, "system")}});
+        sys_parts.push_back(anthropic_text_blocks(*sys, "system"));
+        have_system = true;
     }
     const Json& msgs = require_array(body, "messages", "messages", true);
     if (msgs.size() > cfg.max_messages) bad("messages", std::format("at most {} messages are allowed", cfg.max_messages));
     for (std::size_t i = 0; i < msgs.size(); ++i) {
         const std::string w = join_path("messages", i);
-        append_anthropic_message(require_object(msgs[i], w), w, job.messages);
+        append_anthropic_message(require_object(msgs[i], w), w, job.messages, sys_parts);
+    }
+    {
+        std::string sys_text;
+        for (const auto& part : sys_parts) {
+            if (part.empty()) continue;
+            if (!sys_text.empty()) sys_text += "\n\n";
+            sys_text += part;
+        }
+        if (job.messages.empty()) bad("messages", "must contain at least one user or assistant message");
+        if (have_system || !sys_text.empty()) {
+            job.messages.insert(job.messages.begin(), Json{{"role", "system"}, {"content", std::move(sys_text)}});
+        }
     }
     check_bytes(string_bytes(job.messages), cfg, "messages");
     // tool_result blocks expand into separate template messages (S-17).
@@ -587,8 +669,16 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
         bad("messages", std::format("expands to {} template messages (tool_result blocks count); at most {} are allowed",
                                     job.messages.size(), cfg.max_messages));
     }
-    if (msgs.back().is_object() && msgs.back().value("role", "") == "assistant") {
-        unsupported("messages", "a final assistant message (response prefill) is not supported");
+    // The last message that is not system/developer (those were hoisted): a trailing
+    // system message must not hide an assistant prefill, nor count as one.
+    if (!count_only) {
+        for (std::size_t i = msgs.size(); i-- > 0;) {
+            const Json& last = msgs[i];
+            const std::string r = last.is_object() ? last.value("role", "") : "";
+            if (is_system_role(r)) continue;
+            if (r == "assistant") unsupported("messages", "a final assistant message (response prefill) is not supported");
+            break;
+        }
     }
 
     // tools
@@ -599,7 +689,13 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
         if (type == "none") {
             tools_enabled = false;
         } else if (type == "any" || type == "tool") {
-            unsupported("tool_choice.type", "forced tool use is not supported");
+            // Forcing a call would need a grammar for the template's <tool_call> markup; the
+            // constrained decoder only compiles JSON Schema, so this cannot be enforced.
+            // Degrade to auto (never a 400: harnesses send these on ordinary calls).
+            std::string what = type == "any" ? "\"any\"" : "\"tool\"";
+            if (const auto n = opt_string(*tc, "name", "tool_choice.name")) what += " (" + display_name(*n) + ")";
+            job.warnings.push_back("tool_choice " + what + " is not enforced (forced tool calls are not supported); "
+                                   "treated as \"auto\"");
         } else if (type != "auto") {
             bad("tool_choice.type", "must be auto, any, tool or none");
         }
@@ -644,17 +740,29 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
         require_object(*th, "thinking");
         const auto type = opt_string(*th, "type", "thinking.type");
         if (!type) bad("thinking.type", "is required");
+        // display only decides whether the thinking text is returned ("summarized" |
+        // "omitted"); it has no effect on generation.
+        if (const auto d = opt_string(*th, "display", "thinking.display")) {
+            if (*d == "omitted") {
+                job.omit_thinking = true;
+            } else if (*d != "summarized") {
+                job.warnings.push_back("thinking.display '" + display_name(*d) + "' is not recognized; treated as \"summarized\"");
+            }
+        }
         if (*type == "disabled") {
             job.thinking_disabled = true;
         } else if (*type == "enabled") {
             const auto b = opt_int(*th, "budget_tokens", "thinking.budget_tokens", 1, std::numeric_limits<std::int64_t>::max());
             if (!b) bad("thinking.budget_tokens", "is required when thinking is enabled");
-            if (static_cast<std::size_t>(*b) >= *job.max_tokens) bad("thinking.budget_tokens", "must be less than max_tokens");
+            if (job.max_tokens && static_cast<std::size_t>(*b) >= *job.max_tokens) {
+                bad("thinking.budget_tokens", "must be less than max_tokens");
+            }
             job.reasoning_budget = static_cast<std::size_t>(*b);
         } else if (*type != "adaptive") {
             bad("thinking.type", "must be enabled, disabled or adaptive");
         }
     }
+    if (!job.thinking_disabled && !job.reasoning_budget) job.adaptive_budget_cap = kAdaptiveReasoningBudgetCap;
     Json& x = job.render.extra_context;
     if (job.thinking_disabled) {
         x["enable_thinking"] = false;
@@ -668,6 +776,7 @@ ChatJob parse_anthropic_messages(const Json& body, const ServerConfig& cfg) {
     if (auto v = opt_int(body, "top_k", "top_k", 0, 1 << 20)) job.sampling.top_k = static_cast<int>(*v);
     parse_anthropic_structured(body, job.sampling, cfg);
     structured_output_disables_thinking(job);
+    if (job.thinking_disabled) job.adaptive_budget_cap = 0;
     job.stop = parse_stop(body, "stop_sequences", cfg, false);
     job.stream = opt_bool(body, "stream", "stream").value_or(false);
     job.include_usage = true;
