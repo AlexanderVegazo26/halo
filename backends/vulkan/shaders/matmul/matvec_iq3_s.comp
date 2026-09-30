@@ -31,6 +31,7 @@ layout(constant_id = 1) const uint BATCHED = 1;
 const uint MAX_VEC = 8u;
 
 shared float red[WG];
+shared float redb[MAX_VEC * WG];  // batched reduction (all vectors at once)
 
 HALO_DEFINE_BYTE_READERS(wq)
 // IQ3S_GRID + shared iq3s_grid_sh[512] + halo_iq3s_setup() (also defines halo_dequant,

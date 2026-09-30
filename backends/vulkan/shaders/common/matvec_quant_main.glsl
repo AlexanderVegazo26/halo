@@ -31,6 +31,7 @@ layout(push_constant) uniform Push {
 layout(constant_id = 1) const uint BATCHED = 1;
 
 shared float red[WG];
+shared float redb[MAX_VEC * WG];  // batched reduction (all vectors at once)
 
 // Per-type one-time workgroup setup (e.g. the IQ3_S shared grid); empty for most types.
 #ifndef HALO_DEQUANT_SETUP
@@ -103,15 +104,22 @@ void main() {
             if (t < pc.n_vec) acc[t] += w * x[pc.x_off + t * pc.x_stride + c];
     }
 #endif
-    for (uint t = 0u; t < pc.n_vec; ++t) {
-        red[tid] = acc[t];
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
+    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
+    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
+    // to log2 WG+1).
+    for (uint t = 0u; t < MAX_VEC; ++t)
+        if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            for (uint t = 0u; t < MAX_VEC; ++t)
+                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
         }
-        if (tid == 0u) y[pc.y_off + t * pc.y_stride + row] = red[0];
         barrier();
+    }
+    if (tid == 0u) {
+        for (uint t = 0u; t < MAX_VEC; ++t)
+            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
     }
 }
 

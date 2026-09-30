@@ -90,15 +90,22 @@ void IQ4NL_PASTE(iq4nl_, IQ4NL_FN)(const uint row, const uint row_off) {
                     acc[t] = IQ4NL_PASTE(iq4nl_apply_, IQ4NL_FN)(b, xb + t * pc.x_stride, acc[t]);
         }
     }
-    for (uint t = 0u; t < pc.n_vec; ++t) {
-        red[tid] = acc[t];
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
+    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
+    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
+    // to log2 WG+1).
+    for (uint t = 0u; t < MAX_VEC; ++t)
+        if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            for (uint t = 0u; t < MAX_VEC; ++t)
+                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
         }
-        if (tid == 0u) y[pc.y_off + t * pc.y_stride + row] = red[0];
         barrier();
+    }
+    if (tid == 0u) {
+        for (uint t = 0u; t < MAX_VEC; ++t)
+            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
     }
 }
 

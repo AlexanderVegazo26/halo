@@ -30,6 +30,7 @@ layout(constant_id = 1) const uint BATCHED = 1;
 const uint MAX_VEC = 8u;
 
 shared float red[WG];
+shared float redb[MAX_VEC * WG];  // batched reduction (all vectors at once)
 
 // kvalues_iq4nl staged in shared memory (see matvec_iq4_xs.comp).
 shared int sh_kv[16];
