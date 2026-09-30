@@ -61,9 +61,11 @@ void matmul(ConstRows x, const WeightMatrix& w, Rows y, ThreadPool* pool) {
 TopKEntry argmax(std::span<const float> logits) {
     HALO_CHECK(!logits.empty(), ErrorCode::Kernel, "argmax: empty row");
     check_index_range(logits.size(), "argmax");
-    check_no_nan(logits, "argmax");
+    // Single pass: the NaN check and the max-finding scan used to be two separate O(n) passes.
+    HALO_CHECK(!std::isnan(logits[0]), ErrorCode::Kernel, "argmax: NaN at index {}", 0);
     std::size_t best = 0;
     for (std::size_t i = 1; i < logits.size(); ++i) {
+        HALO_CHECK(!std::isnan(logits[i]), ErrorCode::Kernel, "argmax: NaN at index {}", i);
         if (logits[i] > logits[best]) best = i;  // strict: ties keep the lower index
     }
     return {static_cast<std::int32_t>(best), logits[best]};

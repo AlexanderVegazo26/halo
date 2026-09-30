@@ -8,6 +8,11 @@
 //
 // This models the kernel's work decomposition, indexing and arithmetic. It does NOT model
 // device scheduling, the memory model, wave-level behaviour or the device libm.
+//
+// Perf note (cpp23-efficiency-review.md §G): every block/thread here runs fully sequentially,
+// so wall-clock timing of this path says nothing about real device performance -- HIP has not
+// yet run on real ROCm hardware in this project, so this emulation is the only path anyone has
+// timed so far. Do not treat a timing taken through this path as representative of the device.
 
 #include <cstring>
 #include <memory>

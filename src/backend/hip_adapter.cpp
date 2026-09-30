@@ -227,6 +227,11 @@ public:
 
     void submit() override {}  // HIP work is enqueued as each op is called
 
+    // Perf note (cpp23-efficiency-review.md §G): correctness of the async batching here depends
+    // entirely on call-site discipline -- the device path only synchronizes and evaluates status
+    // words here, in wait(), not per op. Callers must invoke wait() once per batch of enqueued ops
+    // (e.g. once per decode tick), not once per op, or every op degenerates into a full
+    // hipStreamSynchronize and the async pipeline this backend enqueues into is defeated.
     void wait() override {
         if (dev_) {
             try {

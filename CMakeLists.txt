@@ -12,6 +12,9 @@ option(HALO_BUILD_BENCHMARKS "Build benchmark tools"                 ON)
 option(HALO_BUILD_SERVER     "Build the HTTP API server"             ON)
 option(HALO_BUILD_VULKAN     "Build the Vulkan/RADV backend"         ON)
 option(HALO_BUILD_HIP        "Build the HIP backend (needs ROCm)"    OFF)
+# Off by default: this hasn't been benchmarked yet (no A/B build comparison exists), and the
+# multi-static-lib-per-module layout means a from-scratch LTO build is materially slower --
+# not a rejected-for-a-bug default, just an unevaluated one (cpp23-efficiency-review.md §H/§K).
 option(HALO_ENABLE_LTO       "Enable link-time optimization"         OFF)
 option(HALO_ENABLE_ASAN      "Enable AddressSanitizer + UBSan"       OFF)
 option(HALO_NATIVE           "Tune for the build machine CPU"        OFF)
