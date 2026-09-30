@@ -54,7 +54,7 @@ std::uint64_t KvPool::segment_bytes_for(const KvLayout& layout, Placement placem
     return mul_checked(unit, n_blocks, "segment");
 }
 
-KvPool::KvPool(KvLayout layout, std::size_t n_blocks, Placement placement)
+KvPool::KvPool(KvLayout layout, std::size_t n_blocks, Placement placement, bool host_image)
     : layout_(layout),
       placement_(placement),
       block_floats_(layout.block_floats()),
@@ -67,7 +67,7 @@ KvPool::KvPool(KvLayout layout, std::size_t n_blocks, Placement placement)
     const std::size_t total = mul_checked(block_floats_, n_blocks, "pool");
     (void)mul_checked(block_bytes_, n_blocks, "pool");
     slab_floats_ = mul_checked(layer_block_floats_, n_blocks, "pool");
-    if (layout_.type == backend::KvType::F32) {
+    if (layout_.type == backend::KvType::F32 && host_image) {
         try {
             // Zero-filled, as the backends' allocate() (the State-arena image starts zeroed on
             // every backend, so attach() uploads content only after real host writes).
@@ -157,6 +157,9 @@ void KvPool::attach(backend::Backend& be) {
                "(unset the variable or use --backend vulkan)",
                backend::to_string(layout_.type), backend::to_string(be.kind()));
     const bool zero_copy = be.kind() == backend::Kind::Cpu || be.kind() == backend::Kind::HipEmulation;
+    HALO_CHECK(!zero_copy || storage_ != nullptr, ErrorCode::Config,
+               "KvPool: built without a host image (device-resident only), so it cannot attach to the zero-copy {} backend",
+               backend::to_string(be.kind()));
     if (placement_ == Placement::PerLayer) {
         // One backend buffer per layer slab. Built into a local vector so a failure part-way
         // (allocation, import) leaves the pool unattached and attach() retryable.

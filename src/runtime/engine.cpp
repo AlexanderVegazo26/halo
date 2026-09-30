@@ -546,12 +546,14 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
                    what, n, kv_cache::KvPool::segment_bytes_for(l, kv_cache::Placement::PerLayer, n), buf_cap);
         return kv_cache::Placement::PerLayer;
     };
-    kv_pool_ = std::make_unique<kv_cache::KvPool>(trunk_layout, blocks, placement_for(trunk_layout, blocks, "trunk"));
+    // A GPU backend keeps the pool device-only: no zero-filled host mirror (fp32 was 44 GiB of host RAM).
+    const bool host_image = model_->backend().kind() != backend::Kind::Vulkan;
+    kv_pool_ = std::make_unique<kv_cache::KvPool>(trunk_layout, blocks, placement_for(trunk_layout, blocks, "trunk"), host_image);
     // ADR-001 §5.2 (WS-BI-2 stage 2): the pool image is a State-arena buffer of the model's
     // backend — device-resident on GPU backends, zero-copy host memory on the CPU backend.
     kv_pool_->attach(model_->backend());
     if (mtp) {
-        mtp_pool_ = std::make_unique<kv_cache::KvPool>(mtp_layout, mtp_blocks, placement_for(mtp_layout, mtp_blocks, "MTP"));
+        mtp_pool_ = std::make_unique<kv_cache::KvPool>(mtp_layout, mtp_blocks, placement_for(mtp_layout, mtp_blocks, "MTP"), host_image);
         mtp_pool_->attach(model_->backend());
     }
     {

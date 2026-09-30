@@ -100,7 +100,10 @@ class KvPool {
 public:
     /// Allocates n_blocks blocks up front. Throws Error(Config) for a zero dimension or
     /// size overflow, Error(Memory) if the storage cannot be allocated.
-    KvPool(KvLayout layout, std::size_t n_blocks, Placement placement = Placement::Single);
+    /// host_image = false skips the zero-filled host mirror of an fp32 pool: the pool is then
+    /// device-resident only (as fp16/q8 always are) and attach() must get a non-zero-copy
+    /// backend. A GPU backend should pass false, else a 44 GiB pool is first built in host RAM.
+    KvPool(KvLayout layout, std::size_t n_blocks, Placement placement = Placement::Single, bool host_image = true);
 
     /// Largest block count whose biggest single buffer is <= cap_bytes (0 = no cap: the
     /// largest id-representable count). Single: cap / block_bytes; PerLayer: cap / layer_block_bytes.
