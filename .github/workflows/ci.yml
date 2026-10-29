@@ -41,4 +41,5 @@ jobs:
         with:
           name: test-report
           path: .test-report/
+          include-hidden-files: true  # .test-report is a dot dir: skipped by default
           if-no-files-found: ignore
