@@ -1,4 +1,5 @@
 build/
+.test-report/
 /build-dev/
 /build-m2/
 .venv/

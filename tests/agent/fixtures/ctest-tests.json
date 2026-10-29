@@ -1,0 +1,93 @@
+{
+ "kind": "ctestInfo",
+ "version": {
+  "major": 1,
+  "minor": 0
+ },
+ "tests": [
+  {
+   "name": "Error.CarriesTypedCodeAndPrefix",
+   "command": [
+    "/src/build/tests/test_core",
+    "--gtest_filter=Error.CarriesTypedCodeAndPrefix",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "properties": [
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/test_core.cpp:6"
+    }
+   ]
+  },
+  {
+   "name": "Error.CheckMacroThrowsOnlyWhenFalse",
+   "command": [
+    "/src/build/tests/test_core",
+    "--gtest_filter=Error.CheckMacroThrowsOnlyWhenFalse",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "properties": [
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/test_core.cpp:16"
+    }
+   ]
+  },
+  {
+   "name": "Inject.FailsEq",
+   "command": [
+    "/src/build/tests/test_core",
+    "--gtest_filter=Inject.FailsEq",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "properties": [
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/test_core.cpp:27"
+    }
+   ]
+  },
+  {
+   "name": "Inject.Crashes",
+   "command": [
+    "/src/build/tests/test_core",
+    "--gtest_filter=Inject.Crashes",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "properties": [
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/test_core.cpp:28"
+    }
+   ]
+  },
+  {
+   "name": "Inject.Hangs",
+   "command": [
+    "/src/build/tests/test_core",
+    "--gtest_filter=Inject.Hangs",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "properties": [
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/test_core.cpp:29"
+    }
+   ]
+  },
+  {
+   "name": "Inject.Skips",
+   "command": [
+    "/src/build/tests/test_core",
+    "--gtest_filter=Inject.Skips",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "properties": [
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/test_core.cpp:30"
+    }
+   ]
+  }
+ ]
+}

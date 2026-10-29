@@ -25,6 +25,13 @@ endfunction()
 
 halo_add_test(test_core SOURCES unit/test_core.cpp LIBS halo_core)
 
+# scripts/test-agent's report parser and wrapper (stdlib Python, no build needed).
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME test_agent_report
+           COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/agent)
+endif()
+
 file(GLOB _test_dirs LIST_DIRECTORIES true ${CMAKE_CURRENT_SOURCE_DIR}/unit/*)
 foreach(d IN LISTS _test_dirs)
   get_filename_component(_dname ${d} NAME)

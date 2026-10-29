@@ -16,7 +16,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: |
@@ -30,9 +30,15 @@ jobs:
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
             -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
 
-      - name: Build
-        run: cmake --build build -j"$(nproc)"
+      # Builds, runs ctest and writes .test-report/summary.md (failures with file:line,
+      # expected vs actual and a rerun-only command) for whoever fixes a red run.
+      - name: Build and test
+        run: scripts/test-agent
 
-      - name: Test
-        working-directory: build
-        run: ctest --output-on-failure --timeout 300
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report
+          path: .test-report/
+          if-no-files-found: ignore

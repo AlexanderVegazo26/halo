@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="6"
+	failures="3"
+	disabled="0"
+	skipped="1"
+	hostname=""
+	time="3"
+	timestamp="2026-10-29T06:41:37"
+	>
+	<testcase name="Error.CarriesTypedCodeAndPrefix" classname="Error.CarriesTypedCodeAndPrefix" time="0.00201763" status="run">
+		<properties/>
+		<system-out>Running main() from /src/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Error.CarriesTypedCodeAndPrefix
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Error
+[ RUN      ] Error.CarriesTypedCodeAndPrefix
+[       OK ] Error.CarriesTypedCodeAndPrefix (0 ms)
+[----------] 1 test from Error (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+</system-out>
+	</testcase>
+	<testcase name="Error.CheckMacroThrowsOnlyWhenFalse" classname="Error.CheckMacroThrowsOnlyWhenFalse" time="0.00137743" status="run">
+		<properties/>
+		<system-out>Running main() from /src/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Error.CheckMacroThrowsOnlyWhenFalse
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Error
+[ RUN      ] Error.CheckMacroThrowsOnlyWhenFalse
+[       OK ] Error.CheckMacroThrowsOnlyWhenFalse (0 ms)
+[----------] 1 test from Error (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+</system-out>
+	</testcase>
+	<testcase name="Inject.FailsEq" classname="Inject.FailsEq" time="0.00127749" status="fail">
+		<failure message="Failed"/>
+		<properties/>
+		<system-out>Running main() from /src/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Inject.FailsEq
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Inject
+[ RUN      ] Inject.FailsEq
+/src/tests/unit/test_core.cpp:27: Failure
+Expected equality of these values:
+  got
+    Which is: 3
+  4
+context: id=7
+
+[  FAILED  ] Inject.FailsEq (0 ms)
+[----------] 1 test from Inject (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] Inject.FailsEq
+
+ 1 FAILED TEST
+</system-out>
+	</testcase>
+	<testcase name="Inject.Crashes" classname="Inject.Crashes" time="0.00157484" status="fail">
+		<failure message="SEGFAULT"/>
+		<properties/>
+		<system-out>Running main() from /src/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Inject.Crashes
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Inject
+[ RUN      ] Inject.Crashes
+</system-out>
+	</testcase>
+	<testcase name="Inject.Hangs" classname="Inject.Hangs" time="3.02456" status="fail">
+		<failure message="Timeout"/>
+		<properties/>
+		<system-out>Running main() from /src/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Inject.Hangs
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Inject
+[ RUN      ] Inject.Hangs
+</system-out>
+	</testcase>
+	<testcase name="Inject.Skips" classname="Inject.Skips" time="0.00281272" status="notrun">
+		<skipped message="SKIP_REGULAR_EXPRESSION_MATCHED"/>
+		<properties/>
+		<system-out>Running main() from /src/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Inject.Skips
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Inject
+[ RUN      ] Inject.Skips
+/src/tests/unit/test_core.cpp:30: Skipped
+needs HALO_REF_DIR
+
+[  SKIPPED ] Inject.Skips (0 ms)
+[----------] 1 test from Inject (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 0 tests.
+[  SKIPPED ] 1 test, listed below:
+[  SKIPPED ] Inject.Skips
+</system-out>
+	</testcase>
+</testsuite>

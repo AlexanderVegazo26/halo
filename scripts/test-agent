@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Build + run the blocking test suite and write a report a fixing agent can act on:
+#   .test-report/summary.md   per failure: test, file:line + source line, expected vs actual,
+#                             rerun-only commands; build errors with file:line when the build fails
+#   .test-report/results.json machine-readable verdict, counts, failures/skips
+#   .test-report/junit.xml    ctest's JUnit output
+#   .test-report/run.log      full build + ctest output
+#
+#   scripts/test-agent [--build-dir=DIR] [--report-dir=DIR] [--no-build] [-- extra ctest args, e.g. -R '^Sampling']
+#
+# A missing build dir is configured CPU-only like CI (clang, Vulkan/HIP off); pass your own
+# cmake flags by configuring it first (scripts/build.sh --no-test). Exit: 0 pass, 1 fail.
+set -euo pipefail
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD="$SRC/build"
+REPORT="$SRC/.test-report"
+DO_BUILD=1
+CTEST_ARGS=()
+while (($#)); do
+  case "$1" in
+    --build-dir=*) BUILD="${1#*=}" ;;
+    --report-dir=*) REPORT="${1#*=}" ;;
+    --no-build) DO_BUILD=0 ;;
+    --) shift; CTEST_ARGS=("$@"); break ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) echo "test-agent: unknown argument $1 (ctest args go after --)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+export TZ=UTC LC_ALL=C.UTF-8
+mkdir -p "$REPORT"
+REPORT="$(cd "$REPORT" && pwd)"  # ctest resolves --output-junit against the build dir
+# Only our own files: --report-dir may point at a directory that holds other things.
+rm -f "$REPORT"/{summary.md,results.json,junit.xml,tests.json,run.log}
+LOG="$REPORT/run.log"
+REPORTER=(python3 "$SRC/scripts/test_agent_report.py" --report-dir "$REPORT" --build-dir "$BUILD" --source-root "$SRC")
+
+if ((DO_BUILD)); then
+  {
+    if [[ ! -f "$BUILD/CMakeCache.txt" ]]; then
+      cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}" \
+        -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+    fi
+    cmake --build "$BUILD" -j"$(nproc)"
+  } >"$LOG" 2>&1 || {
+    "${REPORTER[@]}" --build-log "$LOG" || true
+    cat "$REPORT/summary.md"
+    exit 1
+  }
+fi
+
+ctest --test-dir "$BUILD" --show-only=json-v1 ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"} >"$REPORT/tests.json" 2>>"$LOG" || true
+status=0
+ctest --test-dir "$BUILD" --output-on-failure --timeout 300 -j"$(nproc)" \
+  --output-junit "$REPORT/junit.xml" ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"} >>"$LOG" 2>&1 || status=$?
+
+code=0
+"${REPORTER[@]}" --junit "$REPORT/junit.xml" --tests-json "$REPORT/tests.json" --exit-code "$status" || code=$?
+cat "$REPORT/summary.md"
+exit "$code"

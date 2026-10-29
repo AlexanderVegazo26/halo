@@ -64,6 +64,11 @@ scripts/build.sh --asan                # ASan/UBSan build + tests
 scripts/build.sh -DHALO_BUILD_HIP=ON   # also compile the HIP backend (needs ROCm)
 ```
 
+`scripts/test-agent [-- ctest args]` builds (configuring a CPU-only `build/` if there is none)
+and runs the suite like CI does, then writes `.test-report/summary.md`: each failure with its
+`file:line`, the GoogleTest expected-vs-actual message, and the command that reruns only that
+test (plus `results.json`, `junit.xml` and the full `run.log`). CI uploads it as `test-report`.
+
 `-DHALO_ONLY="model;sampling;api"` (a semicolon list of module/backend/test-directory names)
 builds only the named subset — useful when iterating on one part of the tree without paying
 for a full rebuild.
