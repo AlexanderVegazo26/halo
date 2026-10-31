@@ -31,8 +31,8 @@ target_link_libraries(halo_minja INTERFACE nlohmann_json::nlohmann_json)
 # HTTP/1.1 + SSE server (MIT) — header-only.
 if(HALO_BUILD_SERVER)
   FetchContent_Declare(httplib
-    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.57.1.tar.gz
-    URL_HASH SHA256=5c9e56b6638eb415dc451ac57531e84931fcb50e261ca3dd74eec6b484fb4712)
+    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.63.0.tar.gz
+    URL_HASH SHA256=44ab42e16926e95f7641d286bc90d739ab1c16886114d7cc5bc7a9f905c5edf8)
   FetchContent_Populate(httplib)
   add_library(halo_httplib INTERFACE)
   target_include_directories(halo_httplib SYSTEM INTERFACE ${httplib_SOURCE_DIR})
