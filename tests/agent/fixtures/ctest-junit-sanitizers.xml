@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="3"
+	failures="3"
+	disabled="0"
+	skipped="0"
+	hostname=""
+	time="0"
+	timestamp="2026-10-31T18:14:40"
+	>
+	<testcase name="PlantedSan.HeapOverflow" classname="PlantedSan.HeapOverflow" time="0.239228" status="fail">
+		<failure message="Failed"/>
+		<properties/>
+		<system-out>Running main() from /build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = PlantedSan.HeapOverflow
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from PlantedSan
+[ RUN      ] PlantedSan.HeapOverflow
+=================================================================
+==2050589==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7bd1221e10c0 at pc 0x5c75b1ca0760 bp 0x7ffd412a2930 sp 0x7ffd412a2928
+WRITE of size 4 at 0x7bd1221e10c0 thread T0
+    #0 0x5c75b1ca075f in PlantedSan_HeapOverflow_Test::TestBody() /src/tests/unit/sampling/test_smoke.cpp:42:80
+    #1 0x5c75b24b14e3 in void testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #2 0x5c75b2495c65 in void testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #3 0x5c75b2474e96 in testing::Test::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2773:5
+    #4 0x5c75b24758ee in testing::TestInfo::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2919:11
+    #5 0x5c75b2476149 in testing::TestSuite::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:3097:30
+    #6 0x5c75b2487313 in testing::internal::UnitTestImpl::RunAllTests() /build/_deps/googletest-src/googletest/src/gtest.cc:6090:44
+    #7 0x5c75b24b3573 in bool testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #8 0x5c75b2497f35 in bool testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #9 0x5c75b2486bf5 in testing::UnitTest::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:5631:10
+    #10 0x5c75b2460160 in RUN_ALL_TESTS() /build/_deps/googletest-src/googletest/include/gtest/gtest.h:2344:73
+    #11 0x5c75b246013c in main /build/_deps/googletest-src/googletest/src/gtest_main.cc:64:10
+    #12 0x7fb12302a600 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:59:16
+    #13 0x7fb12302a717 in __libc_start_main csu/../csu/libc-start.c:360:3
+    #14 0x5c75b1bb3494 in _start (/build/tests/unit/sampling/test_sampling+0x5f8494) (BuildId: a80da575ab2fcf58c17ad9735bc9c36d864d87ce)
+
+0x7bd1221e10c0 is located 0 bytes after 16-byte region [0x7bd1221e10b0,0x7bd1221e10c0)
+allocated by thread T0 here:
+    #0 0x5c75b1c9cd81 in operator new[](unsigned long) (/build/tests/unit/sampling/test_sampling+0x6e1d81) (BuildId: a80da575ab2fcf58c17ad9735bc9c36d864d87ce)
+    #1 0x5c75b1ca0668 in PlantedSan_HeapOverflow_Test::TestBody() /src/tests/unit/sampling/test_smoke.cpp:42:63
+    #2 0x5c75b24b14e3 in void testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #3 0x5c75b2495c65 in void testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #4 0x5c75b2474e96 in testing::Test::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2773:5
+    #5 0x5c75b24758ee in testing::TestInfo::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2919:11
+    #6 0x5c75b2476149 in testing::TestSuite::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:3097:30
+    #7 0x5c75b2487313 in testing::internal::UnitTestImpl::RunAllTests() /build/_deps/googletest-src/googletest/src/gtest.cc:6090:44
+    #8 0x5c75b24b3573 in bool testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #9 0x5c75b2497f35 in bool testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #10 0x5c75b2486bf5 in testing::UnitTest::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:5631:10
+    #11 0x5c75b2460160 in RUN_ALL_TESTS() /build/_deps/googletest-src/googletest/include/gtest/gtest.h:2344:73
+    #12 0x5c75b246013c in main /build/_deps/googletest-src/googletest/src/gtest_main.cc:64:10
+    #13 0x7fb12302a600 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:59:16
+    #14 0x7fb12302a717 in __libc_start_main csu/../csu/libc-start.c:360:3
+    #15 0x5c75b1bb3494 in _start (/build/tests/unit/sampling/test_sampling+0x5f8494) (BuildId: a80da575ab2fcf58c17ad9735bc9c36d864d87ce)
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /src/tests/unit/sampling/test_smoke.cpp:42:80 in PlantedSan_HeapOverflow_Test::TestBody()
+Shadow bytes around the buggy address:
+  0x7bd1221e0e00: fa fa fd fd fa fa fd fa fa fa 00 fa fa fa 00 00
+  0x7bd1221e0e80: fa fa 00 fa fa fa 00 fa fa fa 04 fa fa fa 00 fa
+  0x7bd1221e0f00: fa fa fd fa fa fa fd fa fa fa 00 fa fa fa fd fd
+  0x7bd1221e0f80: fa fa fd fa fa fa 00 fa fa fa 00 00 fa fa 00 fa
+  0x7bd1221e1000: fa fa 00 fa fa fa 04 fa fa fa fd fd fa fa 00 fa
+=&gt;0x7bd1221e1080: fa fa 00 00 fa fa 00 00[fa]fa fa fa fa fa fa fa
+  0x7bd1221e1100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7bd1221e1180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7bd1221e1200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7bd1221e1280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7bd1221e1300: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==2050589==ABORTING
+</system-out>
+	</testcase>
+	<testcase name="PlantedSan.SignedOverflow" classname="PlantedSan.SignedOverflow" time="0.219407" status="fail">
+		<failure message="Failed"/>
+		<properties/>
+		<system-out>Running main() from /build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = PlantedSan.SignedOverflow
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from PlantedSan
+[ RUN      ] PlantedSan.SignedOverflow
+/src/tests/unit/sampling/test_smoke.cpp:43:84: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+    #0 0x574498a407fe in PlantedSan_SignedOverflow_Test::TestBody() /src/tests/unit/sampling/test_smoke.cpp:43:84
+    #1 0x5744992514e3 in void testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #2 0x574499235c65 in void testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #3 0x574499214e96 in testing::Test::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2773:5
+    #4 0x5744992158ee in testing::TestInfo::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2919:11
+    #5 0x574499216149 in testing::TestSuite::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:3097:30
+    #6 0x574499227313 in testing::internal::UnitTestImpl::RunAllTests() /build/_deps/googletest-src/googletest/src/gtest.cc:6090:44
+    #7 0x574499253573 in bool testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #8 0x574499237f35 in bool testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #9 0x574499226bf5 in testing::UnitTest::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:5631:10
+    #10 0x574499200160 in RUN_ALL_TESTS() /build/_deps/googletest-src/googletest/include/gtest/gtest.h:2344:73
+    #11 0x57449920013c in main /build/_deps/googletest-src/googletest/src/gtest_main.cc:64:10
+    #12 0x7f359a62a600 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:59:16
+    #13 0x7f359a62a717 in __libc_start_main csu/../csu/libc-start.c:360:3
+    #14 0x574498953494 in _start (/build/tests/unit/sampling/test_sampling+0x5f8494) (BuildId: a80da575ab2fcf58c17ad9735bc9c36d864d87ce)
+
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/tests/unit/sampling/test_smoke.cpp:43:84 
+</system-out>
+	</testcase>
+	<testcase name="PlantedSan.Leak" classname="PlantedSan.Leak" time="0.236403" status="fail">
+		<failure message="Failed"/>
+		<properties/>
+		<system-out>Running main() from /build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = PlantedSan.Leak
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from PlantedSan
+[ RUN      ] PlantedSan.Leak
+[       OK ] PlantedSan.Leak (0 ms)
+[----------] 1 test from PlantedSan (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+
+=================================================================
+==2050591==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 12 byte(s) in 1 object(s) allocated from:
+    #0 0x5eed67f06d81 in operator new[](unsigned long) (/build/tests/unit/sampling/test_sampling+0x6e1d81) (BuildId: a80da575ab2fcf58c17ad9735bc9c36d864d87ce)
+    #1 0x5eed67f0a855 in PlantedSan_Leak_Test::TestBody() /src/tests/unit/sampling/test_smoke.cpp:44:44
+    #2 0x5eed6871b4e3 in void testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #3 0x5eed686ffc65 in void testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::Test, void&gt;(testing::Test*, void (testing::Test::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #4 0x5eed686dee96 in testing::Test::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2773:5
+    #5 0x5eed686df8ee in testing::TestInfo::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:2919:11
+    #6 0x5eed686e0149 in testing::TestSuite::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:3097:30
+    #7 0x5eed686f1313 in testing::internal::UnitTestImpl::RunAllTests() /build/_deps/googletest-src/googletest/src/gtest.cc:6090:44
+    #8 0x5eed6871d573 in bool testing::internal::HandleSehExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2698:10
+    #9 0x5eed68701f35 in bool testing::internal::HandleExceptionsInMethodIfSupported&lt;testing::internal::UnitTestImpl, bool&gt;(testing::internal::UnitTestImpl*, bool (testing::internal::UnitTestImpl::*)(), char const*) /build/_deps/googletest-src/googletest/src/gtest.cc:2734:14
+    #10 0x5eed686f0bf5 in testing::UnitTest::Run() /build/_deps/googletest-src/googletest/src/gtest.cc:5631:10
+    #11 0x5eed686ca160 in RUN_ALL_TESTS() /build/_deps/googletest-src/googletest/include/gtest/gtest.h:2344:73
+    #12 0x5eed686ca13c in main /build/_deps/googletest-src/googletest/src/gtest_main.cc:64:10
+    #13 0x7752a522a600 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:59:16
+    #14 0x7752a522a717 in __libc_start_main csu/../csu/libc-start.c:360:3
+    #15 0x5eed67e1d494 in _start (/build/tests/unit/sampling/test_sampling+0x5f8494) (BuildId: a80da575ab2fcf58c17ad9735bc9c36d864d87ce)
+
+SUMMARY: AddressSanitizer: 12 byte(s) leaked in 1 allocation(s).
+</system-out>
+	</testcase>
+</testsuite>

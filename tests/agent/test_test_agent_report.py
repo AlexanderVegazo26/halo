@@ -122,6 +122,83 @@ class ReportFromCtestOutput(unittest.TestCase):
         self.assertIn("FAIL (no tests ran)", summary)
 
 
+class ReportFromSanitizerBuild(unittest.TestCase):
+    """Fixtures: real ctest output from the ASan+UBSan build (-DHALO_ENABLE_ASAN=ON, Debug,
+    UBSAN_OPTIONS=halt_on_error=1) over three injected tests: a heap overflow, a signed
+    overflow and a leak; checkout path rewritten to /src, build dir to /build."""
+
+    LINES = [
+        "TEST(PlantedSan, HeapOverflow) { volatile int n = 4; int* p = new int[n]; p[n] = 1; delete[] p; }",
+        "TEST(PlantedSan, SignedOverflow) { volatile int a = 2147483647; volatile int b = a + 1; (void)b; }",
+        "TEST(PlantedSan, Leak) { volatile int* p = new int[3]; p[0] = 1; p = nullptr; }",
+    ]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        src = self.root / "src" / "tests" / "unit" / "sampling" / "test_smoke.cpp"
+        src.parent.mkdir(parents=True)
+        src.write_text("\n" * 41 + "\n".join(self.LINES) + "\n")  # the injected tests sat at lines 42-44
+        for name in ("ctest-junit-sanitizers.xml", "ctest-tests-sanitizers.json"):
+            text = (FIXTURES / name).read_text().replace("/src/", f"{self.root / 'src'}/")
+            (self.root / name).write_text(text)
+        self.report = self.root / "report"
+        code = rep.main(["--report-dir", str(self.report), "--build-dir", "/build",
+                         "--source-root", str(self.root / "src"),
+                         "--junit", str(self.root / "ctest-junit-sanitizers.xml"),
+                         "--tests-json", str(self.root / "ctest-tests-sanitizers.json"), "--exit-code", "8"])
+        self.assertEqual(code, 1, "sanitizer failures must fail the run")
+        self.summary = (self.report / "summary.md").read_text()
+        self.results = json.loads((self.report / "results.json").read_text())
+
+    def section(self, test: str) -> str:
+        start = self.summary.find(f"## FAILED {test} ")
+        self.assertNotEqual(start, -1, f"summary.md has no section for {test}:\n{self.summary}")
+        end = self.summary.find("\n## ", start + 1)
+        return self.summary[start:end if end != -1 else None]
+
+    def test_asan_names_the_bug_kind_and_the_access_and_allocation_sites(self):
+        s = self.section("PlantedSan.HeapOverflow")
+        self.assertIn("**AddressSanitizer: heap-buffer-overflow**", s, s)
+        self.assertIn("- WRITE of size 4 at 0x7bd1221e10c0 thread T0: `tests/unit/sampling/test_smoke.cpp:42` in "
+                      "`PlantedSan_HeapOverflow_Test::TestBody()`: `" + self.LINES[0] + "`", s, s)
+        self.assertIn("- allocated by thread T0 here: `tests/unit/sampling/test_smoke.cpp:42`", s, s)
+        self.assertIn("first in-repo frame", s, f"sanitizer hint missing:\n{s}")
+
+    def test_asan_excerpt_keeps_the_error_line_and_drops_shadow_bytes_and_foreign_frames(self):
+        s = self.section("PlantedSan.HeapOverflow")
+        self.assertIn("ERROR: AddressSanitizer: heap-buffer-overflow on address", s,
+                      f"the excerpt must start at the error line, not the end of the shadow dump:\n{s}")
+        self.assertIn("SUMMARY: AddressSanitizer: heap-buffer-overflow", s, s)
+        for noise in ("Shadow byte legend", "Heap left redzone", "testing::internal::", "_deps/googletest"):
+            self.assertNotIn(noise, s, f"{noise!r} is noise in the excerpt:\n{s}")
+
+    def test_ubsan_points_at_the_offending_line(self):
+        s = self.section("PlantedSan.SignedOverflow")
+        self.assertIn("**UndefinedBehaviorSanitizer: signed integer overflow: 2147483647 + 1 cannot be represented "
+                      "in type 'int'**", s, s)
+        self.assertIn("- at `tests/unit/sampling/test_smoke.cpp:43` in `PlantedSan_SignedOverflow_Test::TestBody()`: `"
+                      + self.LINES[1] + "`", s, s)
+
+    def test_leak_points_at_the_allocation(self):
+        s = self.section("PlantedSan.Leak")
+        self.assertIn("**LeakSanitizer: detected memory leaks**", s, s)
+        self.assertIn("- Direct leak of 12 byte(s) in 1 object(s) allocated from: "
+                      "`tests/unit/sampling/test_smoke.cpp:44`", s, s)
+
+    def test_findings_are_in_results_json(self):
+        by_name = {t["name"]: t for t in self.results["tests"]}
+        heap = by_name["PlantedSan.HeapOverflow"]["sanitizer"]
+        self.assertEqual([f["kind"] for f in heap], ["AddressSanitizer: heap-buffer-overflow"], heap)
+        self.assertEqual([(fr["file"], fr["line"]) for fr in heap[0]["frames"]],
+                         [("tests/unit/sampling/test_smoke.cpp", 42)] * 2, heap)
+
+    def test_plain_failures_have_no_sanitizer_findings(self):
+        out = "[ RUN      ] A.B\n/src/x.cpp:3: Failure\nExpected equality\n[  FAILED  ] A.B (0 ms)\n"
+        self.assertEqual(rep.parse_sanitizer_output(out, Path("/src"))[0], [])
+
+
 class ReportFromBuildFailure(unittest.TestCase):
     def test_compiler_and_linker_errors_are_listed_with_file_line(self):
         with tempfile.TemporaryDirectory() as tmp:

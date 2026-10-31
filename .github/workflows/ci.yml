@@ -43,3 +43,35 @@ jobs:
           path: .test-report/
           include-hidden-files: true  # .test-report is a dot dir: skipped by default
           if-no-files-found: ignore
+
+  # AddressSanitizer + UBSan + LeakSanitizer over the same suite (Debug). test-agent sets
+  # UBSAN_OPTIONS=halt_on_error=1, so undefined behaviour fails the test instead of only printing;
+  # the report names the bug kind and the first in-repo frame (access, allocation, leak site).
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      - name: Configure (ASan + UBSan, Debug)
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug -DHALO_ENABLE_ASAN=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+
+      - name: Build and test under sanitizers
+        run: scripts/test-agent --build-dir=build-asan --report-dir=.test-report-asan
+
+      - name: Upload sanitizer test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-asan
+          path: .test-report-asan/
+          include-hidden-files: true
+          if-no-files-found: ignore

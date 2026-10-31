@@ -68,6 +68,10 @@ scripts/build.sh -DHALO_BUILD_HIP=ON   # also compile the HIP backend (needs ROC
 and runs the suite like CI does, then writes `.test-report/summary.md`: each failure with its
 `file:line`, the GoogleTest expected-vs-actual message, and the command that reruns only that
 test (plus `results.json`, `junit.xml` and the full `run.log`). CI uploads it as `test-report`.
+CI also runs the suite under ASan + UBSan + LSan (`sanitizers` job, report `test-report-asan`);
+locally, configure `build-asan` with `-DHALO_ENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug` and run
+`scripts/test-agent --build-dir=build-asan`. A sanitizer failure is reported with its kind and
+the first in-repo frame of each stack (the access, the allocation, the leak).
 
 `-DHALO_ONLY="model;sampling;api"` (a semicolon list of module/backend/test-directory names)
 builds only the named subset — useful when iterating on one part of the tree without paying

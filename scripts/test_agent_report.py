@@ -29,6 +29,13 @@ _GTEST_LOC = re.compile(r"^(?P<file>[^\s:][^:]*):(?P<line>\d+): (?P<kind>Failure
 _COMPILER_ERR = re.compile(r"^(?P<file>[^\s:][^:]*):(?P<line>\d+):(?:\d+:)? (?:fatal )?error: (?P<msg>.*)$")
 _LINKER_ERR = re.compile(r"(undefined reference to|ld(?:\.lld)?: error:|collect2: error:)")
 _GTEST_END = re.compile(r"^\[ {2}(FAILED|SKIPPED|  OK  ) {1,2}\] ")
+# Sanitizer reports (the HALO_ENABLE_ASAN build): "==123==ERROR: AddressSanitizer: heap-buffer-overflow
+# on address ...", UBSan's "file:line:col: runtime error: ...", and stack frames
+# "    #0 0x55 in func /path/file.cpp:42:7".
+_SAN_ERROR = re.compile(r"^==\d+==ERROR: (?P<tool>\w+Sanitizer): (?P<what>.*)$")
+_UBSAN = re.compile(r"^(?P<file>[^\s:][^:]*):(?P<line>\d+):\d+: runtime error: (?P<what>.*)$")
+_FRAME = re.compile(r"^\s+#\d+ 0x[0-9a-f]+ in (?P<func>.+?) (?P<file>/[^\s:]+):(?P<line>\d+)(?::\d+)?$")
+_SAN_END = re.compile(r"^(SUMMARY: \w+Sanitizer|Shadow bytes around|==\d+==ABORTING)")
 
 # ctest's <failure message=...> for a test that never reported a gtest failure.
 _CRASH_HINT = {
@@ -37,6 +44,9 @@ _CRASH_HINT = {
     "Subprocess aborted": "the process aborted (assert/abort/uncaught exception)",
     "Exception": "the process died on a signal",
 }
+_SANITIZER_HINT = ("a sanitizer stopped the test: fix the memory/UB bug at the first in-repo frame below "
+                   "(the report is from the ASan+UBSan build, `-DHALO_ENABLE_ASAN=ON`; rerun with the "
+                   "same build dir)")
 
 
 @dataclass
@@ -48,6 +58,21 @@ class Assertion:
 
 
 @dataclass
+class Frame:
+    label: str  # the report line the frame belongs to: "WRITE of size 4 ...", "allocated by thread T0 here:"
+    func: str
+    file: str
+    line: int
+    source: str | None
+
+
+@dataclass
+class SanitizerFinding:
+    kind: str  # "AddressSanitizer: heap-buffer-overflow", "UndefinedBehaviorSanitizer: signed integer overflow ..."
+    frames: list[Frame] = field(default_factory=list)
+
+
+@dataclass
 class TestResult:
     name: str
     status: str  # passed | failed | skipped
@@ -55,6 +80,7 @@ class TestResult:
     time_s: float = 0.0
     defined_at: str | None = None
     assertions: list[Assertion] = field(default_factory=list)
+    sanitizer: list[SanitizerFinding] = field(default_factory=list)
     skip_reason: str = ""
     output_tail: str = ""
     rerun: list[str] = field(default_factory=list)
@@ -104,6 +130,60 @@ def parse_gtest_output(text: str, source_root: Path) -> tuple[list[Assertion], s
     return assertions, skip_reason
 
 
+def _in_repo(source_root: Path, file: str) -> bool:
+    """Our code, not the toolchain's or a FetchContent dependency (build/_deps lives under the root)."""
+    rel = _relative(source_root, file)
+    return not Path(rel).is_absolute() and "_deps" not in Path(rel).parts
+
+
+def parse_sanitizer_output(text: str, source_root: Path) -> tuple[list[SanitizerFinding], str]:
+    """Sanitizer findings with the first in-repo frame of each stack, and the report text minus
+    the shadow-byte dump (which is all a fixed-size output tail would otherwise show)."""
+    findings: list[SanitizerFinding] = []
+    report: list[str] = []
+    current: SanitizerFinding | None = None
+    label = ""
+    labelled: set[str] = set()  # one frame per stack: the first in-repo one
+    in_report = skipping = False
+    for raw in text.splitlines():
+        m = _SAN_ERROR.match(raw)
+        u = _UBSAN.match(raw)
+        if m or u:
+            if m:
+                kind = f"{m['tool']}: {m['what'].split(' on address ')[0].strip()}"
+            else:
+                kind = f"UndefinedBehaviorSanitizer: {u['what'].strip()}"
+            current = SanitizerFinding(kind)
+            findings.append(current)
+            label, labelled, in_report, skipping = (kind if u else ""), set(), True, False
+            report.append(raw)
+            continue
+        if not in_report:
+            continue
+        if raw.startswith("Shadow bytes around"):
+            skipping = True
+        if _SAN_END.match(raw) and raw.startswith("SUMMARY"):
+            skipping = False
+        f = _FRAME.match(raw)
+        if not skipping:
+            if f and not _in_repo(source_root, f["file"]) or raw.lstrip().startswith("#") and not f:
+                # toolchain/gtest/libc frames: one marker per run of them instead of 10+ lines
+                if not report or report[-1] != "    ...":
+                    report.append("    ...")
+            else:
+                report.append(raw)
+        if f and current is not None:
+            if label not in labelled and _in_repo(source_root, f["file"]):
+                labelled.add(label)
+                rel = _relative(source_root, f["file"])
+                line = int(f["line"])
+                current.frames.append(Frame(label or current.kind, f["func"], rel, line,
+                                            _source_line(source_root, rel, line)))
+        elif raw.strip() and not raw.startswith((" ", "==", "SUMMARY", "Shadow", "=>")) and not skipping:
+            label = raw.strip().rstrip(":")
+    return findings, "\n".join(report)
+
+
 def _tail(text: str, n: int = 30) -> str:
     keep = [l for l in text.splitlines() if not l.startswith(("Running main() from", "Note: Google Test filter"))]
     return "\n".join(keep[-n:])
@@ -150,7 +230,10 @@ def parse_junit(junit: Path, listing: dict[str, dict], source_root: Path, build_
             r.rerun = [f"ctest --test-dir {shlex.quote(build_dir)} -R {shlex.quote(_ctest_regex(name))} --output-on-failure"]
             if info.get("command"):
                 r.rerun.append(shlex.join(info["command"]))
-            if not r.assertions:
+            r.sanitizer, san_report = parse_sanitizer_output(out, source_root)
+            if r.sanitizer:
+                r.output_tail = _tail(san_report, 40)
+            elif not r.assertions:
                 r.output_tail = _tail(out)
         results.append(r)
     return results
@@ -214,9 +297,16 @@ def render(results: list[TestResult], build_errors: list[dict] | None, exit_code
         out += [f"## FAILED {r.name} ({r.reason})", ""]
         if r.defined_at:
             out.append(f"- defined at `{r.defined_at}`")
-        hint = _CRASH_HINT.get(r.reason)
+        hint = _SANITIZER_HINT if r.sanitizer else _CRASH_HINT.get(r.reason)
         if hint:
             out.append(f"- {hint}")
+        for sf in r.sanitizer:
+            out.append(f"- **{sf.kind}**")
+            if not sf.frames:
+                out.append("  - no frame in this repo's sources: read the report below")
+            for fr in sf.frames:
+                where = f"`{fr.file}:{fr.line}` in `{fr.func}`" + (f": `{fr.source}`" if fr.source else "")
+                out.append(f"  - {fr.label}: {where}" if fr.label != sf.kind else f"  - at {where}")
         for a in r.assertions:
             out.append(f"- assertion at `{a.file}:{a.line}`" + (f": `{a.source}`" if a.source else ""))
             if a.message:

@@ -1,0 +1,86 @@
+{
+ "backtraceGraph": {
+  "commands": [],
+  "files": [],
+  "nodes": []
+ },
+ "kind": "ctestInfo",
+ "tests": [
+  {
+   "command": [
+    "/build/tests/unit/sampling/test_sampling",
+    "--gtest_filter=PlantedSan.HeapOverflow",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "name": "PlantedSan.HeapOverflow",
+   "properties": [
+    {
+     "name": "SKIP_REGULAR_EXPRESSION",
+     "value": [
+      "\\[  SKIPPED \\]"
+     ]
+    },
+    {
+     "name": "WORKING_DIRECTORY",
+     "value": "/build/tests/unit/sampling"
+    },
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/sampling/test_smoke.cpp:42"
+    }
+   ]
+  },
+  {
+   "command": [
+    "/build/tests/unit/sampling/test_sampling",
+    "--gtest_filter=PlantedSan.SignedOverflow",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "name": "PlantedSan.SignedOverflow",
+   "properties": [
+    {
+     "name": "SKIP_REGULAR_EXPRESSION",
+     "value": [
+      "\\[  SKIPPED \\]"
+     ]
+    },
+    {
+     "name": "WORKING_DIRECTORY",
+     "value": "/build/tests/unit/sampling"
+    },
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/sampling/test_smoke.cpp:43"
+    }
+   ]
+  },
+  {
+   "command": [
+    "/build/tests/unit/sampling/test_sampling",
+    "--gtest_filter=PlantedSan.Leak",
+    "--gtest_also_run_disabled_tests"
+   ],
+   "name": "PlantedSan.Leak",
+   "properties": [
+    {
+     "name": "SKIP_REGULAR_EXPRESSION",
+     "value": [
+      "\\[  SKIPPED \\]"
+     ]
+    },
+    {
+     "name": "WORKING_DIRECTORY",
+     "value": "/build/tests/unit/sampling"
+    },
+    {
+     "name": "DEF_SOURCE_LINE",
+     "value": "/src/tests/unit/sampling/test_smoke.cpp:44"
+    }
+   ]
+  }
+ ],
+ "version": {
+  "major": 1,
+  "minor": 0
+ }
+}
