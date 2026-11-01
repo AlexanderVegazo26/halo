@@ -9,3 +9,18 @@ halo_add_test(test_api
   LIBS halo_api halo_httplib halo_template halo_tokenizer halo_core)
 target_compile_definitions(test_api PRIVATE HALO_API_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 target_include_directories(test_api PRIVATE ${PROJECT_SOURCE_DIR}/src/api)  # conn_guard.h (ConnectionGuard unit tests)
+
+# k6 load layer (load/README.md): the real ApiServer over the FakeEngine as a standalone process,
+# driven by k6. The blocking smoke runs in ctest (and so in scripts/test-agent and both CI jobs);
+# it reports SKIPPED, not passed, where k6 is not installed.
+add_executable(halo_load_server load_server.cpp fake_engine.cpp)
+target_link_libraries(halo_load_server PRIVATE halo_api halo_httplib halo_template halo_tokenizer halo_core halo_warnings)
+target_include_directories(halo_load_server PRIVATE ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(halo_load_server PRIVATE HALO_REF_DIR="${HALO_REF_DIR}")
+if(Python3_Interpreter_FOUND)
+  add_test(NAME load_smoke
+           COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/load/run.py
+                   --server $<TARGET_FILE:halo_load_server> ${PROJECT_SOURCE_DIR}/load/smoke.js)
+  set_tests_properties(load_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 LABELS load
+                                             RESOURCE_LOCK load_smoke)
+endif()

@@ -47,6 +47,7 @@ actually route a request through (see "Where the GPU work stands" below).
 | `include/halo/`, `src/` | tensor/dtype handling, the GGUF model loader, tokenizer, chat template engine, hardware discovery, the memory planner, paged KV cache, DeltaNet state, the `models::Qwen35` forward graph, speculative decoding, sampling, the runtime `Engine`, the HTTP API, benchmarking/profiling, the autotuner |
 | `backends/cpu`, `backends/vulkan`, `backends/hip` | the operator backends behind the `Backend` interface |
 | `tools/halo` | the `halo` CLI — `inspect`, `devices`, `tokenize`, `template`, `run`, `serve`, `bench`, `tune` (`docs/cli.md`) |
+| `load/` | k6 load tests of the HTTP API against a local test server (`load/README.md`) |
 | `tests/unit` | GoogleTest suites, mostly differential: every backend and every quantization path is checked against the CPU reference or an independent transformers golden |
 | `scripts/` | build scripts, the EVO-X2 field-kit packager, and the pinned llama.cpp reference build |
 | `docs/` | the product/technical specs, engineering decisions, architecture decision records, security hardening notes, and per-subsystem references |
@@ -72,6 +73,10 @@ CI also runs the suite under ASan + UBSan + LSan (`sanitizers` job, report `test
 locally, configure `build-asan` with `-DHALO_ENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug` and run
 `scripts/test-agent --build-dir=build-asan`. A sanitizer failure is reported with its kind and
 the first in-repo frame of each stack (the access, the allocation, the leak).
+
+The suite includes a k6 load smoke (`load_smoke`: `load/smoke.js` against `halo_load_server`,
+the real HTTP API over a scripted fake engine, ~20 s; skipped where `k6` is not installed). The
+heavier ramp/soak/spike run is opt-in, see `load/README.md`.
 
 `-DHALO_ONLY="model;sampling;api"` (a semicolon list of module/backend/test-directory names)
 builds only the named subset — useful when iterating on one part of the tree without paying

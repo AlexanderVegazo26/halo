@@ -1,6 +1,7 @@
 build/
 .test-report/
 .test-report-asan/
+/load-report/
 /build-asan/
 /build-dev/
 /build-m2/

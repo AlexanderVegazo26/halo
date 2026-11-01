@@ -5,6 +5,7 @@
 #   .test-report/results.json machine-readable verdict, counts, failures/skips
 #   .test-report/junit.xml    ctest's JUnit output
 #   .test-report/run.log      full build + ctest output
+#   .test-report/load/        k6 summary JSON of the load smoke (ctest load_smoke, load/README.md)
 #
 #   scripts/test-agent [--build-dir=DIR] [--report-dir=DIR] [--no-build] [-- extra ctest args, e.g. -R '^Sampling']
 #
@@ -42,6 +43,9 @@ REPORT="$(cd "$REPORT" && pwd)"  # ctest resolves --output-junit against the bui
 # Only our own files: --report-dir may point at a directory that holds other things.
 rm -f "$REPORT"/{summary.md,results.json,junit.xml,tests.json,run.log}
 LOG="$REPORT/run.log"
+# ctest load_smoke (load/run.py) writes k6's end-of-test summary JSON here.
+export HALO_LOAD_REPORT_DIR="$REPORT/load"
+rm -rf "$HALO_LOAD_REPORT_DIR"
 REPORTER=(python3 "$SRC/scripts/test_agent_report.py" --report-dir "$REPORT" --build-dir "$BUILD" --source-root "$SRC")
 
 if ((DO_BUILD)); then

@@ -23,6 +23,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
 
+      # k6 for the ctest load smoke (load/smoke.js against halo_load_server); without it the
+      # test reports SKIPPED instead of running.
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: '2.3.0'
+
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
@@ -56,6 +63,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      # k6 for the ctest load smoke (load/smoke.js against halo_load_server); without it the
+      # test reports SKIPPED instead of running.
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: '2.3.0'
 
       - name: Configure (ASan + UBSan, Debug)
         run: |
