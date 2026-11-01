@@ -5,6 +5,13 @@
 
 #include <thread>
 
+#if defined(__linux__)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
+
 #include "api_test_util.h"
 
 namespace halo::test {
@@ -111,6 +118,54 @@ TEST(ApiServer, HealthModelsMetrics) {
           "halo_api_queued_requests 0"}) {
         EXPECT_NE(x->body.find(needle), std::string::npos) << needle << "\n" << x->body;
     }
+}
+
+// Every reply is written in several small send() calls (headers, then each SSE event). With
+// Nagle on, a write that follows an unacknowledged one waits for the client's delayed ACK, so
+// every streamed reply on a keep-alive connection (not the first) stalled ~40 ms on Linux.
+// The accepted socket must have TCP_NODELAY set. The server runs in this process, so its
+// side of the connection is found in /proc/self/fd and its socket option read directly.
+TEST(ApiServer, AcceptedConnectionsDisableNagleSoStreamsDoNotStall) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "needs /proc/self/fd to find the server's accepted socket";
+#else
+    TestServer ts;
+    httplib::Client c("127.0.0.1", ts.port);
+    c.set_connection_timeout(std::chrono::seconds(5));
+    c.set_read_timeout(std::chrono::seconds(20));
+    c.set_keep_alive(true);  // keeps the server's accepted socket open after the reply
+    auto h = c.Get("/health");
+    ASSERT_TRUE(h) << httplib::to_string(h.error());
+    ASSERT_EQ(h->status, 200);
+
+    int checked = 0;
+    std::vector<int> nagle_on;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+        int fd = -1;
+        try {
+            fd = std::stoi(entry.path().filename().string());
+        } catch (const std::exception&) {
+            continue;
+        }
+        sockaddr_storage local{};
+        sockaddr_storage peer{};
+        socklen_t ll = sizeof(local);
+        socklen_t pl = sizeof(peer);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &ll) != 0 || local.ss_family != AF_INET) continue;
+        if (ntohs(reinterpret_cast<const sockaddr_in*>(&local)->sin_port) != ts.port) continue;
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &pl) != 0) continue;  // the listening socket
+        int on = 0;
+        socklen_t ol = sizeof(on);
+        ASSERT_EQ(::getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, &ol), 0) << "getsockopt(TCP_NODELAY) on fd " << fd;
+        ++checked;
+        if (on == 0) nagle_on.push_back(fd);
+    }
+    ASSERT_GE(checked, 1) << "no accepted socket on local port " << ts.port
+                          << " found in /proc/self/fd while a keep-alive client was connected";
+    EXPECT_TRUE(nagle_on.empty()) << nagle_on.size() << " of " << checked << " accepted socket(s) on port " << ts.port
+                                  << " have TCP_NODELAY off (Nagle on): streamed replies stall ~40 ms per request;"
+                                  << " expected svr.set_tcp_nodelay(true) in ApiServer setup()";
+#endif
 }
 
 TEST(ApiServer, ServedModelNameOverride) {

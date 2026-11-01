@@ -845,6 +845,10 @@ struct ApiServer::Impl {
         svr.set_write_timeout(cfg.write_timeout);
         svr.set_keep_alive_max_count(100);
         svr.set_keep_alive_timeout(cfg.keep_alive_timeout);
+        // Replies go out in several small writes (headers, then each SSE event); with Nagle on,
+        // a write behind an unacknowledged one waits for the client's delayed ACK (~40 ms per
+        // streamed reply on a keep-alive connection). Token streaming wants every event sent now.
+        svr.set_tcp_nodelay(true);
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
             guard.headers_done(req.remote_addr, req.remote_port);  // S-13: header deadline met
