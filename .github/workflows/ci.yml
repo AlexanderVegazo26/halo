@@ -11,6 +11,9 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 7 * * 1' # weekly, Monday 07:30 UTC
 
 jobs:
   build-and-test:
