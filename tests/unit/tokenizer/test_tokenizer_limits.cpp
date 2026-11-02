@@ -27,7 +27,7 @@
 #include "tokenizer/unicode.h"
 
 #if defined(__has_feature)
-#if __has_feature(address_sanitizer)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)  // ASan/UBSan and TSan builds
 #define HALO_LIMITS_TEST_ASAN 1
 #endif
 #endif

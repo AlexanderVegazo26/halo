@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions (HALO_ENABLE_TSAN builds; scripts/test-agent passes this file).
+# Keep it to reviewed false positives, one comment each; a real race must be fixed, not listed.
+
+# ConnectionGuard::scan() deliberately probes the descriptors it finds in /proc/self/fd
+# (fstat, getsockopt, ioctl, recv MSG_PEEK) that the accept thread created. The kernel
+# serializes those calls on the file description; TSan only sees an accept4() write and a
+# later fstat() read of the same fd slot with no happens-before edge between the threads.
+race:halo::api::ConnectionGuard::scan

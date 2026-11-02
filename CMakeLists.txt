@@ -17,6 +17,7 @@ option(HALO_BUILD_HIP        "Build the HIP backend (needs ROCm)"    OFF)
 # not a rejected-for-a-bug default, just an unevaluated one (cpp23-efficiency-review.md §H/§K).
 option(HALO_ENABLE_LTO       "Enable link-time optimization"         OFF)
 option(HALO_ENABLE_ASAN      "Enable AddressSanitizer + UBSan"       OFF)
+option(HALO_ENABLE_TSAN      "Enable ThreadSanitizer (exclusive with ASAN)" OFF)
 option(HALO_NATIVE           "Tune for the build machine CPU"        OFF)
 # CPU target passed as -march=<value> to every HALO target (C, C++ and the host side of HIP).
 # Empty (the default) passes no -march, i.e. the compiler's baseline x86-64; HALO_NATIVE=ON
@@ -51,6 +52,13 @@ if(NOT HALO_WERROR)
 endif()
 include(HaloDeps)
 
+if(HALO_ENABLE_ASAN AND HALO_ENABLE_TSAN)
+  message(FATAL_ERROR "HALO_ENABLE_ASAN and HALO_ENABLE_TSAN cannot be combined: build them in separate directories")
+endif()
+if(HALO_ENABLE_TSAN)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+endif()
 if(HALO_ENABLE_ASAN)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)

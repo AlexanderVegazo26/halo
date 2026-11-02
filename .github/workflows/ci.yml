@@ -92,3 +92,40 @@ jobs:
           path: .test-report-asan/
           include-hidden-files: true
           if-no-files-found: ignore
+
+  # ThreadSanitizer over the whole suite: the API server (httplib workers, ConnectionGuard scanner,
+  # admission), engine/scheduler threads and the template parse thread. Separate build dir because
+  # TSan cannot be combined with ASan. cmake/tsan.supp lists the reviewed false positives.
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: '2.3.0'
+
+      - name: Configure (TSan, Debug)
+        run: |
+          cmake -S . -B build-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug -DHALO_ENABLE_TSAN=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+
+      - name: Build and test under ThreadSanitizer
+        run: scripts/test-agent --build-dir=build-tsan --report-dir=.test-report-tsan
+
+      - name: Upload TSan test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-tsan
+          path: .test-report-tsan/
+          include-hidden-files: true
+          if-no-files-found: ignore

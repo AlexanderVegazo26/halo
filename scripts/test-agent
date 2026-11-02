@@ -12,6 +12,8 @@
 # Sanitizers: configure an ASan+UBSan dir first and point --build-dir at it (CI's sanitizers job):
 #   cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHALO_ENABLE_ASAN=ON \
 #     -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF && scripts/test-agent --build-dir=build-asan
+# ThreadSanitizer (CI's tsan job) is a separate build dir, -DHALO_ENABLE_TSAN=ON (not combinable with ASan);
+# its reviewed false positives are in cmake/tsan.supp, which this script passes as TSAN_OPTIONS.
 # A sanitizer failure is reported with its kind and the first in-repo frame of each stack.
 # A missing build dir is configured CPU-only like CI (clang, Vulkan/HIP off); pass your own
 # cmake flags by configuring it first (scripts/build.sh --no-test). Exit: 0 pass, 1 fail.
@@ -38,6 +40,8 @@ export TZ=UTC LC_ALL=C.UTF-8
 # carries on unless told to halt, which would let undefined behaviour pass. No effect on other builds.
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}"
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1}"
+# TSan: stop on the first race (exit 66 fails the test) and apply the reviewed suppressions.
+export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1:second_deadlock_stack=1:suppressions=$SRC/cmake/tsan.supp}"
 mkdir -p "$REPORT"
 REPORT="$(cd "$REPORT" && pwd)"  # ctest resolves --output-junit against the build dir
 # Only our own files: --report-dir may point at a directory that holds other things.

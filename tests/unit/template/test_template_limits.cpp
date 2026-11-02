@@ -46,8 +46,11 @@ using halo::chat::TemplateLimits;
 namespace {
 
 #if defined(__has_feature)
-#if __has_feature(address_sanitizer)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)  // ASan/UBSan and TSan builds
 #define HALO_TEST_ASAN 1
+#endif
+#if __has_feature(thread_sanitizer)
+#define HALO_TEST_TSAN 1
 #endif
 #endif
 #if defined(HALO_TEST_ASAN)
@@ -437,6 +440,12 @@ TEST_F(TemplateRows, WhitespaceControlIsLinear) {
 }
 
 TEST_F(TemplateRows, LongTokensParseOnTheDedicatedStack) {
+#if defined(HALO_TEST_TSAN)
+    // Recursive std::regex over 60 KB tokens costs more than ctest's 1500 s under TSan's
+    // per-access instrumentation. The row is single-threaded compute (the parse thread is joined
+    // before the render), so TSan has nothing to check in it; ASan and the release build run it.
+    GTEST_SKIP() << "too slow under ThreadSanitizer and nothing for it to check (no shared state)";
+#endif
     // Longest possible single tokens inside the 64 KiB cap: an identifier (\w*) and a
     // `for` variable list, both matched by recursive std::regex. Parsed on the dedicated
     // parse thread, so the 8 MiB worker stack is not used.

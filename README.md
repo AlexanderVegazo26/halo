@@ -62,6 +62,7 @@ pinned SHA-256 hashes — nothing is vendored, nothing is fetched unpinned.
 ```bash
 scripts/build.sh                       # release build + the full test suite
 scripts/build.sh --asan                # ASan/UBSan build + tests
+HALO_BUILD_DIR=~/halo-build-tsan scripts/build.sh -DHALO_ENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug   # ThreadSanitizer
 scripts/build.sh -DHALO_BUILD_HIP=ON   # also compile the HIP backend (needs ROCm)
 ```
 
@@ -73,6 +74,10 @@ CI also runs the suite under ASan + UBSan + LSan (`sanitizers` job, report `test
 locally, configure `build-asan` with `-DHALO_ENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug` and run
 `scripts/test-agent --build-dir=build-asan`. A sanitizer failure is reported with its kind and
 the first in-repo frame of each stack (the access, the allocation, the leak).
+A third CI job (`tsan`, report `test-report-tsan`) runs it under ThreadSanitizer
+(`-DHALO_ENABLE_TSAN=ON`, a separate build dir: TSan and ASan cannot be combined). `scripts/test-agent`
+sets `TSAN_OPTIONS` to stop on the first race and apply `cmake/tsan.supp`, the reviewed false
+positives (one comment each: fix a real race, don't list it).
 
 The suite includes a k6 load smoke (`load_smoke`: `load/smoke.js` against `halo_load_server`,
 the real HTTP API over a scripted fake engine, ~20 s; skipped where `k6` is not installed). The
