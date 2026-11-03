@@ -1,0 +1,8 @@
+I{%- macro render(m) -%}<|im_start|>{{ m.role }}
+{{ m.content | trim }}<|im_end|>
+{% endmacro -%}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for m in messages -%}{%- if m.role == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}{%- endfor -%}
+{%- for m in messages -%}{{ render(m) }}{%- if loop.index0 == ns.last_user and not loop.last %}<!-- last user -->{% endif -%}{%- endfor -%}
+{%- if add_generation_prompt %}<|im_start|>assistant
+{% endif -%}

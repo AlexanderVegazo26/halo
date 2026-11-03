@@ -1,0 +1,8 @@
+C{{ bos_token }}{%- if tools is defined and tools %}{{ tools | map(attribute='function') | map(attribute='name') | join(', ') | upper }}
+{{ tools[0] | tojson(indent=2) }}
+{%- endif %}
+{%- for m in messages | selectattr('role', 'equalto', 'user') -%}
+<|im_start|>user
+{{ m.content.replace('Paris', 'P') }}{{ (m.content | length) ~ '/' ~ (m.content.split(' ') | length) }}<|im_end|>
+{% endfor -%}
+{{ messages[-1].content[:5] }}{{ messages | length }}{{ eos_token }}

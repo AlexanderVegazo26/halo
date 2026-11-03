@@ -1,0 +1,1 @@
+A{%- if messages[0].role != 'user' -%}{{ raise_exception('Conversation must start with a user message.') }}{%- endif -%}ok

@@ -1,0 +1,5 @@
+A{%- for i in range(3) %}{{ i }},{% endfor -%}
+{{ strftime_now('%Y-%m-%d') }}
+{%- if foo is undefined %} no-foo{% endif %}
+{%- set d = {'a': 1, 'b': [1, 2, 3]} %}{% for k, v in d | items %} {{ k }}={{ v }}{% endfor %}
+{{- '%s-%d' | format('x', 2) if false else 'y' }}

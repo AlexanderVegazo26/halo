@@ -41,6 +41,7 @@ endfunction()
 
 halo_add_fuzzer(gguf SOURCES fuzz_gguf.cpp LIBS halo_model)
 halo_add_fuzzer(output_parser SOURCES fuzz_output_parser.cpp LIBS halo_template)
+halo_add_fuzzer(chat_template SOURCES fuzz_chat_template.cpp LIBS halo_template)
 if(TARGET halo_api)
   halo_add_fuzzer(api_request
     SOURCES fuzz_api_request.cpp ${PROJECT_SOURCE_DIR}/tests/unit/api/fake_engine.cpp

@@ -152,7 +152,7 @@ jobs:
             -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
 
       - name: Build the fuzz targets
-        run: cmake --build build-fuzz --target fuzz_gguf fuzz_api_request fuzz_output_parser
+        run: cmake --build build-fuzz --target fuzz_gguf fuzz_api_request fuzz_output_parser fuzz_chat_template
 
       - name: Fuzz (seed replay + fixed-seed campaigns)
         run: scripts/test-agent --build-dir=build-fuzz --report-dir=.test-report-fuzz --no-build -- -L fuzz

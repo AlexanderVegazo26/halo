@@ -1,0 +1,3 @@
+O{%- for m in messages %}{%- if m.tool_calls is defined %}{%- for tc in m.tool_calls %}<tool_call>{{ tc.function.name }}
+{%- if tc.function.arguments is mapping %}{%- for k, v in tc.function.arguments | items %} {{ k }}={{ v | tojson }}{%- endfor %}{%- else %} {{ tc.function.arguments }}{%- endif %}</tool_call>
+{% endfor %}{%- endif %}{%- if m.reasoning_content is defined %}<think>{{ m.reasoning_content }}</think>{% endif %}{%- endfor %}

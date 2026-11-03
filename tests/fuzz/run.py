@@ -20,8 +20,8 @@ from pathlib import Path
 
 # Per-target smoke budget: a fixed number of executions with a fixed seed, so a run is
 # reproducible (same corpus + same binary = same inputs) and takes seconds, not minutes.
-SMOKE_RUNS = {"fuzz_gguf": 20000, "fuzz_api_request": 20000, "fuzz_output_parser": 100000}
-MAX_LEN = {"fuzz_gguf": 16384, "fuzz_api_request": 8192, "fuzz_output_parser": 4096}
+SMOKE_RUNS = {"fuzz_gguf": 20000, "fuzz_api_request": 20000, "fuzz_output_parser": 100000, "fuzz_chat_template": 20000}
+MAX_LEN = {"fuzz_gguf": 16384, "fuzz_api_request": 8192, "fuzz_output_parser": 4096, "fuzz_chat_template": 4096}
 
 
 def main(argv: list[str] | None = None) -> int:

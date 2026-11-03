@@ -1,0 +1,41 @@
+?{%- if tools %}
+{{- '<|im_start|>system\n# Tools\n' }}
+{%- for t in tools %}
+{{- t | tojson }}
+{{- '\n' }}
+{%- endfor %}
+{{- '<|im_end|>\n' }}
+{%- endif %}
+{%- for m in messages %}
+{%- if m.role == 'assistant' %}
+{{- '<|im_start|>assistant\n' }}
+{%- if m.reasoning_content is defined and m.reasoning_content %}
+{{- '<think>\n' + m.reasoning_content + '\n</think>\n\n' }}
+{%- endif %}
+{{- m.content }}
+{%- if m.tool_calls is defined %}
+{%- for tc in m.tool_calls %}
+{{- '\n<tool_call>\n<function=' + tc.function.name + '>\n' }}
+{%- for k, v in tc.function.arguments | items %}
+{{- '<parameter=' + k + '>\n' }}
+{%- if v is string %}{{- v }}{%- else %}{{- v | tojson }}{%- endif %}
+{{- '\n</parameter>\n' }}
+{%- endfor %}
+{{- '</function>\n</tool_call>' }}
+{%- endfor %}
+{%- endif %}
+{{- '<|im_end|>\n' }}
+{%- elif m.role == 'tool' %}
+{{- '<|im_start|>user\n<tool_response>\n' + m.content + '\n</tool_response><|im_end|>\n' }}
+{%- else %}
+{{- '<|im_start|>' + m.role + '\n' + m.content + '<|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' }}
+{%- if enable_thinking is defined and enable_thinking is false %}
+{{- '<think>\n\n</think>\n\n' }}
+{%- else %}
+{{- '<think>\n' }}
+{%- endif %}
+{%- endif %}
