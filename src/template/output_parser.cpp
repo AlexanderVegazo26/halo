@@ -180,9 +180,12 @@ OrderedJson ParsedMessage::to_openai_json(std::string_view id_prefix) const {
     if (!tool_calls.empty()) {
         OrderedJson calls = OrderedJson::array();
         for (std::size_t i = 0; i < tool_calls.size(); ++i) {
+            // replace: a parameter may hold invalid UTF-8 (byte-level tokens); a strict dump()
+            // would throw type_error 316 here. Invalid bytes become U+FFFD, as in the server.
+            std::string args = tool_calls[i].arguments.dump(-1, ' ', false, OrderedJson::error_handler_t::replace);
             calls.push_back({{"id", std::string(id_prefix) + std::to_string(i)},
                              {"type", "function"},
-                             {"function", {{"name", tool_calls[i].name}, {"arguments", tool_calls[i].arguments.dump()}}}});
+                             {"function", {{"name", tool_calls[i].name}, {"arguments", std::move(args)}}}});
         }
         j["tool_calls"] = std::move(calls);
     }

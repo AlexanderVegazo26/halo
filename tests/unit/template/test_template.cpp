@@ -379,6 +379,21 @@ TEST(OutputParser, UntypedArgumentsParseJsonWithStringFallback) {
     EXPECT_EQ(m.to_openai_json()["content"], nullptr);
 }
 
+TEST(OutputParser, InvalidUtf8InToolArgumentsSerializesInsteadOfThrowing) {
+    // Byte-level tokens can emit a cut or invalid UTF-8 sequence inside a tool parameter (name
+    // or value). to_openai_json() must still produce the arguments string (invalid bytes become
+    // U+FFFD, as the server's own dump does), not throw nlohmann type_error 316. Found by
+    // tests/fuzz/fuzz_output_parser (corpus/output_parser/invalid_utf8_tool_args.bin).
+    const std::string out = "</think><tool_call>\n<function=f>\n<parameter=q\xf6>\nab\xcb\xce\n</parameter>\n"
+                            "</function>\n</tool_call>";
+    const ParsedMessage m = OutputParser::parse(out);
+    ASSERT_EQ(m.tool_calls.size(), 1u) << "output: " << out;
+    OrderedJson j;
+    ASSERT_NO_THROW(j = m.to_openai_json()) << "invalid UTF-8 in a tool parameter must not throw";
+    EXPECT_EQ(j["tool_calls"][0]["function"]["arguments"], "{\"q\uFFFD\":\"ab\uFFFD\uFFFD\"}")
+        << "arguments: " << j["tool_calls"][0]["function"]["arguments"].dump(-1, ' ', false, OrderedJson::error_handler_t::replace);
+}
+
 TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
     const std::string outputs[] = {
         "Reason A\nmore\n</think>\n\nAnswer with <b>markup</b> and a < sign.",
