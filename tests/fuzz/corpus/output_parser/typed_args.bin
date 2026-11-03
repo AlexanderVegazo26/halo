@@ -1,0 +1,16 @@
+*</think><tool_call>
+<function=f>
+<parameter=s>
+[1, 2]
+</parameter>
+<parameter=n>
+12
+</parameter>
+<parameter=o>
+null
+</parameter>
+<parameter=a>
+[1, {"b": 2}]
+</parameter>
+</function>
+</tool_call>

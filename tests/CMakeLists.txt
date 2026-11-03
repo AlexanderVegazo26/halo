@@ -40,3 +40,9 @@ foreach(d IN LISTS _test_dirs)
     add_subdirectory(${d})
   endif()
 endforeach()
+
+# Fuzz targets: seed-corpus replay in every build, libFuzzer campaigns with HALO_BUILD_FUZZERS.
+halo_selected(fuzz _sel)
+if(_sel)
+  add_subdirectory(fuzz)
+endif()

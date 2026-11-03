@@ -6,6 +6,7 @@
 #   .test-report/junit.xml    ctest's JUnit output
 #   .test-report/run.log      full build + ctest output
 #   .test-report/load/        k6 summary JSON of the load smoke (ctest load_smoke, load/README.md)
+#   .test-report/fuzz/        libFuzzer work corpus + crash reproducers (fuzz_smoke_*, HALO_BUILD_FUZZERS builds)
 #
 #   scripts/test-agent [--build-dir=DIR] [--report-dir=DIR] [--no-build] [-- extra ctest args, e.g. -R '^Sampling']
 #
@@ -14,6 +15,8 @@
 #     -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF && scripts/test-agent --build-dir=build-asan
 # ThreadSanitizer (CI's tsan job) is a separate build dir, -DHALO_ENABLE_TSAN=ON (not combinable with ASan);
 # its reviewed false positives are in cmake/tsan.supp, which this script passes as TSAN_OPTIONS.
+# Fuzzing (CI's fuzz job): -DHALO_BUILD_FUZZERS=ON -DHALO_ENABLE_ASAN=ON, then -- -L fuzz runs the
+# seed replays + fixed-seed libFuzzer smokes (tests/fuzz/README.md).
 # A sanitizer failure is reported with its kind and the first in-repo frame of each stack.
 # A missing build dir is configured CPU-only like CI (clang, Vulkan/HIP off); pass your own
 # cmake flags by configuring it first (scripts/build.sh --no-test). Exit: 0 pass, 1 fail.
@@ -29,7 +32,7 @@ while (($#)); do
     --report-dir=*) REPORT="${1#*=}" ;;
     --no-build) DO_BUILD=0 ;;
     --) shift; CTEST_ARGS=("$@"); break ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "test-agent: unknown argument $1 (ctest args go after --)" >&2; exit 2 ;;
   esac
   shift
@@ -50,6 +53,9 @@ LOG="$REPORT/run.log"
 # ctest load_smoke (load/run.py) writes k6's end-of-test summary JSON here.
 export HALO_LOAD_REPORT_DIR="$REPORT/load"
 rm -rf "$HALO_LOAD_REPORT_DIR"
+# ctest fuzz_smoke_* (tests/fuzz/run.py) writes the libFuzzer corpus and crash reproducers here.
+export HALO_FUZZ_REPORT_DIR="$REPORT/fuzz"
+rm -rf "$HALO_FUZZ_REPORT_DIR"
 REPORTER=(python3 "$SRC/scripts/test_agent_report.py" --report-dir "$REPORT" --build-dir "$BUILD" --source-root "$SRC")
 
 if ((DO_BUILD)); then

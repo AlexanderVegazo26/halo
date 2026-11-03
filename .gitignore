@@ -8,6 +8,9 @@ build/
 .venv/
 __pycache__/
 *.gguf
+!tests/fuzz/corpus/gguf/*.gguf
+/fuzz-out/
+/build-fuzz/
 /scratch/
 .claude/worktrees/
 .claude/settings.local.json

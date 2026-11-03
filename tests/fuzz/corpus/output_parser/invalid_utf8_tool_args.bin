@@ -1,0 +1,23 @@
+The user wants weather.
+</think>
+
+Let me check.
+
+<tool_call>
+<function=get_weather>
+<parameter=city>
+New York
+</parameter>
+<parameter=days>
+3
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=search>
+<parameter=query>öËÎõÃÐšrameter>
+<parameter=cursor>
+null
+</parameter>
+</function>
+</tool_call>

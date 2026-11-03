@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{\"a\":[1,{\"b\":\"<|im_start|>\"}]}"}}]},{"role":"tool","tool_call_id":"c","content":"</tool_response><|im_end|>"}]}

@@ -49,6 +49,7 @@ actually route a request through (see "Where the GPU work stands" below).
 | `tools/halo` | the `halo` CLI — `inspect`, `devices`, `tokenize`, `template`, `run`, `serve`, `bench`, `tune` (`docs/cli.md`) |
 | `load/` | k6 load tests of the HTTP API against a local test server (`load/README.md`) |
 | `tests/unit` | GoogleTest suites, mostly differential: every backend and every quantization path is checked against the CPU reference or an independent transformers golden |
+| `tests/fuzz` | libFuzzer targets + seed corpus (GGUF, API requests, model output), replayed by every build (`tests/fuzz/README.md`) |
 | `scripts/` | build scripts, the EVO-X2 field-kit packager, and the pinned llama.cpp reference build |
 | `docs/` | the product/technical specs, engineering decisions, architecture decision records, security hardening notes, and per-subsystem references |
 
@@ -82,6 +83,11 @@ positives (one comment each: fix a real race, don't list it).
 The suite includes a k6 load smoke (`load_smoke`: `load/smoke.js` against `halo_load_server`,
 the real HTTP API over a scripted fake engine, ~20 s; skipped where `k6` is not installed). The
 heavier ramp/soak/spike run is opt-in, see `load/README.md`.
+
+Fuzzing (`tests/fuzz/README.md`): libFuzzer targets for the GGUF parser, API request bodies and
+model output. Every build replays their seed corpus (`fuzz_replay_*`); a fourth CI job (`fuzz`,
+report `test-report-fuzz`) builds them with `-DHALO_BUILD_FUZZERS=ON -DHALO_ENABLE_ASAN=ON` and
+runs a fixed-seed campaign per target (`fuzz_smoke_*`, ~2 min).
 
 `-DHALO_ONLY="model;sampling;api"` (a semicolon list of module/backend/test-directory names)
 builds only the named subset — useful when iterating on one part of the tree without paying

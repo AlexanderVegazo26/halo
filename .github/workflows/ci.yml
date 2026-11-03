@@ -129,3 +129,39 @@ jobs:
           path: .test-report-tsan/
           include-hidden-files: true
           if-no-files-found: ignore
+
+  # Coverage-guided fuzzing (libFuzzer + ASan/UBSan) of the parsers that take untrusted input: GGUF
+  # files, API request bodies (through render + tokenize) and model output (tests/fuzz/README.md).
+  # Blocking and deterministic: a fixed seed and run count per target over the checked-in corpus.
+  # A finding fails the job; its reproducer is in the uploaded report (fuzz/<target>/artifacts).
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      - name: Configure (libFuzzer + ASan + UBSan)
+        run: |
+          cmake -S . -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHALO_BUILD_FUZZERS=ON -DHALO_ENABLE_ASAN=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+
+      - name: Build the fuzz targets
+        run: cmake --build build-fuzz --target fuzz_gguf fuzz_api_request fuzz_output_parser
+
+      - name: Fuzz (seed replay + fixed-seed campaigns)
+        run: scripts/test-agent --build-dir=build-fuzz --report-dir=.test-report-fuzz --no-build -- -L fuzz
+
+      - name: Upload fuzz report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-fuzz
+          path: .test-report-fuzz/
+          include-hidden-files: true
+          if-no-files-found: ignore

@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":[{"type":"text","text":"<tool_response>x"}]}],"tools":[{"type":"function","function":{"name":"f","description":"<think>","parameters":{"type":"object","properties":{"a":{"type":"string"}}}}}]}

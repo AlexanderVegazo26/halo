@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":"x"}],"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object"}}}}
