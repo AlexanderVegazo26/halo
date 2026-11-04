@@ -9,15 +9,21 @@ set(HALO_REF_DIR "$ENV{HOME}/halo-ref" CACHE PATH "Reference data directory")
 # "gpu" and never run concurrently under `ctest -j`: several GPU processes at once (Vulkan +
 # HIP) wedged a compute ring on gfx1151 and forced a full GPU reset, which also kills the
 # desktop compositor (2026-09-29, MES failed to respond / VRAM lost).
+#
+# PROPERTIES: extra ctest properties for every discovered test (e.g. RUN_SERIAL TRUE LABELS perf).
 function(halo_add_test name)
-  cmake_parse_arguments(T "GPU" "" "SOURCES;LIBS" ${ARGN})
+  cmake_parse_arguments(T "GPU" "" "SOURCES;LIBS;PROPERTIES" ${ARGN})
   add_executable(${name} ${T_SOURCES})
   target_link_libraries(${name} PRIVATE ${T_LIBS} GTest::gtest_main halo_warnings)
   target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(${name} PRIVATE HALO_REF_DIR="${HALO_REF_DIR}"
                                              HALO_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  set(_props ${T_PROPERTIES})
   if(T_GPU)
-    gtest_discover_tests(${name} DISCOVERY_TIMEOUT 60 PROPERTIES RESOURCE_LOCK gpu)
+    list(APPEND _props RESOURCE_LOCK gpu)
+  endif()
+  if(_props)
+    gtest_discover_tests(${name} DISCOVERY_TIMEOUT 60 PROPERTIES ${_props})
   else()
     gtest_discover_tests(${name} DISCOVERY_TIMEOUT 60)
   endif()
