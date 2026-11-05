@@ -509,6 +509,104 @@ TEST(ApiOpenAI, CompletionsRawTextBothModes) {
     EXPECT_EQ(ev.back().at("choices").at(0).at("finish_reason"), "stop");
 }
 
+// The synthetic tokenizer is byte-level, so every multibyte character below reaches the API
+// layer as 2-4 separate tokens: the engine's StreamDecoder, the output parser, the stop matcher
+// and the SSE writer must still only ever send whole characters. A delta that carried half a
+// character would be dumped with U+FFFD replacement (or fail to parse), and the joined text
+// would not match what the model wrote.
+TEST(ApiServer, StreamedMultibyteCharactersArriveWholeOnEveryEndpoint) {
+    const std::string kReasoning = "Pensé… 日本語";
+    const std::string kContent = "Café ☕ naïve 🎉 Ωmega 𝄞 end";
+    const std::string kCity = "Zürich 🌧";
+    const std::string kReplacement = "\xEF\xBF\xBD";
+    // One check per delta string: valid (Json::parse already rejected invalid UTF-8) and no
+    // replacement character, with the endpoint, field and delta index in the message.
+    const auto whole = [&](const std::string& where, std::size_t i, const std::string& delta) {
+        EXPECT_EQ(delta.find(kReplacement), std::string::npos)
+            << where << " delta #" << i << " carried a split character (U+FFFD): \"" << delta << "\"";
+    };
+
+    TestServer ts;
+    const std::string tool_output = kReasoning + "</think>\n\n" + kContent +
+                                    "<tool_call>\n<function=get_weather>\n<parameter=city>\n" + kCity +
+                                    "\n</parameter>\n</function>\n</tool_call>";
+    ts.engine->script = [&](const auto&, int) { return sc(tool_output); };
+
+    {  // OpenAI chat: reasoning_content, content and tool-call arguments.
+        Json b = user_chat("weather?");
+        b["tools"] = weather_tools_openai();
+        b["stream"] = true;
+        const auto s = post_stream(ts, "/v1/chat/completions", b);
+        ASSERT_EQ(s.status, 200) << s.body;
+        bool done = false;
+        const auto ev = data_events(s.body, done);
+        EXPECT_TRUE(done) << s.body;
+        std::string reasoning, content, args;
+        for (std::size_t i = 0; i < ev.size(); ++i) {
+            if (ev[i].at("choices").empty()) continue;
+            const Json& d = ev[i].at("choices").at(0).at("delta");
+            if (d.contains("reasoning_content")) {
+                reasoning += d.at("reasoning_content").get<std::string>();
+                whole("chat reasoning_content", i, d.at("reasoning_content"));
+            }
+            if (d.contains("content") && d.at("content").is_string()) {
+                content += d.at("content").get<std::string>();
+                whole("chat content", i, d.at("content"));
+            }
+            if (d.contains("tool_calls")) {
+                const std::string a = d.at("tool_calls").at(0).at("function").value("arguments", "");
+                args += a;
+                whole("chat tool_calls arguments", i, a);
+            }
+        }
+        EXPECT_EQ(reasoning, kReasoning) << "chat reasoning_content joined";
+        EXPECT_EQ(content, kContent) << "chat content joined";
+        EXPECT_EQ(Json::parse(args), Json({{"city", kCity}})) << "chat tool arguments joined: " << args;
+    }
+
+    {  // Anthropic messages: thinking_delta, text_delta and input_json_delta.
+        Json b = user_messages("weather?");
+        b["tools"] = weather_tools_anthropic();
+        b["stream"] = true;
+        const auto s = post_stream(ts, "/v1/messages", b);
+        ASSERT_EQ(s.status, 200) << s.body;
+        std::string thinking, text, partial;
+        const auto ev = parse_sse(s.body);
+        for (std::size_t i = 0; i < ev.size(); ++i) {
+            if (ev[i].event != "content_block_delta") continue;
+            const Json d = Json::parse(ev[i].data).at("delta");
+            const std::string type = d.at("type");
+            const char* field = type == "thinking_delta" ? "thinking" : type == "text_delta" ? "text" : "partial_json";
+            const std::string piece = d.value(field, "");
+            whole("messages " + type, i, piece);
+            if (type == "thinking_delta") thinking += piece;
+            if (type == "text_delta") text += piece;
+            if (type == "input_json_delta") partial += piece;
+        }
+        EXPECT_EQ(thinking, kReasoning) << "messages thinking joined";
+        EXPECT_EQ(text, kContent) << "messages text joined";
+        EXPECT_EQ(Json::parse(partial), Json({{"city", kCity}})) << "messages input_json joined: " << partial;
+    }
+
+    {  // Raw completions (no output parsing) with a multibyte stop sequence.
+        ts.engine->script = [&](const auto&, int) { return sc(kContent); };
+        const auto s = post_stream(ts, "/v1/completions",
+                                   Json{{"prompt", "x"}, {"stream", true}, {"stop", Json::array({"🎉"})}});
+        ASSERT_EQ(s.status, 200) << s.body;
+        bool done = false;
+        const auto ev = data_events(s.body, done);
+        EXPECT_TRUE(done) << s.body;
+        std::string text;
+        for (std::size_t i = 0; i < ev.size(); ++i) {
+            const std::string t = ev[i].at("choices").at(0).at("text");
+            whole("completions text", i, t);
+            text += t;
+        }
+        EXPECT_EQ(text, "Café ☕ naïve ") << "completions text stops right before the multibyte stop sequence";
+        EXPECT_EQ(ev.back().at("choices").at(0).at("finish_reason"), "stop");
+    }
+}
+
 // ---- Anthropic -----------------------------------------------------------------------------
 
 TEST(ApiAnthropic, MessagesNonStreaming) {
