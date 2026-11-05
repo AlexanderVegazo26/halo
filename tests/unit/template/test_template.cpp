@@ -10,6 +10,8 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "halo/core/error.h"
 #include "halo/template/chat_template.h"
@@ -445,6 +447,103 @@ TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
     EXPECT_EQ(m5.content, "unterminated\n\n<tool_call>\n<function=x>\n<parameter=a>\n1");
     EXPECT_EQ(m5.warnings.size(), 1u);
     EXPECT_EQ(OutputParser::parse(outputs[6], o).content, "unicode ws ✓");
+}
+
+namespace {
+
+// Byte offset of the first ill-formed UTF-8 sequence in `s` (RFC 3629: no overlongs,
+// surrogates or code points past U+10FFFF), or npos when the whole string is well formed.
+std::size_t first_invalid_utf8(std::string_view s) {
+    for (std::size_t i = 0; i < s.size();) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        std::size_t len = 0;
+        unsigned char lo = 0x80, hi = 0xBF;  // allowed range of the second byte
+        if (b0 < 0x80) len = 1;
+        else if (b0 >= 0xC2 && b0 <= 0xDF) len = 2;
+        else if (b0 >= 0xE0 && b0 <= 0xEF) {
+            len = 3;
+            if (b0 == 0xE0) lo = 0xA0;
+            if (b0 == 0xED) hi = 0x9F;
+        } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+            len = 4;
+            if (b0 == 0xF0) lo = 0x90;
+            if (b0 == 0xF4) hi = 0x8F;
+        } else {
+            return i;
+        }
+        if (i + len > s.size()) return i;
+        for (std::size_t k = 1; k < len; ++k) {
+            const auto b = static_cast<unsigned char>(s[i + k]);
+            if (k == 1 ? (b < lo || b > hi) : (b & 0xC0u) != 0x80u) return i;
+        }
+        i += len;
+    }
+    return std::string_view::npos;
+}
+
+std::string hex_bytes(std::string_view s) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    for (const char c : s) {
+        const auto b = static_cast<unsigned char>(c);
+        out.append(out.empty() ? "" : " ").push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0xF]);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(OutputParser, DeltasNeverSplitAMultibyteCharacter) {
+    // The server writes each delta into its own SSE frame, so a delta that ends or starts in the
+    // middle of a character reaches the client as U+FFFD (or breaks its JSON parse). The parser
+    // must hold an incomplete sequence until its last byte arrives, whatever the piece split:
+    // every split point of each text into two pieces, and byte-at-a-time. Covers 2/3/4-byte
+    // characters in reasoning and content, next to the </think> and <tool_call> tags whose
+    // partial prefixes are also held, next to trailing whitespace (held separately), and
+    // U+3000, a multibyte character the parser treats as whitespace.
+    const std::string outputs[] = {
+        "é€😀 reasoning ü\n</think>\n\nAnswer ñ€😀",
+        "ㅤ　思考　\n</think>\n\n　中文 content 　",
+        "</think>😀<tool_call>\n<function=get_weather>\n<parameter=city>\nZürich 😀\n</parameter>\n</function>\n"
+        "</tool_call>\nafter € ✓",
+        "pre ü</think>post 😀 <tool_cal😀l> not a tag ✓",
+    };
+    for (const auto& text : outputs) {
+        ParserOptions o;
+        o.tools = kTools;
+        const ParsedMessage ref = OutputParser::parse(text, o);
+        ASSERT_EQ(first_invalid_utf8(ref.reasoning_content), std::string_view::npos) << text;
+        ASSERT_EQ(first_invalid_utf8(ref.content), std::string_view::npos) << text;
+        std::vector<std::vector<std::string>> splits;
+        for (std::size_t cut = 1; cut < text.size(); ++cut) splits.push_back({text.substr(0, cut), text.substr(cut)});
+        std::vector<std::string> bytes;
+        for (const char c : text) bytes.emplace_back(1, c);
+        splits.push_back(std::move(bytes));
+        for (const auto& pieces : splits) {
+            const std::string where =
+                pieces.size() == 2 ? "split at byte " + std::to_string(pieces[0].size()) : std::string("byte-at-a-time");
+            OutputParser p(o);
+            std::string rs, cs;
+            std::size_t n = 0;
+            const auto check = [&](const std::vector<OutputEvent>& evs) {
+                for (const auto& e : evs) {
+                    ++n;
+                    if (e.kind == OutputEvent::Kind::ToolCall) continue;
+                    const std::size_t bad = first_invalid_utf8(e.text);
+                    EXPECT_EQ(bad, std::string_view::npos)
+                        << where << ": delta #" << n << " is not whole UTF-8 at byte " << bad << " (bytes "
+                        << hex_bytes(e.text) << ") for output: " << text;
+                    (e.kind == OutputEvent::Kind::ReasoningDelta ? rs : cs) += e.text;
+                }
+            };
+            for (const auto& piece : pieces) check(p.feed(piece));
+            check(p.finish());
+            EXPECT_EQ(rs, ref.reasoning_content) << where << ": reasoning deltas joined != one-shot for: " << text;
+            EXPECT_EQ(cs, ref.content) << where << ": content deltas joined != one-shot for: " << text;
+            if (::testing::Test::HasFailure()) return;  // one failing split is enough to act on
+        }
+    }
 }
 
 TEST(OutputParser, ThinkingDisabledAndExplicitThinkBlock) {
