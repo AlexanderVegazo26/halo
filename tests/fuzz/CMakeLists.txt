@@ -49,6 +49,11 @@ if(TARGET halo_api)
   target_include_directories(fuzz_api_request PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit/api)
   target_compile_definitions(fuzz_api_request PRIVATE HALO_REF_DIR="${HALO_REF_DIR}")
   halo_add_fuzzer(stop_matcher SOURCES fuzz_stop_matcher.cpp LIBS halo_api)
+  halo_add_fuzzer(stream_decode
+    SOURCES fuzz_stream_decode.cpp ${PROJECT_SOURCE_DIR}/tests/unit/api/fake_engine.cpp
+    LIBS halo_api halo_template halo_tokenizer halo_core)
+  target_include_directories(fuzz_stream_decode PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit/api)
+  target_compile_definitions(fuzz_stream_decode PRIVATE HALO_REF_DIR="${HALO_REF_DIR}")
 endif()
 
 # Regenerates the binary GGUF seeds (corpus/gguf) from tests/unit/model/gguf_builder.h.

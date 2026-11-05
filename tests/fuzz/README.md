@@ -9,6 +9,7 @@ libFuzzer entry points (`LLVMFuzzerTestOneInput`) for the code that parses untru
 | `fuzz_output_parser` | byte 0 = options (bit 0 `starts_in_reasoning`, bit 1 typed tools), byte 1 = chunking seed, rest = model output | never throws; feeding in chunks gives exactly the one-shot result; every ToolCall event indexes a tool call |
 | `fuzz_chat_template` | byte 0 = options (bit 0 generation prompt, bit 1 tools, bit 2 `enable_thinking=false`, bit 3 parsed tool arguments, bit 4 a spoofed `<\|im_start\|>` in the last user message), rest = Jinja template source, rendered over one fixed conversation under tightened `TemplateLimits` | parses or throws `halo::Error(Config)`; renders or throws `halo::Error(Api)`; a render stays within its limits, is deterministic, and its message offsets point at turn headers in order |
 | `fuzz_stop_matcher` | byte 0 = chunking seed, byte 1 = stop count (low 3 bits), then each stop as a length byte (low 4 bits) + bytes, rest = content | never throws; chunked pushes emit exactly what a byte-at-a-time stream emits and match the same stop; no match returns the content unchanged; a match is the stop that ends first (ties: the longer), with nothing emitted after it |
+| `fuzz_stream_decode` | byte 0 = options (bit 0 `skip_special`), rest = token ids (a byte < 0xFF is that byte token, `0xFF n` the extra token n) over a vocab with split/invalid UTF-8 and SSE-delimiter tokens | never throws; every streamed piece and the flush are valid UTF-8; at most 3 bytes held back; the pieces concatenate to `Tokenizer::decode`; each piece's SSE `data:` frame has no CR/LF before its final `\n\n` and its JSON parses back to the piece |
 
 A broken invariant aborts with `FUZZ INVARIANT BROKEN (file:line): …`; in sanitizer builds any
 memory error, leak or undefined behaviour fails too.
@@ -25,13 +26,13 @@ all CI lanes. Replay one input: `build/tests/fuzz/fuzz_gguf path/to/crash-…`.
 ```sh
 cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DHALO_BUILD_FUZZERS=ON -DHALO_ENABLE_ASAN=ON -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
-cmake --build build-fuzz --target fuzz_gguf fuzz_api_request fuzz_output_parser fuzz_chat_template fuzz_stop_matcher
+cmake --build build-fuzz --target fuzz_gguf fuzz_api_request fuzz_output_parser fuzz_chat_template fuzz_stop_matcher fuzz_stream_decode
 scripts/test-agent --build-dir=build-fuzz --no-build -- -L fuzz      # what CI's fuzz job runs
 ```
 
 The whole tree gets `-fsanitize=fuzzer-no-link` and the targets link libFuzzer. ctest
 `fuzz_smoke_<target>` runs `run.py --smoke`: seed 1 and a fixed run count (`SMOKE_RUNS` in
-`run.py`), so a run is reproducible; about 2.5 minutes for all five under ASan. The checked-in
+`run.py`), so a run is reproducible; about 2.5 minutes for all six under ASan. The checked-in
 corpus is never written: new inputs and `crash-*`/`timeout-*`/`oom-*` reproducers go to
 `$HALO_FUZZ_REPORT_DIR/<target>/` (`.test-report/fuzz/` under test-agent), and `run.py` prints
 the replay command for each finding.
