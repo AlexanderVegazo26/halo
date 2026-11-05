@@ -344,6 +344,41 @@ TEST(ApiStop, FlushAndUtf8) {
     EXPECT_EQ(none.push("abc"), "abc");
 }
 
+// The same output must stop the same way however the engine split it into token pieces: the
+// stop sequence that *ends* first wins (what a byte-at-a-time stream sees), not the one that
+// starts first within one piece.
+TEST(ApiStop, OverlappingStopsDoNotDependOnPieceBoundaries) {
+    struct Case {
+        std::vector<std::string> stops;
+        std::string text;
+        std::string emitted;
+        std::string matched;
+    };
+    const std::vector<Case> cases = {
+        {{"ABCD", "BC"}, "xABCDy", "xA", "BC"},  // BC ends before ABCD although ABCD starts first
+        {{"AB", "ABC"}, "xABCy", "x", "AB"},     // AB is complete before ABC can be
+        {{"BC", "ABC"}, "xABCy", "x", "ABC"},    // same end: the longer one (starts earlier)
+        {{"END"}, "aENDbEND", "a", "END"},
+    };
+    for (const auto& c : cases) {
+        const auto run = [&](const std::vector<std::string_view>& pieces) {
+            api::StopMatcher m(c.stops);
+            std::string out;
+            for (const auto p : pieces) out += m.push(p);
+            if (!m.matched()) out += m.flush();
+            return std::pair{out, m.matched().value_or("<none>")};
+        };
+        std::vector<std::string_view> bytes;
+        for (std::size_t i = 0; i < c.text.size(); ++i) bytes.emplace_back(c.text.data() + i, 1);
+        const auto whole = run({c.text});
+        const auto bytewise = run(bytes);
+        EXPECT_EQ(whole.first, c.emitted) << "text \"" << c.text << "\" pushed as one piece";
+        EXPECT_EQ(whole.second, c.matched) << "text \"" << c.text << "\" pushed as one piece";
+        EXPECT_EQ(bytewise.first, c.emitted) << "text \"" << c.text << "\" pushed byte by byte";
+        EXPECT_EQ(bytewise.second, c.matched) << "text \"" << c.text << "\" pushed byte by byte";
+    }
+}
+
 // ---- admission -----------------------------------------------------------------------------
 
 TEST(ApiAdmission, QueueFullTimeoutAndShutdown) {

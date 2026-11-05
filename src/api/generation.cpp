@@ -25,18 +25,24 @@ std::string StopMatcher::push(std::string_view text) {
     pending_ += text;
     if (stops_.empty()) return std::exchange(pending_, {});
 
-    std::size_t best = std::string::npos;
+    // The stop that *ends* first wins (ties: the longer one, which starts earlier). That is what
+    // a byte-at-a-time stream would see, so the result does not depend on how the engine split
+    // the output into pieces. Everything before this push's text was already checked, so a
+    // stop that ends inside pending_ can only end in the new text.
+    std::size_t best_end = std::string::npos;
     const std::string* which = nullptr;
     for (const auto& s : stops_) {
         const auto p = pending_.find(s);
-        if (p != std::string::npos && (p < best || (p == best && s.size() > which->size()))) {
-            best = p;
+        if (p == std::string::npos) continue;
+        const std::size_t end = p + s.size();
+        if (end < best_end || (end == best_end && s.size() > which->size())) {
+            best_end = end;
             which = &s;
         }
     }
     if (which != nullptr) {
         matched_ = *which;
-        std::string out = pending_.substr(0, best);
+        std::string out = pending_.substr(0, best_end - which->size());
         pending_.clear();
         return out;
     }
