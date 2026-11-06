@@ -25,6 +25,10 @@
 //   * Prefix cache eviction (a third engine, prefix_cache_entries = 2): once a third distinct
 //     prompt retires, the least recently used entry is the one evicted and the two newer ones
 //     still hit.
+//   * Batched decode (a fourth engine, max_sequences = 4): four concurrent requests share one
+//     trunk forward per tick, tick by tick. Structural, so it runs in every lane; there is no
+//     timing check: on this tiny model per-sequence work dominates, and 4 batched requests
+//     measured only ~1.14x faster than 4 sequential ones on the dev host (too close to noise).
 //
 // Dev-host baseline (2026-11-05, RelWithDebInfo clang-21, no -march, one thread): decode
 // ~0.033 ms/token at 16 tokens of context, TTFT 1024-token prompt ~28 ms, context scaling
@@ -36,12 +40,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -133,14 +141,15 @@ std::filesystem::path write_synthetic_model(const std::string& tag) {
     return path;
 }
 
-// Single-threaded, one sequence, no MTP.
+// Single-threaded, one sequence unless `max_sequences` says otherwise, no MTP.
 std::unique_ptr<halo::runtime::Engine> make_engine(const std::filesystem::path& path, bool prefix_cache,
-                                                   const halo::runtime::CpuEngineOptions& opts = {}) {
+                                                   const halo::runtime::CpuEngineOptions& opts = {},
+                                                   std::size_t max_sequences = 1) {
     EngineConfig c;
     c.model_path = path.string();
     c.max_context = kMaxContext;
     c.max_context_explicit = true;
-    c.max_sequences = 1;
+    c.max_sequences = max_sequences;
     c.threads = 1;
     c.mtp_enabled = false;
     c.prefix_cache = prefix_cache;
@@ -435,3 +444,165 @@ TEST_F(PrefixCacheEviction, CacheHoldsExactlyPrefixCacheEntriesDistinctPrompts) 
         << "than prefix_cache_entries finished sequences";
 }
 
+
+namespace {
+
+// A fourth engine with four sequence slots (the API server's default max_sequences), to pin
+// that concurrent requests share one batched forward per tick (cpu_engine.h "Scheduling").
+// Every other test here runs one sequence at a time, so a scheduler that served sequences
+// round-robin (one forward per sequence per tick, or one sequence per tick) would pass them.
+//
+// The arrival of concurrent requests is made deterministic with the before_step fault hook:
+// the first request's first step waits until the other three are queued, so they are all
+// admitted together at the next tick. Then, with prompts of kPrompt tokens (one prefill
+// chunk, which also samples the first token) and kTokens tokens each:
+//   tick 1:              A prefills                       (1 sequence)
+//   tick 2:              A decodes, B C D prefill          (4 sequences, one trunk pass)
+//   ticks 3 .. kTokens:  A B C D decode                   (4 decode rows, one trunk pass)
+//   tick kTokens + 1:    B C D decode their last token    (A finished at tick kTokens)
+class BatchedDecode : public ::testing::Test {
+protected:
+    static constexpr std::size_t kSlots = 4;
+    static constexpr std::size_t kPrompt = 16;
+    static constexpr std::size_t kTokens = 64;
+    static constexpr auto kWaitLimit = std::chrono::seconds(60);
+
+    static void SetUpTestSuite() {
+        path_ = write_synthetic_model("batched-decode");
+        halo::runtime::CpuEngineOptions o;
+        o.faults.before_step = [](std::span<const halo::speculative::StepRequest>) {
+            if (!gate_armed_.exchange(false)) return;
+            worker_waiting_ = true;
+            const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
+            while (!gate_open_ && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        };
+        o.on_tick = [](const halo::runtime::TickInfo& t) {
+            const std::lock_guard lk(ticks_mu_);
+            ticks_.push_back(t);
+        };
+        engine_ = make_engine(path_, /*prefix_cache=*/false, o, kSlots);
+    }
+    static void TearDownTestSuite() {
+        engine_.reset();
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    void SetUp() override { ASSERT_NE(engine_, nullptr) << "engine creation on the synthetic model failed"; }
+
+    // Polls `done` (no sleeps) until it holds or kWaitLimit passes; false on timeout.
+    template <class F>
+    static bool wait_for(F done) {
+        const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
+        while (!done()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
+    static GenerateResult run_one(std::int32_t token) {
+        GenerateRequest r;
+        r.prompt.assign(kPrompt, token);
+        r.sampling.temperature = 0.0f;
+        r.max_tokens = kTokens;
+        return engine_->generate(r, [](const TokenEvent&) { return true; });
+    }
+
+    struct Batch {
+        std::vector<GenerateResult> results;
+        std::vector<halo::runtime::TickInfo> ticks;  // the ticks of this batch only
+        double wall_ms = 0;
+    };
+
+    // kSlots requests that arrive together (see the class comment). Fatal failures leave
+    // `results` short; the caller checks its size.
+    static Batch run_batch() {
+        Batch b;
+        const std::uint64_t ticks_before = engine_->stats().ticks;
+        std::size_t recorded_before = 0;
+        {
+            const std::lock_guard lk(ticks_mu_);
+            recorded_before = ticks_.size();
+        }
+        worker_waiting_ = false;
+        gate_open_ = false;
+        gate_armed_ = true;
+        std::vector<GenerateResult> results(kSlots);
+        std::vector<std::thread> threads;
+        const auto t0 = std::chrono::steady_clock::now();
+        threads.emplace_back([&] { results[0] = run_one('A'); });
+        const bool first_waiting = wait_for([] { return worker_waiting_.load(); });
+        for (std::size_t i = 1; i < kSlots; ++i) {
+            threads.emplace_back([&, i] { results[i] = run_one(static_cast<std::int32_t>('A' + i)); });
+        }
+        const bool all_queued = wait_for([] { return engine_->stats().queued_requests == kSlots - 1; });
+        gate_open_ = true;
+        for (auto& t : threads) t.join();
+        b.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        EXPECT_TRUE(first_waiting) << "the first request's first step never reached the before_step gate";
+        EXPECT_TRUE(all_queued) << "the other " << kSlots - 1 << " requests were not all queued while the first "
+                                << "step waited (queued_requests=" << engine_->stats().queued_requests << ")";
+        // on_tick runs after the tick that delivered the last token, possibly after generate() returned.
+        const std::uint64_t ticks_after = engine_->stats().ticks;
+        const bool all_recorded = wait_for([&] {
+            const std::lock_guard lk(ticks_mu_);
+            return ticks_.size() - recorded_before >= ticks_after - ticks_before;
+        });
+        EXPECT_TRUE(all_recorded) << "on_tick did not report every tick the engine counted";
+        const std::lock_guard lk(ticks_mu_);
+        b.ticks.assign(ticks_.begin() + static_cast<std::ptrdiff_t>(recorded_before), ticks_.end());
+        b.results = std::move(results);
+        return b;
+    }
+
+    static inline std::filesystem::path path_;
+    static inline std::unique_ptr<halo::runtime::Engine> engine_;
+    static inline std::atomic<bool> gate_armed_{false};
+    static inline std::atomic<bool> gate_open_{false};
+    static inline std::atomic<bool> worker_waiting_{false};
+    static inline std::mutex ticks_mu_;
+    static inline std::vector<halo::runtime::TickInfo> ticks_;
+};
+
+}  // namespace
+
+TEST_F(BatchedDecode, ConcurrentRequestsShareOneTrunkPassPerTick) {
+    const Batch b = run_batch();
+    ASSERT_EQ(b.results.size(), kSlots);
+    for (std::size_t i = 0; i < kSlots; ++i) {
+        const GenerateResult& r = b.results[i];
+        EXPECT_EQ(r.finish, FinishReason::Length) << "request " << i << ": error='" << r.error << "'";
+        EXPECT_EQ(r.tokens.size(), kTokens) << "request " << i;
+        EXPECT_EQ(r.tokens, b.results[0].tokens) << "request " << i << ": all-zero weights must generate the same "
+                                                 << "tokens whether or not a sequence shares its tick with others";
+    }
+    std::string trace;  // the first 8 and the last 3 ticks
+    for (std::size_t i = 0; i < b.ticks.size(); ++i) {
+        if (i == 8 && b.ticks.size() > 11) trace += " ...";
+        if (i >= 8 && i + 3 < b.ticks.size()) continue;
+        const auto& t = b.ticks[i];
+        trace += " [" + std::to_string(i + 1) + ": seq " + std::to_string(t.sequences) + ", prefill " +
+                 std::to_string(t.prefill_rows) + ", decode " + std::to_string(t.decode_rows) + ", trunk " +
+                 std::to_string(t.trunk_passes) + "]";
+    }
+    ASSERT_EQ(b.ticks.size(), kTokens + 1)
+        << kSlots << " requests of " << kTokens << " tokens, the first one tick ahead of the rest, should take "
+        << kTokens + 1
+        << " ticks when every tick serves every active sequence; " << kSlots * kTokens
+        << " means one sequence per tick (no batching). Ticks:" << trace;
+    std::size_t full = 0;
+    for (std::size_t i = 0; i < b.ticks.size(); ++i) {
+        const auto& t = b.ticks[i];
+        const std::string at = "tick " + std::to_string(i + 1) + " of " + std::to_string(b.ticks.size());
+        EXPECT_EQ(t.trunk_passes, 1u) << at << ": one batched trunk forward per tick, whatever the number of "
+                                      << "sequences (" << t.sequences << "); more means a forward per sequence";
+        const std::size_t expect_seq = i == 0 ? 1 : i == kTokens ? kSlots - 1 : kSlots;
+        EXPECT_EQ(t.sequences, expect_seq) << at;
+        const std::size_t expect_prefill = i == 0 ? kPrompt : i == 1 ? (kSlots - 1) * kPrompt : 0;
+        EXPECT_EQ(t.prefill_rows, expect_prefill) << at << ": prompts of " << kPrompt << " tokens are one chunk";
+        const std::size_t expect_decode = i == 0 ? 0 : i == 1 ? 1 : expect_seq;
+        EXPECT_EQ(t.decode_rows, expect_decode) << at << ": one decode row per decoding sequence (no MTP)";
+        full += t.sequences == kSlots ? 1 : 0;
+    }
+    EXPECT_EQ(full, kTokens - 1) << "ticks serving all " << kSlots << " sequences at once";
+}
