@@ -237,15 +237,32 @@ TEST_F(DecodeBudget, TimeToFirstTokenOfA1024TokenPrompt) {
 
 TEST_F(DecodeBudget, DecodeCostIsAtMostLinearInContext) {
     if (const char* why = skip_reason()) GTEST_SKIP() << why;
-    const double small = best_of(3, 768, 128).decode_ms_per_token;
-    const double large = best_of(3, 3072, 128).decode_ms_per_token;
-    const double ratio = large / small;
-    std::printf("[perf] %-46s %9.4f -> %9.4f ms/token  ratio %5.2f (limit 4.0)\n", "decode context 768 -> 3072", small,
-                large, ratio);
+    // The ratio is the median of 5 back-to-back (768, 3072) pairs, not best-of-N of all small
+    // runs vs best-of-N of all large ones: a pair runs within ~30 ms, so a burst of host load
+    // or a move to a slower core (hybrid CPU, powersave governor) usually hits both sides of a
+    // pair, and the median drops a pair it splits. Measured as best of 3 each, back to back,
+    // the ratio ranged 0.7-6.9 over 20 runs on the loaded dev host (2 over the limit) although
+    // per-token work is linear.
+    (void)generate(768, 128);
+    (void)generate(3072, 128);
+    constexpr int kPairs = 5;
+    std::vector<double> ratios;
+    double small = 1e300, large = 1e300;
+    for (int i = 0; i < kPairs; ++i) {
+        const double s_ms = 1000.0 / generate(768, 128).decode_tps;
+        const double l_ms = 1000.0 / generate(3072, 128).decode_tps;
+        ratios.push_back(l_ms / s_ms);
+        small = std::min(small, s_ms);
+        large = std::min(large, l_ms);
+    }
+    std::sort(ratios.begin(), ratios.end());
+    const double ratio = ratios[kPairs / 2];
+    std::printf("[perf] %-46s %9.4f -> %9.4f ms/token  median pair ratio %5.2f (limit 4.0)\n",
+                "decode context 768 -> 3072", small, large, ratio);
     ::testing::Test::RecordProperty("decode context 768 -> 3072 ratio", std::to_string(ratio));
-    EXPECT_LE(ratio, 4.0) << "decode ms/token after a 3072-token prompt (" << large << ") vs a 768-token prompt ("
-                          << small << ") grew " << ratio
-                          << "x for 4x the context; only attention depends on the context and is O(context) per "
+    EXPECT_LE(ratio, 4.0) << "decode ms/token after a 3072-token prompt (best " << large << ") vs a 768-token prompt "
+                          << "(best " << small << ") grew " << ratio << "x (median of " << kPairs << " pairs)"
+                          << " for 4x the context; only attention depends on the context and is O(context) per "
                              "token, so more than 4x means per-token work grew faster than linear in the history";
 }
 
