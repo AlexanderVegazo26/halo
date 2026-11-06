@@ -302,9 +302,12 @@ TEST_F(PrefixCache, ExactResubmitRestoresAllButTheLastPromptToken) {
     EXPECT_EQ(hot.tokens, cold.tokens) << "a restored prefix must generate what the cold prefill generated";
 }
 
-TEST_F(PrefixCache, FollowUpTurnReusesTheConversationPrefix) {
+TEST_F(PrefixCache, FollowUpTurnReusesThePreviousPromptAndReply) {
     // A chat client re-sends the whole conversation each turn: previous prompt + the reply + a
-    // new user message. The previous prompt's state must come from the cache.
+    // new user message. The previous prompt's state and the reply's must come from the cache:
+    // retirement checkpoints everything turn 1 fed (its prompt + every reply token but the last,
+    // which was sampled and never fed), so only that last reply token and the new message are
+    // computed again.
     const Prompt turn1 = prompt_of(512, 'q');
     const GenerateResult r1 = run(turn1, 8, "turn 1, 512-token prompt");
     EXPECT_EQ(r1.cached_prompt_tokens, 0u) << "turn 1: nothing cached starts with this token yet";
@@ -312,9 +315,15 @@ TEST_F(PrefixCache, FollowUpTurnReusesTheConversationPrefix) {
     turn2.insert(turn2.end(), r1.tokens.begin(), r1.tokens.end());
     turn2.insert(turn2.end(), 64, 'r');
     const GenerateResult r2 = run(turn2, 4, "turn 2 = turn 1 prompt + reply + 64 new tokens");
-    EXPECT_GE(r2.cached_prompt_tokens, turn1.size() - 1)
-        << "turn 2 (" << turn2.size() << " tokens) should reuse at least turn 1's prompt minus its last token ("
-        << turn1.size() - 1 << ") from the cache; it reused " << r2.cached_prompt_tokens;
+    const std::size_t turn1_fed = turn1.size() + r1.tokens.size() - 1;
+    EXPECT_GE(r2.cached_prompt_tokens, turn1_fed)
+        << "turn 2 (" << turn2.size() << " tokens) should reuse turn 1's prompt (" << turn1.size()
+        << ") and its reply minus the last, never-fed token (" << r1.tokens.size() - 1 << "), " << turn1_fed
+        << " tokens, from the checkpoint taken at retirement; it reused " << r2.cached_prompt_tokens
+        << (r2.cached_prompt_tokens + 1 >= turn1.size() && r2.cached_prompt_tokens < turn1_fed
+                ? " (only the prompt: the retirement checkpoint is missing or cut short, so every turn recomputes the "
+                  "previous reply)"
+                : "");
     EXPECT_LT(r2.cached_prompt_tokens, turn2.size()) << "at least one prompt row is recomputed for the logits";
 }
 
