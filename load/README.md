@@ -8,12 +8,13 @@ a real deployment.
 
 | Script | Where it runs | What it checks |
 |---|---|---|
-| `smoke.js` | ctest `load_smoke` (so `scripts/test-agent` and both CI jobs, incl. ASan) | 4 VUs, 20 s over every route; no failed requests, every check passes, p95 < 1 s (generous, holds under ASan) |
+| `smoke.js` | ctest `load_smoke` (so `scripts/test-agent` and the release, ASan and TSan CI jobs) | 4 VUs, 20 s over every route; no failed requests, every check passes, p95 < 25 ms, p99 < 50 ms, streamed chat p95 < 30 ms (x20 on sanitizer/Debug builds) |
 | `load.js` | on demand | ramps to 16 VUs, soaks 2 min, spikes to 48 (past `max_concurrent` 4 + `max_queue` 16): overload is shed with 429/503 + `Retry-After`, never an error; admitted requests p95 < 3 s |
 
 ```bash
 cmake --build build --target halo_load_server
 python3 load/run.py --server build/tests/unit/api/halo_load_server load/smoke.js
+python3 load/run.py --server build-asan/tests/unit/api/halo_load_server --budget-scale=20 load/smoke.js
 python3 load/run.py --server build/tests/unit/api/halo_load_server --server-arg=--token-delay-ms=2 load/load.js
 ```
 
@@ -24,5 +25,20 @@ crossed threshold and failed check with the rerun command. The k6 summary JSON g
 The server must also exit 0 on SIGTERM, so under ASan a leak or memory error at shutdown fails
 the run.
 
-Baseline (2026-10-31, RelWithDebInfo, 32 threads): smoke ~840 req/s, 0 % failed, p95 41 ms (the
-streaming route, ~40 ms per stream), p99 42 ms.
+Latency budgets are ~10x what the GitHub-hosted runner measures on an optimized build, so the
+release lane catches an order-of-magnitude slowdown (e.g. the ~41 ms Nagle stall per streamed reply
+fixed in 9814e0d fails it). `--budget-scale` multiplies them (`HALO_LOAD_BUDGET_SCALE` in the
+script); `tests/unit/api/CMakeLists.txt` passes 20 for ASan, TSan and Debug/unconfigured builds,
+1 otherwise.
+
+Baseline (2026-11-06, smoke.js, 4 VUs x 20 s):
+
+| Build | Host | req/s | p95 | p99 | chat_stream p95 |
+|---|---|---|---|---|---|
+| RelWithDebInfo | GitHub ubuntu-24.04 | ~4,400 | 2.5 ms | 3.8 ms | 3.7 ms |
+| Debug + ASan | GitHub ubuntu-24.04 | ~290 | 54 ms | 72 ms | 76 ms |
+| Debug + TSan | GitHub ubuntu-24.04 | ~470 | 31 ms | 45 ms | 47 ms |
+| RelWithDebInfo | dev host, 32 threads | ~10,300 | 1.0 ms | 1.3 ms | 1.3 ms |
+| Debug + ASan | dev host, 32 threads | ~1,000 | 18 ms | 21 ms | 21 ms |
+
+(2026-10-31, before the Nagle fix: ~840 req/s, p95 41 ms on the dev host, release.)

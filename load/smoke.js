@@ -1,7 +1,9 @@
-// Blocking k6 smoke (ctest `load_smoke`, so scripts/test-agent and both CI jobs): a few virtual
-// users for ~20 s over every public route of the real ApiServer, served by halo_load_server
-// (FakeEngine, no model). Thresholds are generous so they hold under the ASan/Debug CI job too;
-// what they catch is a route that errors, hangs or slows down by an order of magnitude.
+// Blocking k6 smoke (ctest `load_smoke`, so scripts/test-agent and the release, ASan and TSan CI
+// jobs): a few virtual users for ~20 s over every public route of the real ApiServer, served by halo_load_server
+// (FakeEngine, no model). What it catches: a route that errors, hangs or slows down by an order of
+// magnitude. Latency budgets are ~10x the GitHub-hosted runner (load/README.md, "Baseline") for an
+// optimized build, times HALO_LOAD_BUDGET_SCALE for sanitizer/Debug builds (run.py --budget-scale,
+// which CMake sets per build), so a 41 ms stall per stream fails the release lane, not just ASan.
 // Run it with load/run.py (it starts the server and sets BASE_URL), never against a real host.
 import http from 'k6/http';
 import { check, group } from 'k6';
@@ -11,14 +13,20 @@ if (!BASE || !/^http:\/\/127\.0\.0\.1:\d+$/.test(BASE)) {
   throw new Error(`BASE_URL must be the local halo_load_server (http://127.0.0.1:<port>), got '${BASE}'`);
 }
 
+const SCALE = Number(__ENV.HALO_LOAD_BUDGET_SCALE ?? '1');
+if (!Number.isFinite(SCALE) || SCALE < 1) {
+  throw new Error(`HALO_LOAD_BUDGET_SCALE must be a number >= 1, got '${__ENV.HALO_LOAD_BUDGET_SCALE}'`);
+}
+const ms = (budget) => budget * SCALE;
+
 export const options = {
   scenarios: {
     smoke: { executor: 'constant-vus', vus: 4, duration: '20s' },
   },
   thresholds: {
     http_req_failed: ['rate<0.01'],
-    http_req_duration: ['p(95)<1000', 'p(99)<2000'],
-    'http_req_duration{route:chat_stream}': ['p(95)<1500'],
+    http_req_duration: [`p(95)<${ms(25)}`, `p(99)<${ms(50)}`],
+    'http_req_duration{route:chat_stream}': [`p(95)<${ms(30)}`],
     checks: ['rate>0.99'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],

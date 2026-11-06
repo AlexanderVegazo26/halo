@@ -3,12 +3,15 @@
 
     python3 load/run.py --server build/tests/unit/api/halo_load_server load/smoke.js
     python3 load/run.py --server ... --server-arg=--token-delay-ms=2 load/load.js
+    python3 load/run.py --server build-asan/... --budget-scale=20 load/smoke.js   # sanitizer/Debug build
 
 Starts the server (the real ApiServer over the FakeEngine, 127.0.0.1, ephemeral port), runs
 `k6 run` with BASE_URL pointing at it, stops the server and checks it exited cleanly (under
 ASan a leak or memory error at shutdown fails the run). k6's end-of-test summary is written to
 $HALO_LOAD_REPORT_DIR (scripts/test-agent sets it to .test-report/load) or ./load-report as
 k6-<script>.json; the failed thresholds and checks are printed with the rerun command.
+--budget-scale multiplies the script's latency budgets (HALO_LOAD_BUDGET_SCALE): 1 for an optimized
+build, larger for sanitizer/Debug builds (CMake picks it per build, tests/unit/api/CMakeLists.txt).
 
 Exit: 0 pass, 1 fail, 77 skipped (k6 not installed; ctest reports SKIPPED), 2 usage.
 Never targets anything but the server it started (no production, no third parties).
@@ -91,10 +94,22 @@ def failures_from_summary(summary: dict) -> list[str]:
     return out
 
 
+def budget_scale(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number in [1, 1000], got '{text}'") from None
+    if not 1.0 <= value <= 1000.0:  # also rejects nan/inf: a budget must stay a real bound
+        raise argparse.ArgumentTypeError(f"expected a number in [1, 1000], got '{text}'")
+    return value
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", required=True, help="path to the halo_load_server binary")
     ap.add_argument("--server-arg", action="append", default=[], help="extra server argument (repeatable)")
+    ap.add_argument("--budget-scale", type=budget_scale, default=1.0,
+                    help="multiply the script's latency budgets (1 = optimized build; sanitizer/Debug builds need more)")
     ap.add_argument("script", help="k6 script, e.g. load/smoke.js")
     args = ap.parse_args(argv)
 
@@ -109,7 +124,8 @@ def main(argv: list[str]) -> int:
     summary_path = report_dir / f"k6-{script.stem}.json"
     summary_path.unlink(missing_ok=True)
     rerun = shlex.join([sys.executable, str(Path(__file__).resolve()), "--server", str(Path(args.server).resolve()),
-                        *(f"--server-arg={a}" for a in args.server_arg), str(script)])
+                        *(f"--server-arg={a}" for a in args.server_arg), f"--budget-scale={args.budget_scale:g}",
+                        str(script)])
 
     try:
         proc, port = start_server(args.server, args.server_arg)
@@ -117,7 +133,8 @@ def main(argv: list[str]) -> int:
         print(f"load: FAIL, could not start the server: {e}\nrerun: {rerun}")
         return 1
 
-    env = {**os.environ, "BASE_URL": f"http://127.0.0.1:{port}", "K6_NO_USAGE_REPORT": "true"}
+    env = {**os.environ, "BASE_URL": f"http://127.0.0.1:{port}", "K6_NO_USAGE_REPORT": "true",
+           "HALO_LOAD_BUDGET_SCALE": f"{args.budget_scale:g}"}
     try:
         k6_rc = subprocess.run(
             [k6, "run", "--quiet", "--no-usage-report", "--summary-export", str(summary_path), str(script)],
