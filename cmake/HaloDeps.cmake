@@ -10,6 +10,12 @@ FetchContent_Declare(nlohmann_json
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
 
+# Header-only deps below: FetchContent_MakeAvailable (FetchContent_Populate with declared
+# details is deprecated, CMP0169) with SOURCE_SUBDIR pointing at a directory that doesn't
+# exist, so the archive is downloaded, hash-checked and patched but its own CMakeLists.txt
+# (tests, install rules, options) is never added to the build. We only need the include dir.
+set(HALO_HEADER_ONLY_SUBDIR halo-header-only-no-cmake)
+
 # Jinja-subset template engine (MIT) — header-only; we only need the include dir.
 # HALO carries a pinned patch (security review S-3; docs/security-hardening.md): resource
 # limits, linear lexing, iterative Value teardown. URL_HASH still verifies the upstream
@@ -22,8 +28,9 @@ FetchContent_Declare(minja
   URL https://github.com/google/minja/archive/021c2293c187789ef13d56c6cfd89c9b134fd80f.tar.gz
   URL_HASH SHA256=dc3ddd37497b79a4cd35fd41550e22b3b0139439de8be6eab3d2d024fed47bb4
   PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${HALO_MINJA_PATCH} -DPATCH_SHA256=${HALO_MINJA_PATCH_SHA256}
-                -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply_patch.cmake)
-FetchContent_Populate(minja)
+                -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply_patch.cmake
+  SOURCE_SUBDIR ${HALO_HEADER_ONLY_SUBDIR})
+FetchContent_MakeAvailable(minja)
 add_library(halo_minja INTERFACE)
 target_include_directories(halo_minja SYSTEM INTERFACE ${minja_SOURCE_DIR}/include)
 target_link_libraries(halo_minja INTERFACE nlohmann_json::nlohmann_json)
@@ -32,8 +39,9 @@ target_link_libraries(halo_minja INTERFACE nlohmann_json::nlohmann_json)
 if(HALO_BUILD_SERVER)
   FetchContent_Declare(httplib
     URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.64.0.tar.gz
-    URL_HASH SHA256=1ada413782af5e67e80452c39b7c90beb6fa4fc8341e18c0896bf95684b9a620)
-  FetchContent_Populate(httplib)
+    URL_HASH SHA256=1ada413782af5e67e80452c39b7c90beb6fa4fc8341e18c0896bf95684b9a620
+    SOURCE_SUBDIR ${HALO_HEADER_ONLY_SUBDIR})
+  FetchContent_MakeAvailable(httplib)
   add_library(halo_httplib INTERFACE)
   target_include_directories(halo_httplib SYSTEM INTERFACE ${httplib_SOURCE_DIR})
 endif()
