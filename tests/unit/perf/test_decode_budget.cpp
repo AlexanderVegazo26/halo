@@ -17,6 +17,11 @@
 //     context) may grow at most linearly. Only the attention layer depends on the context,
 //     so an honest engine measures well under 4x; re-reading the history quadratically per
 //     token blows far past it.
+//   * Prefix cache (D-013, a second engine with the cache on): an exact re-submit of a
+//     1024-token prompt restores all but the last prompt token from the cache, a follow-up
+//     turn that extends the conversation reuses the same prefix, and in timing builds the
+//     re-submit's time to first token is under a quarter of the cold prefill. These run in
+//     every lane: the other prefix-cache engine tests (tests/unit/runtime) need HALO_REF_DIR.
 //
 // Dev-host baseline (2026-11-05, RelWithDebInfo clang-21, no -march, one thread): decode
 // ~0.033 ms/token at 16 tokens of context, TTFT 1024-token prompt ~28 ms, context scaling
@@ -114,25 +119,35 @@ std::vector<std::byte> synthetic_model() {
     return s.build(true);
 }
 
+// Writes the synthetic model to a per-process temp file named after `tag`.
+std::filesystem::path write_synthetic_model(const std::string& tag) {
+    const auto path =
+        std::filesystem::temp_directory_path() / ("halo-" + tag + "-" + std::to_string(::getpid()) + ".gguf");
+    const auto bytes = synthetic_model();
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    EXPECT_TRUE(f.good()) << "could not write the synthetic model to " << path;
+    return path;
+}
+
+// Single-threaded, one sequence, no MTP.
+std::unique_ptr<halo::runtime::Engine> make_engine(const std::filesystem::path& path, bool prefix_cache) {
+    EngineConfig c;
+    c.model_path = path.string();
+    c.max_context = kMaxContext;
+    c.max_context_explicit = true;
+    c.max_sequences = 1;
+    c.threads = 1;
+    c.mtp_enabled = false;
+    c.prefix_cache = prefix_cache;
+    return halo::runtime::create_cpu_engine(c, {});
+}
+
 class DecodeBudget : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
-        path_ = std::filesystem::temp_directory_path() / ("halo-decode-budget-" + std::to_string(::getpid()) + ".gguf");
-        const auto bytes = synthetic_model();
-        {
-            std::ofstream f(path_, std::ios::binary | std::ios::trunc);
-            f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-            ASSERT_TRUE(f.good()) << "could not write the synthetic model to " << path_;
-        }
-        EngineConfig c;
-        c.model_path = path_.string();
-        c.max_context = kMaxContext;
-        c.max_context_explicit = true;
-        c.max_sequences = 1;
-        c.threads = 1;
-        c.mtp_enabled = false;
-        c.prefix_cache = false;  // every repetition recomputes its prompt
-        engine_ = halo::runtime::create_cpu_engine(c, {});
+        path_ = write_synthetic_model("decode-budget");
+        engine_ = make_engine(path_, /*prefix_cache=*/false);  // every repetition recomputes its prompt
     }
     static void TearDownTestSuite() {
         engine_.reset();
@@ -228,4 +243,96 @@ TEST_F(DecodeBudget, DecodeCostIsAtMostLinearInContext) {
                           << small << ") grew " << ratio
                           << "x for 4x the context; only attention depends on the context and is O(context) per "
                              "token, so more than 4x means per-token work grew faster than linear in the history";
+}
+
+namespace {
+
+using Prompt = decltype(GenerateRequest{}.prompt);
+
+// A second engine with the prefix cache on (D-013). Each test starts its prompts with its own
+// token, so no test can hit an entry another test left behind (any order, --gtest_shuffle).
+class PrefixCache : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        path_ = write_synthetic_model("prefix-cache");
+        engine_ = make_engine(path_, /*prefix_cache=*/true);
+    }
+    static void TearDownTestSuite() {
+        engine_.reset();
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    void SetUp() override { ASSERT_NE(engine_, nullptr) << "engine creation on the synthetic model failed"; }
+
+    static Prompt prompt_of(std::size_t len, std::int32_t token) { return Prompt(len, token); }
+
+    // One greedy generation with the functional checks every case relies on.
+    static GenerateResult run(const Prompt& prompt, std::size_t max_tokens, const std::string& ctx) {
+        GenerateRequest r;
+        r.prompt = prompt;
+        r.sampling.temperature = 0.0f;
+        r.max_tokens = max_tokens;
+        GenerateResult res = engine_->generate(r, [](const TokenEvent&) { return true; });
+        EXPECT_EQ(res.finish, FinishReason::Length) << ctx << ": error='" << res.error << "'";
+        EXPECT_EQ(res.tokens.size(), max_tokens) << ctx;
+        EXPECT_EQ(res.prompt_tokens, prompt.size()) << ctx;
+        return res;
+    }
+
+    static inline std::filesystem::path path_;
+    static inline std::unique_ptr<halo::runtime::Engine> engine_;
+};
+
+}  // namespace
+
+TEST_F(PrefixCache, ExactResubmitRestoresAllButTheLastPromptToken) {
+    const Prompt prompt = prompt_of(1024, 'p');
+    const auto hits_before = engine_->stats().prefix_cache_hits;
+    const GenerateResult cold = run(prompt, 4, "first submit of a 1024-token prompt");
+    EXPECT_EQ(cold.cached_prompt_tokens, 0u) << "first submit: nothing cached starts with this token yet";
+    const GenerateResult hot = run(prompt, 4, "exact re-submit of the same 1024-token prompt");
+    EXPECT_EQ(hot.cached_prompt_tokens, prompt.size() - 1)
+        << "exact re-submit should restore the KV rows and GDN state of every prompt token but the last (one row "
+           "is always recomputed for the logits; the checkpoint at N - tail, D-013); 0 means the cache missed";
+    EXPECT_EQ(engine_->stats().prefix_cache_hits, hits_before + 1) << "one hit (the re-submit), one miss";
+    EXPECT_EQ(hot.tokens, cold.tokens) << "a restored prefix must generate what the cold prefill generated";
+}
+
+TEST_F(PrefixCache, FollowUpTurnReusesTheConversationPrefix) {
+    // A chat client re-sends the whole conversation each turn: previous prompt + the reply + a
+    // new user message. The previous prompt's state must come from the cache.
+    const Prompt turn1 = prompt_of(512, 'q');
+    const GenerateResult r1 = run(turn1, 8, "turn 1, 512-token prompt");
+    EXPECT_EQ(r1.cached_prompt_tokens, 0u) << "turn 1: nothing cached starts with this token yet";
+    Prompt turn2 = turn1;
+    turn2.insert(turn2.end(), r1.tokens.begin(), r1.tokens.end());
+    turn2.insert(turn2.end(), 64, 'r');
+    const GenerateResult r2 = run(turn2, 4, "turn 2 = turn 1 prompt + reply + 64 new tokens");
+    EXPECT_GE(r2.cached_prompt_tokens, turn1.size() - 1)
+        << "turn 2 (" << turn2.size() << " tokens) should reuse at least turn 1's prompt minus its last token ("
+        << turn1.size() - 1 << ") from the cache; it reused " << r2.cached_prompt_tokens;
+    EXPECT_LT(r2.cached_prompt_tokens, turn2.size()) << "at least one prompt row is recomputed for the logits";
+}
+
+TEST_F(PrefixCache, ResubmitTimeToFirstTokenIsUnderAQuarterOfAColdPrefill) {
+    if (const char* why = skip_reason()) GTEST_SKIP() << why;
+    // Cold: a different first token each time, so every prompt misses. Hot: the same prompt again.
+    (void)run(prompt_of(1024, 'A'), 2, "warm-up");
+    double cold_ms = 1e300, hot_ms = 1e300;
+    for (std::int32_t i = 0; i < 3; ++i) {
+        const Prompt prompt = prompt_of(1024, 'B' + i);
+        const GenerateResult cold = run(prompt, 2, "cold 1024-token prompt #" + std::to_string(i));
+        ASSERT_EQ(cold.cached_prompt_tokens, 0u) << "cold run #" << i << " must miss the cache";
+        const GenerateResult hot = run(prompt, 2, "re-submit #" + std::to_string(i));
+        ASSERT_EQ(hot.cached_prompt_tokens, prompt.size() - 1) << "re-submit #" << i << " must hit the cache";
+        cold_ms = std::min(cold_ms, cold.ttft_ms);
+        hot_ms = std::min(hot_ms, hot.ttft_ms);
+    }
+    const double ratio = hot_ms / cold_ms;
+    std::printf("[perf] %-46s cold %9.4f ms  hit %9.4f ms  ratio %5.3f (limit 0.25)\n", "TTFT 1024-token prompt, prefix cache",
+                cold_ms, hot_ms, ratio);
+    ::testing::Test::RecordProperty("prefix cache TTFT hit/cold ratio", std::to_string(ratio));
+    EXPECT_LE(ratio, 0.25) << "TTFT of an exact re-submit (" << hot_ms << " ms, 1023 of 1024 tokens from the cache) vs "
+                           << "the cold prefill (" << cold_ms << " ms): a hit recomputes one row, so it should be a "
+                              "small fraction; near 1 means the restored prefix is being recomputed anyway";
 }
