@@ -22,6 +22,9 @@
 //     turn that extends the conversation reuses the same prefix, and in timing builds the
 //     re-submit's time to first token is under a quarter of the cold prefill. These run in
 //     every lane: the other prefix-cache engine tests (tests/unit/runtime) need HALO_REF_DIR.
+//   * Prefix cache eviction (a third engine, prefix_cache_entries = 2): once a third distinct
+//     prompt retires, the least recently used entry is the one evicted and the two newer ones
+//     still hit.
 //
 // Dev-host baseline (2026-11-05, RelWithDebInfo clang-21, no -march, one thread): decode
 // ~0.033 ms/token at 16 tokens of context, TTFT 1024-token prompt ~28 ms, context scaling
@@ -131,7 +134,8 @@ std::filesystem::path write_synthetic_model(const std::string& tag) {
 }
 
 // Single-threaded, one sequence, no MTP.
-std::unique_ptr<halo::runtime::Engine> make_engine(const std::filesystem::path& path, bool prefix_cache) {
+std::unique_ptr<halo::runtime::Engine> make_engine(const std::filesystem::path& path, bool prefix_cache,
+                                                   const halo::runtime::CpuEngineOptions& opts = {}) {
     EngineConfig c;
     c.model_path = path.string();
     c.max_context = kMaxContext;
@@ -140,7 +144,7 @@ std::unique_ptr<halo::runtime::Engine> make_engine(const std::filesystem::path& 
     c.threads = 1;
     c.mtp_enabled = false;
     c.prefix_cache = prefix_cache;
-    return halo::runtime::create_cpu_engine(c, {});
+    return halo::runtime::create_cpu_engine(c, opts);
 }
 
 class DecodeBudget : public ::testing::Test {
@@ -336,3 +340,72 @@ TEST_F(PrefixCache, ResubmitTimeToFirstTokenIsUnderAQuarterOfAColdPrefill) {
                            << "the cold prefill (" << cold_ms << " ms): a hit recomputes one row, so it should be a "
                               "small fraction; near 1 means the restored prefix is being recomputed anyway";
 }
+
+namespace {
+
+// A third engine whose cache holds two finished sequences (prefix_cache_entries = 2, with
+// one slot), to pin which entry goes when a third distinct prompt retires (D-013: least
+// recently used). The cache is shared, so each test uses its own first tokens (no leftover
+// entry can serve its prompts) and submits two new prompts before it checks an eviction, which
+// pushes out whatever an earlier test left behind (any order, --gtest_shuffle).
+class PrefixCacheEviction : public ::testing::Test {
+protected:
+    static constexpr std::size_t kEntries = 2;
+    static constexpr std::size_t kLen = 128;
+
+    static void SetUpTestSuite() {
+        path_ = write_synthetic_model("prefix-cache-eviction");
+        halo::runtime::CpuEngineOptions o;
+        o.prefix_cache_entries = kEntries;
+        engine_ = make_engine(path_, /*prefix_cache=*/true, o);
+    }
+    static void TearDownTestSuite() {
+        engine_.reset();
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    void SetUp() override { ASSERT_NE(engine_, nullptr) << "engine creation on the synthetic model failed"; }
+
+    // One greedy 2-token generation of a kLen-token prompt of `token`; returns the cached prompt tokens.
+    static std::size_t cached(std::int32_t token, const std::string& ctx) {
+        GenerateRequest r;
+        r.prompt = Prompt(kLen, token);
+        r.sampling.temperature = 0.0f;
+        r.max_tokens = 2;
+        const GenerateResult res = engine_->generate(r, [](const TokenEvent&) { return true; });
+        EXPECT_EQ(res.finish, FinishReason::Length) << ctx << ": error='" << res.error << "'";
+        EXPECT_EQ(res.prompt_tokens, kLen) << ctx;
+        return res.cached_prompt_tokens;
+    }
+
+    static inline std::filesystem::path path_;
+    static inline std::unique_ptr<halo::runtime::Engine> engine_;
+};
+
+}  // namespace
+
+TEST_F(PrefixCacheEviction, ThirdDistinctPromptEvictsTheLeastRecentlyUsed) {
+    // Prompts start with different tokens, so no entry can serve another prompt.
+    EXPECT_EQ(cached('a', "prompt a, first submit"), 0u) << "nothing cached starts with 'a' yet";
+    EXPECT_EQ(cached('b', "prompt b, first submit"), 0u) << "nothing cached starts with 'b' yet";
+    EXPECT_EQ(cached('c', "prompt c, first submit"), 0u) << "nothing cached starts with 'c' yet";
+    // Cache now holds c (most recent) and b; a, the oldest, was evicted when c retired.
+    EXPECT_EQ(cached('a', "prompt a, re-submit after b and c"), 0u)
+        << "with " << kEntries << " entries, a (the least recently used of a, b, c) must have been evicted; a hit "
+        << "means the cache kept more than prefix_cache_entries or evicted a newer entry instead";
+    // a's retirement evicted b (now the oldest); c is still cached.
+    EXPECT_EQ(cached('c', "prompt c, re-submit"), kLen - 1)
+        << "c was the most recent entry before a retired, so it must still hit (all but the last prompt token "
+        << "restored); 0 means the newest entry was evicted instead of the oldest";
+}
+
+TEST_F(PrefixCacheEviction, CacheHoldsExactlyPrefixCacheEntriesDistinctPrompts) {
+    EXPECT_EQ(cached('x', "prompt x, first submit"), 0u) << "nothing cached starts with 'x' yet";
+    EXPECT_EQ(cached('y', "prompt y, first submit"), 0u) << "nothing cached starts with 'y' yet";
+    // Only the older one is checked: a hit retires as a new entry too, so re-submitting y first
+    // would evict x before x is checked.
+    EXPECT_EQ(cached('x', "prompt x, re-submit after y"), kLen - 1)
+        << "x and y are the only " << kEntries << " entries, so x must still hit; 0 means the cache holds fewer "
+        << "than prefix_cache_entries finished sequences";
+}
+
