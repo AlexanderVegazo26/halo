@@ -17,6 +17,7 @@
 #include "halo/template/chat_template.h"
 #include "halo/template/output_parser.h"
 #include "halo/tokenizer/tokenizer.h"
+#include "tokenizer/unicode.h"
 
 namespace fs = std::filesystem;
 using halo::ErrorCode;
@@ -394,6 +395,60 @@ TEST(OutputParser, InvalidUtf8InToolArgumentsSerializesInsteadOfThrowing) {
     ASSERT_NO_THROW(j = m.to_openai_json()) << "invalid UTF-8 in a tool parameter must not throw";
     EXPECT_EQ(j["tool_calls"][0]["function"]["arguments"], "{\"q\uFFFD\":\"ab\uFFFD\uFFFD\"}")
         << "arguments: " << j["tool_calls"][0]["function"]["arguments"].dump(-1, ' ', false, OrderedJson::error_handler_t::replace);
+}
+
+TEST(OutputParser, InvalidUtf8InToolArgumentsBecomesOneReplacementPerMaximalSubpart) {
+    // Tool arguments must replace ill-formed UTF-8 the way decoded text does (the tokenizer's
+    // to_valid_utf8, Python's 'replace', Unicode 16 section 3.9 "U+FFFD Substitution of
+    // Maximal Subparts"): a cut sequence is ONE U+FFFD, a byte that can never start or continue
+    // a character is one U+FFFD each. Otherwise the same model bytes read differently in
+    // content and in a tool call, and a per-byte policy turns one cut emoji into three U+FFFD.
+    // The server dumps ToolCall::arguments with the same replace handler (json_util dump), so
+    // this pins chat, streamed chat and /v1/messages tool_use too.
+    const std::string R = "�";
+    struct Case {
+        const char* what;
+        std::string raw;
+        std::string expected;
+    };
+    const Case cases[] = {
+        {"cut 3-byte sequence at the end", "x\xE2\x82", "x" + R},
+        {"cut 3-byte sequence before ASCII", "\xE2\x82" "A", R + "A"},
+        {"cut 4-byte emoji before ASCII", "\xF0\x9F\x98" "A", R + "A"},
+        {"lone continuation bytes", "\x80\xBF", R + R},
+        {"overlong 2-byte (C0 never valid)", "\xC0\xAF", R + R},
+        {"overlong 3-byte (E0 needs A0..BF)", "\xE0\x80\xAF", R + R + R},
+        {"surrogate D800 (ED needs 80..9F)", "\xED\xA0\x80", R + R + R},
+        {"above U+10FFFF (F4 needs 80..8F)", "\xF4\x90\x80\x80", R + R + R + R},
+        {"5-byte form (F8 never valid)", "\xF8\x88\x80\x80\x80", R + R + R + R + R},
+        {"lead byte then a non-continuation", "\xC3(", R + "("},
+        {"Unicode 16 Table 3-8", "a\xF1\x80\x80\xE1\x80\xC2" "b\x80" "c\x80\xBF" "d",
+         "a" + R + R + R + "b" + R + "c" + R + R + "d"},
+    };
+    // "obj" is typed object: an ill-formed value does not parse as JSON and falls back to the
+    // raw string, which must then be replaced the same way.
+    const OrderedJson tools = OrderedJson::parse(
+        R"([{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"obj":{"type":"object"}}}}}])");
+    for (const Case& c : cases) {
+        ASSERT_EQ(halo::tokenizer::unicode::to_valid_utf8(c.raw), c.expected)
+            << c.what << ": the table's expectation disagrees with the tokenizer's to_valid_utf8";
+        const std::string out = "</think><tool_call>\n<function=f>\n<parameter=k" + c.raw + ">\n" + c.raw +
+                                "\n</parameter>\n<parameter=obj>\n{\"v\":\"" + c.raw +
+                                "\"}\n</parameter>\n</function>\n</tool_call>";
+        const ParsedMessage m = OutputParser::parse(out, {.tools = tools});
+        ASSERT_EQ(m.tool_calls.size(), 1u) << c.what << ": warnings " << ::testing::PrintToString(m.warnings);
+        OrderedJson j;
+        ASSERT_NO_THROW(j = m.to_openai_json()) << c.what;
+        const std::string args = j["tool_calls"][0]["function"]["arguments"].get<std::string>();
+        OrderedJson parsed;
+        ASSERT_NO_THROW(parsed = OrderedJson::parse(args)) << c.what << ": arguments are not valid JSON: " << args;
+        const std::string key = "k" + c.expected;
+        ASSERT_TRUE(parsed.contains(key)) << c.what << ": parameter name not replaced per maximal subpart; arguments "
+                                          << args;
+        EXPECT_EQ(parsed[key], c.expected) << c.what << ": parameter value; arguments " << args;
+        EXPECT_EQ(parsed["obj"], "{\"v\":\"" + c.expected + "\"}")
+            << c.what << ": object-typed value with ill-formed bytes; arguments " << args;
+    }
 }
 
 TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
