@@ -130,6 +130,69 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
 
+  # The heavier k6 run (load/load.js: ramp to 16 VUs, 2 min soak, 48-VU spike past the admission
+  # limits) against an optimized halo_load_server. ~5 min, so weekly (and on manual dispatch) only;
+  # pushes and PRs get the 20 s smoke inside the jobs above. Its budgets come from the admission
+  # limits, not host speed (load/README.md), so a red run means a queueing or shedding regression.
+  load:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: '2.3.0'
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+
+      - name: Build halo_load_server
+        run: cmake --build build --target halo_load_server
+
+      # Exit 77 (k6 missing) fails this job too: here a skipped run is not a pass.
+      - name: k6 load.js
+        env:
+          HALO_LOAD_REPORT_DIR: .test-report-load/load
+        run: |
+          mkdir -p .test-report-load
+          set +e
+          python3 load/run.py --server build/tests/unit/api/halo_load_server \
+            --server-arg=--token-delay-ms=2 load/load.js 2>&1 | tee .test-report-load/run.log
+          rc=${PIPESTATUS[0]}
+          {
+            if [ "$rc" = 0 ]; then echo '# load.js: PASS'; else echo "# load.js: FAIL (exit $rc)"; fi
+            echo
+            echo '```'
+            sed -n '/^load: /,$p' .test-report-load/run.log
+            echo '```'
+            echo
+            echo 'k6 summary JSON: load/k6-load.json in the test-report-load artifact; full output: run.log.'
+            echo 'Baseline and budgets: load/README.md.'
+          } > .test-report-load/summary.md
+          cat .test-report-load/summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Upload load report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-load
+          path: .test-report-load/
+          include-hidden-files: true
+          if-no-files-found: ignore
+
   # Coverage-guided fuzzing (libFuzzer + ASan/UBSan) of the parsers that take untrusted input: GGUF
   # files, API request bodies (through render + tokenize) and model output (tests/fuzz/README.md).
   # Blocking and deterministic: a fixed seed and run count per target over the checked-in corpus.

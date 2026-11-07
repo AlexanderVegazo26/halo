@@ -9,7 +9,7 @@ a real deployment.
 | Script | Where it runs | What it checks |
 |---|---|---|
 | `smoke.js` | ctest `load_smoke` (so `scripts/test-agent` and the release, ASan and TSan CI jobs) | 4 VUs, 20 s over every route; no failed requests, every check passes, p95 < 25 ms, p99 < 50 ms, streamed chat p95 < 30 ms (x20 on sanitizer/Debug builds) |
-| `load.js` | on demand | ramps to 16 VUs, soaks 2 min, spikes to 48 (past `max_concurrent` 4 + `max_queue` 16): overload is shed with 429/503 + `Retry-After`, never an error; admitted requests p95 < 700 ms, p99 < 1 s; >= 25 served/s; the spike is shed (x scale) |
+| `load.js` | CI `load` job (weekly cron + manual dispatch, optimized build; report artifact `test-report-load`), or on demand | ramps to 16 VUs, soaks 2 min, spikes to 48 (past `max_concurrent` 4 + `max_queue` 16): overload is shed with 429/503 + `Retry-After`, never an error; admitted requests p95 < 700 ms, p99 < 1 s; >= 25 served/s; the spike is shed (x scale) |
 
 ```bash
 cmake --build build --target halo_load_server
