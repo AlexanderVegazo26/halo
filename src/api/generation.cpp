@@ -35,7 +35,7 @@ std::string StopMatcher::push(std::string_view text) {
         const auto p = pending_.find(s);
         if (p == std::string::npos) continue;
         const std::size_t end = p + s.size();
-        if (end < best_end || (end == best_end && s.size() > which->size())) {
+        if (which == nullptr || end < best_end || (end == best_end && s.size() > which->size())) {
             best_end = end;
             which = &s;
         }

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Static analysis gate: clang-tidy (pinned) over every translation unit in src/, with the checks in
+# .clang-tidy (bugprone, clang-analyzer, performance; every enabled check is an error).
+#
+#   scripts/clang-tidy [--build-dir=DIR] [--report-dir=DIR] [--files=REGEX] [-j N] [-- extra run-clang-tidy args]
+#
+# --files limits the run to the TUs whose path matches REGEX (default: everything under src/), e.g.
+# --files=src/api/generation.cpp to recheck one file.
+#
+# Needs DIR/compile_commands.json (CMake writes it at configure time; no build is needed). A missing
+# build dir is configured CPU-only like CI. clang-tidy comes from the PyPI wheel at the pinned
+# version below, run through uvx (or a cached venv when uv isn't installed), so local runs and CI agree.
+# Writes DIR_REPORT/clang-tidy.log (full output) and clang-tidy.md (one line per finding:
+# file:line, check, message, and the command to rerun only that file). Exit: 0 clean, 1 findings.
+set -euo pipefail
+CLANG_TIDY_VERSION=23.1.4
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD="$SRC/build"
+REPORT="$SRC/.test-report"
+JOBS="$(nproc)"
+FILES="^$SRC/src/"
+EXTRA=()
+while (($#)); do
+  case "$1" in
+    --build-dir=*) BUILD="$(realpath -m "${1#*=}")" ;;
+    --report-dir=*) REPORT="$(realpath -m "${1#*=}")" ;;
+    --files=*) FILES="${1#*=}" ;;
+    -j) JOBS="$2"; shift ;;
+    --) shift; EXTRA=("$@"); break ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "scripts/clang-tidy: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ ! -f "$BUILD/compile_commands.json" ]]; then
+  cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF >&2
+fi
+
+# run-clang-tidy.py looks up clang-tidy on PATH: uvx puts the wheel's bin there; otherwise use a
+# cached venv with the same wheel (CI's hosted image has python3-venv, not uv).
+if command -v uvx >/dev/null; then
+  RUN=(uvx --from "clang-tidy==$CLANG_TIDY_VERSION")
+else
+  VENV="${XDG_CACHE_HOME:-$HOME/.cache}/halo-clang-tidy-$CLANG_TIDY_VERSION"
+  if [[ ! -x "$VENV/bin/clang-tidy" ]]; then
+    python3 -m venv "$VENV" && "$VENV/bin/pip" install -q "clang-tidy==$CLANG_TIDY_VERSION" \
+      || { echo "scripts/clang-tidy: could not install clang-tidy $CLANG_TIDY_VERSION into $VENV" >&2; exit 2; }
+  fi
+  RUN=(env "PATH=$VENV/bin:$PATH")
+fi
+
+mkdir -p "$REPORT"
+LOG="$REPORT/clang-tidy.log"
+MD="$REPORT/clang-tidy.md"
+"${RUN[@]}" clang-tidy --version | sed -n 's/^ *//p' | head -2 >&2
+set +e
+(cd "$SRC" && "${RUN[@]}" run-clang-tidy.py -p "$BUILD" -j "$JOBS" -quiet -config-file "$SRC/.clang-tidy" \
+  "${EXTRA[@]}" "$FILES") >"$LOG" 2>&1
+rc=$?
+set -e
+
+# One line per distinct finding (a header finding repeats once per TU that includes it).
+mapfile -t findings < <(grep -E '^/.*:[0-9]+:[0-9]+: (warning|error): .*\[[^]]+\]$' "$LOG" \
+  | sed "s#^$SRC/##" | sort -u)
+{
+  if ((${#findings[@]} == 0 && rc == 0)); then
+    echo "# clang-tidy: PASS"
+    echo
+    echo "clang-tidy $CLANG_TIDY_VERSION, checks from .clang-tidy, TUs matching \`$FILES\`. Full output: \`$LOG\`."
+  else
+    echo "# clang-tidy: FAIL"
+    echo
+    echo "${#findings[@]} finding(s), clang-tidy $CLANG_TIDY_VERSION, checks from .clang-tidy. Full output (with the"
+    echo "code excerpt and notes for each): \`$LOG\`. Fix the code; for a reviewed false positive add"
+    echo "\`// NOLINT(<check>)\` with the reason on the line above. Don't add the check to the RATCHET list."
+    echo
+    for f in "${findings[@]}"; do
+      file="${f%%:*}"
+      check="${f##*[}"; check="${check%]}"; check="${check%,-warnings-as-errors}"
+      loc="$(sed -E 's/: (warning|error): .*//' <<<"$f")"
+      msg="$(sed -E 's/^.*: (warning|error): //; s/ \[[^]]+\]$//' <<<"$f")"
+      tu="$file"
+      [[ "$file" == src/* ]] || tu="<a src/ file that includes it>"
+      echo "- \`$loc\` [$check]: $msg"
+      echo "  rerun: \`scripts/clang-tidy --build-dir=$BUILD --files=$tu\`"
+    done
+    if ((${#findings[@]} == 0)); then
+      echo "run-clang-tidy exited $rc without a finding line (a compile error or a crash): see the log."
+    fi
+  fi
+} >"$MD"
+cat "$MD"
+((${#findings[@]} == 0 && rc == 0))

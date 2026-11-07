@@ -228,3 +228,38 @@ jobs:
           path: .test-report-fuzz/
           include-hidden-files: true
           if-no-files-found: ignore
+
+  # Static analysis: clang-tidy 23.1.4 (PyPI wheel, pinned in scripts/clang-tidy) over every TU in
+  # src/ with the checks in .clang-tidy (bugprone, clang-analyzer, performance; findings are errors).
+  # Configure only: compile_commands.json is all it needs. The report lists each finding with
+  # file:line, check and a rerun-one-file command; checks still being worked down are the RATCHET
+  # list in .clang-tidy.
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_BUILD_VULKAN=OFF -DHALO_BUILD_HIP=OFF
+
+      # No uv on the hosted image: the script installs the pinned wheel into a cached venv.
+      - name: clang-tidy
+        run: scripts/clang-tidy --build-dir=build --report-dir=.test-report-tidy
+
+      - name: Upload clang-tidy report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clang-tidy-report
+          path: .test-report-tidy/
+          include-hidden-files: true
+          if-no-files-found: ignore

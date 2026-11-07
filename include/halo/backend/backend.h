@@ -80,18 +80,23 @@ enum class KvType : std::uint8_t { F32, F16, Q8 };
 }
 
 /// Bytes of one K (or V) row of `kv_dim` elements in format `t`. Error(Config) if `kv_dim` is
-/// not representable in that format (F16 needs an even kv_dim, Q8 a multiple of 32).
+/// not representable in that format (F16 needs an even kv_dim, Q8 a multiple of 32) or the row
+/// size does not fit in 64 bits.
 [[nodiscard]] inline std::uint64_t kv_row_bytes(KvType t, std::uint64_t kv_dim) {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
     switch (t) {
-        case KvType::F32: return kv_dim * 4;
+        case KvType::F32: break;
         case KvType::F16:
             HALO_CHECK(kv_dim % 2 == 0, ErrorCode::Config, "KV type f16 needs an even kv_dim, got {}", kv_dim);
+            HALO_CHECK(kv_dim <= kMax / 2, ErrorCode::Config, "KV row size overflow (f16, kv_dim {})", kv_dim);
             return kv_dim * 2;
         case KvType::Q8:
             HALO_CHECK(kv_dim % 32 == 0, ErrorCode::Config, "KV type q8 needs a kv_dim that is a multiple of 32, got {}",
                        kv_dim);
+            HALO_CHECK(kv_dim / 32 <= kMax / 36, ErrorCode::Config, "KV row size overflow (q8, kv_dim {})", kv_dim);
             return kv_dim / 32 * 36;
     }
+    HALO_CHECK(kv_dim <= kMax / 4, ErrorCode::Config, "KV row size overflow (f32, kv_dim {})", kv_dim);
     return kv_dim * 4;
 }
 

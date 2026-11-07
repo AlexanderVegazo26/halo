@@ -33,7 +33,7 @@ std::size_t KvLayout::block_floats() const {
 }
 
 std::size_t KvLayout::block_bytes() const {
-    if (type == backend::KvType::F32) return block_floats() * sizeof(float);
+    if (type == backend::KvType::F32) return mul_checked(block_floats(), sizeof(float), "block");
     HALO_CHECK(n_layers > 0 && kv_dim > 0 && block_tokens > 0, ErrorCode::Config,
                "KvLayout: zero dimension (layers {}, kv_dim {}, block_tokens {})", n_layers, kv_dim, block_tokens);
     const std::size_t row = backend::kv_row_bytes(type, kv_dim);
@@ -46,6 +46,7 @@ std::size_t KvPool::max_blocks(const KvLayout& layout, Placement placement, std:
     const std::uint64_t unit = placement == Placement::Single ? layout.block_bytes() : layout.layer_block_bytes();
     const std::uint64_t id_max = std::numeric_limits<BlockId>::max();
     if (cap_bytes == 0) return static_cast<std::size_t>(id_max);
+    HALO_CHECK(unit > 0, ErrorCode::Config, "KvPool: zero-byte block");  // block_bytes() never returns 0; guards the division
     return static_cast<std::size_t>(std::min<std::uint64_t>(cap_bytes / unit, id_max));
 }
 

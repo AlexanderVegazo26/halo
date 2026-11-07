@@ -1,0 +1,59 @@
+# clang-tidy gate for halo's own code (src/ and include/halo/). Run it with scripts/clang-tidy;
+# CI's `clang-tidy` job runs the same script with the same pinned clang-tidy.
+#
+# Every enabled check is an error: a new finding fails the job. Two kinds of checks are off:
+#   * off for good: style rules that don't find bugs in this codebase (see the reason per check);
+#   * RATCHET: checks that still have findings in src/ (count as of 2026-11-07). Fix a check's
+#     findings (or NOLINT a false positive with its reason), then delete its line here so the
+#     gate holds it at zero from then on. Never add a check to this list to get a red run green.
+Checks: >-
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-signed-bitwise,
+  -performance-enum-size,
+  -clang-analyzer-optin.performance.Padding,
+  -bugprone-unchecked-optional-access,
+  -bugprone-casting-through-void,
+  -bugprone-empty-catch,
+  -bugprone-exception-escape,
+  -performance-inefficient-vector-operation,
+  -performance-faster-string-find,
+  -performance-prefer-single-char-overloads,
+  -performance-inefficient-string-concatenation,
+  -performance-use-std-move,
+  -performance-unnecessary-value-param,
+  -performance-move-const-arg,
+  -bugprone-suspicious-stringview-data-usage,
+  -bugprone-assignment-in-if-condition,
+  -performance-unnecessary-copy-initialization,
+  -bugprone-std-exception-baseclass,
+  -bugprone-signed-char-misuse,
+  -bugprone-return-const-ref-from-parameter,
+  -bugprone-optional-value-conversion,
+  -bugprone-misplaced-widening-cast,
+  -bugprone-branch-clone
+# Why each one is off (same order as above):
+#   off for good:
+#     easily-swappable-parameters    kernel signatures are (rows, cols, ...) by design
+#     narrowing-conversions          -Wconversion already covers it, with the casts reviewed
+#     implicit-widening-of-mult...   size_t index arithmetic everywhere; -Wconversion covers it
+#     signed-bitwise                 315 hits, all bit packing on fixed-width ints (quant formats)
+#     enum-size                      23 hits, enum width doesn't matter here
+#     optin Padding                  struct layout follows the GGUF/kernel structs
+#   RATCHET (findings left in src/ on 2026-11-07):
+#     unchecked-optional-access 30, casting-through-void 10, empty-catch 9, exception-escape 6,
+#     inefficient-vector-operation 7, faster-string-find 4, prefer-single-char-overloads 4,
+#     inefficient-string-concatenation 3, use-std-move 2, unnecessary-value-param 2,
+#     move-const-arg 2, suspicious-stringview-data-usage 2, assignment-in-if-condition 2,
+#     unnecessary-copy-initialization 1, std-exception-baseclass 1, signed-char-misuse 1,
+#     return-const-ref-from-parameter 1, optional-value-conversion 1, misplaced-widening-cast 1,
+#     branch-clone 1
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(src|include/halo)/.*'
+ExcludeHeaderFilterRegex: '.*/_deps/.*'
+SystemHeaders: false

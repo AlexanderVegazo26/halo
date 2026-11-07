@@ -5,6 +5,7 @@
 
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "halo/backends/cpu/ops.h"
@@ -82,6 +83,39 @@ TEST(KvPool, LayoutAndConfigErrors) {
         ADD_FAILURE() << "expected overflow error";
     } catch (const halo::Error& e) {
         EXPECT_EQ(e.code(), halo::ErrorCode::Config);
+    }
+}
+
+// The element count fits but the byte size doesn't: block_bytes() must throw Error(Config) like
+// block_floats() does, not wrap (to 0 for these F32/F16 cases, which made max_blocks() divide by
+// zero and segment_bytes_for() size a 0-byte segment).
+TEST(KvPool, BlockBytesOverflowIsAConfigErrorForEveryKvType) {
+    using halo::backend::KvType;
+    constexpr std::size_t kTop = std::size_t{1} << 63;
+    const struct {
+        const char* name;
+        KvLayout layout;
+    } cases[] = {
+        {"f32 floats 2^63 x 4 bytes", KvLayout{1, kTop / 2, 1, KvType::F32}},
+        {"f16 row 2^63 x 2 bytes", KvLayout{1, kTop, 1, KvType::F16}},
+        {"q8 row (2^64 - 32) / 32 x 36 bytes", KvLayout{1, SIZE_MAX - 31, 1, KvType::Q8}},
+    };
+    for (const auto& c : cases) {
+        for (const auto placement : {halo::kv_cache::Placement::Single, halo::kv_cache::Placement::PerLayer}) {
+            const std::string what = std::string(c.name) +
+                                     (placement == halo::kv_cache::Placement::Single ? ", single segment" : ", per layer");
+            try {
+                const auto bytes = c.layout.block_bytes();
+                ADD_FAILURE() << what << ": expected Error(Config) for a block size past SIZE_MAX, got block_bytes "
+                              << bytes;
+            } catch (const halo::Error& e) {
+                EXPECT_EQ(e.code(), halo::ErrorCode::Config) << what << ": block_bytes threw " << e.what();
+            }
+            EXPECT_THROW((void)KvPool::max_blocks(c.layout, placement, 1u << 30), halo::Error)
+                << what << ": max_blocks must reject the layout, not divide by a wrapped block size";
+            EXPECT_THROW((void)KvPool::segment_bytes_for(c.layout, placement, 1), halo::Error)
+                << what << ": segment_bytes_for must reject the layout";
+        }
     }
 }
 

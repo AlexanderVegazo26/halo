@@ -762,7 +762,8 @@ public:
             auto* id = static_cast<std::int32_t*>(static_cast<void*>(ids.wbase + i * ids.stride));
             float* v = vals.wf() + i * vals.fstride();
             for (std::size_t j = 0; j < a.k; ++j) {
-                id[j] = all[i][j].index;
+                // Resolver::get sets wbase for every Access::Write operand, so ids.wbase is never null here.
+                id[j] = all[i][j].index;  // NOLINT(clang-analyzer-core.NullDereference)
                 v[j] = all[i][j].value;
             }
         }
