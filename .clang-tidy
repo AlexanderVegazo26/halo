@@ -29,14 +29,7 @@ Checks: >-
   -performance-unnecessary-value-param,
   -performance-move-const-arg,
   -bugprone-suspicious-stringview-data-usage,
-  -bugprone-assignment-in-if-condition,
-  -performance-unnecessary-copy-initialization,
-  -bugprone-std-exception-baseclass,
-  -bugprone-signed-char-misuse,
-  -bugprone-return-const-ref-from-parameter,
-  -bugprone-optional-value-conversion,
-  -bugprone-misplaced-widening-cast,
-  -bugprone-branch-clone
+  -bugprone-assignment-in-if-condition
 # Why each one is off (same order as above):
 #   off for good:
 #     easily-swappable-parameters    kernel signatures are (rows, cols, ...) by design
@@ -49,10 +42,10 @@ Checks: >-
 #     unchecked-optional-access 30, casting-through-void 10, empty-catch 9, exception-escape 6,
 #     inefficient-vector-operation 7, faster-string-find 4, prefer-single-char-overloads 4,
 #     inefficient-string-concatenation 3, use-std-move 2, unnecessary-value-param 2,
-#     move-const-arg 2, suspicious-stringview-data-usage 2, assignment-in-if-condition 2,
-#     unnecessary-copy-initialization 1, std-exception-baseclass 1, signed-char-misuse 1,
-#     return-const-ref-from-parameter 1, optional-value-conversion 1, misplaced-widening-cast 1,
-#     branch-clone 1
+#     move-const-arg 2, suspicious-stringview-data-usage 2, assignment-in-if-condition 2
+#   (fixed and gated since: unnecessary-copy-initialization, std-exception-baseclass,
+#    signed-char-misuse, return-const-ref-from-parameter, optional-value-conversion,
+#    misplaced-widening-cast, branch-clone)
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/(src|include/halo)/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'

@@ -1,6 +1,7 @@
 #include "halo/template/output_parser.h"
 
 #include <algorithm>
+#include <exception>
 #include <utility>
 
 namespace halo::chat {
@@ -140,7 +141,7 @@ OrderedJson convert_value(const OrderedJson* schema, std::string_view value) {
     return parsed;
 }
 
-struct TooDeep {};
+struct TooDeep : std::exception {};
 
 }  // namespace
 

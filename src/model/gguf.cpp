@@ -164,7 +164,8 @@ void read_array(Reader& r, GgufArray& a, int depth);
 void read_scalar_into(Reader& r, GgufType t, GgufValue& v) {
     switch (t) {
         case GgufType::U8: v.u = r.scalar<std::uint8_t>("u8"); break;
-        case GgufType::I8: v.i = r.scalar<std::int8_t>("i8"); break;
+        // GGUF I8 is signed: sign-extending it to int64 is the intent (-5 stays -5, see test_gguf).
+        case GgufType::I8: v.i = r.scalar<std::int8_t>("i8"); break;  // NOLINT(bugprone-signed-char-misuse)
         case GgufType::U16: v.u = r.scalar<std::uint16_t>("u16"); break;
         case GgufType::I16: v.i = r.scalar<std::int16_t>("i16"); break;
         case GgufType::U32: v.u = r.scalar<std::uint32_t>("u32"); break;

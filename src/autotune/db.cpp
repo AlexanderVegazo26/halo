@@ -154,7 +154,7 @@ void migrate(sql::Connection& c, int from, const OpenOptions& o) {
         sql::Transaction tx(c);
         it->apply([&c](const std::string& statement) { c.exec(statement); });
         sql::Statement up(c, "UPDATE schema_version SET version = ?1 WHERE id = 1");
-        up.bind(1, static_cast<std::int64_t>(v + 1));
+        up.bind(1, static_cast<std::int64_t>(v) + 1);
         up.step();
         tx.commit();
         HALO_INFO("autotune", "profile db migrated from schema {} to {}", v, v + 1);

@@ -14,7 +14,7 @@ namespace halo::api {
 
 int http_status(ErrorKind k) noexcept {
     switch (k) {
-        case ErrorKind::InvalidRequest: return 400;
+        case ErrorKind::InvalidRequest:
         case ErrorKind::Unsupported: return 400;
         case ErrorKind::Authentication: return 401;
         case ErrorKind::Forbidden: return 403;

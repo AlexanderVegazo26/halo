@@ -37,6 +37,8 @@ const Json& require_object(const Json& v, const std::string& where) {
     if (!v.is_object()) bad(where, "must be an object");
     return v;
 }
+// The result aliases the argument: binding it to a temporary would dangle, so refuse rvalues.
+const Json& require_object(Json&& v, const std::string& where) = delete;
 
 const Json& require_array(const Json& obj, std::string_view key, const std::string& where, bool non_empty) {
     const Json* v = field(obj, key);
@@ -371,7 +373,7 @@ void parse_openai_thinking(const Json& body, ChatJob& job) {
     if (const Json* kw = field(body, "chat_template_kwargs")) {
         require_object(*kw, "chat_template_kwargs");
         for (auto it = kw->begin(); it != kw->end(); ++it) {
-            const std::string k = it.key();
+            const std::string& k = it.key();
             if (k != "enable_thinking" && k != "preserve_thinking" && k != "reasoning_effort") {
                 unsupported("chat_template_kwargs." + k,
                             "only enable_thinking, preserve_thinking and reasoning_effort are accepted");

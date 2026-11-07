@@ -68,7 +68,7 @@ WorkloadMessage parse_message(const nlohmann::json& j, const std::string& where)
         const auto n = as_uint(j.at("synthetic_tokens"));
         HALO_CHECK(n && *n > 0 && *n <= kMaxSyntheticTokens, ErrorCode::Config,
                    "{}: synthetic_tokens must be an integer in [1, {}]", where, kMaxSyntheticTokens);
-        m.synthetic_tokens = *n;
+        m.synthetic_tokens = n;
         if (j.contains("seed")) {
             const auto seed = as_uint(j.at("seed"));
             HALO_CHECK(seed.has_value(), ErrorCode::Config, "{}: seed must be a non-negative integer", where);
