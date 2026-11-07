@@ -161,10 +161,15 @@ struct GgufSpec {
 struct TinySpecOptions {
     bool mtp = true;
     bool recurrent_layers_key = true;
+    /// Width of the residual stream and of the FFN. Only the perf tests widen them (a weight
+    /// pass large enough that sharing it across sequences shows in the timings).
+    std::int64_t embd = 64;
+    std::int64_t ffn = 128;
 };
 
 inline GgufSpec tiny_qwen35(TinySpecOptions o = {}) {
-    constexpr std::int64_t E = 64, FF = 128, V = 64, NH = 2, NKV = 1, HD = 32, DS = 16, NK = 1, NV = 2, K = 4;
+    const std::int64_t E = o.embd, FF = o.ffn;
+    constexpr std::int64_t V = 64, NH = 2, NKV = 1, HD = 32, DS = 16, NK = 1, NV = 2, K = 4;
     const std::uint32_t n_layer = 4;
     const std::uint32_t blocks = n_layer + (o.mtp ? 1 : 0);
     GgufSpec s;

@@ -26,13 +26,18 @@
 //     prompt retires, the least recently used entry is the one evicted and the two newer ones
 //     still hit.
 //   * Batched decode (a fourth engine, max_sequences = 4): four concurrent requests share one
-//     trunk forward per tick, tick by tick. Structural, so it runs in every lane; there is no
-//     timing check: on this tiny model per-sequence work dominates, and 4 batched requests
-//     measured only ~1.14x faster than 4 sequential ones on the dev host (too close to noise).
+//     trunk forward per tick, tick by tick. Structural, so it runs in every lane; no timing:
+//     on this tiny F32 model per-sequence work dominates (4 batched requests measured only
+//     ~1.14x faster than 4 sequential ones).
+//   * Batched throughput (a fifth engine, a wider model with Q6_K matmul weights, timing builds
+//     only): 4 concurrent requests finish >= 1.5x faster than the same 4 in a row (dev host
+//     2.32x), because a batched tick dequantizes each weight block once for every row. Catches
+//     a forward per sequence that still reports one trunk pass, which BatchedDecode passes.
 //
 // Dev-host baseline (2026-11-05, RelWithDebInfo clang-21, no -march, one thread): decode
 // ~0.033 ms/token at 16 tokens of context, TTFT 1024-token prompt ~28 ms, context scaling
-// 768 -> 3072 ~2.1x. Timings are NOT a HALO performance claim (DECISIONS.md D-001).
+// 768 -> 3072 ~2.1x; batched throughput (2026-11-07, same build) 4 x 32 tokens 286 ms in a
+// row vs 123 ms concurrent = 2.32x. Timings are NOT a HALO performance claim (DECISIONS.md D-001).
 // Debug and sanitizer builds run one short generation (the functional checks) and skip the
 // timing checks with a reason. ctest runs this RUN_SERIAL (label `perf`).
 // Rerun: ctest --test-dir build -R test_decode_budget --output-on-failure
@@ -108,10 +113,12 @@ std::vector<std::string> byte_tokens() {
 }
 
 // tiny_qwen35 without MTP (no drafts: one token per tick, so ticks == tokens) and with the
-// byte-level vocabulary; token_embd / output grow to the new vocabulary size.
-std::vector<std::byte> synthetic_model() {
+// byte-level vocabulary; token_embd / output grow to the new vocabulary size. `width` / `ffn`
+// widen the model (BatchedThroughput); the defaults are tiny_qwen35's E=64, FF=128.
+std::vector<std::byte> synthetic_model(std::int64_t width = 64, std::int64_t ffn = 128,
+                                       halo::DType matmul_type = halo::DType::F32) {
     using namespace halo::test;
-    GgufSpec s = tiny_qwen35({.mtp = false});
+    GgufSpec s = tiny_qwen35({.mtp = false, .embd = width, .ffn = ffn});
     std::vector<std::string> tokens = byte_tokens();
     std::vector<std::int32_t> types(256, 1);  // 1 = normal
     for (const char* t : {"<|endoftext|>", "<|im_start|>", "<|im_end|>"}) {
@@ -127,14 +134,22 @@ std::vector<std::byte> synthetic_model() {
     const std::int64_t embd = s.find("token_embd.weight")->ne.at(0);
     s.find("token_embd.weight")->ne = {embd, vocab};
     s.find("output.weight")->ne = {embd, vocab};
+    // Every matmul weight (2-D, rows a whole number of `matmul_type` blocks) except the embedding
+    // table takes `matmul_type`; zero blocks dequantize to zero weights whatever the type.
+    for (auto& t : s.tensors) {
+        if (t.ne.size() == 2 && t.ne[0] % halo::traits(matmul_type).block_elems == 0 && t.name != "token_embd.weight") {
+            t.type = static_cast<std::uint32_t>(matmul_type);
+        }
+    }
     return s.build(true);
 }
 
 // Writes the synthetic model to a per-process temp file named after `tag`.
-std::filesystem::path write_synthetic_model(const std::string& tag) {
+std::filesystem::path write_synthetic_model(const std::string& tag, std::int64_t width = 64, std::int64_t ffn = 128,
+                                            halo::DType matmul_type = halo::DType::F32) {
     const auto path =
         std::filesystem::temp_directory_path() / ("halo-" + tag + "-" + std::to_string(::getpid()) + ".gguf");
-    const auto bytes = synthetic_model();
+    const auto bytes = synthetic_model(width, ffn, matmul_type);
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     EXPECT_TRUE(f.good()) << "could not write the synthetic model to " << path;
@@ -605,4 +620,111 @@ TEST_F(BatchedDecode, ConcurrentRequestsShareOneTrunkPassPerTick) {
         full += t.sequences == kSlots ? 1 : 0;
     }
     EXPECT_EQ(full, kTokens - 1) << "ticks serving all " << kSlots << " sequences at once";
+}
+
+namespace {
+
+// A fifth engine on a wider synthetic model (E=512, FF=1536: ~44 MB of F32 weights, so a
+// decode step is dominated by streaming the weights once) with four sequence slots. Four
+// requests that run together must finish clearly faster than the same four one after another:
+// a batched tick reads every weight once for all decode rows. BatchedDecode pins the schedule
+// (one trunk pass per tick, as the engine reports it); this pins that the shared pass is real
+// in wall time, so a forward per sequence that still reported one pass would fail here. On
+// tiny_qwen35 (E=64) per-sequence work dominates and batching measured only ~1.14x.
+//
+// Why Q6_K, E=256, FF=1024: with F32 weights a single-threaded decode is compute-bound (the
+// dev host's 64 MiB L3 holds them), so 4 rows cost 4x and batching measured 1.00x even at
+// E=512. Quantized weights are dequantized once per block for every row (cpu::matmul), so
+// that cost is shared: measured Q8_0 1.36x, Q4_K 1.45x, Q6_K 2.32-2.35x (E=256 and E=512).
+// Mutant check (2026-11-07): Speculative::step calling model_->forward once per sequence and
+// reporting one pass measured 1.00x here while BatchedDecode stayed green.
+//
+// The ratio is the median of kPairs back-to-back (sequential, concurrent) pairs, the pattern
+// that keeps DecodeCostIsAtMostLinearInContext stable on the loaded dev host. Timing builds
+// only: the functional side of batching is BatchedDecode, which runs in every lane.
+class BatchedThroughput : public ::testing::Test {
+protected:
+    static constexpr std::size_t kSlots = 4;
+    static constexpr std::size_t kPrompt = 16;
+    static constexpr std::size_t kTokens = 32;
+    static constexpr int kPairs = 5;
+    static constexpr double kMinSpeedup = 1.5;
+
+    void SetUp() override {
+        if (const char* why = skip_reason()) GTEST_SKIP() << why;
+        path_ = write_synthetic_model("batched-throughput", 256, 1024, halo::DType::Q6_K);
+        engine_ = make_engine(path_, /*prefix_cache=*/false, {}, kSlots);
+        ASSERT_NE(engine_, nullptr) << "engine creation on the wide synthetic model failed";
+    }
+    void TearDown() override {
+        engine_.reset();
+        std::error_code ec;
+        if (!path_.empty()) std::filesystem::remove(path_, ec);
+    }
+
+    GenerateResult run_one(std::int32_t token) {
+        GenerateRequest r;
+        r.prompt.assign(kPrompt, token);
+        r.sampling.temperature = 0.0f;
+        r.max_tokens = kTokens;
+        return engine_->generate(r, [](const TokenEvent&) { return true; });
+    }
+
+    void expect_complete(const GenerateResult& r, const std::string& ctx) {
+        EXPECT_EQ(r.finish, FinishReason::Length) << ctx << ": error='" << r.error << "'";
+        EXPECT_EQ(r.tokens.size(), kTokens) << ctx;
+    }
+
+    // Wall time of kSlots requests, one after another.
+    double sequential_ms() {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < kSlots; ++i) {
+            expect_complete(run_one(static_cast<std::int32_t>('a' + i)), "sequential request " + std::to_string(i));
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // Wall time of kSlots requests submitted together from their own threads.
+    double concurrent_ms() {
+        std::vector<GenerateResult> results(kSlots);
+        std::vector<std::thread> threads;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < kSlots; ++i) {
+            threads.emplace_back([&, i] { results[i] = run_one(static_cast<std::int32_t>('a' + i)); });
+        }
+        for (auto& t : threads) t.join();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        for (std::size_t i = 0; i < kSlots; ++i) expect_complete(results[i], "concurrent request " + std::to_string(i));
+        return ms;
+    }
+
+    std::filesystem::path path_;
+    std::unique_ptr<halo::runtime::Engine> engine_;
+};
+
+}  // namespace
+
+TEST_F(BatchedThroughput, FourConcurrentRequestsFinishFasterThanFourInARow) {
+    (void)sequential_ms();  // warm-up: pages in the weights, sizes the KV pool
+    (void)concurrent_ms();
+    std::vector<double> speedups;
+    double best_seq = 1e300, best_conc = 1e300;
+    for (int i = 0; i < kPairs; ++i) {
+        const double seq = sequential_ms();
+        const double conc = concurrent_ms();
+        speedups.push_back(seq / conc);
+        best_seq = std::min(best_seq, seq);
+        best_conc = std::min(best_conc, conc);
+    }
+    std::sort(speedups.begin(), speedups.end());
+    const double speedup = speedups[kPairs / 2];
+    std::printf("[perf] %-46s %9.2f -> %9.2f ms  median pair speedup %5.2f (min %.1f)\n",
+                "4 x 32 tokens, in a row -> concurrent", best_seq, best_conc, speedup, kMinSpeedup);
+    ::testing::Test::RecordProperty("batched speedup 4 sequences", std::to_string(speedup));
+    EXPECT_GE(speedup, kMinSpeedup)
+        << kSlots << " concurrent requests of " << kTokens << " tokens (best " << best_conc << " ms) were only "
+        << speedup << "x faster than the same " << kSlots << " in a row (best " << best_seq << " ms), median of "
+        << kPairs << " pairs; a batched tick streams the weights once for every decode row, so less than "
+        << kMinSpeedup << "x means each sequence pays its own weight pass (a forward per sequence) or the "
+        << "scheduler serialises the requests";
 }
