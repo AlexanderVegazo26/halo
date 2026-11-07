@@ -942,7 +942,7 @@ struct ApiServer::Impl {
             return httplib::Server::HandlerResponse::Handled;
         });
 
-        svr.set_exception_handler([this](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
+        svr.set_exception_handler([this](const httplib::Request& req, httplib::Response& res, const std::exception_ptr& ep) {
             std::string what = "unknown";
             try {
                 if (ep) std::rethrow_exception(ep);

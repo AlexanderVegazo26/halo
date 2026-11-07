@@ -104,7 +104,7 @@ LookupResult ProfileLookup::find(const ProfileKey& key, const OpKey& op, std::st
     const Entry* pick = best_exact != nullptr ? best_exact : best_compat;
     if (pick == nullptr) return r;
     r.source = best_exact != nullptr ? SelectionSource::Exact : SelectionSource::Compatible;
-    if (best_exact == nullptr) r.differing = best_compat_fields;
+    if (best_exact == nullptr) r.differing = std::move(best_compat_fields);
     r.candidate = Candidate::parse(pick->candidate);
     r.value = pick->value;
     r.strategy = pick->strategy;

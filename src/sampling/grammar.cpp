@@ -118,7 +118,7 @@ Sym Builder::repeat(Sym item, std::size_t min, std::optional<std::size_t> max, s
     return seq({item, plain(tail, min - 1, tail_max)}, name);
 }
 
-Sym Builder::literal_set(std::vector<std::string> strings, std::string name) {
+Sym Builder::literal_set(std::vector<std::string> strings, const std::string& name) {
     std::sort(strings.begin(), strings.end());
     strings.erase(std::unique(strings.begin(), strings.end()), strings.end());
     if (strings.empty()) return never(name + "_none");

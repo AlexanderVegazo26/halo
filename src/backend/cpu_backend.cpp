@@ -642,10 +642,11 @@ public:
     }
 
     void eltwise(Stream& s, const EltwiseArgs& a, OpId op, bool allow_out_eq_a) {
-        const std::string_view name = op_name(op);
-        check_stream(s, name.data());
+        // op_name() returns a string_view; the callees take a C string, so copy it (every name fits SSO).
+        const std::string name(op_name(op));
+        check_stream(s, name.c_str());
         check_kernel(a.kernel, op);
-        const Resolver r(this, name.data());
+        const Resolver r(this, name.c_str());
         const Operand x = r.f32(a.a, a.rows, a.cols, Access::Read, "a");
         const Operand y = r.f32(a.b, a.rows, a.cols, Access::Read, "b");
         const Operand out = r.f32(a.out, a.rows, a.cols, Access::Write, "out");

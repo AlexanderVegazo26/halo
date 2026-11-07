@@ -548,7 +548,7 @@ NormalizedModel NormalizedModel::from_gguf(GgufFile file) {
         mtp.lm_head_origin = own.shared_head_head.present() ? MtpTensorOrigin::NextnBlock : MtpTensorOrigin::Trunk;
         mtp.head_norm = own.shared_head_norm.present() ? own.shared_head_norm : m.output_norm_;
         mtp.head_norm_origin = own.shared_head_norm.present() ? MtpTensorOrigin::NextnBlock : MtpTensorOrigin::Trunk;
-        m.mtp_ = std::move(mtp);
+        m.mtp_ = mtp;
         m.mtp_source_ = MtpSource::Embedded;
     }
 
@@ -632,7 +632,7 @@ void NormalizedModel::attach_mtp(GgufFile file, bool use_mtp_file_head) {
 
     // Commit (strong guarantee: nothing above modified *this).
     mtp_file_ = std::move(owned);
-    mtp_ = std::move(mtp);
+    mtp_ = mtp;
     mtp_source_ = MtpSource::SeparateFile;
     for (auto& w : warnings) warnings_.push_back(std::move(w));
     HALO_DEBUG("model", "attached MTP {} (embedding: {}, lm_head: {})", mtp_file_->source(),

@@ -24,12 +24,7 @@ Checks: >-
   -performance-inefficient-vector-operation,
   -performance-faster-string-find,
   -performance-prefer-single-char-overloads,
-  -performance-inefficient-string-concatenation,
-  -performance-use-std-move,
-  -performance-unnecessary-value-param,
-  -performance-move-const-arg,
-  -bugprone-suspicious-stringview-data-usage,
-  -bugprone-assignment-in-if-condition
+  -performance-inefficient-string-concatenation
 # Why each one is off (same order as above):
 #   off for good:
 #     easily-swappable-parameters    kernel signatures are (rows, cols, ...) by design
@@ -41,11 +36,11 @@ Checks: >-
 #   RATCHET (findings left in src/ on 2026-11-07):
 #     unchecked-optional-access 30, casting-through-void 10, empty-catch 9, exception-escape 6,
 #     inefficient-vector-operation 7, faster-string-find 4, prefer-single-char-overloads 4,
-#     inefficient-string-concatenation 3, use-std-move 2, unnecessary-value-param 2,
-#     move-const-arg 2, suspicious-stringview-data-usage 2, assignment-in-if-condition 2
+#     inefficient-string-concatenation 3
 #   (fixed and gated since: unnecessary-copy-initialization, std-exception-baseclass,
 #    signed-char-misuse, return-const-ref-from-parameter, optional-value-conversion,
-#    misplaced-widening-cast, branch-clone)
+#    misplaced-widening-cast, branch-clone, use-std-move, unnecessary-value-param,
+#    move-const-arg, suspicious-stringview-data-usage, assignment-in-if-condition)
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/(src|include/halo)/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'

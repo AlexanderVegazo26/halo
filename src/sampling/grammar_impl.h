@@ -105,7 +105,7 @@ public:
                std::optional<Sym> separator = std::nullopt);
     /// Any one of a set of byte strings, built as a trie (keeps stacks deterministic for
     /// large enums).
-    Sym literal_set(std::vector<std::string> strings, std::string name = "literals");
+    Sym literal_set(std::vector<std::string> strings, const std::string& name = "literals");
 
     /// Prunes unproductive alternatives, checks for left recursion, keeps reachable rules
     /// and flattens. Throws Error(Api) if the root derives nothing.

@@ -382,7 +382,7 @@ void parse_openai_thinking(const Json& body, ChatJob& job) {
         enable = opt_bool(*kw, "enable_thinking", "chat_template_kwargs.enable_thinking");
         preserve = opt_bool(*kw, "preserve_thinking", "chat_template_kwargs.preserve_thinking");
         if (auto e = opt_string(*kw, "reasoning_effort", "chat_template_kwargs.reasoning_effort")) {
-            effort_raw = e;
+            effort_raw = std::move(e);
             effort_where = "chat_template_kwargs.reasoning_effort";
         }
     }
@@ -553,10 +553,12 @@ void parse_anthropic_structured(const Json& body, SamplingParams& s, const Serve
     std::string where;
     if (const Json* oc = field(body, "output_config")) {
         require_object(*oc, "output_config");
-        if ((fmt = field(*oc, "format")) != nullptr) where = "output_config.format";
+        fmt = field(*oc, "format");
+        if (fmt != nullptr) where = "output_config.format";
     }
     if (fmt == nullptr) {
-        if ((fmt = field(body, "output_format")) != nullptr) where = "output_format";
+        fmt = field(body, "output_format");
+        if (fmt != nullptr) where = "output_format";
     }
     if (fmt == nullptr) return;
     require_object(*fmt, where);
