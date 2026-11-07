@@ -9,7 +9,7 @@ a real deployment.
 | Script | Where it runs | What it checks |
 |---|---|---|
 | `smoke.js` | ctest `load_smoke` (so `scripts/test-agent` and the release, ASan and TSan CI jobs) | 4 VUs, 20 s over every route; no failed requests, every check passes, p95 < 25 ms, p99 < 50 ms, streamed chat p95 < 30 ms (x20 on sanitizer/Debug builds) |
-| `load.js` | on demand | ramps to 16 VUs, soaks 2 min, spikes to 48 (past `max_concurrent` 4 + `max_queue` 16): overload is shed with 429/503 + `Retry-After`, never an error; admitted requests p95 < 3 s |
+| `load.js` | on demand | ramps to 16 VUs, soaks 2 min, spikes to 48 (past `max_concurrent` 4 + `max_queue` 16): overload is shed with 429/503 + `Retry-After`, never an error; admitted requests p95 < 700 ms, p99 < 1 s; >= 25 served/s; the spike is shed (x scale) |
 
 ```bash
 cmake --build build --target halo_load_server
@@ -42,3 +42,10 @@ Baseline (2026-11-06, smoke.js, 4 VUs x 20 s):
 | Debug + ASan | dev host, 32 threads | ~1,000 | 18 ms | 21 ms | 21 ms |
 
 (2026-10-31, before the Nagle fix: ~840 req/s, p95 41 ms on the dev host, release.)
+
+load.js (2026-11-06, dev host, RelWithDebInfo, `--token-delay-ms=2`, 4 min): ~15,400 req/s, almost
+all shed (429/503 with `Retry-After`) during the 48-VU spike, 0 failed; served replies min 91 ms
+(one generation), median 369 ms, p95 466 ms, p99 468 ms. That is the admission bound, not host
+speed: an admitted request waits behind at most 16 / 4 = 4 generations. With the queue unbounded
+(`--queue=1000`) or half the slots (`--concurrent=2`) the budgets fail; the old p95 < 3 s did not
+catch the unbounded queue.
