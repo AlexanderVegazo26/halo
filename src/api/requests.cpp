@@ -414,7 +414,7 @@ std::string anthropic_text_blocks(const Json& v, const std::string& where) {
         const Json& blk = require_object(v[i], bw);
         const auto type = opt_string(blk, "type", join_path(bw, "type"));
         if (type == "text") {
-            if (!out.empty()) out += "\n";
+            if (!out.empty()) out += '\n';
             out += opt_string(blk, "text", join_path(bw, "text")).value_or("");
         } else if (type == "image" || type == "document") {
             unsupported(join_path(bw, "type"), "only text input is supported by this server (" + *type + ")");
@@ -526,14 +526,14 @@ void append_anthropic_message(const Json& m, const std::string& w, Json& out, st
         const Json& blk = require_object((*c)[i], bw);
         const auto type = opt_string(blk, "type", join_path(bw, "type")).value_or("");
         if (type == "text") {
-            if (have_text) text += "\n";
+            if (have_text) text += '\n';
             text += opt_string(blk, "text", join_path(bw, "text")).value_or("");
             have_text = true;
         } else if (type == "tool_result") {
             flush_text();
             std::string result;
             if (const Json* rc = field(blk, "content")) result = anthropic_text_blocks(*rc, join_path(bw, "content"));
-            if (opt_bool(blk, "is_error", join_path(bw, "is_error")).value_or(false)) result = "Error: " + result;
+            if (opt_bool(blk, "is_error", join_path(bw, "is_error")).value_or(false)) result.insert(0, "Error: ");
             Json o = {{"role", "tool"}, {"content", std::move(result)}};
             if (auto id = opt_string(blk, "tool_use_id", join_path(bw, "tool_use_id"))) o["tool_call_id"] = *id;
             out.push_back(std::move(o));

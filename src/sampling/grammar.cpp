@@ -348,7 +348,7 @@ std::string GrammarData::debug_string() const {
                 }
             }
         }
-        out += "\n";
+        out += '\n';
     }
     return out;
 }
@@ -479,6 +479,7 @@ Sym utf8_class(Builder& b, const CpRanges& r, std::string name) {
             continue;
         }
         std::vector<Sym> seq;
+        seq.reserve(s.size());
         for (const auto& [lo, hi] : s) seq.push_back(b.range(lo, hi));
         alts.push_back(std::move(seq));
     }

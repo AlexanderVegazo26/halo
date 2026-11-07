@@ -307,7 +307,7 @@ void add_icd_path(VulkanInfo& vk, const fs::path& root, const std::string& sys_p
         std::string base = sys_path;
         if (!base.empty() && base.back() == '/') base.pop_back();
         for (const auto& name : list_dir(p)) {
-            if (name.ends_with(".json")) add_icd_manifest(vk, root, base + "/" + name, source);
+            if (name.ends_with(".json")) add_icd_manifest(vk, root, std::string(base).append(1, '/').append(name), source);
         }
     } else {
         add_icd_manifest(vk, root, sys_path, source);

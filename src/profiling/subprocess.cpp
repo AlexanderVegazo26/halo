@@ -135,7 +135,7 @@ int spawn(const std::vector<std::string>& argv, const ProcessOptions& o, SpawnSe
     args.storage = argv;
     args.finish();
     CStrings envs;
-    for (const auto& [k, v] : build_env(o)) envs.storage.push_back(k + "=" + v);
+    for (const auto& [k, v] : build_env(o)) envs.storage.push_back(std::string(k).append(1, '=').append(v));
     envs.finish();
     // Last file action: close every fd >= 3 in the child, so fds the embedding program
     // opened without O_CLOEXEC never reach the benchmarked tool (S-33).

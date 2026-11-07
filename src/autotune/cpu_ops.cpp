@@ -69,6 +69,7 @@ OpKey CpuMatmulTunable::key() const { return {"MATMUL", std::format("T={},K={},N
 
 std::vector<Candidate> CpuMatmulTunable::candidates() const {
     std::vector<Candidate> out;
+    out.reserve(threads_.size());
     for (const unsigned n : threads_) out.push_back(Candidate{{{"threads", n}}});
     return out;
 }

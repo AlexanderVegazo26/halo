@@ -582,11 +582,13 @@ Sym emit(JsonGrammar& jg, const Re& r) {
         case Re::Kind::Class: return jg.json_class(r.cls, "re_class");
         case Re::Kind::Concat: {
             std::vector<Sym> s;
+            s.reserve(r.kids.size());
             for (const auto& k : r.kids) s.push_back(emit(jg, k));
             return b.seq(std::move(s), "re_seq");
         }
         case Re::Kind::Alt: {
             std::vector<std::vector<Sym>> a;
+            a.reserve(r.kids.size());
             for (const auto& k : r.kids) a.push_back({emit(jg, k)});
             return b.alt(std::move(a), "re_alt");
         }

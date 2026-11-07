@@ -20,11 +20,7 @@ Checks: >-
   -bugprone-unchecked-optional-access,
   -bugprone-casting-through-void,
   -bugprone-empty-catch,
-  -bugprone-exception-escape,
-  -performance-inefficient-vector-operation,
-  -performance-faster-string-find,
-  -performance-prefer-single-char-overloads,
-  -performance-inefficient-string-concatenation
+  -bugprone-exception-escape
 # Why each one is off (same order as above):
 #   off for good:
 #     easily-swappable-parameters    kernel signatures are (rows, cols, ...) by design
@@ -34,13 +30,13 @@ Checks: >-
 #     enum-size                      23 hits, enum width doesn't matter here
 #     optin Padding                  struct layout follows the GGUF/kernel structs
 #   RATCHET (findings left in src/ on 2026-11-07):
-#     unchecked-optional-access 30, casting-through-void 10, empty-catch 9, exception-escape 6,
-#     inefficient-vector-operation 7, faster-string-find 4, prefer-single-char-overloads 4,
-#     inefficient-string-concatenation 3
+#     unchecked-optional-access 30, casting-through-void 10, empty-catch 9, exception-escape 6
 #   (fixed and gated since: unnecessary-copy-initialization, std-exception-baseclass,
 #    signed-char-misuse, return-const-ref-from-parameter, optional-value-conversion,
 #    misplaced-widening-cast, branch-clone, use-std-move, unnecessary-value-param,
-#    move-const-arg, suspicious-stringview-data-usage, assignment-in-if-condition)
+#    move-const-arg, suspicious-stringview-data-usage, assignment-in-if-condition,
+#    inefficient-vector-operation, faster-string-find, prefer-single-char-overloads,
+#    inefficient-string-concatenation)
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/(src|include/halo)/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'

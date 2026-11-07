@@ -376,6 +376,7 @@ private:
             if (n == 0) continue;
             for (unsigned i = 0; i < total_runs(); ++i) {
                 std::vector<runtime::GenerateRequest> reqs;
+                reqs.reserve(n);
                 for (std::uint32_t k = 0; k < n; ++k) reqs.push_back(request(tokens(ctx - c_.decode_tokens), c_.decode_tokens));
                 const std::int64_t t0 = clock_.now_ns();
                 const auto ts = concurrent(reqs, 0);
@@ -450,6 +451,7 @@ private:
         const std::size_t max_tokens = c_.storm_cancel_after + c_.decode_tokens;
         for (unsigned i = 0; i < total_runs(); ++i) {
             std::vector<runtime::GenerateRequest> reqs;
+            reqs.reserve(c_.storm_requests);
             for (std::uint32_t k = 0; k < c_.storm_requests; ++k) reqs.push_back(request(tokens(c_.prompt_tokens), max_tokens));
             const auto ts = concurrent(reqs, c_.storm_cancel_after);
             std::size_t cancelled = 0;
@@ -532,6 +534,7 @@ SuiteArtifact run_system_suite(runtime::Engine& engine, const SystemSuiteConfig&
         const std::int64_t t0 = clock.now_ns();
         {
             std::vector<std::jthread> threads;
+            threads.reserve(c.agents);
             for (std::uint32_t a = 0; a < c.agents; ++a) {
                 threads.emplace_back([&, a] {
                     const AgentScript& script = c.workload.agents[a % c.workload.agents.size()];

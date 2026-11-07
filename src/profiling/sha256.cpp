@@ -179,7 +179,7 @@ std::string make_pack_id(std::string_view trunk_sha256, const std::optional<std:
     text += trunk_sha256;
     text += "\nmtp=";
     text += mtp_sha256 ? *mtp_sha256 : std::string("none");
-    text += "\n";
+    text += '\n';
     return sha256_hex(text);
 }
 
