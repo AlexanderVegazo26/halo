@@ -874,3 +874,138 @@ TEST_F(SpeculativeDecode, ExhaustedMtpKvFallsBackToPlainDecodingWithTheSameToken
                                          << " tokens: the tick should retry without MTP";
     EXPECT_GT(r.res.draft_tokens, 0u) << "the MTP drafted before its KV ran out";
 }
+
+namespace {
+
+// Batched MTP: kSlots concurrent requests on the MTP synthetic model, admitted together (the
+// first request's first step waits on before_step until the others are queued, as in
+// BatchedDecode). The single-sequence SpeculativeDecode tests can't see a speculator that
+// drafts for one sequence only, mixes up draft rows between sequences, or runs one MTP
+// forward per sequence instead of one batched call per draft depth.
+class BatchedSpeculativeDecode : public ::testing::Test {
+protected:
+    static constexpr std::size_t kSlots = 3;
+    static constexpr std::size_t kPrompt = 16;
+    static constexpr std::size_t kTokens = 24;
+    static constexpr int kMaxDraft = 2;
+    static constexpr auto kWaitLimit = std::chrono::seconds(60);
+
+    static void SetUpTestSuite() {
+        path_ = write_synthetic_model("batched-speculative", 64, 128, halo::DType::F32, /*mtp=*/true);
+    }
+    static void TearDownTestSuite() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+
+    template <class F>
+    static bool wait_for(F done) {
+        const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
+        while (!done()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
+    struct Batch {
+        std::vector<GenerateResult> results;
+        std::vector<halo::runtime::TickInfo> ticks;
+    };
+
+    static Batch run_batch() {
+        std::atomic<bool> gate_armed{true}, gate_open{false}, worker_waiting{false};
+        std::mutex ticks_mu;
+        Batch b;
+        EngineConfig c;
+        c.model_path = path_.string();
+        c.max_context = kMaxContext;
+        c.max_context_explicit = true;
+        c.max_sequences = kSlots;
+        c.threads = 1;
+        c.mtp_enabled = true;
+        c.mtp_max_draft = kMaxDraft;
+        halo::runtime::CpuEngineOptions o;
+        o.gate_mode = halo::speculative::GateMode::Always;
+        o.faults.before_step = [&](std::span<const halo::speculative::StepRequest>) {
+            if (!gate_armed.exchange(false)) return;
+            worker_waiting = true;
+            const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
+            while (!gate_open && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        };
+        o.on_tick = [&](const halo::runtime::TickInfo& t) {
+            const std::lock_guard lk(ticks_mu);
+            b.ticks.push_back(t);
+        };
+        auto engine = halo::runtime::create_cpu_engine(c, o);
+        EXPECT_NE(engine, nullptr) << "MTP engine creation on the synthetic model failed";
+        if (engine == nullptr) return b;
+        auto run_one = [&](std::int32_t token) {
+            GenerateRequest r;
+            r.prompt.assign(kPrompt, token);
+            r.sampling.temperature = 0.0f;
+            r.max_tokens = kTokens;
+            return engine->generate(r, [](const TokenEvent&) { return true; });
+        };
+        std::vector<GenerateResult> results(kSlots);
+        std::vector<std::thread> threads;
+        threads.emplace_back([&] { results[0] = run_one('A'); });
+        const bool first_waiting = wait_for([&] { return worker_waiting.load(); });
+        for (std::size_t i = 1; i < kSlots; ++i) {
+            threads.emplace_back([&, i] { results[i] = run_one(static_cast<std::int32_t>('A' + i)); });
+        }
+        const bool all_queued = wait_for([&] { return engine->stats().queued_requests == kSlots - 1; });
+        gate_open = true;
+        for (auto& t : threads) t.join();
+        engine.reset();  // joins the worker: every on_tick has run
+        EXPECT_TRUE(first_waiting) << "the first request's first step never reached the before_step gate";
+        EXPECT_TRUE(all_queued) << "the other " << kSlots - 1 << " requests were not all queued while the first "
+                                << "step waited";
+        b.results = std::move(results);
+        return b;
+    }
+
+    static inline std::filesystem::path path_;
+};
+
+}  // namespace
+
+TEST_F(BatchedSpeculativeDecode, ConcurrentMtpSequencesDraftInOneMtpForwardPerDepth) {
+    const Batch b = run_batch();
+    ASSERT_EQ(b.results.size(), kSlots);
+    for (std::size_t i = 0; i < kSlots; ++i) {
+        const GenerateResult& r = b.results[i];
+        const std::string ctx = "request " + std::to_string(i);
+        EXPECT_EQ(r.finish, FinishReason::Length) << ctx << ": error='" << r.error << "'";
+        ASSERT_EQ(r.tokens.size(), kTokens) << ctx;
+        for (std::size_t t = 0; t < r.tokens.size(); ++t) {
+            EXPECT_EQ(r.tokens[t], 0) << ctx << ", token " << t
+                                      << ": batched speculative decoding must emit what plain greedy does (id 0)";
+        }
+        EXPECT_GT(r.draft_tokens, 0u) << ctx << ": the MTP never drafted for this sequence";
+        EXPECT_EQ(r.accepted_draft_tokens, r.draft_tokens)
+            << ctx << ": all-zero weights, so every draft (0) equals the trunk's token and is accepted";
+    }
+    std::size_t shared_draft_ticks = 0;
+    std::string trace;
+    for (std::size_t i = 0; i < b.ticks.size(); ++i) {
+        const auto& t = b.ticks[i];
+        trace += " [" + std::to_string(i + 1) + ": seq " + std::to_string(t.sequences) + ", decode " +
+                 std::to_string(t.decode_rows) + ", drafted " + std::to_string(t.drafted) + ", max_draft " +
+                 std::to_string(t.max_draft) + ", passes " + std::to_string(t.weight_passes) + "/trunk " +
+                 std::to_string(t.trunk_passes) + "]";
+        EXPECT_EQ(t.trunk_passes, 1u) << "tick " << i + 1 << ": one batched trunk forward per tick";
+        EXPECT_FALSE(t.mtp_fallback) << "tick " << i + 1 << ": the default MTP KV pool holds " << kSlots
+                                     << " sequences of " << kPrompt + kTokens << " tokens";
+        EXPECT_EQ(t.drafts.size(), t.drafted) << "tick " << i + 1;
+        if (t.drafted == 0) continue;
+        EXPECT_EQ(t.accepted, t.drafted) << "tick " << i + 1 << ": every all-zero draft is accepted";
+        EXPECT_LE(t.weight_passes, 1u + t.max_draft)
+            << "tick " << i + 1 << " (" << t.sequences << " sequences, drafted " << t.drafted
+            << "): one trunk forward + at most one MTP forward per draft depth; more means the speculator ran "
+               "a separate MTP forward per sequence";
+        if (t.sequences == kSlots && t.drafted >= kSlots) ++shared_draft_ticks;
+    }
+    EXPECT_GE(shared_draft_ticks, 2u) << "the " << kSlots << " sequences should draft together in the same ticks; ticks:"
+                                      << trace;
+}
