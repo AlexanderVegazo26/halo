@@ -102,7 +102,7 @@ struct LayerW {
     Vec attn_norm, post_norm;
     std::optional<AttnW> attn;
     std::optional<GdnW> gdn;
-    std::optional<FfnW> ffn;
+    FfnW ffn;  // every layer has one (load_layer always sets it)
     std::uint64_t bytes = 0;  // stored bytes of every weight of the layer
 };
 
@@ -283,7 +283,7 @@ bool fuse_norm = false;
     }
 
     void note_forms(const LayerW& l) {
-        if (l.ffn) (l.ffn->gu.present() ? has_fused_ffn : has_plain_ffn) = true;
+        (l.ffn.gu.present() ? has_fused_ffn : has_plain_ffn) = true;
         if (l.gdn) (l.gdn->ba.present() ? has_fused_ba : has_plain_ba) = true;
         if (l.attn && l.attn->qkv.present()) has_fused_qkv = true;
     }
@@ -756,17 +756,17 @@ bool fuse_norm = false;
     void decoder_layer(Step& st, const Acts& a, const LayerW& l, std::size_t R, Mixer&& mixer, const Vec& next_norm,
                        TensorRef next_out) const {
         mixer();
-        if (fuse_norm && R == 1 && l.ffn->gate.present() && !l.ffn->gu.present() && norm_fusable(l.ffn->gate) &&
-            norm_fusable(l.ffn->up)) {
+        if (fuse_norm && R == 1 && l.ffn.gate.present() && !l.ffn.gu.present() && norm_fusable(l.ffn.gate) &&
+            norm_fusable(l.ffn.up)) {
             // x += y only; the FFN gate/up gemvs normalize x in their prologue (no xn write / norm dispatch).
             be->add(*st.s, backend::EltwiseArgs{a.x, a.y, a.x, u32(R), u32(E), {}});
             st.cost.activation_bytes += cpu::traffic_binary(R * E).total();
             Acts f = a;
             f.fnorm = &l.post_norm;
-            ffn(st, f, *l.ffn, R);
+            ffn(st, f, l.ffn, R);
         } else {
             add_rms_norm(st, a.x, a.y, R, l.post_norm, a.xn);
-            ffn(st, a, *l.ffn, R);
+            ffn(st, a, l.ffn, R);
         }
         add_rms_norm(st, a.x, a.y, R, next_norm, next_out);
     }

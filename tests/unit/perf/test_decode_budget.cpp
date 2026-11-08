@@ -33,6 +33,11 @@
 //     only): 4 concurrent requests finish >= 1.5x faster than the same 4 in a row (dev host
 //     2.32x), because a batched tick dequantizes each weight block once for every row. Catches
 //     a forward per sequence that still reports one trunk pass, which BatchedDecode passes.
+//   * Speculative decode (a sixth engine, the model keeps its embedded MTP block, gate Always):
+//     greedy decoding drafts with the MTP, verifies, commits and keeps the MTP KV in step with
+//     the trunk (Speculator checks that invariant every tick), and an MTP KV pool too small
+//     for the request falls back to plain decoding without changing the tokens. Structural,
+//     every lane; the Spec.* engine tests in tests/unit/runtime need HALO_REF_DIR.
 //
 // Dev-host baseline (2026-11-05, RelWithDebInfo clang-21, no -march, one thread): decode
 // ~0.033 ms/token at 16 tokens of context, TTFT 1024-token prompt ~28 ms, context scaling
@@ -53,6 +58,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -116,10 +122,11 @@ std::vector<std::string> byte_tokens() {
 // tiny_qwen35 without MTP (no drafts: one token per tick, so ticks == tokens) and with the
 // byte-level vocabulary; token_embd / output grow to the new vocabulary size. `width` / `ffn`
 // widen the model (BatchedThroughput); the defaults are tiny_qwen35's E=64, FF=128.
+// `mtp` keeps tiny_qwen35's embedded MTP block (SpeculativeDecode).
 std::vector<std::byte> synthetic_model(std::int64_t width = 64, std::int64_t ffn = 128,
-                                       halo::DType matmul_type = halo::DType::F32) {
+                                       halo::DType matmul_type = halo::DType::F32, bool mtp = false) {
     using namespace halo::test;
-    GgufSpec s = tiny_qwen35({.mtp = false, .embd = width, .ffn = ffn});
+    GgufSpec s = tiny_qwen35({.mtp = mtp, .embd = width, .ffn = ffn});
     std::vector<std::string> tokens = byte_tokens();
     std::vector<std::int32_t> types(256, 1);  // 1 = normal
     for (const char* t : {"<|endoftext|>", "<|im_start|>", "<|im_end|>"}) {
@@ -147,10 +154,10 @@ std::vector<std::byte> synthetic_model(std::int64_t width = 64, std::int64_t ffn
 
 // Writes the synthetic model to a per-process temp file named after `tag`.
 std::filesystem::path write_synthetic_model(const std::string& tag, std::int64_t width = 64, std::int64_t ffn = 128,
-                                            halo::DType matmul_type = halo::DType::F32) {
+                                            halo::DType matmul_type = halo::DType::F32, bool mtp = false) {
     const auto path =
         std::filesystem::temp_directory_path() / ("halo-" + tag + "-" + std::to_string(::getpid()) + ".gguf");
-    const auto bytes = synthetic_model(width, ffn, matmul_type);
+    const auto bytes = synthetic_model(width, ffn, matmul_type, mtp);
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     EXPECT_TRUE(f.good()) << "could not write the synthetic model to " << path;
@@ -774,4 +781,96 @@ TEST_F(BatchedThroughput, FourConcurrentRequestsFinishFasterThanFourInARow) {
         << kPairs << " pairs; a batched tick streams the weights once for every decode row, so less than "
         << kMinSpeedup << "x means each sequence pays its own weight pass (a forward per sequence) or the "
         << "scheduler serialises the requests";
+}
+
+namespace {
+
+// The synthetic model with its embedded MTP block (all-zero weights: the trunk and the MTP both
+// predict token 0, so every draft is accepted and the output equals plain greedy decoding).
+class SpeculativeDecode : public ::testing::Test {
+protected:
+    static constexpr std::size_t kPrompt = 16;
+    static constexpr int kMaxDraft = 2;
+
+    static void SetUpTestSuite() { path_ = write_synthetic_model("speculative", 64, 128, halo::DType::F32, /*mtp=*/true); }
+    static void TearDownTestSuite() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+
+    struct Run {
+        GenerateResult res;
+        halo::runtime::EngineStats stats;
+        std::size_t ticks_drafting = 0;
+    };
+
+    // One greedy request on a fresh MTP engine (gate Always: no profit measurement in the way).
+    static Run run(std::size_t max_tokens, std::optional<std::size_t> mtp_kv_blocks = std::nullopt) {
+        EngineConfig c;
+        c.model_path = path_.string();
+        c.max_context = kMaxContext;
+        c.max_context_explicit = true;
+        c.max_sequences = 1;
+        c.threads = 1;
+        c.mtp_enabled = true;
+        c.mtp_max_draft = kMaxDraft;
+        halo::runtime::CpuEngineOptions o;
+        o.gate_mode = halo::speculative::GateMode::Always;
+        o.mtp_kv_blocks = mtp_kv_blocks;
+        Run out;
+        std::atomic<std::size_t> drafting{0};
+        o.on_tick = [&](const halo::runtime::TickInfo& t) {
+            if (t.drafted > 0) drafting.fetch_add(1);
+        };
+        auto engine = halo::runtime::create_cpu_engine(c, o);
+        EXPECT_NE(engine, nullptr) << "MTP engine creation on the synthetic model failed";
+        if (engine == nullptr) return out;
+        EXPECT_TRUE(engine->model().has_mtp) << "tiny_qwen35({.mtp = true}) embeds an MTP block";
+        GenerateRequest r;
+        r.prompt.assign(kPrompt, kPromptToken);
+        r.sampling.temperature = 0.0f;
+        r.max_tokens = max_tokens;
+        out.res = engine->generate(r, [](const TokenEvent&) { return true; });
+        out.stats = engine->stats();
+        engine.reset();  // joins the worker: every on_tick has run
+        out.ticks_drafting = drafting.load();
+        return out;
+    }
+
+    static void expect_plain_greedy_output(const GenerateResult& res, std::size_t max_tokens, const std::string& ctx) {
+        EXPECT_EQ(res.finish, FinishReason::Length) << ctx << ": error='" << res.error << "'";
+        ASSERT_EQ(res.tokens.size(), max_tokens) << ctx;
+        for (std::size_t i = 0; i < res.tokens.size(); ++i) {
+            EXPECT_EQ(res.tokens[i], 0) << ctx << ", token " << i
+                                        << ": speculative decoding must emit what plain greedy does (id 0)";
+        }
+    }
+
+    static inline std::filesystem::path path_;
+};
+
+}  // namespace
+
+TEST_F(SpeculativeDecode, MtpDraftsAreAcceptedAndTheOutputEqualsPlainGreedy) {
+    constexpr std::size_t kTokens = 24;
+    const Run r = run(kTokens);
+    expect_plain_greedy_output(r.res, kTokens, "MTP on, gate Always");
+    EXPECT_GT(r.res.draft_tokens, 0u) << "the MTP never drafted: speculative decoding did not run";
+    EXPECT_EQ(r.res.accepted_draft_tokens, r.res.draft_tokens)
+        << "all-zero weights: the MTP draft (0) always equals the trunk's token, so every draft is accepted";
+    EXPECT_GT(r.ticks_drafting, 1u) << "drafts in more than one tick: the MTP state carried over between ticks";
+    // Accepted drafts emit several tokens per tick: 1 prefill tick + fewer decode ticks than tokens.
+    EXPECT_LT(r.stats.ticks, 1 + kTokens) << "ticks " << r.stats.ticks << " for " << kTokens
+                                          << " tokens: accepted drafts should save decode ticks";
+    EXPECT_EQ(r.stats.mtp_fallbacks, 0u) << "the default MTP KV pool holds this request";
+}
+
+TEST_F(SpeculativeDecode, ExhaustedMtpKvFallsBackToPlainDecodingWithTheSameTokens) {
+    // 2 blocks x 16 tokens of MTP KV: the 16-token prompt fits, the drafts run out of room.
+    constexpr std::size_t kTokens = 40;
+    const Run r = run(kTokens, /*mtp_kv_blocks=*/2);
+    expect_plain_greedy_output(r.res, kTokens, "MTP KV of 2 blocks");
+    EXPECT_GE(r.stats.mtp_fallbacks, 1u) << "a 32-token MTP KV cannot hold 16 + " << kTokens
+                                         << " tokens: the tick should retry without MTP";
+    EXPECT_GT(r.res.draft_tokens, 0u) << "the MTP drafted before its KV ran out";
 }

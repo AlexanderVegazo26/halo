@@ -16,8 +16,7 @@ Checks: >-
   -bugprone-implicit-widening-of-multiplication-result,
   -bugprone-signed-bitwise,
   -performance-enum-size,
-  -clang-analyzer-optin.performance.Padding,
-  -bugprone-unchecked-optional-access
+  -clang-analyzer-optin.performance.Padding
 # Why each one is off (same order as above):
 #   off for good:
 #     easily-swappable-parameters    kernel signatures are (rows, cols, ...) by design
@@ -26,15 +25,14 @@ Checks: >-
 #     signed-bitwise                 315 hits, all bit packing on fixed-width ints (quant formats)
 #     enum-size                      23 hits, enum width doesn't matter here
 #     optin Padding                  struct layout follows the GGUF/kernel structs
-#   RATCHET (findings left in src/ on 2026-11-07):
-#     unchecked-optional-access 12 (30 on 2026-11-07; left in qwen35.cpp 6, speculative.cpp 6)
+#   RATCHET (findings left in src/): none since 2026-11-08; the list stays empty.
 #   (fixed and gated since: unnecessary-copy-initialization, std-exception-baseclass,
 #    signed-char-misuse, return-const-ref-from-parameter, optional-value-conversion,
 #    misplaced-widening-cast, branch-clone, use-std-move, unnecessary-value-param,
 #    move-const-arg, suspicious-stringview-data-usage, assignment-in-if-condition,
 #    inefficient-vector-operation, faster-string-find, prefer-single-char-overloads,
 #    inefficient-string-concatenation, exception-escape, empty-catch,
-#    casting-through-void)
+#    casting-through-void, unchecked-optional-access)
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/(src|include/halo)/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'

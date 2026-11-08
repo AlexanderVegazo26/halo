@@ -87,14 +87,22 @@ bool is_decode(const StepRequest& r) { return r.prefill.empty(); }
 /// Whether this sequence keeps MTP state (model has MTP and the sequence has an MTP KV).
 bool mtp_on(const models::Qwen35& m, const state::SequenceState& s) { return m.has_mtp() && s.mtp_kv.has_value(); }
 
+/// The sequence's MTP KV. Only reached where mtp_on() held for this sequence (directly, or through
+/// mtp_flushed / the depth-1 batch it selected), so a missing one is a scheduling bug, not a model state.
+kv_cache::SequenceKv& mtp_kv_of(state::SequenceState& s) {
+    HALO_CHECK(s.mtp_kv.has_value(), ErrorCode::Kernel, "speculative: MTP step on a sequence without an MTP KV");
+    return *s.mtp_kv;
+}
+
 void check_mtp_invariant(const models::Qwen35& m, const state::SequenceState& s, std::size_t i) {
-    if (!mtp_on(m, s)) return;
+    if (!m.has_mtp() || !s.mtp_kv) return;  // = !mtp_on(m, s)
+    const kv_cache::SequenceKv& kv = *s.mtp_kv;
     const std::size_t L = s.length();
     const std::size_t E = m.n_embd();
-    const std::size_t have = s.mtp_kv->length() + s.mtp_queue_size();
+    const std::size_t have = kv.length() + s.mtp_queue_size();
     HALO_CHECK(L == 0 ? have == 0 && s.last_hidden.empty() : have + 1 == L && s.last_hidden.size() == E, ErrorCode::Api,
                "speculative request {}: MTP state out of sync (trunk {}, MTP KV {}, queued {}, hidden {} floats)", i, L,
-               s.mtp_kv->length(), s.mtp_queue_size(), s.last_hidden.size());
+               kv.length(), s.mtp_queue_size(), s.last_hidden.size());
     HALO_CHECK(s.mtp_queue_hidden.size() == s.mtp_queue_size() * E, ErrorCode::Api,
                "speculative request {}: MTP queue has {} hidden floats for {} tokens", i, s.mtp_queue_hidden.size(),
                s.mtp_queue_size());
@@ -208,7 +216,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 MtpStep& m = steps[j];
                 m.tokens = toks[j];
                 m.hidden = hid[j];
-                m.kv = &*r.seq->mtp_kv;
+                m.kv = &mtp_kv_of(*r.seq);
                 m.first_position = static_cast<std::int32_t>(tick.seqs[idx[j]].mtp_len0 + 1);
                 m.logit_rows = std::span(&last_row[j], forced ? 0 : 1);
                 // Tree sequences need the whole depth-1 logit row for the runner-up d1' (host scan below).
@@ -271,7 +279,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 } else {
                     m.hidden = s.mtp_hidden;
                 }
-                m.kv = &*reqs[i].seq->mtp_kv;
+                m.kv = &mtp_kv_of(*reqs[i].seq);
                 m.first_position = static_cast<std::int32_t>(reqs[i].seq->length() + depth - 1);
                 HALO_CHECK(static_cast<std::size_t>(m.first_position) == m.kv->length() + 1, ErrorCode::Kernel,
                            "draft depth {}: MTP position {} but MTP KV length {}", depth, m.first_position, m.kv->length());
@@ -324,7 +332,8 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
 
 void Speculator::abort_draft(std::span<const StepRequest> reqs, Tick& tick) noexcept {
     for (std::size_t i = 0; i < reqs.size() && i < tick.seqs.size(); ++i) {
-        if (reqs[i].seq != nullptr && reqs[i].seq->mtp_kv) reqs[i].seq->mtp_kv->truncate(tick.seqs[i].mtp_len0);
+        state::SequenceState* const seq = reqs[i].seq;
+        if (seq != nullptr && seq->mtp_kv) seq->mtp_kv->truncate(tick.seqs[i].mtp_len0);
         tick.seqs[i].mtp_flushed = false;
     }
     tick.phase = Tick::Phase::Empty;
@@ -503,14 +512,18 @@ void Speculator::commit(std::span<const StepRequest> reqs, Tick& tick, std::span
             if (s.mtp_flushed) {
                 // Keep the teacher-forced rows (queue + (x, h_{L-1})) = positions 1..L; drop
                 // the draft-chain rows, which were computed from MTP hiddens.
-                seq.mtp_kv->truncate(s.len0);
+                mtp_kv_of(seq).truncate(s.len0);
                 seq.mtp_queue_tokens.clear();
                 seq.mtp_queue_hidden.clear();
             } else if (s.len0 > 0) {
                 push_pair(seq, s.fed[0], seq.last_hidden.data(), E);
             }
-            for (std::size_t j = 1; j < nk; ++j) push_pair(seq, s.fed[j], &s.hidden[(j - 1) * E], E);
-            seq.last_hidden.assign(&s.hidden[(nk - 1) * E], &s.hidden[nk * E]);
+            // Row j-1 of s.hidden is fed token j's trunk hidden; s.hidden holds exactly nk rows when every
+            // fed row is kept, so the range ends at data() + nk * E (indexing [nk * E] there is out of
+            // bounds: UB, and an abort under the Debug/sanitizer lanes' libstdc++ assertions).
+            const float* const hidden = s.hidden.data();
+            for (std::size_t j = 1; j < nk; ++j) push_pair(seq, s.fed[j], hidden + (j - 1) * E, E);
+            seq.last_hidden.assign(hidden + (nk - 1) * E, hidden + nk * E);
         }
         // ---- metrics + gate (decode only) -----------------------------------------------
         if (!is_decode(r)) continue;
