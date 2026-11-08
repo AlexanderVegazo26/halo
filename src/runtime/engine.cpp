@@ -201,6 +201,12 @@ struct Request {
     bool deadline_hit = false;  ///< worker-written before done (read under mu after done)
 };
 
+/// The sampler of a non-greedy request (generate() creates it iff !fast_greedy).
+sampling::Sampler& sampler_of(Request& r) {
+    HALO_CHECK(r.sampler.has_value(), ErrorCode::Kernel, "runtime: non-greedy request {} has no sampler", r.id);
+    return *r.sampler;
+}
+
 /// A sequence the worker is running.
 struct Active {
     std::shared_ptr<Request> r;
@@ -668,20 +674,23 @@ void CpuEngine::apply_profile() {
         if (r.candidate) s += "(" + r.candidate->to_string() + ")";
         return s;
     };
-    const auto measured = [](const autotune::LookupResult& r) {
-        return r.candidate && (r.source == autotune::SelectionSource::Exact || r.source == autotune::SelectionSource::Compatible);
+    // The candidate a measured (Exact/Compatible) profile row picked, or null.
+    const auto measured = [](const autotune::LookupResult& r) -> const autotune::Candidate* {
+        const bool from_profile =
+            r.source == autotune::SelectionSource::Exact || r.source == autotune::SelectionSource::Compatible;
+        return from_profile && r.candidate ? &*r.candidate : nullptr;
     };
     const autotune::LookupResult mm = autotune::select_kernel(lookup, key, matmul_op_key(hp), "cpu", matmul_candidates(), nullptr, {});
     const autotune::LookupResult gd = autotune::select_kernel(lookup, key, gdn_op_key(hp), "cpu", gdn_candidates(), nullptr, {});
     std::string note;
-    if (measured(mm)) {
+    if (const autotune::Candidate* c = measured(mm)) {
         if (cfg_.threads > 0) {
             note = " [explicit threads override the profile]";
         } else {
-            threads_ = static_cast<std::size_t>(mm.candidate->get("threads"));
+            threads_ = static_cast<std::size_t>(c->get("threads"));
         }
     }
-    if (measured(gd)) gdn_chunk_ = static_cast<std::size_t>(gd.candidate->get("chunk"));
+    if (const autotune::Candidate* c = measured(gd)) gdn_chunk_ = static_cast<std::size_t>(c->get("chunk"));
     tuning_ = std::format("MATMUL={}; GATED_DELTANET={}{}{}", describe(mm), describe(gd), note,
                           std::filesystem::exists(db) ? "" : " [no profile database]");
     for (const auto& r : {mm, gd}) {
@@ -1064,6 +1073,9 @@ void CpuEngine::checkpoint(Active& a) {
 }
 
 bool CpuEngine::emit(Active& a, std::int32_t tok, std::vector<TokenEvent>& events) {
+    // admit() creates the decoder; every caller runs inside the per-sequence try (R-1).
+    HALO_CHECK(a.dec.has_value(), ErrorCode::Kernel, "runtime: request {} has no stream decoder", a.r->id);
+    tokenizer::StreamDecoder& dec = *a.dec;
     const auto now = Clock::now();
     if (!a.t_first) a.t_first = now;
     a.t_last = now;
@@ -1073,7 +1085,7 @@ bool CpuEngine::emit(Active& a, std::int32_t tok, std::vector<TokenEvent>& event
     ev.token = tok;
     ev.is_eos = eos_ && tok == *eos_;
     if (!ev.is_eos) {
-        ev.piece = a.dec->push(tok);
+        ev.piece = dec.push(tok);
         a.text += ev.piece;
     }
     bool done = false;
@@ -1102,7 +1114,7 @@ bool CpuEngine::emit(Active& a, std::int32_t tok, std::vector<TokenEvent>& event
         done = true;
         a.reason = FinishReason::Length;
     }
-    if (done && !ev.is_eos) ev.piece += a.dec->flush();
+    if (done && !ev.is_eos) ev.piece += dec.flush();
     events.push_back(std::move(ev));
     {
         const std::lock_guard lk(mu_);
@@ -1217,11 +1229,15 @@ void CpuEngine::tick() {
                 // token id -1. Caught here, inside this sequence's own try, before it is ever
                 // fed forward or detokenized -- the catch below resets just this slot, so
                 // every other sequence in the tick is unaffected.
+                std::int32_t tok = -1;
                 if (a.r->fast_greedy) {
                     HALO_CHECK(o.tokens.at(0) >= 0, ErrorCode::Kernel, "trunk forward: NaN logit (poisoned argmax row)");
+                    tok = o.tokens.at(0);
+                } else {
+                    sampling::Sampler& sampler = sampler_of(*a.r);
+                    tok = sampler.sample(o.logits, a.history);
+                    sampler.accept(tok);
                 }
-                const std::int32_t tok = a.r->fast_greedy ? o.tokens.at(0) : a.r->sampler->sample(o.logits, a.history);
-                if (a.r->sampler) a.r->sampler->accept(tok);
                 a.pending = tok;
                 (void)emit(a, tok, events);
             }
@@ -1248,8 +1264,9 @@ void CpuEngine::tick() {
                 }
             } else {
                 a.fed.push_back(a.pending);
-                const std::int32_t tok = a.r->sampler->sample(o.logits, a.history);
-                a.r->sampler->accept(tok);
+                sampling::Sampler& sampler = sampler_of(*a.r);
+                const std::int32_t tok = sampler.sample(o.logits, a.history);
+                sampler.accept(tok);
                 a.pending = tok;
                 (void)emit(a, tok, events);
             }

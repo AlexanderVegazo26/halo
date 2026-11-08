@@ -27,7 +27,7 @@ Checks: >-
 #     enum-size                      23 hits, enum width doesn't matter here
 #     optin Padding                  struct layout follows the GGUF/kernel structs
 #   RATCHET (findings left in src/ on 2026-11-07):
-#     unchecked-optional-access 30
+#     unchecked-optional-access 12 (30 on 2026-11-07; left in qwen35.cpp 6, speculative.cpp 6)
 #   (fixed and gated since: unnecessary-copy-initialization, std-exception-baseclass,
 #    signed-char-misuse, return-const-ref-from-parameter, optional-value-conversion,
 #    misplaced-widening-cast, branch-clone, use-std-move, unnecessary-value-param,

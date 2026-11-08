@@ -78,6 +78,7 @@ using halo::runtime::FinishReason;
 using halo::runtime::GenerateRequest;
 using halo::runtime::GenerateResult;
 using halo::runtime::TokenEvent;
+using halo::SamplingParams;
 
 constexpr std::size_t kMaxContext = 4096;
 constexpr std::int32_t kPromptToken = 'a';  // byte tokens are indexed by their byte value
@@ -245,6 +246,52 @@ TEST_F(DecodeBudget, GeneratesOnTheSyntheticModel) {
     for (std::size_t i = 0; i < res.tokens.size(); ++i) {
         EXPECT_EQ(res.tokens[i], 0) << "token " << i << ": all-zero weights give all-zero logits, greedy picks id 0";
     }
+}
+
+namespace {
+
+// One request through the engine's sampler path (anything but plain greedy), every token checked.
+GenerateResult generate_sampled(halo::runtime::Engine& engine, const SamplingParams& sp, std::size_t max_tokens,
+                                const std::string& ctx) {
+    GenerateRequest r;
+    r.prompt.assign(16, kPromptToken);
+    r.sampling = sp;
+    r.max_tokens = max_tokens;
+    GenerateResult res = engine.generate(r, [](const TokenEvent&) { return true; });
+    EXPECT_EQ(res.finish, FinishReason::Length) << ctx << ": error='" << res.error << "'";
+    EXPECT_EQ(res.tokens.size(), max_tokens) << ctx;
+    for (std::size_t i = 0; i < res.tokens.size(); ++i) {
+        EXPECT_TRUE(res.tokens[i] >= 0 && res.tokens[i] < 256) << ctx << ": token " << i << " = " << res.tokens[i]
+                                                               << ", expected a byte token (uniform logits, no EOS)";
+    }
+    return res;
+}
+
+}  // namespace
+
+TEST_F(DecodeBudget, PenalizedGreedyRequestSamplesWithTheGrowingHistory) {
+    // A presence penalty takes the request off the fast greedy path onto its sampler. The
+    // logits are all zero, so the argmax is the lowest id not yet in the history: 0, 1, 2, ...
+    // only if every emitted token reaches the sampler's history before the next step.
+    SamplingParams sp;
+    sp.temperature = 0.0f;
+    sp.presence_penalty = 1.0f;
+    sp.penalty_last_n = -1;
+    const GenerateResult res = generate_sampled(*engine_, sp, 8, "greedy + presence_penalty 1");
+    const std::vector<std::int32_t> want{0, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_EQ(res.tokens, want) << "greedy with a presence penalty over uniform logits must pick the lowest unseen id "
+                                   "each step (all zeros = generated tokens never reach the sampler's history)";
+}
+
+TEST_F(DecodeBudget, SeededSampledRequestIsReproducible) {
+    SamplingParams sp;
+    sp.temperature = 1.0f;
+    sp.seed = 42;
+    const GenerateResult a = generate_sampled(*engine_, sp, 8, "temperature 1, seed 42, run 1");
+    const GenerateResult b = generate_sampled(*engine_, sp, 8, "temperature 1, seed 42, run 2");
+    EXPECT_EQ(a.tokens, b.tokens) << "the same seed must sample the same tokens";
+    EXPECT_NE(a.tokens, std::vector<std::int32_t>(8, 0))
+        << "temperature 1 over 259 equal logits drew id 0 eight times: the request took the greedy path";
 }
 
 TEST_F(DecodeBudget, DecodePerTokenAfterAShortPrompt) {
