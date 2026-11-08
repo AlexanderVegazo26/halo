@@ -52,6 +52,7 @@ struct TensorSpec {
     std::optional<std::uint64_t> offset;       // default: packed + aligned
     std::optional<std::uint32_t> n_dims;       // default: ne.size()
     float fill = 0.0f;                         // F32 tensors: constant value
+    std::vector<float> values;                 // F32 tensors: leading elements (rest 0; overrides fill)
 };
 
 // ---- value encoders --------------------------------------------------------------------
@@ -94,7 +95,7 @@ struct GgufSpec {
         return *this;
     }
     GgufSpec& tensor(std::string name, std::vector<std::int64_t> ne, DType t = DType::F32, float fill = 0.0f) {
-        tensors.push_back({std::move(name), std::move(ne), static_cast<std::uint32_t>(t), {}, {}, fill});
+        tensors.push_back({std::move(name), std::move(ne), static_cast<std::uint32_t>(t), {}, {}, fill, {}});
         return *this;
     }
     TensorSpec* find(std::string_view name) {
@@ -145,6 +146,11 @@ struct GgufSpec {
         out.b.resize(data0 + cursor);
         for (std::size_t i = 0; i < tensors.size(); ++i) {
             const auto& t = tensors[i];
+            if (t.type == static_cast<std::uint32_t>(DType::F32) && !t.values.empty() && offs[i] + nbytes(t) <= cursor) {
+                const std::uint64_t n = std::min<std::uint64_t>(nbytes(t) / 4, t.values.size());
+                std::memcpy(out.b.data() + data0 + offs[i], t.values.data(), n * 4);
+                continue;
+            }
             if (t.type == static_cast<std::uint32_t>(DType::F32) && t.fill != 0.0f && offs[i] + nbytes(t) <= cursor) {
                 const std::uint64_t n = nbytes(t) / 4;
                 for (std::uint64_t k = 0; k < n; ++k) {

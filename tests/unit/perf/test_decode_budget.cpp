@@ -123,8 +123,17 @@ std::vector<std::string> byte_tokens() {
 // byte-level vocabulary; token_embd / output grow to the new vocabulary size. `width` / `ffn`
 // widen the model (BatchedThroughput); the defaults are tiny_qwen35's E=64, FF=128.
 // `mtp` keeps tiny_qwen35's embedded MTP block (SpeculativeDecode).
+// `echo` (F32 only) makes the trunk and the MTP repeat the token they are given, for 'A'..'Z'
+// (kEchoFirst + i): those tokens get a one-hot embedding (dimension i) that output.weight reads
+// back, and eh_proj passes the embedding half of the MTP input through. Every layer stays zero,
+// so the residual stream carries the embedding unchanged: a sequence prompted with 'B' emits 'B'
+// and drafts 'B', and a draft routed to another sequence is rejected (BatchedSpeculativeDecode).
+// Any other token has a zero embedding and still decodes to id 0.
+constexpr std::int32_t kEchoFirst = 'A';
+constexpr std::int32_t kEchoCount = 26;
 std::vector<std::byte> synthetic_model(std::int64_t width = 64, std::int64_t ffn = 128,
-                                       halo::DType matmul_type = halo::DType::F32, bool mtp = false) {
+                                       halo::DType matmul_type = halo::DType::F32, bool mtp = false,
+                                       bool echo = false) {
     using namespace halo::test;
     GgufSpec s = tiny_qwen35({.mtp = mtp, .embd = width, .ffn = ffn});
     std::vector<std::string> tokens = byte_tokens();
@@ -142,6 +151,23 @@ std::vector<std::byte> synthetic_model(std::int64_t width = 64, std::int64_t ffn
     const std::int64_t embd = s.find("token_embd.weight")->ne.at(0);
     s.find("token_embd.weight")->ne = {embd, vocab};
     s.find("output.weight")->ne = {embd, vocab};
+    if (echo) {
+        EXPECT_EQ(matmul_type, halo::DType::F32) << "echo weights are written as F32 values";
+        EXPECT_GE(embd, kEchoCount) << "echo needs one embedding dimension per echo token";
+        std::vector<float> rows(static_cast<std::size_t>(embd * vocab), 0.0f);
+        for (std::int32_t i = 0; i < kEchoCount && i < embd; ++i) {
+            rows[static_cast<std::size_t>((kEchoFirst + i) * embd + i)] = 1.0f;
+        }
+        s.find("token_embd.weight")->values = rows;
+        s.find("output.weight")->values = std::move(rows);
+        if (mtp) {
+            // eh_proj is {2E, E}: output row r reads concat(enorm(embedding), hnorm(hidden)), so
+            // the identity on the first E columns forwards the drafted-from token alone.
+            std::vector<float> eh(static_cast<std::size_t>(2 * embd * embd), 0.0f);
+            for (std::int64_t r = 0; r < embd; ++r) eh[static_cast<std::size_t>(r * 2 * embd + r)] = 1.0f;
+            s.find("blk.4.nextn.eh_proj.weight")->values = std::move(eh);
+        }
+    }
     // Every matmul weight (2-D, rows a whole number of `matmul_type` blocks) except the embedding
     // table takes `matmul_type`; zero blocks dequantize to zero weights whatever the type.
     for (auto& t : s.tensors) {
@@ -154,10 +180,11 @@ std::vector<std::byte> synthetic_model(std::int64_t width = 64, std::int64_t ffn
 
 // Writes the synthetic model to a per-process temp file named after `tag`.
 std::filesystem::path write_synthetic_model(const std::string& tag, std::int64_t width = 64, std::int64_t ffn = 128,
-                                            halo::DType matmul_type = halo::DType::F32, bool mtp = false) {
+                                            halo::DType matmul_type = halo::DType::F32, bool mtp = false,
+                                            bool echo = false) {
     const auto path =
         std::filesystem::temp_directory_path() / ("halo-" + tag + "-" + std::to_string(::getpid()) + ".gguf");
-    const auto bytes = synthetic_model(width, ffn, matmul_type, mtp);
+    const auto bytes = synthetic_model(width, ffn, matmul_type, mtp, echo);
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     EXPECT_TRUE(f.good()) << "could not write the synthetic model to " << path;
@@ -877,11 +904,13 @@ TEST_F(SpeculativeDecode, ExhaustedMtpKvFallsBackToPlainDecodingWithTheSameToken
 
 namespace {
 
-// Batched MTP: kSlots concurrent requests on the MTP synthetic model, admitted together (the
-// first request's first step waits on before_step until the others are queued, as in
-// BatchedDecode). The single-sequence SpeculativeDecode tests can't see a speculator that
-// drafts for one sequence only, mixes up draft rows between sequences, or runs one MTP
-// forward per sequence instead of one batched call per draft depth.
+// Batched MTP: kSlots concurrent requests on the echo MTP synthetic model, admitted together
+// (the first request's first step waits on before_step until the others are queued, as in
+// BatchedDecode). Request i is prompted with 'A' + i, so its trunk emits and its MTP drafts
+// 'A' + i only: a draft handed to the wrong sequence is a rejected draft. The single-sequence
+// SpeculativeDecode tests can't see a speculator that drafts for one sequence only, mixes up
+// draft rows between sequences, or runs one MTP forward per sequence instead of one batched
+// call per draft depth.
 class BatchedSpeculativeDecode : public ::testing::Test {
 protected:
     static constexpr std::size_t kSlots = 3;
@@ -891,7 +920,7 @@ protected:
     static constexpr auto kWaitLimit = std::chrono::seconds(60);
 
     static void SetUpTestSuite() {
-        path_ = write_synthetic_model("batched-speculative", 64, 128, halo::DType::F32, /*mtp=*/true);
+        path_ = write_synthetic_model("batched-speculative", 64, 128, halo::DType::F32, /*mtp=*/true, /*echo=*/true);
     }
     static void TearDownTestSuite() {
         std::error_code ec;
@@ -949,10 +978,10 @@ protected:
         };
         std::vector<GenerateResult> results(kSlots);
         std::vector<std::thread> threads;
-        threads.emplace_back([&] { results[0] = run_one('A'); });
+        threads.emplace_back([&] { results[0] = run_one(kEchoFirst); });
         const bool first_waiting = wait_for([&] { return worker_waiting.load(); });
         for (std::size_t i = 1; i < kSlots; ++i) {
-            threads.emplace_back([&, i] { results[i] = run_one(static_cast<std::int32_t>('A' + i)); });
+            threads.emplace_back([&, i] { results[i] = run_one(kEchoFirst + static_cast<std::int32_t>(i)); });
         }
         const bool all_queued = wait_for([&] { return engine->stats().queued_requests == kSlots - 1; });
         gate_open = true;
@@ -975,16 +1004,18 @@ TEST_F(BatchedSpeculativeDecode, ConcurrentMtpSequencesDraftInOneMtpForwardPerDe
     ASSERT_EQ(b.results.size(), kSlots);
     for (std::size_t i = 0; i < kSlots; ++i) {
         const GenerateResult& r = b.results[i];
-        const std::string ctx = "request " + std::to_string(i);
+        const std::int32_t echo = kEchoFirst + static_cast<std::int32_t>(i);
+        const std::string ctx = "request " + std::to_string(i) + " (prompt token " + std::to_string(echo) + ")";
         EXPECT_EQ(r.finish, FinishReason::Length) << ctx << ": error='" << r.error << "'";
         ASSERT_EQ(r.tokens.size(), kTokens) << ctx;
         for (std::size_t t = 0; t < r.tokens.size(); ++t) {
-            EXPECT_EQ(r.tokens[t], 0) << ctx << ", token " << t
-                                      << ": batched speculative decoding must emit what plain greedy does (id 0)";
+            EXPECT_EQ(r.tokens[t], echo) << ctx << ", token " << t
+                                         << ": the echo model's plain greedy output repeats the prompt token";
         }
         EXPECT_GT(r.draft_tokens, 0u) << ctx << ": the MTP never drafted for this sequence";
         EXPECT_EQ(r.accepted_draft_tokens, r.draft_tokens)
-            << ctx << ": all-zero weights, so every draft (0) equals the trunk's token and is accepted";
+            << ctx << ": the echo MTP drafts this sequence's own token, which the trunk always accepts; a "
+            << "rejected draft was routed from (or computed with) another sequence's token or hidden state";
     }
     std::size_t shared_draft_ticks = 0;
     std::string trace;
@@ -999,7 +1030,9 @@ TEST_F(BatchedSpeculativeDecode, ConcurrentMtpSequencesDraftInOneMtpForwardPerDe
                                      << " sequences of " << kPrompt + kTokens << " tokens";
         EXPECT_EQ(t.drafts.size(), t.drafted) << "tick " << i + 1;
         if (t.drafted == 0) continue;
-        EXPECT_EQ(t.accepted, t.drafted) << "tick " << i + 1 << ": every all-zero draft is accepted";
+        EXPECT_EQ(t.accepted, t.drafted) << "tick " << i + 1 << " (" << t.sequences
+                                         << " sequences): every echo draft is accepted unless it reached the "
+                                            "wrong sequence";
         EXPECT_LE(t.weight_passes, 1u + t.max_draft)
             << "tick " << i + 1 << " (" << t.sequences << " sequences, drafted " << t.drafted
             << "): one trunk forward + at most one MTP forward per draft depth; more means the speculator ran "
