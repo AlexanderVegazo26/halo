@@ -29,9 +29,9 @@ jobs:
       # k6 for the ctest load smoke (load/smoke.js against halo_load_server); without it the
       # test reports SKIPPED instead of running.
       - name: Install k6
-        uses: grafana/setup-k6-action@v1
-        with:
-          k6-version: '2.3.0'
+        run: scripts/install-k6.sh "$RUNNER_TEMP/k6-bin"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Configure
         run: |
@@ -70,9 +70,9 @@ jobs:
       # k6 for the ctest load smoke (load/smoke.js against halo_load_server); without it the
       # test reports SKIPPED instead of running.
       - name: Install k6
-        uses: grafana/setup-k6-action@v1
-        with:
-          k6-version: '2.3.0'
+        run: scripts/install-k6.sh "$RUNNER_TEMP/k6-bin"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Configure (ASan + UBSan, Debug)
         run: |
@@ -107,9 +107,9 @@ jobs:
           sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
 
       - name: Install k6
-        uses: grafana/setup-k6-action@v1
-        with:
-          k6-version: '2.3.0'
+        run: scripts/install-k6.sh "$RUNNER_TEMP/k6-bin"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Configure (TSan, Debug)
         run: |
@@ -147,9 +147,9 @@ jobs:
           sudo apt-get install -y clang ninja-build cmake libsqlite3-dev
 
       - name: Install k6
-        uses: grafana/setup-k6-action@v1
-        with:
-          k6-version: '2.3.0'
+        run: scripts/install-k6.sh "$RUNNER_TEMP/k6-bin"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Configure
         run: |
