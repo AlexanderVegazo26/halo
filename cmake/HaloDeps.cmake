@@ -3,9 +3,16 @@
 include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
 
-# JSON (MIT)
+# JSON (MIT). The second URL is the same release asset (id 244339406) through the REST API:
+# GitHub serves it separately from the github.com download URL, which returned 504 for
+# minutes on 2026-11-08 and failed CI's configure step. CMake tries the URLs in order and
+# checks URL_HASH whichever one served the file; the Accept header makes the API return the
+# file instead of its JSON metadata (the download URL ignores it).
 FetchContent_Declare(nlohmann_json
   URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+      https://api.github.com/repos/nlohmann/json/releases/assets/244339406
+  HTTP_HEADER "Accept: application/octet-stream"
+  DOWNLOAD_NAME json.tar.xz
   URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa)
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
