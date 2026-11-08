@@ -5,6 +5,7 @@
 #include <tuple>
 
 #include "halo/autotune/db.h"
+#include "halo/core/error.h"
 #include "sqlite.h"
 
 namespace halo::autotune {
@@ -117,6 +118,8 @@ LookupResult select_kernel(const ProfileLookup& lookup, const ProfileKey& key, c
                            const std::function<std::optional<CostInputs>(const Candidate&)>& cost) {
     LookupResult r = lookup.find(key, op, backend);
     if (r.source != SelectionSource::None) {
+        HALO_CHECK(r.candidate.has_value(), ErrorCode::Config, "select_kernel: stored {} winner without a candidate",
+                   to_string(r.source));
         if (std::find(candidates.begin(), candidates.end(), *r.candidate) != candidates.end()) return r;
         r.rejections.push_back(std::format("stored {} winner {} is not a current candidate", to_string(r.source),
                                            r.candidate->to_string()));

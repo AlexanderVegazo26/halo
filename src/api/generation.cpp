@@ -88,6 +88,7 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
     bool in_reasoning = spec.parse_output && spec.thinking && spec.parser.starts_in_reasoning;
     bool seen_output = false;
     std::optional<std::size_t> budget = spec.parse_output ? spec.reasoning_budget : std::nullopt;
+    std::size_t budget_reached = 0;  // the budget that set Cancel::Budget (for the warning)
     std::vector<std::int32_t> observed;
     std::string content_out;
     std::vector<chat::ToolCall> emitted_tools;
@@ -192,6 +193,7 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
         }
         if (in_reasoning && budget && out.reasoning_tokens >= *budget) {
             cancel = Cancel::Budget;
+            budget_reached = *budget;
             return false;
         }
         return true;
@@ -281,7 +283,7 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
         out.reasoning_closed_early = true;
         out.warnings.push_back(std::format(
             "reasoning budget of {} tokens reached; the think block was closed early to leave room for the answer",
-            *budget));
+            budget_reached));
         cancel = Cancel::None;
         budget.reset();  // one forced close per request
         in_reasoning = false;

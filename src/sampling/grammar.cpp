@@ -50,8 +50,9 @@ Sym Builder::range(std::uint8_t lo, std::uint8_t hi) {
 
 Sym Builder::empty() {
     if (!empty_rule_) {
-        empty_rule_ = new_rule("empty");
-        add_alt(*empty_rule_, {});
+        const auto r = new_rule("empty");
+        add_alt(r, {});
+        empty_rule_ = r;
     }
     return ref(*empty_rule_);
 }

@@ -382,7 +382,7 @@ bool ProfileDb::persist_tune(const ProfileKey& key, const OpTuneResult& r) {
     }
     bool wrote = false;
     if (r.winner) {
-        HALO_CHECK(winner_cand.has_value(), ErrorCode::Config,
+        HALO_CHECK(winner_cand.has_value() && winner_run.has_value(), ErrorCode::Config,
                    "persist_tune: winner {} is not a measured candidate of the result", winner_text);
         sql::Statement up(c,
                           "INSERT INTO winning_configuration(hardware_profile_id, model_profile_id, "

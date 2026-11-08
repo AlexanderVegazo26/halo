@@ -440,8 +440,7 @@ struct ApiServer::Impl {
         return false;
     }
 
-    bool authorized(const httplib::Request& req) const {
-        const std::string& key = *cfg.api_key;
+    static bool authorized(const httplib::Request& req, const std::string& key) {
         bool ok = false;
         const std::string auth = req.get_header_value("Authorization");
         if (auth.size() > 7) {
@@ -892,7 +891,8 @@ struct ApiServer::Impl {
                 res.status = 204;
                 return httplib::Server::HandlerResponse::Handled;
             }
-            if (cfg.api_key && !cfg.api_key->empty() && req.path != "/health" && !authorized(req)) {
+            if (cfg.api_key && !cfg.api_key->empty() && req.path != "/health" &&
+                !authorized(req, *cfg.api_key)) {
                 metrics.count_rejection("unauthorized");
                 res.set_header("WWW-Authenticate", "Bearer");
                 send_error(res, fam,

@@ -268,7 +268,9 @@ Sampler Sampler::create(const SamplingParams& params, const tokenizer::Tokenizer
         HALO_CHECK(tv->vocab_size() <= vocab, ErrorCode::Api, "sampling: TokenVocab has {} tokens, more than {}",
                    tv->vocab_size(), vocab);
         std::vector<std::int32_t> eos = std::move(cfg.eos_ids);
-        if (eos.empty() && tokenizer != nullptr && tokenizer->eos()) eos.push_back(*tokenizer->eos());
+        if (eos.empty() && tokenizer != nullptr) {
+            if (const auto tok_eos = tokenizer->eos()) eos.push_back(*tok_eos);
+        }
         HALO_CHECK(!eos.empty(), ErrorCode::Api, "sampling: structured output needs at least one EOS id");
         matcher = std::make_unique<TokenMatcher>(g, std::move(tv), std::move(eos));
     }

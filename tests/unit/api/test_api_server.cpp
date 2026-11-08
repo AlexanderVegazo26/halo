@@ -793,6 +793,8 @@ TEST(ApiAnthropic, BudgetContinuationSkippedWhenContextIsFull) {
     EXPECT_EQ(j.at("stop_reason"), "max_tokens");
     EXPECT_EQ(j.at("content").at(0).at("thinking"), std::string(40, 't'));
     EXPECT_NE(j.value("warnings", Json::array()).dump().find("context is full"), std::string::npos) << j.dump();
+    EXPECT_NE(j.value("warnings", Json::array()).dump().find("reasoning budget of 40 tokens reached"), std::string::npos)
+        << "the budget warning should name the budget that closed the think block: " << j.dump();
     const auto calls = ts.engine->calls();
     ASSERT_EQ(calls.size(), 1u) << "no continuation call";
     EXPECT_EQ(calls.at(0).request.prompt.size(), 22u);
