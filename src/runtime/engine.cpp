@@ -822,10 +822,7 @@ void CpuEngine::finish_unscheduled(Request& r, FinishReason why, std::string err
 
 void CpuEngine::run() noexcept {
     const auto log_error = [](const char* what, const char* msg) noexcept {
-        try {
-            HALO_ERROR("runtime", "{}: {}", what, msg);
-        } catch (...) {  // logging must not take the worker down
-        }
+        HALO_ERROR("runtime", "{}: {}", what, msg);  // logging never throws
     };
     const auto fail_all = [&](const char* msg) noexcept {
         for (Active& a : active_) {
@@ -1325,11 +1322,9 @@ void CpuEngine::retire(Active& a, FinishReason why, std::string error) noexcept 
             cache_retired(a);
             cached = true;
         } catch (const std::exception& e) {
-            try {
-                HALO_WARN("runtime", "prefix cache: retired sequence not cached: {}", e.what());
-            } catch (...) {
-            }
+            HALO_WARN("runtime", "prefix cache: retired sequence not cached: {}", e.what());
         } catch (...) {
+            HALO_WARN("runtime", "prefix cache: retired sequence not cached: unknown exception");
         }
     }
     if (!cached) ckpts_->erase_owner(a.r->id);
@@ -1340,7 +1335,10 @@ void CpuEngine::retire(Active& a, FinishReason why, std::string error) noexcept 
         // sequence still counted as active.
         const std::lock_guard lk(mu_);
         --stats_.active_sequences;
+    } catch (const std::exception& e) {  // std::system_error from the lock: the stat stays one high
+        HALO_ERROR("runtime", "active_sequences not decremented: {}", e.what());
     } catch (...) {
+        HALO_ERROR("runtime", "active_sequences not decremented: unknown exception");
     }
     Request& r = *a.r;
     try {

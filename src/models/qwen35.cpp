@@ -27,6 +27,7 @@
 #include "halo/backend/backend.h"
 #include "halo/backends/cpu/traffic.h"
 #include "halo/core/error.h"
+#include "halo/core/log.h"
 #include "halo/tensor/quant.h"
 #include "halo/tensor/repack.h"
 
@@ -206,7 +207,10 @@ bool fuse_norm = false;
         try {
             const std::lock_guard<std::mutex> lk(stream_mu);
             if (stream_pool.size() < kMaxPooledStreams) stream_pool.push_back(std::move(s));
+        } catch (const std::exception& e) {  // lock or allocation failure: drop it, a new one is made on demand
+            HALO_DEBUG("qwen35", "stream not pooled: {}", e.what());
         } catch (...) {
+            HALO_DEBUG("qwen35", "stream not pooled: unknown exception");
         }
     }
 

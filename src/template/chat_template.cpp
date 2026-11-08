@@ -12,6 +12,7 @@
 #include <limits>
 
 #include "halo/core/error.h"
+#include "halo/core/log.h"
 #include "halo/template/output_parser.h"
 
 // Fail closed: without the in-tree patch minja has no limits at all (security review S-3).
@@ -202,7 +203,10 @@ struct ContextCycleBreaker {
         const auto clear = [](const std::shared_ptr<minja::Context>& c) {
             try {
                 for (const auto& key : c->keys()) c->set(key, minja::Value());
-            } catch (...) {  // allocation failure while clearing: the cycle leaks, nothing worse
+            } catch (const std::exception& e) {  // allocation failure while clearing: the cycle leaks, nothing worse
+                HALO_WARN("template", "render context not cleared, its reference cycle leaks: {}", e.what());
+            } catch (...) {
+                HALO_WARN("template", "render context not cleared, its reference cycle leaks: unknown exception");
             }
         };
         clear(ctx);

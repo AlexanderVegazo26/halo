@@ -8,6 +8,7 @@
 #include <random>
 
 #include "halo/core/error.h"
+#include "halo/core/log.h"
 #include "halo/template/output_parser.h"
 #include "halo/tokenizer/tokenizer.h"
 
@@ -262,9 +263,10 @@ ChatPrompt build_chat_prompt(const tokenizer::Tokenizer& tok, const SpecialToken
                 for (std::size_t j = 0; j < i; ++j) prefix.push_back(msgs[j]);
                 const std::string prendered = tmpl.apply(prefix, tl, prefix_opts);
                 out.checkpoint_hints.push_back(tokenize_escaped_render(tok, sp, nonce, table, prendered).size());
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
                 // Not a boundary this template can render standalone (e.g. no user message
                 // yet); skip it, not the request.
+                HALO_DEBUG("prompt", "no checkpoint hint after message {} of {}: {}", i, total, e.what());
             }
         }
     }

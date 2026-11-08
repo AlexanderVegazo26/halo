@@ -154,7 +154,8 @@ void apply_env() noexcept {
 void ensure_env() noexcept {
     try {
         std::call_once(g_env_once, apply_env);
-    } catch (...) {  // std::system_error from call_once: keep the defaults
+    } catch (...) {  // NOLINT(bugprone-empty-catch): std::system_error from call_once; logging
+                     // can't report its own setup failure, so it keeps the defaults (level, stderr)
     }
 }
 

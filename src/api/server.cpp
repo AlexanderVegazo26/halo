@@ -949,6 +949,7 @@ struct ApiServer::Impl {
             } catch (const std::exception& e) {
                 what = e.what();
             } catch (...) {
+                what = "exception not derived from std::exception";
             }
             HALO_ERROR(kLog, "unhandled exception on {} {}: {}", req.method, sanitize_for_log(req.path, 256),
                        sanitize_for_log(what));
