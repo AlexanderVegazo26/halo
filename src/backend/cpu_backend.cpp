@@ -87,8 +87,8 @@ struct Operand {
     std::uint64_t extent = 0;    // bytes from base to one past the last byte touched
     const char* name = "";
 
-    [[nodiscard]] const float* f() const noexcept { return static_cast<const float*>(static_cast<const void*>(base)); }
-    [[nodiscard]] float* wf() const noexcept { return static_cast<float*>(static_cast<void*>(wbase)); }
+    [[nodiscard]] const float* f() const noexcept { return reinterpret_cast<const float*>(base); }
+    [[nodiscard]] float* wf() const noexcept { return reinterpret_cast<float*>(wbase); }
     [[nodiscard]] std::size_t fstride() const noexcept { return static_cast<std::size_t>(stride / kF32); }
 };
 
@@ -194,7 +194,7 @@ cpu::WeightMatrix weight_matrix(DType type, const Operand& w, std::size_t first_
     const std::byte* base = w.base + first_row * w.stride;
     if (type == DType::F32) {
         return cpu::WeightMatrix::dense(
-            cpu::ConstRows(static_cast<const float*>(static_cast<const void*>(base)), rows, cols, w.fstride()));
+            cpu::ConstRows(reinterpret_cast<const float*>(base), rows, cols, w.fstride()));
     }
     const std::uint64_t stride = w.stride;
     if (stride == rb) {
@@ -291,7 +291,7 @@ public:
         const Operand out = r.f32(a.out, a.n_ids, a.cols, Access::Write, "out");
         r.no_overlap(out, table);
         r.no_overlap(out, ids);
-        const auto* id = static_cast<const std::int32_t*>(static_cast<const void*>(ids.base));
+        const auto* id = reinterpret_cast<const std::int32_t*>(ids.base);
         for (std::uint32_t i = 0; i < a.n_ids; ++i) {
             HALO_CHECK(id[i] >= 0 && static_cast<std::uint32_t>(id[i]) < a.n_rows, ErrorCode::Kernel,
                        "GET_ROWS: id {} at {} outside [0, {})", id[i], i, a.n_rows);
@@ -504,7 +504,7 @@ public:
         const Operand x = r.f32(a.x, a.n_tokens, row_cols, Access::Write, "x");
         const Operand pos = r.get(a.positions, 1, mul_u64(a.n_tokens, 4, r.op(), "positions"), 4, Access::Read, "positions");
         r.no_overlap(x, pos);
-        const std::span<const std::int32_t> positions(static_cast<const std::int32_t*>(static_cast<const void*>(pos.base)),
+        const std::span<const std::int32_t> positions(reinterpret_cast<const std::int32_t*>(pos.base),
                                                       a.n_tokens);
         if (hs == a.head_dim) {
             cpu::partial_rope_neox(wrows(x, a.n_tokens, row_cols), a.n_heads, a.head_dim, positions, a.rot_dims, a.theta, pool_);
@@ -539,7 +539,7 @@ public:
         const std::uint64_t needed_blocks = (rows_needed + block_tokens - 1) / block_tokens;
         HALO_CHECK(needed_blocks <= n_table, ErrorCode::Kernel, "{}: {} rows need {} blocks, table has {}", r.op(), rows_needed,
                    needed_blocks, n_table);
-        p.table = static_cast<const std::uint32_t*>(static_cast<const void*>(t.base));
+        p.table = reinterpret_cast<const std::uint32_t*>(t.base);
         for (std::uint64_t b = 0; b < needed_blocks; ++b) {
             HALO_CHECK(p.table[b] < n_pool_blocks, ErrorCode::Kernel, "{}: block table entry {} = {} outside the pool of {}",
                        r.op(), b, p.table[b], n_pool_blocks);
@@ -610,7 +610,7 @@ public:
             HALO_CHECK(qhs == hd, ErrorCode::Unsupported, "ATTENTION: tree attention needs a dense q (q_head_stride 0)");
             const Operand par = r.get(a.tree_parent, 1, mul_u64(T, 4, r.op(), "tree_parent"), 4, Access::Read, "tree_parent");
             r.no_overlap(out, par);
-            const std::span<const std::int32_t> parents(static_cast<const std::int32_t*>(static_cast<const void*>(par.base)), T);
+            const std::span<const std::int32_t> parents(reinterpret_cast<const std::int32_t*>(par.base), T);
             const cpu::PagedRows keys = cpu::PagedRows::paged(kt, bt, rows, kvd, kvd);
             const cpu::PagedRows vals = cpu::PagedRows::paged(vt, bt, rows, kvd, kvd);
             cpu::attention_gqa_tree(cpu::AttentionDims{a.n_head, a.n_kv_head, hd}, crows(q, T, q_cols), keys, vals, a.q_offset,
@@ -728,7 +728,7 @@ public:
         write_results(res, best, std::span<const std::uint8_t>(poisoned));
         if (ids_out.wbase != nullptr) {
             // LmHeadArgs::ids: dense winning ids; a poisoned vector (index -1) writes 0, a valid row.
-            auto* out = static_cast<std::int32_t*>(static_cast<void*>(ids_out.wbase));
+            auto* out = reinterpret_cast<std::int32_t*>(ids_out.wbase);
             for (std::size_t i = 0; i < n; ++i) out[i] = best[i].index < 0 ? 0 : best[i].index;
         }
     }
@@ -760,7 +760,7 @@ public:
         std::vector<std::vector<cpu::TopKEntry>> all(a.n_vec);
         for (std::size_t i = 0; i < a.n_vec; ++i) all[i] = cpu::top_k(std::span<const float>(l.f() + i * l.fstride(), a.n), a.k);
         for (std::size_t i = 0; i < a.n_vec; ++i) {
-            auto* id = static_cast<std::int32_t*>(static_cast<void*>(ids.wbase + i * ids.stride));
+            auto* id = reinterpret_cast<std::int32_t*>(ids.wbase + i * ids.stride);
             float* v = vals.wf() + i * vals.fstride();
             for (std::size_t j = 0; j < a.k; ++j) {
                 // Resolver::get sets wbase for every Access::Write operand, so ids.wbase is never null here.

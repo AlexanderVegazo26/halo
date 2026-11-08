@@ -16,7 +16,7 @@ namespace {
 const float* as_floats(const std::byte* p, const std::string& name) {
     HALO_CHECK(reinterpret_cast<std::uintptr_t>(p) % alignof(float) == 0, ErrorCode::Model,
                "tensor {}: F32 data is not 4-byte aligned", name);
-    return static_cast<const float*>(static_cast<const void*>(p));
+    return reinterpret_cast<const float*>(p);
 }
 
 }  // namespace

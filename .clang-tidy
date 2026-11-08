@@ -17,8 +17,7 @@ Checks: >-
   -bugprone-signed-bitwise,
   -performance-enum-size,
   -clang-analyzer-optin.performance.Padding,
-  -bugprone-unchecked-optional-access,
-  -bugprone-casting-through-void
+  -bugprone-unchecked-optional-access
 # Why each one is off (same order as above):
 #   off for good:
 #     easily-swappable-parameters    kernel signatures are (rows, cols, ...) by design
@@ -28,13 +27,14 @@ Checks: >-
 #     enum-size                      23 hits, enum width doesn't matter here
 #     optin Padding                  struct layout follows the GGUF/kernel structs
 #   RATCHET (findings left in src/ on 2026-11-07):
-#     unchecked-optional-access 30, casting-through-void 10
+#     unchecked-optional-access 30
 #   (fixed and gated since: unnecessary-copy-initialization, std-exception-baseclass,
 #    signed-char-misuse, return-const-ref-from-parameter, optional-value-conversion,
 #    misplaced-widening-cast, branch-clone, use-std-move, unnecessary-value-param,
 #    move-const-arg, suspicious-stringview-data-usage, assignment-in-if-condition,
 #    inefficient-vector-operation, faster-string-find, prefer-single-char-overloads,
-#    inefficient-string-concatenation, exception-escape, empty-catch)
+#    inefficient-string-concatenation, exception-escape, empty-catch,
+#    casting-through-void)
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/(src|include/halo)/.*'
 ExcludeHeaderFilterRegex: '.*/_deps/.*'
