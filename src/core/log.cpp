@@ -108,6 +108,29 @@ std::FILE* open_log_file(const char* path) noexcept {
     return f;
 }
 
+// Writes `prefix + text + suffix` as one JSON string; prefix/suffix are trusted ASCII. Control
+// characters, '"' and '\\' are escaped, and bytes >= 0x80 become '?' so the line stays valid
+// UTF-8 whatever the text holds. For write_dropped(): allocates nothing.
+void put_json_string(std::FILE* out, std::string_view text, const char* prefix, const char* suffix) noexcept {
+    std::fputc('"', out);
+    std::fputs(prefix, out);
+    for (const char ch : text) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c == '"' || c == '\\') {
+            std::fputc('\\', out);
+            std::fputc(c, out);
+        } else if (c < 0x20) {
+            std::fprintf(out, "\\u%04x", static_cast<unsigned>(c));
+        } else if (c >= 0x80) {
+            std::fputc('?', out);
+        } else {
+            std::fputc(c, out);
+        }
+    }
+    std::fputs(suffix, out);
+    std::fputc('"', out);
+}
+
 // Runs once. Must not call level() or write(): those enter the same once_flag.
 void apply_env() noexcept {
     if (const char* v = env_value("HALO_LOG_LEVEL")) {
@@ -163,25 +186,57 @@ bool parse_level(std::string_view name, Level& out) noexcept {
     return false;
 }
 
-void write(Level lvl, std::string_view component, std::string_view message) {
+void write(Level lvl, std::string_view component, std::string_view message) noexcept {
     if (lvl < level()) return;
-    const auto now = std::chrono::system_clock::now();
-    std::string line;
-    if (g_json.load(std::memory_order_relaxed)) {
-        nlohmann::json j = {
-            {"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()},
-            {"level", level_name(lvl)},
-            {"component", component},
-            {"msg", message},
-        };
-        line = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-    } else {
-        line = std::format("[{}] {}: {}", level_name(lvl), component, message);
+    try {
+        const auto now = std::chrono::system_clock::now();
+        std::string line;
+        if (g_json.load(std::memory_order_relaxed)) {
+            nlohmann::json j = {
+                {"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()},
+                {"level", level_name(lvl)},
+                {"component", component},
+                {"msg", message},
+            };
+            line = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+        } else {
+            line = std::format("[{}] {}: {}", level_name(lvl), component, message);
+        }
+        std::lock_guard lock(g_mutex);
+        std::FILE* out = g_sink != nullptr ? g_sink : stderr;
+        std::fprintf(out, "%s\n", line.c_str());
+        if (out != stderr) std::fflush(out);
+    } catch (const std::exception& e) {  // std::bad_alloc, std::system_error from the mutex
+        write_dropped(lvl, component, e.what());
+    } catch (...) {
+        write_dropped(lvl, component, "unknown exception");
     }
-    std::lock_guard lock(g_mutex);
+}
+
+void write_dropped(Level lvl, std::string_view component, const char* reason) noexcept {
+    if (lvl < level()) return;
+    if (reason == nullptr) reason = "?";
+    // No allocation and no g_mutex (locking it may be what failed): flockfile keeps the line
+    // whole, and g_sink is published by the call_once that level() went through.
     std::FILE* out = g_sink != nullptr ? g_sink : stderr;
-    std::fprintf(out, "%s\n", line.c_str());
+    const std::string_view lv = level_name(lvl);
+    ::flockfile(out);
+    if (g_json.load(std::memory_order_relaxed)) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+        std::fprintf(out, "{\"ts_ms\":%lld,\"level\":\"%.*s\",\"component\":", static_cast<long long>(ms),
+                     static_cast<int>(lv.size()), lv.data());
+        put_json_string(out, component, "", "");
+        std::fputs(",\"msg\":", out);
+        put_json_string(out, reason, "(log message dropped: ", ")");
+        std::fputs("}\n", out);
+    } else {
+        std::fprintf(out, "[%.*s] %.*s: (log message dropped: %s)\n", static_cast<int>(lv.size()), lv.data(),
+                     static_cast<int>(component.size()), component.data(), reason);
+    }
     if (out != stderr) std::fflush(out);
+    ::funlockfile(out);
 }
 
 }  // namespace halo::log

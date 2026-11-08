@@ -18,6 +18,7 @@
 // An empty value counts as unset. An unknown value prints one warning on stderr and keeps
 // the default; it never aborts the process.
 
+#include <exception>
 #include <format>
 #include <string>
 #include <string_view>
@@ -31,12 +32,23 @@ void set_level(Level level) noexcept;
 void set_json(bool json) noexcept;
 [[nodiscard]] bool parse_level(std::string_view name, Level& out) noexcept;
 
-void write(Level level, std::string_view component, std::string_view message);
+// Logging never throws: it runs in destructors and noexcept paths, where an escaping exception
+// is std::terminate. A line that can't be built (std::bad_alloc, a formatter that throws) is
+// replaced by a "(log message dropped: <reason>)" line for the same level and component.
+void write(Level level, std::string_view component, std::string_view message) noexcept;
+/// The notice written instead of a message that could not be built; allocates nothing.
+void write_dropped(Level level, std::string_view component, const char* reason) noexcept;
 
 template <typename... Args>
-void logf(Level lvl, std::string_view component, std::format_string<Args...> fmt, Args&&... args) {
+void logf(Level lvl, std::string_view component, std::format_string<Args...> fmt, Args&&... args) noexcept {
     if (lvl < level()) return;
-    write(lvl, component, std::format(fmt, std::forward<Args>(args)...));
+    try {
+        write(lvl, component, std::format(fmt, std::forward<Args>(args)...));
+    } catch (const std::exception& e) {
+        write_dropped(lvl, component, e.what());
+    } catch (...) {
+        write_dropped(lvl, component, "unknown exception");
+    }
 }
 
 }  // namespace halo::log

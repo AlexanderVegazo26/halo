@@ -157,32 +157,36 @@ private:
     // Slab layout (elements): recurrent rings at [layer * P + slot] * recurrent_floats, then
     // conv rings at conv_base + [layer * P + slot] * conv_floats.
     [[nodiscard]] std::size_t rec_at(std::size_t layer, std::size_t slot) const noexcept {
-        return (layer * p_ + slot) * shape_.recurrent_floats();
+        return (layer * p_ + slot) * rf_;
     }
-    [[nodiscard]] std::size_t conv_base() const noexcept { return shape_.n_layers * p_ * shape_.recurrent_floats(); }
+    [[nodiscard]] std::size_t conv_base() const noexcept { return shape_.n_layers * p_ * rf_; }
     [[nodiscard]] std::size_t conv_at(std::size_t layer, std::size_t slot) const noexcept {
-        return conv_base() + (layer * p_ + slot) * shape_.conv_floats();
+        return conv_base() + (layer * p_ + slot) * cf_;
     }
     [[nodiscard]] float* live_rec(std::size_t layer) noexcept { return host_.data() + rec_at(layer, live_); }
     [[nodiscard]] float* live_conv(std::size_t layer) noexcept { return host_.data() + conv_at(layer, live_); }
     /// One physical slot of one layer's ring as a backend operand (attached only).
     [[nodiscard]] backend::TensorRef rec_slot_ref(std::size_t layer, std::size_t slot) const {
-        return {dev_.get(), rec_at(layer, slot) * sizeof(float), shape_.recurrent_floats() * sizeof(float), 0};
+        return {dev_.get(), rec_at(layer, slot) * sizeof(float), rf_ * sizeof(float), 0};
     }
     [[nodiscard]] backend::TensorRef conv_slot_ref(std::size_t layer, std::size_t slot) const {
-        return {dev_.get(), conv_at(layer, slot) * sizeof(float), shape_.conv_floats() * sizeof(float), 0};
+        return {dev_.get(), conv_at(layer, slot) * sizeof(float), cf_ * sizeof(float), 0};
     }
     void check_layer(std::size_t layer) const;
     /// read views (recurrent/conv/slab): current when host-coherent or right after pull().
     void check_current(const char* what) const;
     /// ring views (recurrent_ring/conv_ring): only meaningful over the canonical host slab.
     void check_coherent(const char* what) const;
-    void zero_live();          ///< zero slab[live] of every layer (host)
+    void zero_live() noexcept;  ///< zero slab[live] of every layer (host)
     void upload_live();        ///< host slab[live] -> device (device-resident states)
     void gather_live(float* dst) const;        ///< host slab[live] -> [layer][rec|conv]
     void scatter_live(const float* src);       ///< [layer][rec|conv] -> host slab[live]
 
     GdnShape shape_;
+    // shape_.recurrent_floats() / conv_floats(), validated once by the constructor (they throw on
+    // a bad shape), so the noexcept slab-index helpers and reset() never recompute them.
+    std::size_t rf_;
+    std::size_t cf_;
     std::size_t p_;             ///< physical states per layer: max(2, max_slots + 1)
     std::vector<float> host_;   ///< the slab (host canonical, or the device mirror)
     backend::Backend* be_ = nullptr;

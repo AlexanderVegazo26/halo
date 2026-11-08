@@ -35,7 +35,11 @@ std::size_t GdnShape::conv_floats() const {
 
 std::size_t GdnShape::total_floats() const { return mul_checked(n_layers, layer_floats()); }
 
-GdnState::GdnState(GdnShape shape, std::size_t max_slots) : shape_(shape), p_(std::max<std::size_t>(2, max_slots + 1)) {
+GdnState::GdnState(GdnShape shape, std::size_t max_slots)
+    : shape_(shape),
+      rf_(shape.recurrent_floats()),
+      cf_(shape.conv_floats()),
+      p_(std::max<std::size_t>(2, max_slots + 1)) {
     const std::size_t total = mul_checked(shape_.total_floats(), p_);
     try {
         host_.assign(total, 0.0f);
@@ -85,14 +89,14 @@ void GdnState::attach(backend::Backend& be) {
 backend::TensorRef GdnState::recurrent_ref(std::size_t layer) const {
     check_layer(layer);
     HALO_CHECK(dev_ != nullptr, ErrorCode::Api, "GdnState: not attached to a backend");
-    const std::uint64_t rf = shape_.recurrent_floats();
+    const std::uint64_t rf = rf_;
     return {dev_.get(), rec_at(layer, 0) * sizeof(float), rf * p_ * sizeof(float), 0};
 }
 
 backend::TensorRef GdnState::conv_ref(std::size_t layer) const {
     check_layer(layer);
     HALO_CHECK(dev_ != nullptr, ErrorCode::Api, "GdnState: not attached to a backend");
-    const std::uint64_t cf = shape_.conv_floats();
+    const std::uint64_t cf = cf_;
     return {dev_.get(), conv_at(layer, 0) * sizeof(float), cf * p_ * sizeof(float), 0};
 }
 
@@ -111,7 +115,7 @@ void GdnState::pull() {
 std::span<float> GdnState::recurrent(std::size_t layer) {
     check_layer(layer);
     check_current("recurrent()");
-    return {live_rec(layer), shape_.recurrent_floats()};
+    return {live_rec(layer), rf_};
 }
 
 cpu::Rows GdnState::conv(std::size_t layer) {
@@ -123,14 +127,14 @@ cpu::Rows GdnState::conv(std::size_t layer) {
 cpu::StateRingView GdnState::recurrent_ring(std::size_t layer, std::size_t n_slots) {
     check_layer(layer);
     check_coherent("recurrent_ring()");
-    const std::size_t rf = shape_.recurrent_floats();
+    const std::size_t rf = rf_;
     return {std::span<float>(host_.data() + rec_at(layer, 0), rf * p_), p_, live_, n_slots};
 }
 
 cpu::StateRingView GdnState::conv_ring(std::size_t layer, std::size_t n_slots) {
     check_layer(layer);
     check_coherent("conv_ring()");
-    const std::size_t cf = shape_.conv_floats();
+    const std::size_t cf = cf_;
     return {std::span<float>(host_.data() + conv_at(layer, 0), cf * p_), p_, live_, n_slots};
 }
 
@@ -152,7 +156,7 @@ void GdnState::begin_step(std::size_t rows, std::size_t n_slots) {
     pulled_ = coherent_;  // device writes follow: the mirror is stale from here on
     if (needs_zero_) {
         // reset() on a device-resident state defers the zeroing to here (reset is noexcept).
-        const std::size_t rf = shape_.recurrent_floats(), cf = shape_.conv_floats();
+        const std::size_t rf = rf_, cf = cf_;
         std::vector<float> zeros(std::max(rf, cf), 0.0f);
         const auto s = be_->create_stream();
         for (std::size_t l = 0; l < shape_.n_layers; ++l) {
@@ -210,8 +214,8 @@ std::uint64_t GdnState::commit_bytes(std::size_t rows, std::size_t kept) const n
 
 // ---- snapshots / reset --------------------------------------------------------------------
 
-void GdnState::zero_live() {
-    const std::size_t rf = shape_.recurrent_floats(), cf = shape_.conv_floats();
+void GdnState::zero_live() noexcept {
+    const std::size_t rf = rf_, cf = cf_;
     for (std::size_t l = 0; l < shape_.n_layers; ++l) {
         std::fill_n(live_rec(l), rf, 0.0f);
         std::fill_n(live_conv(l), cf, 0.0f);
@@ -219,7 +223,7 @@ void GdnState::zero_live() {
 }
 
 void GdnState::gather_live(float* dst) const {
-    const std::size_t rf = shape_.recurrent_floats(), cf = shape_.conv_floats();
+    const std::size_t rf = rf_, cf = cf_;
     for (std::size_t l = 0; l < shape_.n_layers; ++l) {
         std::memcpy(dst + l * (rf + cf), host_.data() + rec_at(l, live_), rf * sizeof(float));
         std::memcpy(dst + l * (rf + cf) + rf, host_.data() + conv_at(l, live_), cf * sizeof(float));
@@ -227,7 +231,7 @@ void GdnState::gather_live(float* dst) const {
 }
 
 void GdnState::scatter_live(const float* src) {
-    const std::size_t rf = shape_.recurrent_floats(), cf = shape_.conv_floats();
+    const std::size_t rf = rf_, cf = cf_;
     for (std::size_t l = 0; l < shape_.n_layers; ++l) {
         std::memcpy(host_.data() + rec_at(l, live_), src + l * (rf + cf), rf * sizeof(float));
         std::memcpy(host_.data() + conv_at(l, live_), src + l * (rf + cf) + rf, cf * sizeof(float));
@@ -235,7 +239,7 @@ void GdnState::scatter_live(const float* src) {
 }
 
 void GdnState::upload_live() {
-    const std::size_t rf = shape_.recurrent_floats(), cf = shape_.conv_floats();
+    const std::size_t rf = rf_, cf = cf_;
     const auto s = be_->create_stream();
     for (std::size_t l = 0; l < shape_.n_layers; ++l) {
         be_->upload(*s, rec_slot_ref(l, live_), std::as_bytes(std::span(live_rec(l), rf)));
@@ -270,7 +274,7 @@ GdnSnapshot GdnState::snapshot() const {
         return s;
     }
     // Device-resident: download slab[live] of every layer.
-    const std::size_t rf = shape_.recurrent_floats(), cf = shape_.conv_floats();
+    const std::size_t rf = rf_, cf = cf_;
     const auto st = be_->create_stream();
     for (std::size_t l = 0; l < shape_.n_layers; ++l) {
         be_->download(*st, {dev_.get(), rec_at(l, live_) * sizeof(float), rf * sizeof(float), 0},
