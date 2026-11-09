@@ -59,6 +59,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -940,12 +941,31 @@ protected:
     struct Batch {
         std::vector<GenerateResult> results;
         std::vector<halo::runtime::TickInfo> ticks;
+        std::size_t cancel_tick = 0;  // 1-based tick whose step requested the cancel (0: none)
+        std::size_t fallbacks = 0;
     };
 
-    static Batch run_batch() {
+    // `requests` > kSlots queues the extra requests behind the batch: each waits for a slot.
+    // `cancel` set: that request's stop token fires inside the before_step of its
+    // `cancel_at_draft_step`-th drafting decode step, so the cancel lands on a known tick while
+    // the request has drafts in flight (expired() retires it before the next tick).
+    struct Plan {
+        std::size_t requests = kSlots;
+        std::size_t tokens = kTokens;
+        std::optional<std::size_t> cancel;
+        std::size_t cancel_at_draft_step = 2;
+    };
+
+    static Batch run_batch() { return run_batch(Plan{}); }
+
+    static Batch run_batch(const Plan& plan) {
         std::atomic<bool> gate_armed{true}, gate_open{false}, worker_waiting{false};
         std::mutex ticks_mu;
         Batch b;
+        std::stop_source cancel_src;
+        std::size_t cancel_draft_steps = 0;  // worker thread only
+        const std::int32_t cancel_token =
+            plan.cancel ? kEchoFirst + static_cast<std::int32_t>(*plan.cancel) : std::int32_t{-1};
         EngineConfig c;
         c.model_path = path_.string();
         c.max_context = kMaxContext;
@@ -956,7 +976,18 @@ protected:
         c.mtp_max_draft = kMaxDraft;
         halo::runtime::CpuEngineOptions o;
         o.gate_mode = halo::speculative::GateMode::Always;
-        o.faults.before_step = [&](std::span<const halo::speculative::StepRequest>) {
+        o.faults.before_step = [&](std::span<const halo::speculative::StepRequest> steps) {
+            if (plan.cancel && !cancel_src.stop_requested()) {
+                for (const auto& s : steps) {
+                    // The echo model: a decode step of the cancelled request carries its own token.
+                    if (!s.prefill.empty() || s.token != cancel_token || s.max_draft == 0) continue;
+                    if (++cancel_draft_steps == plan.cancel_at_draft_step) {
+                        cancel_src.request_stop();
+                        const std::lock_guard lk(ticks_mu);
+                        b.cancel_tick = b.ticks.size() + 1;  // this tick's on_tick comes next
+                    }
+                }
+            }
             if (!gate_armed.exchange(false)) return;
             worker_waiting = true;
             const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
@@ -969,29 +1000,62 @@ protected:
         auto engine = halo::runtime::create_cpu_engine(c, o);
         EXPECT_NE(engine, nullptr) << "MTP engine creation on the synthetic model failed";
         if (engine == nullptr) return b;
-        auto run_one = [&](std::int32_t token) {
+        auto run_one = [&](std::size_t i) {
             GenerateRequest r;
-            r.prompt.assign(kPrompt, token);
+            r.prompt.assign(kPrompt, kEchoFirst + static_cast<std::int32_t>(i));
             r.sampling.temperature = 0.0f;
-            r.max_tokens = kTokens;
+            r.max_tokens = plan.tokens;
+            if (plan.cancel == i) r.cancel = cancel_src.get_token();
             return engine->generate(r, [](const TokenEvent&) { return true; });
         };
-        std::vector<GenerateResult> results(kSlots);
+        std::vector<GenerateResult> results(plan.requests);
         std::vector<std::thread> threads;
-        threads.emplace_back([&] { results[0] = run_one(kEchoFirst); });
+        threads.emplace_back([&] { results[0] = run_one(0); });
         const bool first_waiting = wait_for([&] { return worker_waiting.load(); });
-        for (std::size_t i = 1; i < kSlots; ++i) {
-            threads.emplace_back([&, i] { results[i] = run_one(kEchoFirst + static_cast<std::int32_t>(i)); });
+        // One at a time, so the queue (and the FIFO admission) follows the request index.
+        bool all_queued = true;
+        for (std::size_t i = 1; i < plan.requests; ++i) {
+            threads.emplace_back([&, i] { results[i] = run_one(i); });
+            all_queued = all_queued && wait_for([&] { return engine->stats().queued_requests == i; });
         }
-        const bool all_queued = wait_for([&] { return engine->stats().queued_requests == kSlots - 1; });
         gate_open = true;
         for (auto& t : threads) t.join();
+        b.fallbacks = engine->stats().mtp_fallbacks;
         engine.reset();  // joins the worker: every on_tick has run
         EXPECT_TRUE(first_waiting) << "the first request's first step never reached the before_step gate";
-        EXPECT_TRUE(all_queued) << "the other " << kSlots - 1 << " requests were not all queued while the first "
-                                << "step waited";
+        EXPECT_TRUE(all_queued) << "the other " << plan.requests - 1
+                                << " requests were not all queued while the first step waited";
         b.results = std::move(results);
         return b;
+    }
+
+    static std::string tick_trace(const std::vector<halo::runtime::TickInfo>& ticks) {
+        std::string trace;
+        for (std::size_t i = 0; i < ticks.size(); ++i) {
+            const auto& t = ticks[i];
+            trace += " [" + std::to_string(i + 1) + ": seq " + std::to_string(t.sequences) + ", decode " +
+                     std::to_string(t.decode_rows) + ", drafted " + std::to_string(t.drafted) + ", max_draft " +
+                     std::to_string(t.max_draft) + ", passes " + std::to_string(t.weight_passes) + "/trunk " +
+                     std::to_string(t.trunk_passes) + ", drafts '";
+            for (const std::int32_t d : t.drafts) trace += static_cast<char>(d);
+            trace += "']";
+        }
+        return trace;
+    }
+
+    static void expect_echo_with_every_draft_accepted(const GenerateResult& r, std::size_t i, std::size_t tokens) {
+        const std::int32_t echo = kEchoFirst + static_cast<std::int32_t>(i);
+        const std::string ctx = "request " + std::to_string(i) + " (prompt token '" + static_cast<char>(echo) + "')";
+        EXPECT_EQ(r.finish, FinishReason::Length) << ctx << ": error='" << r.error << "'";
+        ASSERT_EQ(r.tokens.size(), tokens) << ctx;
+        for (std::size_t t = 0; t < r.tokens.size(); ++t) {
+            EXPECT_EQ(r.tokens[t], echo) << ctx << ", token " << t
+                                         << ": the echo model's plain greedy output repeats the prompt token";
+        }
+        EXPECT_GT(r.draft_tokens, 0u) << ctx << ": the MTP never drafted for this sequence";
+        EXPECT_EQ(r.accepted_draft_tokens, r.draft_tokens)
+            << ctx << ": the echo MTP drafts this sequence's own token, which the trunk always accepts; a "
+            << "rejected draft was routed from (or computed with) another sequence's token or hidden state";
     }
 
     static inline std::filesystem::path path_;
@@ -1002,29 +1066,10 @@ protected:
 TEST_F(BatchedSpeculativeDecode, ConcurrentMtpSequencesDraftInOneMtpForwardPerDepth) {
     const Batch b = run_batch();
     ASSERT_EQ(b.results.size(), kSlots);
-    for (std::size_t i = 0; i < kSlots; ++i) {
-        const GenerateResult& r = b.results[i];
-        const std::int32_t echo = kEchoFirst + static_cast<std::int32_t>(i);
-        const std::string ctx = "request " + std::to_string(i) + " (prompt token " + std::to_string(echo) + ")";
-        EXPECT_EQ(r.finish, FinishReason::Length) << ctx << ": error='" << r.error << "'";
-        ASSERT_EQ(r.tokens.size(), kTokens) << ctx;
-        for (std::size_t t = 0; t < r.tokens.size(); ++t) {
-            EXPECT_EQ(r.tokens[t], echo) << ctx << ", token " << t
-                                         << ": the echo model's plain greedy output repeats the prompt token";
-        }
-        EXPECT_GT(r.draft_tokens, 0u) << ctx << ": the MTP never drafted for this sequence";
-        EXPECT_EQ(r.accepted_draft_tokens, r.draft_tokens)
-            << ctx << ": the echo MTP drafts this sequence's own token, which the trunk always accepts; a "
-            << "rejected draft was routed from (or computed with) another sequence's token or hidden state";
-    }
+    for (std::size_t i = 0; i < kSlots; ++i) expect_echo_with_every_draft_accepted(b.results[i], i, kTokens);
     std::size_t shared_draft_ticks = 0;
-    std::string trace;
     for (std::size_t i = 0; i < b.ticks.size(); ++i) {
         const auto& t = b.ticks[i];
-        trace += " [" + std::to_string(i + 1) + ": seq " + std::to_string(t.sequences) + ", decode " +
-                 std::to_string(t.decode_rows) + ", drafted " + std::to_string(t.drafted) + ", max_draft " +
-                 std::to_string(t.max_draft) + ", passes " + std::to_string(t.weight_passes) + "/trunk " +
-                 std::to_string(t.trunk_passes) + "]";
         EXPECT_EQ(t.trunk_passes, 1u) << "tick " << i + 1 << ": one batched trunk forward per tick";
         EXPECT_FALSE(t.mtp_fallback) << "tick " << i + 1 << ": the default MTP KV pool holds " << kSlots
                                      << " sequences of " << kPrompt + kTokens << " tokens";
@@ -1040,7 +1085,54 @@ TEST_F(BatchedSpeculativeDecode, ConcurrentMtpSequencesDraftInOneMtpForwardPerDe
         if (t.sequences == kSlots && t.drafted >= kSlots) ++shared_draft_ticks;
     }
     EXPECT_GE(shared_draft_ticks, 2u) << "the " << kSlots << " sequences should draft together in the same ticks; ticks:"
-                                      << trace;
+                                      << tick_trace(b.ticks);
+}
+
+TEST_F(BatchedSpeculativeDecode, CancellingOneDraftingSequenceLeavesTheOthersAndItsSlotsNextRequestIntact) {
+    // 'A' 'B' 'C' draft together; 'B' is cancelled at its 2nd drafting step and 'D', queued
+    // behind the full batch, takes the freed slot while 'A' and 'C' are still drafting. The
+    // retire runs between two batched ticks, so a cancel that retired or freed the wrong
+    // sequence's slot, missed a sequence behind the first, or shifted the draft routing of the
+    // survivors shows up as a rejected echo draft, a 'B' draft after the cancel, or a request
+    // that never finishes as asked. (MTP rows a cancel leaves in its slot are pinned by
+    // SpeculativeCancel: here 'D' only appends to them after the batch's peak.)
+    constexpr std::size_t kLongTokens = 48;  // 'A' and 'C' still draft when 'D' joins
+    Plan plan;
+    plan.requests = kSlots + 1;
+    plan.tokens = kLongTokens;
+    plan.cancel = 1;
+    const Batch b = run_batch(plan);
+    ASSERT_EQ(b.results.size(), kSlots + 1);
+    const std::string trace = tick_trace(b.ticks);
+    ASSERT_GT(b.cancel_tick, 0u) << "request 1 ('B') never reached its 2nd drafting step; ticks:" << trace;
+
+    const GenerateResult& cancelled = b.results[1];
+    EXPECT_EQ(cancelled.finish, FinishReason::Cancelled) << "'B' stop token fired: error='" << cancelled.error << "'";
+    EXPECT_LT(cancelled.tokens.size(), kLongTokens) << "'B' was cancelled mid-generation";
+    EXPECT_GT(cancelled.draft_tokens, 0u) << "'B' never drafted: the cancel did not hit the MTP path";
+    for (std::size_t t = 0; t < cancelled.tokens.size(); ++t) {
+        EXPECT_EQ(cancelled.tokens[t], kEchoFirst + 1) << "'B' token " << t << " before its cancel";
+    }
+    for (const std::size_t i : {std::size_t{0}, std::size_t{2}, std::size_t{3}}) {
+        expect_echo_with_every_draft_accepted(b.results[i], i, kLongTokens);
+    }
+    EXPECT_EQ(b.fallbacks, 0u) << "the default MTP KV pool holds 3 live requests; ticks:" << trace;
+
+    bool d_drafted_with_survivor = false;
+    for (std::size_t i = 0; i < b.ticks.size(); ++i) {
+        const auto& t = b.ticks[i];
+        EXPECT_EQ(t.trunk_passes, 1u) << "tick " << i + 1 << ": one batched trunk forward per tick";
+        EXPECT_EQ(t.accepted, t.drafted) << "tick " << i + 1 << ": every echo draft is accepted unless it reached "
+                                         << "the wrong sequence; ticks:" << trace;
+        if (i + 1 <= b.cancel_tick) continue;
+        const auto has = [&](char ch) { return std::ranges::count(t.drafts, std::int32_t{ch}) > 0; };
+        EXPECT_FALSE(has('B')) << "tick " << i + 1 << " (after the cancel in tick " << b.cancel_tick
+                               << ") drafted for the retired 'B'; ticks:" << trace;
+        if (has('D') && (has('A') || has('C'))) d_drafted_with_survivor = true;
+    }
+    EXPECT_TRUE(d_drafted_with_survivor) << "'D' should draft in the same tick as 'A' or 'C' (it took 'B's slot "
+                                         << "while they were still drafting); cancel in tick " << b.cancel_tick
+                                         << ", ticks:" << trace;
 }
 
 namespace {
