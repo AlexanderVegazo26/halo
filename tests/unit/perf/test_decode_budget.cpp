@@ -946,13 +946,14 @@ protected:
     };
 
     // `requests` > kSlots queues the extra requests behind the batch: each waits for a slot.
-    // `cancel` set: that request's stop token fires inside the before_step of its
-    // `cancel_at_draft_step`-th drafting decode step, so the cancel lands on a known tick while
-    // the request has drafts in flight (expired() retires it before the next tick).
+    // `cancel` non-empty: those requests share one stop token, which fires inside the
+    // before_step of the first listed request's `cancel_at_draft_step`-th drafting decode step,
+    // so every listed request is cancelled on the same known tick while it has drafts in flight
+    // (expired() retires them before the next tick).
     struct Plan {
         std::size_t requests = kSlots;
         std::size_t tokens = kTokens;
-        std::optional<std::size_t> cancel;
+        std::vector<std::size_t> cancel;
         std::size_t cancel_at_draft_step = 2;
     };
 
@@ -965,7 +966,7 @@ protected:
         std::stop_source cancel_src;
         std::size_t cancel_draft_steps = 0;  // worker thread only
         const std::int32_t cancel_token =
-            plan.cancel ? kEchoFirst + static_cast<std::int32_t>(*plan.cancel) : std::int32_t{-1};
+            plan.cancel.empty() ? std::int32_t{-1} : kEchoFirst + static_cast<std::int32_t>(plan.cancel.front());
         EngineConfig c;
         c.model_path = path_.string();
         c.max_context = kMaxContext;
@@ -977,7 +978,7 @@ protected:
         halo::runtime::CpuEngineOptions o;
         o.gate_mode = halo::speculative::GateMode::Always;
         o.faults.before_step = [&](std::span<const halo::speculative::StepRequest> steps) {
-            if (plan.cancel && !cancel_src.stop_requested()) {
+            if (!plan.cancel.empty() && !cancel_src.stop_requested()) {
                 for (const auto& s : steps) {
                     // The echo model: a decode step of the cancelled request carries its own token.
                     if (!s.prefill.empty() || s.token != cancel_token || s.max_draft == 0) continue;
@@ -1005,7 +1006,7 @@ protected:
             r.prompt.assign(kPrompt, kEchoFirst + static_cast<std::int32_t>(i));
             r.sampling.temperature = 0.0f;
             r.max_tokens = plan.tokens;
-            if (plan.cancel == i) r.cancel = cancel_src.get_token();
+            if (std::ranges::count(plan.cancel, i) > 0) r.cancel = cancel_src.get_token();
             return engine->generate(r, [](const TokenEvent&) { return true; });
         };
         std::vector<GenerateResult> results(plan.requests);
@@ -1100,7 +1101,7 @@ TEST_F(BatchedSpeculativeDecode, CancellingOneDraftingSequenceLeavesTheOthersAnd
     Plan plan;
     plan.requests = kSlots + 1;
     plan.tokens = kLongTokens;
-    plan.cancel = 1;
+    plan.cancel = {1};
     const Batch b = run_batch(plan);
     ASSERT_EQ(b.results.size(), kSlots + 1);
     const std::string trace = tick_trace(b.ticks);
@@ -1133,6 +1134,57 @@ TEST_F(BatchedSpeculativeDecode, CancellingOneDraftingSequenceLeavesTheOthersAnd
     EXPECT_TRUE(d_drafted_with_survivor) << "'D' should draft in the same tick as 'A' or 'C' (it took 'B's slot "
                                          << "while they were still drafting); cancel in tick " << b.cancel_tick
                                          << ", ticks:" << trace;
+}
+
+TEST_F(BatchedSpeculativeDecode, TwoDraftingSequencesCancelledInOneTickAreBothRetiredBeforeTheNext) {
+    // 'B' and 'C' share one stop token that fires at 'B's 2nd drafting step, so both are
+    // cancelled in the same tick while 'A' keeps drafting; 'D' and 'E', queued behind the full
+    // batch, take the two freed slots. The per-tick cancel poll must retire every cancelled
+    // sequence, not only the first it finds: one left behind runs (and drafts) one more tick.
+    constexpr std::size_t kLongTokens = 48;  // 'A' still drafts when 'D' and 'E' join
+    Plan plan;
+    plan.requests = kSlots + 2;
+    plan.tokens = kLongTokens;
+    plan.cancel = {1, 2};
+    const Batch b = run_batch(plan);
+    ASSERT_EQ(b.results.size(), kSlots + 2);
+    const std::string trace = tick_trace(b.ticks);
+    ASSERT_GT(b.cancel_tick, 0u) << "request 1 ('B') never reached its 2nd drafting step; ticks:" << trace;
+
+    for (const std::size_t i : {std::size_t{1}, std::size_t{2}}) {
+        const GenerateResult& r = b.results[i];
+        const char echo = static_cast<char>(kEchoFirst + static_cast<std::int32_t>(i));
+        const std::string ctx = std::string("'") + echo + "' (request " + std::to_string(i) + ")";
+        EXPECT_EQ(r.finish, FinishReason::Cancelled) << ctx << ": shared stop token fired: error='" << r.error << "'";
+        EXPECT_LT(r.tokens.size(), kLongTokens) << ctx << " was cancelled mid-generation";
+        EXPECT_GT(r.draft_tokens, 0u) << ctx << " never drafted: the cancel did not hit the MTP path";
+        for (std::size_t t = 0; t < r.tokens.size(); ++t) {
+            EXPECT_EQ(r.tokens[t], kEchoFirst + static_cast<std::int32_t>(i)) << ctx << " token " << t;
+        }
+    }
+    for (const std::size_t i : {std::size_t{0}, std::size_t{3}, std::size_t{4}}) {
+        expect_echo_with_every_draft_accepted(b.results[i], i, kLongTokens);
+    }
+    EXPECT_EQ(b.fallbacks, 0u) << "the default MTP KV pool holds 3 live requests; ticks:" << trace;
+
+    bool d_or_e_drafted_with_a = false;
+    for (std::size_t i = 0; i < b.ticks.size(); ++i) {
+        const auto& t = b.ticks[i];
+        EXPECT_EQ(t.trunk_passes, 1u) << "tick " << i + 1 << ": one batched trunk forward per tick";
+        EXPECT_EQ(t.accepted, t.drafted) << "tick " << i + 1 << ": every echo draft is accepted unless it reached "
+                                         << "the wrong sequence; ticks:" << trace;
+        if (i + 1 <= b.cancel_tick) continue;
+        const auto has = [&](char ch) { return std::ranges::count(t.drafts, std::int32_t{ch}) > 0; };
+        for (const char gone : {'B', 'C'}) {
+            EXPECT_FALSE(has(gone)) << "tick " << i + 1 << " (after both cancels in tick " << b.cancel_tick
+                                    << ") drafted for the retired '" << gone
+                                    << "': the cancel poll left it active; ticks:" << trace;
+        }
+        if (has('A') && (has('D') || has('E'))) d_or_e_drafted_with_a = true;
+    }
+    EXPECT_TRUE(d_or_e_drafted_with_a) << "'D' or 'E' should draft in the same tick as 'A' (they took the freed "
+                                       << "slots while 'A' was still drafting); cancel in tick " << b.cancel_tick
+                                       << ", ticks:" << trace;
 }
 
 namespace {
