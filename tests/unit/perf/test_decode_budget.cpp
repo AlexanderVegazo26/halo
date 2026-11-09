@@ -1042,3 +1042,107 @@ TEST_F(BatchedSpeculativeDecode, ConcurrentMtpSequencesDraftInOneMtpForwardPerDe
     EXPECT_GE(shared_draft_ticks, 2u) << "the " << kSlots << " sequences should draft together in the same ticks; ticks:"
                                       << trace;
 }
+
+namespace {
+
+// A request cancelled while it is drafting, then the next request on the same engine and slot
+// (max_sequences 1), on the echo MTP model: request 'A' stops from its token callback after a
+// few tokens (drafts already in flight), request 'B' follows. A cancel that left the slot's MTP
+// state behind (KV rows, queued (token, hidden) pairs) would hand 'B' stale 'A' rows: 'B's
+// drafts are then rejected, or the MTP KV pool runs dry and the tick falls back to plain decoding.
+class SpeculativeCancel : public ::testing::Test {
+protected:
+    static constexpr std::size_t kPrompt = 16;
+    static constexpr std::size_t kTokens = 24;
+    static constexpr std::size_t kCancelAfter = 5;  // tokens delivered before the callback stops
+    static constexpr int kMaxDraft = 2;
+
+    static void SetUpTestSuite() {
+        path_ = write_synthetic_model("speculative-cancel", 64, 128, halo::DType::F32, /*mtp=*/true, /*echo=*/true);
+    }
+    static void TearDownTestSuite() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+
+    struct Pair {
+        GenerateResult cancelled;  // the 'A' request, stopped by its callback
+        GenerateResult next;       // the 'B' request that reuses the slot
+        std::size_t fallbacks = 0;
+    };
+
+    // `mtp_kv_blocks` set: an MTP KV pool that holds one request (prompt + tokens + drafts) and
+    // little more, so blocks the cancelled request kept would starve the next one.
+    static Pair run(bool prefix_cache, std::int32_t next_token, std::optional<std::size_t> mtp_kv_blocks) {
+        EngineConfig c;
+        c.model_path = path_.string();
+        c.max_context = kMaxContext;
+        c.max_context_explicit = true;
+        c.max_sequences = 1;
+        c.threads = 1;
+        c.mtp_enabled = true;
+        c.mtp_max_draft = kMaxDraft;
+        c.prefix_cache = prefix_cache;
+        halo::runtime::CpuEngineOptions o;
+        o.gate_mode = halo::speculative::GateMode::Always;
+        o.mtp_kv_blocks = mtp_kv_blocks;
+        Pair out;
+        auto engine = halo::runtime::create_cpu_engine(c, o);
+        EXPECT_NE(engine, nullptr) << "MTP engine creation on the synthetic model failed";
+        if (engine == nullptr) return out;
+        auto request = [](std::int32_t token) {
+            GenerateRequest r;
+            r.prompt.assign(kPrompt, token);
+            r.sampling.temperature = 0.0f;
+            r.max_tokens = kTokens;
+            return r;
+        };
+        std::size_t seen = 0;
+        out.cancelled = engine->generate(request(kEchoFirst), [&](const TokenEvent&) { return ++seen < kCancelAfter; });
+        out.next = engine->generate(request(next_token), [](const TokenEvent&) { return true; });
+        out.fallbacks = engine->stats().mtp_fallbacks;
+        return out;
+    }
+
+    static void expect_cancelled_while_drafting(const GenerateResult& r) {
+        EXPECT_EQ(r.finish, FinishReason::Cancelled) << "the callback returned false at token " << kCancelAfter
+                                                     << ": error='" << r.error << "'";
+        EXPECT_EQ(r.tokens.size(), kCancelAfter) << "generate() returns the tokens delivered up to the cancel";
+        EXPECT_GT(r.draft_tokens, 0u) << "the cancelled request never drafted: the cancel did not hit the MTP path";
+    }
+
+    static void expect_echo_with_every_draft_accepted(const GenerateResult& r, std::int32_t token,
+                                                      const std::string& ctx) {
+        EXPECT_EQ(r.finish, FinishReason::Length) << ctx << ": error='" << r.error << "'";
+        ASSERT_EQ(r.tokens.size(), kTokens) << ctx;
+        for (std::size_t t = 0; t < r.tokens.size(); ++t) {
+            EXPECT_EQ(r.tokens[t], token) << ctx << ", token " << t << ": the echo model repeats its prompt token";
+        }
+        EXPECT_GT(r.draft_tokens, 0u) << ctx << ": the MTP never drafted after the cancel";
+        EXPECT_EQ(r.accepted_draft_tokens, r.draft_tokens)
+            << ctx << ": the echo MTP drafts the request's own token, which the trunk always accepts; a rejected "
+            << "draft was computed from the cancelled request's MTP rows";
+    }
+
+    static inline std::filesystem::path path_;
+};
+
+}  // namespace
+
+TEST_F(SpeculativeCancel, NextRequestOnTheSlotDraftsItsOwnTokensAfterACancelMidDraft) {
+    // 3 blocks x 16 = 48 MTP rows: 'B' needs 16 + 24 + 2 drafts = 42 of them.
+    const Pair p = run(/*prefix_cache=*/false, kEchoFirst + 1, /*mtp_kv_blocks=*/3);
+    expect_cancelled_while_drafting(p.cancelled);
+    expect_echo_with_every_draft_accepted(p.next, kEchoFirst + 1, "request 'B' after 'A' was cancelled mid-draft");
+    EXPECT_EQ(p.fallbacks, 0u) << "a 48-row MTP KV pool holds 'B' alone: the cancelled 'A' kept its MTP KV blocks";
+}
+
+TEST_F(SpeculativeCancel, ResubmitAfterACancelMidDraftReusesTheCachedPrefixWithCorrectDrafts) {
+    // Prefix cache on: the cancelled 'A' is kept as a cache entry and the identical re-submit
+    // shares its prefix (trunk KV + GDN checkpoint, and its MTP rows when it had no queued pairs).
+    const Pair p = run(/*prefix_cache=*/true, kEchoFirst, std::nullopt);
+    expect_cancelled_while_drafting(p.cancelled);
+    expect_echo_with_every_draft_accepted(p.next, kEchoFirst, "'A' re-submitted after its cancel mid-draft");
+    EXPECT_GT(p.next.cached_prompt_tokens, 0u) << "the identical re-submit should hit the cancelled request's entry";
+    EXPECT_EQ(p.fallbacks, 0u) << "the default MTP KV pool holds both requests";
+}
