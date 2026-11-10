@@ -158,11 +158,15 @@ std::vector<ConnectionGuard::Victim> ConnectionGuard::decide(const std::vector<O
     }
     auto is_marked = [&](const Key& k) { return marked.contains(&k); };
 
-    // 3. Per-peer cap on connections stalled before their first request.
+    // 3. Per-peer cap on connections stalled before their first request. A connection first
+    //    seen less than a scan interval ago is not stalled yet: a burst of clients behind one
+    //    address (the reverse proxy D-017 requires, or loopback load) has fresh connections
+    //    whose request is still in flight or half parsed, and closing them resets real requests.
     if (lim_.per_peer_header_limit > 0) {
         std::map<std::string_view, std::vector<std::pair<const Key*, const Conn*>>> by_peer;
         for (const auto& [k, c] : conns_) {
             if (c.fd < 0 || c.phase != Phase::Header || c.served || c.ready || is_marked(k)) continue;
+            if (now - c.first_seen < lim_.scan_interval) continue;
             by_peer[k.first].push_back({&k, &c});
         }
         for (auto& [addr, v] : by_peer) {

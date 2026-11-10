@@ -23,8 +23,10 @@
 //     has no deadline running. A connection that has sent nothing is timed from accept.
 //     Body deadline: from the end of the headers.
 //   * Per-peer cap (S-38 b). At most `per_peer_header_limit` connections per peer address
-//     may be stalled before their first request: in the header phase, never served, and
-//     without a complete header block buffered. The oldest beyond the cap are shut down.
+//     may be stalled before their first request: in the header phase, never served,
+//     without a complete header block buffered, and first seen at least a scan interval
+//     ago (a fresh connection's request may still be in flight). The oldest beyond the cap
+//     are shut down.
 //   * Overload shedding (S-38 b). When a complete request has waited a full scan interval
 //     without a worker picking it up, the pool is saturated; every header-phase connection
 //     that is not a complete buffered request (dribbling, silent, or idle keep-alive) and

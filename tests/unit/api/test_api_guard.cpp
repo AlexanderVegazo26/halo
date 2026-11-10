@@ -115,10 +115,33 @@ TEST(ConnGuardUnit, PerPeerCapClosesTheOldestStalledConnectionsOfThatPeer) {
     live.push_back(obs("10.0.0.9", 20, 0, 90, true));  // a complete request, queued: exempt
     live.push_back(obs("10.0.0.8", 21, 5, 0));        // another address: its own budget
     live.push_back(obs("10.0.0.9", 30, 400, 0));      // served keep-alive: not "before its first request"
-    const auto v = g.decide(live, t + 10s, t + 10s);
+    EXPECT_TRUE(g.decide(live, t + 10s, t + 10s).empty()) << "12 and 13 are fresh: not stalled for a scan interval yet";
+    const auto v = g.decide(live, t + 10200ms, t + 10200ms);
     EXPECT_EQ(keys_of(v, Reason::PeerLimit), (std::vector<std::pair<std::string, int>>{{"10.0.0.9", 10}, {"10.0.0.9", 11}}))
         << "the two oldest stalled connections of 10.0.0.9, and nothing else";
     EXPECT_EQ(v.size(), 2u);
+}
+
+TEST(ConnGuardUnit, PerPeerCapLeavesABurstOfFreshConnectionsAlone) {
+    // Many clients behind one address (the D-017 reverse proxy, or k6 on loopback) open new
+    // connections faster than they write: a scan sees them before their request arrives, or
+    // while a worker is half way through parsing it. That is not a stall; closing them reset
+    // ~160 real requests per weekly load.js run. Only connections still stalled a scan
+    // interval later count toward the cap.
+    ConnectionGuard g(limits(0ms, 2, 0ms));
+    const auto t = Clock::now();
+    std::vector<ConnectionGuard::Observed> burst;
+    for (int p = 1; p <= 6; ++p) burst.push_back(obs("10.0.0.7", p, p % 2 == 0 ? 0 : 40, 0));
+    auto v = g.decide(burst, t, t);
+    EXPECT_TRUE(keys_of(v, Reason::PeerLimit).empty())
+        << "6 connections of 10.0.0.7 first seen in this scan (cap 2) were closed: " << v.size();
+    // 100 ms later (a scan that ran early) they are still fresh.
+    v = g.decide(burst, t + 100ms, t + 100ms);
+    EXPECT_TRUE(keys_of(v, Reason::PeerLimit).empty()) << "closed at 100 ms old: " << v.size();
+    // A whole interval later the cap applies as before: all 6 still stalled, 4 beyond the cap go.
+    v = g.decide(burst, t + 200ms, t + 200ms);
+    EXPECT_EQ(keys_of(v, Reason::PeerLimit).size(), 4u)
+        << "connections stalled for a full scan interval beyond the cap (2) must still be closed";
 }
 
 TEST(ConnGuardUnit, OverloadShedsOnlyWhileACompleteRequestWaits) {

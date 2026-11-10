@@ -111,8 +111,10 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
     of the headers.
   - **Per-peer cap.** One peer address may hold at most `max_header_connections_per_peer`
     (default 8) connections that are stalled before their first request: still reading
-    headers, never served, and without a complete header block in the receive buffer. The
-    oldest beyond the cap are closed.
+    headers, never served, without a complete header block in the receive buffer, and
+    first seen at least one scan interval (200 ms) ago. The oldest beyond the cap are
+    closed. The interval keeps a burst of fresh connections from many clients behind one
+    address (a reverse proxy, a loopback load test) from being reset mid-request.
   - **Overload shedding.** When a complete request has waited a whole scan interval for a
     worker, the pool is saturated. Every connection still reading headers that is older
     than `header_shed_grace` (default 1 s) and is not a complete buffered request is then
