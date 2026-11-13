@@ -372,7 +372,8 @@ struct ApiServer::Impl {
           guard(GuardLimits{.header_timeout = cfg.header_timeout,
                             .body_timeout = cfg.body_timeout,
                             .per_peer_header_limit = cfg.max_header_connections_per_peer,
-                            .shed_grace = cfg.header_shed_grace}) {
+                            .shed_grace = cfg.header_shed_grace,
+                            .header_stall_limit = cfg.max_stalled_header_connections}) {
         model_name = cfg.served_model_name.empty() ? engine.model().id : cfg.served_model_name;
         if (model_name.empty()) model_name = "halo";
         close_reasoning = engine.tokenizer().encode("\n</think>\n\n", true);
@@ -987,16 +988,18 @@ struct ApiServer::Impl {
             std::string text = metrics.render(engine.stats(), admission.queued(), admission.active());
             text += std::format(
                 "# HELP halo_api_connection_deadline_closes_total Connections closed while reading a request (read "
-                "deadline, per-peer limit or overload shedding).\n"
+                "deadline, per-peer or global limit, or overload shedding).\n"
                 "# TYPE halo_api_connection_deadline_closes_total counter\n"
                 "halo_api_connection_deadline_closes_total {}\n"
                 "# HELP halo_api_connection_closes_total Connections closed while reading a request, by reason.\n"
                 "# TYPE halo_api_connection_closes_total counter\n"
                 "halo_api_connection_closes_total{{reason=\"deadline\"}} {}\n"
                 "halo_api_connection_closes_total{{reason=\"peer_limit\"}} {}\n"
-                "halo_api_connection_closes_total{{reason=\"overload\"}} {}\n",
+                "halo_api_connection_closes_total{{reason=\"overload\"}} {}\n"
+                "halo_api_connection_closes_total{{reason=\"global_limit\"}} {}\n",
                 guard.timeouts(), guard.closes(ConnectionGuard::Reason::Deadline),
-                guard.closes(ConnectionGuard::Reason::PeerLimit), guard.closes(ConnectionGuard::Reason::Overload));
+                guard.closes(ConnectionGuard::Reason::PeerLimit), guard.closes(ConnectionGuard::Reason::Overload),
+                guard.closes(ConnectionGuard::Reason::GlobalLimit));
             res.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
         }));
         svr.Post("/v1/chat/completions", guarded([this](const httplib::Request& q, httplib::Response& r) {

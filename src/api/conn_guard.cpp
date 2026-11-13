@@ -37,7 +37,7 @@ ConnectionGuard::~ConnectionGuard() { stop(); }
 void ConnectionGuard::start(int port) {
 #if defined(__linux__)
     if (lim_.header_timeout.count() <= 0 && lim_.body_timeout.count() <= 0 && lim_.per_peer_header_limit == 0 &&
-        lim_.shed_grace.count() <= 0) {
+        lim_.shed_grace.count() <= 0 && lim_.header_stall_limit == 0) {
         return;
     }
     std::lock_guard lk(mu_);
@@ -189,7 +189,23 @@ std::vector<ConnectionGuard::Victim> ConnectionGuard::decide(const std::vector<O
         }
     }
 
-    // 4. Overload: a complete request has waited a whole interval for a worker.
+    // 4. Global cap on header-phase stalls across every peer: many source addresses (all of
+    //    127.0.0.0/8 is local) each under the per-peer cap must not fill httplib's queue.
+    if (lim_.header_stall_limit > 0) {
+        std::vector<std::pair<const Key*, const Conn*>> stalled;
+        for (const auto& [k, c] : conns_) {
+            if (!is_marked(k) && header_stalled(c)) stalled.push_back({&k, &c});
+        }
+        if (stalled.size() > lim_.header_stall_limit) {
+            std::ranges::sort(stalled, [](const auto& a, const auto& b) { return a.second->first_seen < b.second->first_seen; });
+            for (std::size_t i = 0; i + lim_.header_stall_limit < stalled.size(); ++i) {
+                victim(*stalled[i].first, *stalled[i].second, Reason::GlobalLimit);
+                marked.insert(stalled[i].first);
+            }
+        }
+    }
+
+    // 5. Overload: a complete request has waited a whole interval for a worker.
     if (saturated && lim_.shed_grace.count() > 0) {
         for (const auto& [k, c] : conns_) {
             if (c.fd < 0 || is_marked(k)) continue;
@@ -326,11 +342,11 @@ void ConnectionGuard::scan() {
         const auto it = conns_.find(v.key);
         if (it != conns_.end() && it->second.ino == v.ino) conns_.erase(it);
     }
-    if (n[0] + n[1] + n[2] > 0) {  // one line per scan, not one per connection
+    if (n[0] + n[1] + n[2] + n[3] > 0) {  // one line per scan, not one per connection
         HALO_WARN("api",
                   "closed {} connection(s) while reading a request: {} past the read deadline, {} over the per-peer "
-                  "limit, {} shed under overload",
-                  n[0] + n[1] + n[2], n[0], n[1], n[2]);
+                  "limit, {} shed under overload, {} over the global stalled-connection limit",
+                  n[0] + n[1] + n[2] + n[3], n[0], n[1], n[2], n[3]);
     }
 #endif
 }

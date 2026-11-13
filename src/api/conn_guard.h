@@ -28,6 +28,11 @@
 //     connection's request may still be in flight); or in the body phase -- a worker is
 //     blocked reading it -- for at least a scan interval with nothing unread in its receive
 //     buffer (the client, not the server, is behind). The oldest beyond the cap are shut down.
+//   * Global cap. At most `header_stall_limit` connections in total may be stalled in the
+//     header phase before their first request (the per-peer definition above), so a local
+//     process using many 127.0.0.0/8 source addresses cannot fill httplib's queue with
+//     silent connections that each stay under the per-peer cap. The oldest beyond it are
+//     shut down.
 //   * Overload shedding (S-38 b). When a complete request has waited a full scan interval
 //     without a worker picking it up, the pool is saturated; every header-phase connection
 //     that is not a complete buffered request (dribbling, silent, or idle keep-alive) and
@@ -69,6 +74,7 @@ struct GuardLimits {
     std::size_t per_peer_header_limit = 8;            ///< 0 = no per-peer cap
     std::chrono::milliseconds shed_grace{1000};       ///< 0 = no overload shedding
     std::chrono::milliseconds scan_interval{200};
+    std::size_t header_stall_limit = 32;              ///< 0 = no global cap on stalled header-phase connections
 };
 
 class ConnectionGuard {
@@ -86,8 +92,8 @@ public:
         std::uint64_t unread = 0;    ///< bytes waiting in the receive buffer
         bool complete_header = false;  ///< the unread bytes hold a complete header block
     };
-    enum class Reason { Deadline, PeerLimit, Overload };
-    static constexpr int kReasons = 3;
+    enum class Reason { Deadline, PeerLimit, Overload, GlobalLimit };
+    static constexpr int kReasons = 4;
     struct Victim {
         Key key;
         int fd = -1;

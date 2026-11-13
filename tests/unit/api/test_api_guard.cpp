@@ -212,6 +212,33 @@ TEST(ConnGuardUnit, OverloadShedsBodyPhaseStalls) {
     EXPECT_EQ(v.size(), 1u);
 }
 
+TEST(ConnGuardUnit, GlobalCapBoundsStalledConnectionsAcrossAddresses) {
+    // Every 127.0.0.0/8 address is local: one silent connection from each of many addresses
+    // stays under any per-peer cap and used to fill httplib's queue until the header deadline.
+    GuardLimits l = limits(0ms, 8, 0ms);
+    l.header_stall_limit = 3;
+    ConnectionGuard g(l);
+    const auto t = Clock::now();
+    std::vector<ConnectionGuard::Observed> live;
+    for (int i = 0; i < 6; ++i) {  // first seen 10 ms apart, oldest first
+        live.push_back(obs("127.0.0." + std::to_string(10 + i), 100 + i, 0, 0));
+        EXPECT_TRUE(g.decide(live, t + i * 10ms, t + i * 10ms).empty());
+    }
+    g.request_done("127.0.0.30", 300);                    // a served keep-alive connection
+    live.push_back(obs("127.0.0.30", 300, 400, 0));
+    live.push_back(obs("127.0.0.31", 301, 0, 90, true));  // a complete request waiting in the queue
+    const auto v = g.decide(live, t + 300ms, t + 300ms);
+    EXPECT_EQ(keys_of(v, Reason::GlobalLimit),
+              (std::vector<std::pair<std::string, int>>{{"127.0.0.10", 100}, {"127.0.0.11", 101}, {"127.0.0.12", 102}}))
+        << "six stalled connections against a global cap of 3: the three oldest are closed, whatever their address";
+    EXPECT_EQ(v.size(), 3u) << "served and complete-request connections never count";
+    // 0 turns the global cap off.
+    l.header_stall_limit = 0;
+    ConnectionGuard off(l);
+    (void)off.decide(live, t, t);
+    EXPECT_TRUE(off.decide(live, t + 300ms, t + 300ms).empty());
+}
+
 TEST(ConnGuardUnit, HttpQueueMustBeBounded) {
     api::ServerConfig cfg;
     cfg.http_queue = 0;  // httplib would treat 0 as unbounded
@@ -544,6 +571,41 @@ TEST(ApiGuard, OverloadSheddingFreesWorkersHeldByBodyStallers) {
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 3s);
     EXPECT_GE(metric(ts, "halo_api_connection_closes_total{reason=\"overload\"}"), 1);
     EXPECT_EQ(metric(ts, "halo_api_connection_closes_total{reason=\"deadline\"}"), 0);
+}
+
+TEST(ApiGuard, GlobalLimitKeepsSilentConnectionsFromManyAddressesOutOfTheQueue) {
+    // Twelve silent connections, one per 127.0.0.x address: each is under the per-peer cap and
+    // the header deadline is 30 s. The global cap (4) closes the oldest eight; the four that
+    // stay each hold a worker until their deadline, so the pool is sized above the cap.
+    api::ServerConfig cfg;
+    cfg.http_threads = 6;
+    cfg.header_timeout = 30s;
+    cfg.header_shed_grace = 0ms;
+    cfg.max_stalled_header_connections = 4;
+    TestServer ts(cfg);
+    std::vector<int> fds;
+    for (int i = 0; i < 12; ++i) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in src{};
+        src.sin_family = AF_INET;
+        ::inet_pton(AF_INET, ("127.0.0." + std::to_string(40 + i)).c_str(), &src.sin_addr);
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(static_cast<std::uint16_t>(ts.port));
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&src), sizeof(src)), 0);     // NOLINT: sockets API
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)), 0);  // NOLINT: sockets API
+        fds.push_back(fd);
+    }
+    std::this_thread::sleep_for(1500ms);
+    int closed = 0;
+    for (const int fd : fds) closed += client_state(fd) != 1 ? 1 : 0;
+    EXPECT_EQ(closed, 8) << "the silent connections beyond the global cap are closed, the newest four stay";
+    auto r = make_client(ts.port, 5s)->Get("/health");
+    ASSERT_TRUE(r) << httplib::to_string(r.error());
+    EXPECT_EQ(r->status, 200);
+    EXPECT_EQ(metric(ts, "halo_api_connection_closes_total{reason=\"global_limit\"}"), 8);
+    for (const int fd : fds) ::close(fd);
 }
 
 TEST(ApiGuard, OverloadSheddingFreesWorkersHeldByManyAddresses) {

@@ -117,6 +117,11 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
     with nothing the client sent waiting unread (headers sent, body not). The oldest beyond
     the cap are closed. The interval keeps a burst of fresh connections from many clients
     behind one address (a reverse proxy, a loopback load test) from being reset mid-request.
+  - **Global cap.** All peers together may hold at most `max_stalled_header_connections`
+    (default 32) connections stalled in the header phase before their first request (as
+    above). The oldest beyond it are closed, so a local process using many 127.0.0.0/8 source
+    addresses cannot fill `http_queue` with silent connections that each stay under the
+    per-peer cap.
   - **Overload shedding.** When a complete request has waited a whole scan interval for a
     worker, the pool is saturated. Every connection still reading headers that is older
     than `header_shed_grace` (default 1 s) and is not a complete buffered request is then
@@ -125,7 +130,7 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
     Complete requests are never shed, and handlers (generation, streaming) are never touched.
   - Closed connections are counted in `halo_api_connection_deadline_closes_total` (all
     reasons) and `halo_api_connection_closes_total{reason}` (`deadline`, `peer_limit`,
-    `overload`).
+    `overload`, `global_limit`).
   - Measured with the review's S-38 repro (WSL, tiny model, `--parallel 1`, so 31 HTTP
     threads and a 256-slot queue; 100 dribblers that reconnect as soon as they are closed,
     `/health` probed every 0.5 s with a 3 s timeout for 40 s): `/health` answered 100% of
@@ -176,8 +181,9 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
 
 ## Resource governance
 
-`halo serve` sets `http_queue`, `max_header_connections_per_peer` and `header_shed_grace`
-with `--http-queue`, `--max-header-connections-per-peer` and `--header-shed-grace-ms`
+`halo serve` sets `http_queue`, `max_header_connections_per_peer`, `max_stalled_header_connections`
+and `header_shed_grace` with `--http-queue`, `--max-header-connections-per-peer`,
+`--max-stalled-header-connections` and `--header-shed-grace-ms`
 (also `HALO_*` variables and config-file keys, see docs/cli.md).
 
 | Setting (`ServerConfig`) | Default | Effect |
@@ -193,6 +199,7 @@ with `--http-queue`, `--max-header-connections-per-peer` and `--header-shed-grac
 | `utility_concurrency` / `utility_queue` | 2 / 8 | Admission for `/tokenize` and `/apply-template`. Beyond it: 429 (review S-16). |
 | `header_timeout` / `body_timeout` | 10 s / 10 s | Per-connection read deadlines (reviews S-13, S-38). 0 = unlimited. |
 | `max_header_connections_per_peer` | 8 | Connections one address may hold stalled before their handler, in the header or body phase (review S-38). 0 = no cap. |
+| `max_stalled_header_connections` | 32 | Connections all addresses together may hold stalled before their first request. 0 = no cap. |
 | `header_shed_grace` | 1 s | Overload shedding of connections stalled reading a request (headers, or a body the client is not sending) for longer than this (review S-38). 0 = off. |
 | `http_threads` | 0 (`max_concurrent + max_queue + utility_concurrency + utility_queue + 4`) | Size of the HTTP worker pool. `max_queue` and `utility_queue` are capped at 4096. |
 | `http_queue` | 256 | Connections accepted and waiting for an HTTP worker (1-65536). One more is closed at accept. Every queued connection holds a descriptor; the server warns at start when `http_threads + http_queue` comes within 64 of the open-file limit. |

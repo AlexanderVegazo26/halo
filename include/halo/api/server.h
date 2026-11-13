@@ -79,6 +79,10 @@ struct ServerConfig {
     /// phase (not yet served, no complete header block buffered) or in the body phase with
     /// the client not sending; the oldest beyond this are closed. 0 = no limit (S-38).
     std::size_t max_header_connections_per_peer = 8;
+    /// Connections all peers together may hold stalled in the header phase before their first
+    /// request; the oldest beyond this are closed (many local source addresses must not fill
+    /// http_queue with silent connections). 0 = no limit.
+    std::size_t max_stalled_header_connections = 32;
     /// Overload shedding (S-38): when a complete request has waited a scan interval for an
     /// HTTP thread, header-phase connections that are not a complete buffered request
     /// (dribbling, silent or idle keep-alive) and body-phase connections whose client is not

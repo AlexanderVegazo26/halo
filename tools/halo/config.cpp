@@ -99,6 +99,9 @@ std::vector<ConfigKey> make_keys() {
         u("server.max_header_connections_per_peer", "max-header-connections-per-peer",
           "HALO_MAX_HEADER_CONNECTIONS_PER_PEER", sd.max_header_connections_per_peer, 0, 65536,
           "connections one address may hold stalled before their handler (0 = no cap; S-38)"),
+        u("server.max_stalled_header_connections", "max-stalled-header-connections",
+          "HALO_MAX_STALLED_HEADER_CONNECTIONS", sd.max_stalled_header_connections, 0, 65536,
+          "connections all addresses together may hold stalled before their first request (0 = no cap)"),
         u("server.header_shed_grace_ms", "header-shed-grace-ms", "HALO_HEADER_SHED_GRACE_MS",
           sd.header_shed_grace.count(), 0, 600000,
           "under overload, close connections stalled reading a request for this long, milliseconds (0 = off; S-38)"),
@@ -316,7 +319,7 @@ const std::vector<std::string>& server_keys() {
         "server.max_body_bytes", "server.max_tokens_cap", "server.default_max_tokens", "server.request_timeout_s",
         "server.allow_unauthenticated_remote", "server.allow_remote", "server.utility_concurrency", "server.utility_queue",
         "server.header_timeout_s", "server.body_timeout_s", "server.completions_parse_special", "server.http_queue",
-        "server.max_header_connections_per_peer", "server.header_shed_grace_ms"};
+        "server.max_header_connections_per_peer", "server.max_stalled_header_connections", "server.header_shed_grace_ms"};
     return k;
 }
 
@@ -382,6 +385,7 @@ api::ServerConfig server_config(const ResolvedConfig& c) {
     s.completions_parse_special = c.boolean("server.completions_parse_special");
     s.http_queue = c.u64("server.http_queue");
     s.max_header_connections_per_peer = c.u64("server.max_header_connections_per_peer");
+    s.max_stalled_header_connections = c.u64("server.max_stalled_header_connections");
     s.header_shed_grace = std::chrono::milliseconds(c.u64("server.header_shed_grace_ms"));
     return s;
 }
