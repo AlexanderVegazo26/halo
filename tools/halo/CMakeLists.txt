@@ -48,6 +48,10 @@ target_compile_definitions(halo_cli PUBLIC HALO_CLI_HAVE_RUNTIME=${_have_runtime
                                            HALO_CLI_HAVE_PROFILING=${_have_profiling} HALO_CLI_HAVE_CPU=${_have_cpu}
                                            HALO_CLI_HAVE_AUTOTUNE=${_have_autotune}
                                            HALO_CLI_HAVE_AUTOTUNE_CPU=${_have_autotune_cpu})
+# The one place the version is written is project(halo VERSION ...) in the top CMakeLists.txt:
+# `halo version` and the benchmark artifacts print this definition, so they cannot drift from it
+# (release.yml names the archives after the same value and checks the binary prints it).
+target_compile_definitions(halo_cli PUBLIC HALO_VERSION="${PROJECT_VERSION}")
 message(STATUS "halo CLI: runtime=${_have_runtime} api=${_have_api} profiling=${_have_profiling} cpu_kernels=${_have_cpu} autotune=${_have_autotune} autotune_cpu=${_have_autotune_cpu}")
 
 add_executable(halo_cli_main main.cpp)

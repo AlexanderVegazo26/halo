@@ -257,7 +257,7 @@ int finish(const profiling::SuiteArtifact& art, const ParsedArgs& a, Context& ct
 void stamp_invocation(profiling::SuiteArtifact& art, const std::vector<std::string>& args, const Context& ctx) {
     profiling::Invocation inv;
     inv.binary = ctx.argv0.empty() ? "halo" : ctx.argv0.front();
-    inv.version = "0.2.0";
+    inv.version = HALO_VERSION;
     inv.argv.push_back(inv.binary);
     inv.argv.push_back("bench");
     inv.argv.insert(inv.argv.end(), args.begin(), args.end());

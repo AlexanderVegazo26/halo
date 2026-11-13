@@ -12,9 +12,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -172,7 +174,10 @@ TEST(Cli, UsageAndExitCodes) {
         << r.err;
     r = cli_run({"version"});
     EXPECT_EQ(r.rc, 0);
-    EXPECT_NE(r.out.find("halo 0.2.0"), std::string::npos);
+    // HALO_VERSION is CMake's PROJECT_VERSION (tools/halo/CMakeLists.txt): the CLI prints that,
+    // not a second hard-coded copy.
+    EXPECT_TRUE(r.out.starts_with("halo " HALO_VERSION "\n")) << r.out;
+    EXPECT_GE(std::ranges::count(std::string_view(HALO_VERSION), '.'), 2) << "PROJECT_VERSION is major.minor.patch";
 }
 
 // ---- config resolution (TRD §44) -----------------------------------------------------------

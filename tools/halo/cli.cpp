@@ -62,7 +62,7 @@ int dispatch(const std::string& cmd, const std::vector<std::string>& rest, Conte
     if (cmd == "bench" || cmd == "benchmark") return cmd_bench(rest, ctx);
     if (cmd == "tune") return cmd_tune(rest, ctx);
     if (cmd == "version" || cmd == "--version") {
-        *ctx.out << "halo 0.2.0\n"
+        *ctx.out << "halo " HALO_VERSION "\n"
                  << "components: api " << (have_api() ? "yes" : "no") << ", runtime " << (have_runtime() ? "yes" : "no")
                  << ", profiling " << (have_profiling() ? "yes" : "no") << ", autotune "
                  << (HALO_CLI_HAVE_AUTOTUNE ? (HALO_CLI_HAVE_AUTOTUNE_CPU ? "yes (cpu ops)" : "yes (no ops)") : "no")
