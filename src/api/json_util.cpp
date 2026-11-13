@@ -284,8 +284,13 @@ std::optional<std::int64_t> opt_int(const Json& obj, std::string_view key, const
         x = v->get<std::int64_t>();
     } else if (v->is_number_float()) {
         // Accept integral floats such as 256.0 (some clients send them); reject 1.5.
+        // The cast below is undefined unless d is inside int64's range, and the lo/hi tests do
+        // not guarantee that: static_cast<double>(INT64_MAX) rounds up to 2^63, so with
+        // hi == INT64_MAX the value 2^63 itself passed `d > hi`. Bound it by the exact powers of
+        // two first (-2^63 is INT64_MIN and representable, 2^63 is not).
         const double d = v->get<double>();
-        if (!std::isfinite(d) || std::floor(d) != d || d < static_cast<double>(lo) || d > static_cast<double>(hi)) {
+        if (!std::isfinite(d) || std::floor(d) != d || d < -0x1p63 || d >= 0x1p63 || d < static_cast<double>(lo) ||
+            d > static_cast<double>(hi)) {
             throw RequestError(ErrorKind::InvalidRequest, std::format("must be an integer between {} and {}", lo, hi),
                                where);
         }
