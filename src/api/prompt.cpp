@@ -201,7 +201,7 @@ std::vector<std::int32_t> encode_as_text(const tokenizer::Tokenizer& tok, const 
 
 ChatPrompt build_chat_prompt(const tokenizer::Tokenizer& tok, const SpecialTokens& sp,
                              const chat::ChatTemplate& tmpl, const OrderedJson& messages,
-                             const OrderedJson& tools, const chat::RenderOptions& options) {
+                             const OrderedJson& tools, const chat::RenderOptions& options, PromptHints hints) {
     HALO_CHECK(messages.is_array(), ErrorCode::Api, "messages must be an array");
     // M9: escape_json below recursively walks/copies messages and tools before render() ever
     // runs its own depth check (chat_template.cpp), and this function is also a public library
@@ -251,7 +251,8 @@ ChatPrompt build_chat_prompt(const tokenizer::Tokenizer& tok, const SpecialToken
     // prefix of a longer one's for prefix reuse to mean anything at all). Some templates
     // (Qwen's included) reject a prefix that has no user message yet ("No user query found");
     // a hint is optional metadata, so that prefix is skipped rather than failing the request.
-    if (msgs.is_array()) {
+    // Only a generation consumes them: PromptHints::None skips the extra renders entirely.
+    if (hints == PromptHints::Checkpoints && msgs.is_array()) {
         constexpr std::size_t kMaxHintBoundaries = 8;
         const std::size_t total = msgs.size();
         const std::size_t first = total > kMaxHintBoundaries ? total - kMaxHintBoundaries : 0;

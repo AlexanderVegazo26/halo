@@ -782,7 +782,7 @@ struct ApiServer::Impl {
         job.render.add_generation_prompt = job.add_generation_prompt;
         const AdmissionSlot slot = admit_utility();
         const ChatPrompt p = build_chat_prompt(engine.tokenizer(), specials, engine.chat_template(), job.messages,
-                                               job.tools, job.render);
+                                               job.tools, job.render, PromptHints::None);
         Json j = {{"prompt", p.text}};
         if (job.tokenize) j["tokens"] = p.tokens;
         j["neutralized_literals"] = p.neutralized_literals;
@@ -799,7 +799,7 @@ struct ApiServer::Impl {
         job.render.add_generation_prompt = true;
         const AdmissionSlot slot = admit_utility();
         const ChatPrompt p = build_chat_prompt(engine.tokenizer(), specials, engine.chat_template(), job.messages,
-                                               job.tools, job.render);
+                                               job.tools, job.render, PromptHints::None);
         res.set_content(dump(Json{{"input_tokens", p.tokens.size()}}), "application/json");
     }
 

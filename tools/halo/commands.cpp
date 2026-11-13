@@ -347,7 +347,7 @@ EncodedChat encode_chat(const tokenizer::Tokenizer& tok, const chat::ChatTemplat
                         const ordered_json& tools, const chat::RenderOptions& opt) {
 #if HALO_CLI_HAVE_API
     const api::SpecialTokens sp(tok);
-    auto p = api::build_chat_prompt(tok, sp, tmpl, messages, tools, opt);
+    auto p = api::build_chat_prompt(tok, sp, tmpl, messages, tools, opt, api::PromptHints::None);
     return {std::move(p.text), std::move(p.tokens), p.starts_in_reasoning};
 #else
     EncodedChat e;

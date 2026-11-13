@@ -69,16 +69,23 @@ struct ChatPrompt {
     /// M10 (D-013): token offsets of the last few message boundaries, for
     /// GenerateRequest::checkpoint_hints. Bounded to a small, fixed number of the most
     /// recent messages regardless of conversation length (an O(messages) re-render per
-    /// hint would be an O(N^2) cost for a long-running conversation).
+    /// hint would be an O(N^2) cost for a long-running conversation). Empty with
+    /// PromptHints::None.
     std::vector<std::size_t> checkpoint_hints;
 };
+
+/// Whether build_chat_prompt computes ChatPrompt::checkpoint_hints. Each hint renders and
+/// tokenizes one more message prefix (up to 7 extra passes over the conversation), which only
+/// a generation uses: callers that discard them (/apply-template, count_tokens, the CLI) pass None.
+enum class PromptHints : std::uint8_t { Checkpoints, None };
 
 /// Renders `messages`/`tools` with `tmpl` and tokenizes them as described above. Throws
 /// halo::Error(Api) for template errors (raise_exception, malformed input) and for a
 /// placeholder-nonce collision that persists after several retries.
 [[nodiscard]] ChatPrompt build_chat_prompt(const tokenizer::Tokenizer& tok, const SpecialTokens& specials,
                                            const chat::ChatTemplate& tmpl, const chat::OrderedJson& messages,
-                                           const chat::OrderedJson& tools, const chat::RenderOptions& options);
+                                           const chat::OrderedJson& tools, const chat::RenderOptions& options,
+                                           PromptHints hints = PromptHints::Checkpoints);
 
 /// Tokenizes `text` so that no added token (Control or UserDefined) is produced: each
 /// occurrence of an added-token literal becomes its plain-text tokenization (or, if that
