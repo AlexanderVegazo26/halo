@@ -82,6 +82,14 @@ public:
     using Clock = std::chrono::steady_clock;
     using Key = std::pair<std::string, int>;  ///< peer (numeric address, port)
 
+    /// The key of a peer socket address (`addr`: a sockaddr_in / sockaddr_in6 of `len` bytes), in
+    /// exactly the text httplib reports as Request::remote_addr -- getnameinfo(NI_NUMERICHOST),
+    /// which keeps the "%zone" of a scoped IPv6 address (fe80::1%eth0) where inet_ntop drops
+    /// it. The scan's keys and the handlers' phase reports must be the same string, or a
+    /// connection is tracked twice and its handler is cut off at the header deadline.
+    /// False for other address families (and always on non-Linux builds).
+    static bool key_of(const void* addr, std::size_t len, Key& out);
+
     /// What one scan saw of one connected socket (step 1, no lock held).
     struct Observed {
         Key key;

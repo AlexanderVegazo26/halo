@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstring>
 #include <thread>
 
 #include "api_test_util.h"
@@ -237,6 +238,52 @@ TEST(ConnGuardUnit, GlobalCapBoundsStalledConnectionsAcrossAddresses) {
     ConnectionGuard off(l);
     (void)off.decide(live, t, t);
     EXPECT_TRUE(off.decide(live, t + 300ms, t + 300ms).empty());
+}
+
+TEST(ConnGuardUnit, KeysMatchHttplibsRemoteAddrForScopedIpv6) {
+    // The scan keys a connection by its peer address; handlers report phases under httplib's
+    // Request::remote_addr. httplib formats with getnameinfo, which keeps the zone of a scoped
+    // IPv6 address ("fe80::1%lo"); inet_ntop (what the scan used) drops it. With two different
+    // strings the handler's reports went to a second entry, the scanned one stayed in the
+    // header phase and the connection was shut down header_timeout into its generation.
+    sockaddr_in6 a6{};
+    a6.sin6_family = AF_INET6;
+    a6.sin6_port = htons(40123);
+    ASSERT_EQ(::inet_pton(AF_INET6, "fe80::1", &a6.sin6_addr), 1);
+    a6.sin6_scope_id = 1;  // the loopback interface: always present
+    sockaddr_storage ss{};
+    std::memcpy(&ss, &a6, sizeof(a6));
+    std::string ip;
+    int port = 0;
+    ASSERT_TRUE(httplib::detail::get_ip_and_port(ss, sizeof(a6), ip, port));
+    ASSERT_NE(ip.find('%'), std::string::npos) << "premise: httplib reports the zone: " << ip;
+    ConnectionGuard::Key k;
+    ASSERT_TRUE(ConnectionGuard::key_of(&a6, sizeof(a6), k));
+    EXPECT_EQ(k.first, ip);
+    EXPECT_EQ(k.second, port);
+    EXPECT_EQ(k.second, 40123);
+
+    // Unscoped addresses are unchanged: IPv4, IPv6 loopback, IPv4-mapped IPv6.
+    sockaddr_in a4{};
+    a4.sin_family = AF_INET;
+    a4.sin_port = htons(8080);
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.9", &a4.sin_addr), 1);
+    ASSERT_TRUE(ConnectionGuard::key_of(&a4, sizeof(a4), k));
+    EXPECT_EQ(k, (ConnectionGuard::Key{"127.0.0.9", 8080}));
+    for (const char* text : {"::1", "::ffff:10.1.2.3"}) {
+        sockaddr_in6 b{};
+        b.sin6_family = AF_INET6;
+        b.sin6_port = htons(9);
+        ASSERT_EQ(::inet_pton(AF_INET6, text, &b.sin6_addr), 1);
+        sockaddr_storage bs{};
+        std::memcpy(&bs, &b, sizeof(b));
+        ASSERT_TRUE(httplib::detail::get_ip_and_port(bs, sizeof(b), ip, port));
+        ASSERT_TRUE(ConnectionGuard::key_of(&b, sizeof(b), k));
+        EXPECT_EQ(k.first, ip) << text;
+    }
+    sockaddr_storage other{};
+    other.ss_family = AF_UNIX;
+    EXPECT_FALSE(ConnectionGuard::key_of(&other, sizeof(other), k));
 }
 
 TEST(ConnGuardUnit, HttpQueueMustBeBounded) {

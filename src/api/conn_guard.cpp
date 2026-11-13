@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/tcp.h>  // struct tcp_info with tcpi_bytes_received (glibc's netinet/tcp.h lacks it)
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -240,19 +241,10 @@ bool peer_of(int fd, int port, std::string& addr, int& peer_port) {
     sockaddr_storage peer{};
     len = sizeof(peer);
     if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) != 0) return false;  // listener / not connected
-    char buf[INET6_ADDRSTRLEN] = {};
-    if (peer.ss_family == AF_INET) {
-        const auto* p = reinterpret_cast<const sockaddr_in*>(&peer);  // NOLINT: sockets API
-        if (::inet_ntop(AF_INET, &p->sin_addr, buf, sizeof(buf)) == nullptr) return false;
-        peer_port = ntohs(p->sin_port);
-    } else if (peer.ss_family == AF_INET6) {
-        const auto* p = reinterpret_cast<const sockaddr_in6*>(&peer);  // NOLINT: sockets API
-        if (::inet_ntop(AF_INET6, &p->sin6_addr, buf, sizeof(buf)) == nullptr) return false;
-        peer_port = ntohs(p->sin6_port);
-    } else {
-        return false;
-    }
-    addr = buf;
+    ConnectionGuard::Key key;
+    if (!ConnectionGuard::key_of(&peer, len, key)) return false;
+    addr = std::move(key.first);
+    peer_port = key.second;
     return true;
 }
 
@@ -262,6 +254,30 @@ bool has_header_end(std::string_view s) {
 
 }  // namespace
 #endif
+
+bool ConnectionGuard::key_of(const void* addr, std::size_t len, Key& out) {
+#if defined(__linux__)
+    const auto* sa = static_cast<const sockaddr*>(addr);
+    if (sa == nullptr) return false;
+    if (sa->sa_family == AF_INET && len >= sizeof(sockaddr_in)) {
+        out.second = ntohs(reinterpret_cast<const sockaddr_in*>(sa)->sin_port);  // NOLINT: sockets API
+    } else if (sa->sa_family == AF_INET6 && len >= sizeof(sockaddr_in6)) {
+        out.second = ntohs(reinterpret_cast<const sockaddr_in6*>(sa)->sin6_port);  // NOLINT: sockets API
+    } else {
+        return false;
+    }
+    // The same call httplib makes for Request::remote_addr (detail::get_ip_and_port, 0.64.0).
+    char host[NI_MAXHOST] = {};
+    if (::getnameinfo(sa, static_cast<socklen_t>(len), host, sizeof(host), nullptr, 0, NI_NUMERICHOST) != 0) return false;
+    out.first = host;
+    return true;
+#else
+    (void)addr;
+    (void)len;
+    (void)out;
+    return false;
+#endif
+}
 
 bool ConnectionGuard::shutdown_verified(const Victim& v, int port, const std::function<void()>& between) {
 #if defined(__linux__)
