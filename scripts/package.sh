@@ -156,16 +156,25 @@ case "$SOURCE" in
           --exclude=__pycache__ \
           --exclude=*.db --exclude=*.sqlite --exclude=*.sqlite3 --exclude=*.log \
           --exclude=.env --exclude=.env.* --exclude=*.pem --exclude=*.key \
-          -cf - . | tar -x -m -C "$NEW" ;;
+          --exclude=*.gguf \
+          -cf - . | tar -x -m -C "$NEW"
+        # *.gguf is excluded above: a model file in the repository directory is gigabytes and is
+        # not ours to ship (copy mode ignores .gitignore, which lists it). The only tracked
+        # GGUFs are the header-only fuzz seeds the test suite replays; stage those back.
+        if [[ -d "$REPO/tests/fuzz/corpus/gguf" ]]; then
+          tar -C "$REPO" -cf - tests/fuzz/corpus/gguf | tar -x -m -C "$NEW"
+        fi ;;
 esac
-# M8: refuse to package a tree that still carries a name matching a secret pattern, regardless
-# of --source mode (a stray .env/key/DB/model would otherwise be integrity-endorsed into the
-# shipped kit's SHA256SUMS).
+# M8: refuse to package a tree that still carries a name matching a secret pattern or a model
+# file, regardless of --source mode (a stray .env/key/DB/model would otherwise be
+# integrity-endorsed into the shipped kit's SHA256SUMS). The header-only fuzz seeds under
+# tests/fuzz/corpus/gguf are the one place a .gguf belongs.
 mapfile -d '' -t _secret_hits < <(find "$NEW" -type f \( \
     -iname '*.db' -o -iname '*.sqlite' -o -iname '*.sqlite3' -o -iname '.env' -o -iname '.env.*' \
-    -o -iname '*.pem' -o -iname '*.key' \) -print0)
+    -o -iname '*.pem' -o -iname '*.key' \
+    -o \( -iname '*.gguf' -not -path "$NEW/tests/fuzz/corpus/gguf/*" \) \) -print0)
 if ((${#_secret_hits[@]} > 0)); then
-  printf 'package.sh: refusing to package: secret-pattern files in the staged tree:\n' >&2
+  printf 'package.sh: refusing to package: secret-pattern or model files in the staged tree:\n' >&2
   printf '  %s\n' "${_secret_hits[@]#"$NEW/"}" >&2
   die "remove these from $REPO (or its untracked files) before packaging"
 fi
