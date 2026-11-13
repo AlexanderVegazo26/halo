@@ -107,19 +107,22 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
     or at the previous response on a keep-alive connection. A connection waiting in the
     queue with its request already sent has no clock running, so it is not closed while it
     waits. A connection that sends nothing is timed from accept.
-  - **Body deadline.** A complete body must arrive within `body_timeout` (default 60 s)
-    of the headers.
+  - **Body deadline.** A complete body must arrive within `body_timeout` (default 10 s)
+    of the headers. A worker is blocked reading the body the whole time, so this deadline is
+    short.
   - **Per-peer cap.** One peer address may hold at most `max_header_connections_per_peer`
-    (default 8) connections that are stalled before their first request: still reading
-    headers, never served, without a complete header block in the receive buffer, and
-    first seen at least one scan interval (200 ms) ago. The oldest beyond the cap are
-    closed. The interval keeps a burst of fresh connections from many clients behind one
-    address (a reverse proxy, a loopback load test) from being reset mid-request.
+    (default 8) connections that are stalled before their handler: still reading headers,
+    never served, without a complete header block in the receive buffer, and first seen at
+    least one scan interval (200 ms) ago; or reading the body for at least one scan interval
+    with nothing the client sent waiting unread (headers sent, body not). The oldest beyond
+    the cap are closed. The interval keeps a burst of fresh connections from many clients
+    behind one address (a reverse proxy, a loopback load test) from being reset mid-request.
   - **Overload shedding.** When a complete request has waited a whole scan interval for a
     worker, the pool is saturated. Every connection still reading headers that is older
     than `header_shed_grace` (default 1 s) and is not a complete buffered request is then
-    closed: dribbling, silent and idle keep-alive connections alike. Complete requests are
-    never shed, and handlers (generation, streaming) are never touched.
+    closed: dribbling, silent and idle keep-alive connections alike; so is every connection
+    that has been reading its body for that long with nothing unread from its client.
+    Complete requests are never shed, and handlers (generation, streaming) are never touched.
   - Closed connections are counted in `halo_api_connection_deadline_closes_total` (all
     reasons) and `halo_api_connection_closes_total{reason}` (`deadline`, `peer_limit`,
     `overload`).
@@ -131,8 +134,9 @@ These implement PRD §12 and the security reviews of 2026-09-24 and 2026-09-25
     in all three cases. With 400 dribblers, more than threads plus queue, it answered 31%:
     new connections are then refused at accept, which only the reverse proxy can prevent.
   - Enforcement is Linux-only.
-  - Residual: a request that sends its headers promptly and then dribbles its body holds a
-    worker for up to `body_timeout`; overload shedding does not cover the body phase.
+  - Residual: a request that sends its headers promptly and then dribbles its body (a byte
+    at a time, so its receive buffer is never empty for long) holds a worker for up to
+    `body_timeout` unless the pool is saturated, when overload shedding closes it.
 - **Body size.** `max_body_bytes` (default 8 MiB) is enforced by httplib before the body is
   parsed. A larger body gets 413.
 - **Strict JSON.** The parser accepts RFC 8259 only: no comments, no trailing data, and valid
@@ -187,9 +191,9 @@ with `--http-queue`, `--max-header-connections-per-peer` and `--header-shed-grac
 | `reasoning_output_reserve` | 512 | Output headroom kept free of reasoning. See "Reasoning". |
 | `max_output_nesting` | 256 | Unmatched `[`/`{` allowed in model output (review S-9). |
 | `utility_concurrency` / `utility_queue` | 2 / 8 | Admission for `/tokenize` and `/apply-template`. Beyond it: 429 (review S-16). |
-| `header_timeout` / `body_timeout` | 10 s / 60 s | Per-connection read deadlines (reviews S-13, S-38). 0 = unlimited. |
-| `max_header_connections_per_peer` | 8 | Connections one address may hold before its first request (review S-38). 0 = no cap. |
-| `header_shed_grace` | 1 s | Overload shedding of header-phase connections older than this (review S-38). 0 = off. |
+| `header_timeout` / `body_timeout` | 10 s / 10 s | Per-connection read deadlines (reviews S-13, S-38). 0 = unlimited. |
+| `max_header_connections_per_peer` | 8 | Connections one address may hold stalled before their handler, in the header or body phase (review S-38). 0 = no cap. |
+| `header_shed_grace` | 1 s | Overload shedding of connections stalled reading a request (headers, or a body the client is not sending) for longer than this (review S-38). 0 = off. |
 | `http_threads` | 0 (`max_concurrent + max_queue + utility_concurrency + utility_queue + 4`) | Size of the HTTP worker pool. `max_queue` and `utility_queue` are capped at 4096. |
 | `http_queue` | 256 | Connections accepted and waiting for an HTTP worker (1-65536). One more is closed at accept. Every queued connection holds a descriptor; the server warns at start when `http_threads + http_queue` comes within 64 of the open-file limit. |
 | `read_timeout` / `write_timeout` / `keep_alive_timeout` | 60 s / 60 s / 5 s | Socket timeouts. At most 100 requests per keep-alive connection. |

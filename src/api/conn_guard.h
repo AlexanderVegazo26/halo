@@ -23,15 +23,17 @@
 //     has no deadline running. A connection that has sent nothing is timed from accept.
 //     Body deadline: from the end of the headers.
 //   * Per-peer cap (S-38 b). At most `per_peer_header_limit` connections per peer address
-//     may be stalled before their first request: in the header phase, never served,
-//     without a complete header block buffered, and first seen at least a scan interval
-//     ago (a fresh connection's request may still be in flight). The oldest beyond the cap
-//     are shut down.
+//     may be stalled before their handler: in the header phase, never served, without a
+//     complete header block buffered, and first seen at least a scan interval ago (a fresh
+//     connection's request may still be in flight); or in the body phase -- a worker is
+//     blocked reading it -- for at least a scan interval with nothing unread in its receive
+//     buffer (the client, not the server, is behind). The oldest beyond the cap are shut down.
 //   * Overload shedding (S-38 b). When a complete request has waited a full scan interval
 //     without a worker picking it up, the pool is saturated; every header-phase connection
 //     that is not a complete buffered request (dribbling, silent, or idle keep-alive) and
-//     is older than `shed_grace` is shut down, so the queue drains to the waiting requests.
-//     Complete buffered requests are never shed.
+//     every body-phase connection with nothing unread (its client is not sending the body)
+//     that is older than `shed_grace` is shut down, so the queue drains to the waiting
+//     requests. Complete buffered requests are never shed.
 //   * Shutting down (shutdown(2), SHUT_RDWR) makes httplib see a read error, close the
 //     socket and free the worker. It goes through a dup() of the descriptor whose inode
 //     and peer are checked on the duplicate itself, so a descriptor number that was closed
@@ -63,7 +65,7 @@ namespace halo::api {
 
 struct GuardLimits {
     std::chrono::milliseconds header_timeout{10000};  ///< 0 = no header deadline
-    std::chrono::milliseconds body_timeout{60000};    ///< 0 = no body deadline
+    std::chrono::milliseconds body_timeout{10000};    ///< 0 = no body deadline
     std::size_t per_peer_header_limit = 8;            ///< 0 = no per-peer cap
     std::chrono::milliseconds shed_grace{1000};       ///< 0 = no overload shedding
     std::chrono::milliseconds scan_interval{200};
@@ -85,6 +87,7 @@ public:
         bool complete_header = false;  ///< the unread bytes hold a complete header block
     };
     enum class Reason { Deadline, PeerLimit, Overload };
+    static constexpr int kReasons = 3;
     struct Victim {
         Key key;
         int fd = -1;
@@ -139,6 +142,7 @@ private:
         bool served = false;   ///< at least one request's headers were read
         bool seen = false;
         bool ready = false;    ///< header phase: a complete request is buffered, unread
+        bool io_known = false;  ///< the last scan read TCP_INFO/FIONREAD (unread is meaningful)
         std::uint64_t unread = 0;
     };
 
@@ -155,7 +159,7 @@ private:
     std::atomic<bool> running_{false};
     bool quit_ = false;
     std::atomic<std::uint64_t> timeouts_{0};
-    std::atomic<std::uint64_t> by_reason_[3] = {};
+    std::atomic<std::uint64_t> by_reason_[kReasons] = {};
     std::vector<char> peek_buf_;
 };
 

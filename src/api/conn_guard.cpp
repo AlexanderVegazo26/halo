@@ -115,13 +115,14 @@ std::vector<ConnectionGuard::Victim> ConnectionGuard::decide(const std::vector<O
         c.fd = o.fd;
         c.ino = o.ino;
         c.seen = true;
+        c.io_known = o.tcp_info;
+        c.unread = o.unread;
         if (c.phase != Phase::Header) continue;
         // S-38 (a): the header clock starts once a worker has read from the connection.
         if (!c.started && (!o.tcp_info || o.consumed > 0)) {
             c.started = true;
             c.since = now;
         }
-        c.unread = o.unread;
         c.ready = !c.started && o.complete_header;
         if (!c.ready) {
             c.ready_since = {};
@@ -157,16 +158,25 @@ std::vector<ConnectionGuard::Victim> ConnectionGuard::decide(const std::vector<O
         }
     }
     auto is_marked = [&](const Key& k) { return marked.contains(&k); };
+    // Stalled before its first request: header phase, never served, no complete request
+    // buffered. A connection first seen less than a scan interval ago is not stalled yet: a
+    // burst of clients behind one address (the reverse proxy D-017 requires, or loopback load)
+    // has fresh connections whose request is still in flight or half parsed, and closing them
+    // resets real requests.
+    auto header_stalled = [&](const Conn& c) {
+        return c.fd >= 0 && c.phase == Phase::Header && !c.served && !c.ready && now - c.first_seen >= lim_.scan_interval;
+    };
+    // Stalled reading the body: a worker is blocked in it, and nothing the client sent is
+    // waiting unread (a server that is merely slow to read a delivered body is not the client's fault).
+    auto body_stalled = [&](const Conn& c, std::chrono::milliseconds age) {
+        return c.fd >= 0 && c.phase == Phase::Body && c.io_known && c.unread == 0 && now - c.since >= age;
+    };
 
-    // 3. Per-peer cap on connections stalled before their first request. A connection first
-    //    seen less than a scan interval ago is not stalled yet: a burst of clients behind one
-    //    address (the reverse proxy D-017 requires, or loopback load) has fresh connections
-    //    whose request is still in flight or half parsed, and closing them resets real requests.
+    // 3. Per-peer cap on connections stalled before their handler (header or body phase).
     if (lim_.per_peer_header_limit > 0) {
         std::map<std::string_view, std::vector<std::pair<const Key*, const Conn*>>> by_peer;
         for (const auto& [k, c] : conns_) {
-            if (c.fd < 0 || c.phase != Phase::Header || c.served || c.ready || is_marked(k)) continue;
-            if (now - c.first_seen < lim_.scan_interval) continue;
+            if (is_marked(k) || !(header_stalled(c) || body_stalled(c, lim_.scan_interval))) continue;
             by_peer[k.first].push_back({&k, &c});
         }
         for (auto& [addr, v] : by_peer) {
@@ -182,9 +192,13 @@ std::vector<ConnectionGuard::Victim> ConnectionGuard::decide(const std::vector<O
     // 4. Overload: a complete request has waited a whole interval for a worker.
     if (saturated && lim_.shed_grace.count() > 0) {
         for (const auto& [k, c] : conns_) {
-            if (c.fd < 0 || c.phase != Phase::Header || c.ready || is_marked(k)) continue;
-            const auto age = c.started ? now - c.since : now - c.first_seen;
-            if (age >= lim_.shed_grace) victim(k, c, Reason::Overload);
+            if (c.fd < 0 || is_marked(k)) continue;
+            if (c.phase == Phase::Header && !c.ready) {
+                const auto age = c.started ? now - c.since : now - c.first_seen;
+                if (age >= lim_.shed_grace) victim(k, c, Reason::Overload);
+            } else if (body_stalled(c, lim_.shed_grace)) {
+                victim(k, c, Reason::Overload);
+            }
         }
     }
     return out;
@@ -302,7 +316,7 @@ void ConnectionGuard::scan() {
     // 2. Merge and decide.
     const std::vector<Victim> victims = decide(live, t_snap, Clock::now());
     // 3. Shut them down.
-    std::size_t n[3] = {0, 0, 0};
+    std::size_t n[kReasons] = {};
     for (const Victim& v : victims) {
         if (!shutdown_verified(v, port_)) continue;
         ++n[static_cast<int>(v.reason)];

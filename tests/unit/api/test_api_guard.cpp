@@ -168,6 +168,50 @@ TEST(ConnGuardUnit, OverloadShedsOnlyWhileACompleteRequestWaits) {
     EXPECT_EQ(w.size(), 1u);
 }
 
+TEST(ConnGuardUnit, BodyPhaseStallsCountTowardThePerPeerCap) {
+    // A client that sends its headers and no body has a worker blocked reading the body. Those
+    // connections used to be outside the per-peer cap (only the 60 s body deadline applied), so
+    // one address could pin every worker with as many requests as there are HTTP threads.
+    ConnectionGuard g(limits(0ms, 2, 0ms));
+    for (int p = 1; p <= 4; ++p) {
+        g.headers_done("10.0.2.1", p);  // body phase, oldest first
+        std::this_thread::sleep_for(2ms);
+    }
+    g.headers_done("10.0.2.1", 5);
+    g.handler_started("10.0.2.1", 5);  // its body arrived: a running handler is never counted
+    const auto t = Clock::now();
+    const std::vector<ConnectionGuard::Observed> live = {
+        obs("10.0.2.1", 1, 300, 0), obs("10.0.2.1", 2, 300, 0), obs("10.0.2.1", 3, 300, 0),
+        obs("10.0.2.1", 4, 300, 64),  // its body is in the receive buffer: the server is behind, not the client
+        obs("10.0.2.1", 5, 400, 0)};
+    EXPECT_TRUE(g.decide(live, t, t).empty()) << "in the body phase for less than a scan interval: not stalled yet";
+    const auto v = g.decide(live, t + 300ms, t + 300ms);
+    EXPECT_EQ(keys_of(v, Reason::PeerLimit), (std::vector<std::pair<std::string, int>>{{"10.0.2.1", 1}}))
+        << "three body stalls against a cap of 2: the oldest is closed";
+    EXPECT_EQ(v.size(), 1u);
+}
+
+TEST(ConnGuardUnit, OverloadShedsBodyPhaseStalls) {
+    // One body staller per address (no per-peer cap can help) while a complete request waits
+    // for a worker: the stalled bodies older than the grace are shed like header dribblers.
+    ConnectionGuard g(limits(0ms, 0, 1000ms));
+    g.headers_done("10.0.3.1", 1);
+    g.headers_done("10.0.3.2", 2);
+    g.headers_done("10.0.3.3", 3);
+    g.handler_started("10.0.3.3", 3);
+    const auto t = Clock::now();
+    std::vector<ConnectionGuard::Observed> live = {obs("10.0.3.1", 1, 300, 0), obs("10.0.3.2", 2, 300, 4096),
+                                                   obs("10.0.3.3", 3, 400, 0)};
+    (void)g.decide(live, t, t);
+    EXPECT_TRUE(g.decide(live, t + 5s, t + 5s).empty()) << "nothing waits: no shedding however long the body stalls";
+    live.push_back(obs("10.0.3.9", 9, 0, 200, true));  // a complete request, queued
+    (void)g.decide(live, t + 5s, t + 5s);
+    const auto v = g.decide(live, t + 5200ms, t + 5200ms);
+    EXPECT_EQ(keys_of(v, Reason::Overload), (std::vector<std::pair<std::string, int>>{{"10.0.3.1", 1}}))
+        << "the stalled body is shed; the delivered body, the handler and the waiting request are not";
+    EXPECT_EQ(v.size(), 1u);
+}
+
 TEST(ConnGuardUnit, HttpQueueMustBeBounded) {
     api::ServerConfig cfg;
     cfg.http_queue = 0;  // httplib would treat 0 as unbounded
@@ -407,6 +451,99 @@ TEST(ApiGuard, PerPeerLimitFreesWorkersHeldByOneAddress) {
     for (const auto& x : d) closed += x->closed_by_server();
     EXPECT_EQ(closed, 3) << "exactly the connections beyond the cap are closed";
     EXPECT_EQ(metric(ts, "halo_api_connection_closes_total{reason=\"peer_limit\"}"), 3);
+}
+
+/// A raw connection from source address `from` that sends a complete header block announcing
+/// a body and then never sends the body.
+class BodyStaller {
+public:
+    BodyStaller(int port, const std::string& from) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in src{};
+        src.sin_family = AF_INET;
+        ::inet_pton(AF_INET, from.c_str(), &src.sin_addr);
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(static_cast<std::uint16_t>(port));
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        static constexpr std::string_view head =
+            "POST /v1/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+            "Content-Length: 64\r\n\r\n";
+        ok_ = fd_ >= 0 && ::bind(fd_, reinterpret_cast<sockaddr*>(&src), sizeof(src)) == 0 &&     // NOLINT: sockets API
+              ::connect(fd_, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0 &&              // NOLINT: sockets API
+              ::send(fd_, head.data(), head.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(head.size());
+    }
+    ~BodyStaller() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    BodyStaller(const BodyStaller&) = delete;
+    BodyStaller& operator=(const BodyStaller&) = delete;
+    [[nodiscard]] bool connected() const { return ok_; }
+    /// True once the server has closed or reset the connection (it never answers a stalled body).
+    [[nodiscard]] bool closed_by_server() const {
+        char c = 0;
+        const ssize_t n = ::recv(fd_, &c, 1, MSG_DONTWAIT | MSG_PEEK);
+        return n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK);
+    }
+
+private:
+    int fd_ = -1;
+    bool ok_ = false;
+};
+
+TEST(ApiGuard, PerPeerLimitFreesWorkersHeldByBodyStallers) {
+    // Six requests from 127.0.0.4 send their headers and no body: every worker is blocked
+    // reading a body. The body deadline (30 s) and shedding are out of the picture; the cap
+    // (3) closes the three oldest, /health is served, the three under the cap are left alone.
+    api::ServerConfig cfg;
+    cfg.http_threads = 6;
+    cfg.header_timeout = 30s;
+    cfg.body_timeout = 30s;
+    cfg.header_shed_grace = 0ms;
+    cfg.max_header_connections_per_peer = 3;
+    TestServer ts(cfg);
+    std::vector<std::unique_ptr<BodyStaller>> d;
+    for (int i = 0; i < 6; ++i) {
+        d.push_back(std::make_unique<BodyStaller>(ts.port, "127.0.0.4"));
+        ASSERT_TRUE(d.back()->connected());
+        std::this_thread::sleep_for(20ms);
+    }
+    std::this_thread::sleep_for(300ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = make_client(ts.port, 5s)->Get("/health");
+    ASSERT_TRUE(r) << "/health starved by stalled bodies: " << httplib::to_string(r.error());
+    EXPECT_EQ(r->status, 200);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 3s);
+    std::this_thread::sleep_for(1500ms);
+    int closed = 0;
+    for (const auto& x : d) closed += x->closed_by_server() ? 1 : 0;
+    EXPECT_EQ(closed, 3) << "exactly the connections beyond the cap are closed";
+    EXPECT_EQ(metric(ts, "halo_api_connection_closes_total{reason=\"peer_limit\"}"), 3);
+}
+
+TEST(ApiGuard, OverloadSheddingFreesWorkersHeldByBodyStallers) {
+    // One body staller per address holds every worker; no per-peer cap, body deadline 30 s.
+    // A complete /health waits a scan interval, which sheds the stalled bodies past the grace.
+    api::ServerConfig cfg;
+    cfg.http_threads = 4;
+    cfg.header_timeout = 30s;
+    cfg.body_timeout = 30s;
+    cfg.max_header_connections_per_peer = 0;
+    cfg.header_shed_grace = 500ms;
+    TestServer ts(cfg);
+    std::vector<std::unique_ptr<BodyStaller>> d;
+    for (int i = 0; i < 4; ++i) {
+        d.push_back(std::make_unique<BodyStaller>(ts.port, "127.0.0." + std::to_string(20 + i)));
+        ASSERT_TRUE(d.back()->connected());
+    }
+    std::this_thread::sleep_for(300ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = make_client(ts.port, 5s)->Get("/health");
+    ASSERT_TRUE(r) << "/health starved by stalled bodies: " << httplib::to_string(r.error());
+    EXPECT_EQ(r->status, 200);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 3s);
+    EXPECT_GE(metric(ts, "halo_api_connection_closes_total{reason=\"overload\"}"), 1);
+    EXPECT_EQ(metric(ts, "halo_api_connection_closes_total{reason=\"deadline\"}"), 0);
 }
 
 TEST(ApiGuard, OverloadSheddingFreesWorkersHeldByManyAddresses) {

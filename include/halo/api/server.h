@@ -71,15 +71,18 @@ struct ServerConfig {
     /// complete body. A connection waiting in the queue with its request buffered has no
     /// deadline running; one that has sent nothing is timed from accept. 0 = unlimited.
     /// Linux only (see conn_guard.h).
+    /// The body deadline is short: a worker is blocked reading the body the whole time, so a
+    /// client that sends headers and no body holds an HTTP thread for up to this long.
     std::chrono::milliseconds header_timeout{10000};
-    std::chrono::milliseconds body_timeout{60000};
-    /// Connections one peer address may hold before its first request is complete (header
-    /// phase, not yet served, no complete header block buffered); the oldest beyond this
-    /// are closed. 0 = no limit (S-38).
+    std::chrono::milliseconds body_timeout{10000};
+    /// Connections one peer address may hold stalled before their handler: in the header
+    /// phase (not yet served, no complete header block buffered) or in the body phase with
+    /// the client not sending; the oldest beyond this are closed. 0 = no limit (S-38).
     std::size_t max_header_connections_per_peer = 8;
     /// Overload shedding (S-38): when a complete request has waited a scan interval for an
     /// HTTP thread, header-phase connections that are not a complete buffered request
-    /// (dribbling, silent or idle keep-alive) and older than this are closed. 0 = off.
+    /// (dribbling, silent or idle keep-alive) and body-phase connections whose client is not
+    /// sending, older than this, are closed. 0 = off.
     std::chrono::milliseconds header_shed_grace{1000};
     std::chrono::seconds read_timeout{60};
     std::chrono::seconds write_timeout{60};

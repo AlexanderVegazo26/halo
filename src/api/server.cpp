@@ -369,8 +369,10 @@ struct ApiServer::Impl {
           specials(e.tokenizer()),
           admission(cfg.max_concurrent, cfg.max_queue),
           utility(cfg.utility_concurrency, cfg.utility_queue),
-          guard(GuardLimits{cfg.header_timeout, cfg.body_timeout, cfg.max_header_connections_per_peer,
-                            cfg.header_shed_grace}) {
+          guard(GuardLimits{.header_timeout = cfg.header_timeout,
+                            .body_timeout = cfg.body_timeout,
+                            .per_peer_header_limit = cfg.max_header_connections_per_peer,
+                            .shed_grace = cfg.header_shed_grace}) {
         model_name = cfg.served_model_name.empty() ? engine.model().id : cfg.served_model_name;
         if (model_name.empty()) model_name = "halo";
         close_reasoning = engine.tokenizer().encode("\n</think>\n\n", true);
