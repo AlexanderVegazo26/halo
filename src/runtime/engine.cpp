@@ -443,6 +443,10 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     pr.prefix_checkpoints.enabled = cfg.prefix_cache;
     if (opts.checkpoint_spacing > 0) pr.prefix_checkpoints.spacing_tokens = static_cast<std::uint32_t>(opts.checkpoint_spacing);
     pr.max_memory = cfg.max_memory_bytes;
+    // The KV pools also hold the prefix cache's share (cache_cap_ extra sequences): plan it, so
+    // the default --ctx 32768 --parallel 4 is not zero-filled at twice the planned KV size.
+    cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
+    pr.prefix_cache_sequences = static_cast<std::uint32_t>(std::min<std::size_t>(cache_cap_, std::numeric_limits<std::uint32_t>::max()));
     try {
         plan_ = memory::plan_memory_or_throw(model_shape(*nm_, *model_), pr, hw.tiers);
     } catch (const Error& e) {
@@ -468,7 +472,9 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     mtp_layout.type = kv_type;
     const auto blocks_for = [&](std::size_t ctx) { return ceil_div(ctx + max_draft_ + tree_extra_ + 1, bt) + 1; };  // +1: one COW copy
     std::size_t per_seq = blocks_for(info_.context_length);
-    cache_cap_ = cfg.prefix_cache ? (opts.prefix_cache_entries > 0 ? opts.prefix_cache_entries : cfg.max_sequences) : 0;
+    // The prefix-cache share the plan holds room for (shrunk below cache_cap_ when the full
+    // share does not fit; the cache keeps cache_cap_ entries and evicts under block pressure).
+    const std::size_t cache_seqs = plan_.sizes.prefix_cache_sequences;
     // ---- KV pool sizing (large contexts) -------------------------------------------------
     // A backend caps ONE buffer (RADV: min(maxMemoryAllocationSize, maxStorageBufferRange) = 4 GiB)
     // and the attention / kv-write kernels bind one pool buffer. The pool is therefore split
@@ -477,7 +483,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     // is 2 GiB per layer; x 4 sequences is 4 GiB + the COW/draft slack per layer, which does NOT fit
     // under a 4 GiB cap in fp32 -- refused below -- but does in fp16/q8). The pool is sized for every
     // sequence at the full context; the prefix-cache
-    // share (cache_cap_ extra sequences' worth of blocks, opportunistic: cached prefixes are
+    // share (cache_seqs extra sequences' worth of blocks, as planned; opportunistic: cached prefixes are
     // evicted under pressure) is what shrinks first, so the cache stays enabled. If the
     // sequences themselves do not fit (per-buffer cap, or the pools would exceed the VRAM the plan
     // leaves), an explicit --ctx is refused (Error(Config)) and a defaulted one is halved with a
@@ -486,7 +492,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     const std::uint64_t buf_cap = opts.kv_buffer_cap_bytes.value_or(active_backend.limits().max_pool_buffer_bytes);
     const std::uint64_t trunk_blk = trunk_layout.block_bytes();
     const std::uint64_t mtp_blk = mtp ? mtp_layout.block_bytes() : 0;
-    // Free-VRAM guard: the plan counts max_sequences x context of KV, not the cache share nor the
+    // Free-VRAM guard: the plan counts max_sequences x context of KV plus the cache share, not the
     // per-sequence COW/draft slack. The sequences' blocks may use the plan's KV budget plus all
     // FREE VRAM the plan leaves (hard limit: beyond it the allocation would fail); the prefix-cache
     // share only the plan's safety-reduced budget, so the reserve for the activation / workspace
@@ -495,11 +501,12 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     if (plan_.tier_of(memory::Component::KvCache) == hardware::MemoryTier::Vram) {
         for (const auto& t : plan_.tiers) {
             if (t.tier != hardware::MemoryTier::Vram) continue;
-            vram_hard = plan_.sizes.kv + plan_.sizes.mtp_kv + (t.available > t.planned ? t.available - t.planned : 0);
-            vram_soft = plan_.sizes.kv + plan_.sizes.mtp_kv + (t.budget > t.planned ? t.budget - t.planned : 0);
+            const std::uint64_t planned_kv = plan_.sizes.kv + plan_.sizes.mtp_kv + plan_.sizes.prefix_cache_kv;
+            vram_hard = planned_kv + (t.available > t.planned ? t.available - t.planned : 0);
+            vram_soft = planned_kv + (t.budget > t.planned ? t.budget - t.planned : 0);
         }
     }
-    std::size_t default_blocks = per_seq * (cfg.max_sequences + cache_cap_);
+    std::size_t default_blocks = per_seq * (cfg.max_sequences + cache_seqs);
     if (!opts.kv_blocks) {
         std::size_t cap_blocks = kv_cache::KvPool::max_blocks(trunk_layout, kv_cache::Placement::PerLayer, buf_cap);
         if (mtp) cap_blocks = std::min(cap_blocks, kv_cache::KvPool::max_blocks(mtp_layout, kv_cache::Placement::PerLayer, buf_cap));
@@ -518,7 +525,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
             }
             const std::size_t need = per_seq * cfg.max_sequences;
             if (need <= limit) {
-                default_blocks = std::min(per_seq * (cfg.max_sequences + cache_cap_), std::max(std::min(soft, limit), need));
+                default_blocks = std::min(per_seq * (cfg.max_sequences + cache_seqs), std::max(std::min(soft, limit), need));
                 break;
             }
             HALO_CHECK(!cfg.max_context_explicit && info_.context_length > 1024, ErrorCode::Config,
@@ -536,7 +543,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
                       info_.context_length, cfg.max_sequences);
         }
         if (default_blocks < per_seq * (cfg.max_sequences + cache_cap_)) {
-            HALO_INFO("runtime", "prefix-cache share of the KV pool reduced to {} of {} blocks (pool limit); the cache stays on",
+            HALO_INFO("runtime", "prefix-cache share of the KV pool reduced to {} of {} blocks (memory plan / pool limit); the cache stays on",
                       default_blocks - per_seq * cfg.max_sequences, per_seq * cache_cap_);
         }
     }
@@ -613,16 +620,16 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     }
     if (opts.checkpoint_budget_bytes) ck = *opts.checkpoint_budget_bytes;
     ckpts_ = std::make_unique<state::CheckpointStore>(cfg.prefix_cache ? ck : 0);
-    if (cfg.max_memory_bytes) {
-        // The planner sized KV for max_sequences; the pools also hold the prefix cache's
-        // share, and the host checkpoint budget is outside the plan: check the real total.
-        const std::uint64_t pools = static_cast<std::uint64_t>(kv_pool_->total_blocks()) * kv_pool_->layout().block_bytes() +
-                                    (mtp_pool_ ? static_cast<std::uint64_t>(mtp_pool_->total_blocks()) * mtp_pool_->layout().block_bytes() : 0);
-        const std::uint64_t planned_other = plan_.planned_total - plan_.sizes.kv - plan_.sizes.mtp_kv - plan_.sizes.prefix_checkpoints;
-        const std::uint64_t real = planned_other + pools + ckpts_->budget_bytes();
-        HALO_CHECK(real <= *cfg.max_memory_bytes, ErrorCode::Memory,
-                   "allocation of {} bytes (KV pools {} incl. prefix cache, checkpoints {}) exceeds max_memory {}", real, pools,
-                   ckpts_->budget_bytes(), *cfg.max_memory_bytes);
+    {
+        // Always check the real allocation against the plan, not only under max_memory: the
+        // pools carry per-sequence slack (and an explicit kv_blocks may exceed the plan), and
+        // the CPU reference's checkpoint budget is host memory the plan did not place. A start
+        // that does not fit fails here with a message instead of being OOM-killed later.
+        memory::RuntimeFootprint real;
+        real.kv_pools = static_cast<std::uint64_t>(kv_pool_->total_blocks()) * kv_pool_->layout().block_bytes() +
+                        (mtp_pool_ ? static_cast<std::uint64_t>(mtp_pool_->total_blocks()) * mtp_pool_->layout().block_bytes() : 0);
+        real.host_extra = plan_.sizes.prefix_checkpoints > 0 ? 0 : ckpts_->budget_bytes();
+        memory::require_footprint_fits(plan_, real, cfg.max_memory_bytes);
     }
 
     worker_ = std::thread([this] { run(); });

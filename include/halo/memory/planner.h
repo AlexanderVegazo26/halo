@@ -12,9 +12,10 @@
 //     go to HOST. With no GPU, everything goes to HOST (CPU reference path).
 //   * Placement is greedy in Component declaration order: GDN recurrent/conv state and its
 //     MTP rollback copies first (read and written every token, so they get the fastest
-//     tier that fits), then KV, then small per-step buffers, then weights, and last the
-//     prefix-cache GDN checkpoints (D-013, on by default; GPU pool only, never HOST; the derived
-//     per-slot count shrinks to fit unless configured explicitly).
+//     tier that fits), then KV, then small per-step buffers, then weights, then the
+//     prefix-cache share of the KV pools (same tier as the KV cache; shrinks to fit), and last
+//     the prefix-cache GDN checkpoints (D-013, on by default; GPU pool only, never HOST; the
+//     derived per-slot count shrinks to fit unless configured explicitly).
 //   * GTT pages come from OS RAM, so GTT placements also count against the HOST budget
 //     (constraint "HOST": planned(HOST) + planned(GTT) <= budget(HOST)).
 //   * A user tier override pins a class to one tier (no fallback) but never bypasses a
@@ -131,6 +132,7 @@ enum class Component : std::uint8_t {
     LmHead,
     Embeddings,
     MtpWeights,
+    PrefixCacheKv,      ///< the prefix cache's share of the KV pools (trunk + MTP); KV's tier only
     PrefixCheckpoints,  ///< prefix-cache GDN state checkpoints; GPU tiers only, lowest priority
     HostRuntimeOverhead,
 };
@@ -173,6 +175,13 @@ struct PlanRequest {
     /// (failure atomicity of every decode step).
     std::optional<std::uint32_t> gdn_rollback_copies;
     PrefixCheckpoints prefix_checkpoints;
+    /// Extra sequences' worth of KV (trunk + MTP, max_context tokens each) that the runtime's
+    /// prefix cache keeps in the same pools as the live sequences: CpuEngine sizes its pools
+    /// for max_sequences + this. Planned as PrefixCacheKv on the KV cache's tier. The share is
+    /// opportunistic (cached prefixes are evicted under pressure), so when the plan does not
+    /// fit, plan_memory reduces it to the largest count that fits before refusing
+    /// (SizeBreakdown::prefix_cache_sequences is what was planned).
+    std::uint32_t prefix_cache_sequences = 0;
     std::uint32_t batch = 512;
     std::uint32_t ubatch = 256;
     bool flash_attention = true;  ///< false adds an ubatch × n_head × ctx fp32 score buffer
@@ -200,6 +209,8 @@ struct SizeBreakdown {
     std::uint64_t gdn_rollback = 0;
     std::uint32_t prefix_checkpoints_per_slot = 0;
     std::uint64_t prefix_checkpoints = 0;
+    std::uint32_t prefix_cache_sequences = 0;  ///< planned (possibly shrunk) prefix-cache share
+    std::uint64_t prefix_cache_kv = 0;         ///< trunk + MTP KV of that share
     std::uint64_t logits = 0;
     std::uint64_t activations = 0;
     std::uint64_t workspace = 0;
@@ -268,10 +279,31 @@ struct MemoryPlan {
 [[nodiscard]] MemoryPlan plan_memory_or_throw(const ModelShape& shape, const PlanRequest& request,
                                               const hardware::MemoryTiers& tiers);
 
+/// What the runtime actually allocated for the classes the plan only estimates.
+struct RuntimeFootprint {
+    /// Trunk + MTP KV pools as allocated: the live sequences, the prefix-cache share and the
+    /// per-sequence block slack (draft rows, copy-on-write block). Replaces the plan's
+    /// kv + mtp_kv + prefix_cache_kv on the KV cache's tier.
+    std::uint64_t kv_pools = 0;
+    /// Host memory the runtime may use outside the plan (the CPU reference's prefix
+    /// checkpoint budget when the plan placed none).
+    std::uint64_t host_extra = 0;
+};
+
+/// Throws Error(Memory) naming the tier unless `plan`, with its KV estimate replaced by the
+/// real pools and `host_extra` added on HOST, still fits every tier budget (the same
+/// constraints plan_memory checks, GTT pages counted against HOST; VRAM against what is
+/// available, since the runtime's own VRAM guard lets live KV use the reserve) and `max_memory`. Lets the
+/// runtime fail at start with a clear message instead of being OOM-killed while zero-filling
+/// pools the plan never counted.
+void require_footprint_fits(const MemoryPlan& plan, const RuntimeFootprint& real,
+                            std::optional<std::uint64_t> max_memory = std::nullopt);
+
 /// Largest max_context in [1, upper] whose plan fits (other request fields unchanged);
 /// 0 if even 1 token does not fit. `upper` defaults to shape.max_trained_context.
 /// Requests whose size arithmetic overflows count as "does not fit". A plan only counts
-/// as fitting with the full requested prefix-checkpoint count (no shrink-to-fit).
+/// as fitting with the full requested prefix-checkpoint count (no shrink-to-fit); the
+/// prefix-cache KV share is opportunistic and not required (the search plans it as 0).
 [[nodiscard]] std::uint64_t max_context_for_budget(const ModelShape& shape, const PlanRequest& request,
                                                    const hardware::MemoryTiers& tiers,
                                                    std::optional<std::uint64_t> upper = std::nullopt);

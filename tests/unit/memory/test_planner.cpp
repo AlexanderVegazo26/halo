@@ -352,3 +352,127 @@ TEST(PlannerOutput, JsonAndTable) {
     EXPECT_NE(plan.table().find("HOST"), std::string::npos);
     EXPECT_NE(plan.table().find("OK: fits"), std::string::npos);
 }
+
+// ---- prefix-cache KV share and the runtime footprint (review: KV pools held 2x the plan) ----
+
+TEST(PlannerPrefixCache, ShareIsSizedAsExtraSequencesOfKv) {
+    auto r = mtp2(32768, 4, KvLayout::PerSequence);
+    const auto base = compute_sizes(qwen(), r);
+    EXPECT_EQ(base.prefix_cache_kv, 0u);
+    r.prefix_cache_sequences = 4;  // CpuEngine's default: one cache entry per sequence
+    const auto s = compute_sizes(qwen(), r);
+    EXPECT_EQ(s.prefix_cache_sequences, 4u);
+    EXPECT_EQ(s.prefix_cache_kv, 4ULL * 32768 * (kKvF16PerToken + kMtpKvF16PerToken));
+    EXPECT_EQ(s.prefix_cache_kv, s.kv + s.mtp_kv);  // as much again as the live sequences
+    EXPECT_EQ(s.total(), base.total() + s.prefix_cache_kv);
+}
+
+TEST(PlannerPrefixCache, PlannedOnTheKvTierAndShrunkToFit) {
+    auto r = mtp2(32768, 2, KvLayout::PerSequence);
+    const auto base = plan_memory(qwen(), r, host_only_32g());
+    ASSERT_TRUE(base.ok) << base.table();
+    const std::uint64_t share = 32768ULL * (kKvF16PerToken + kMtpKvF16PerToken);  // one sequence
+    // A host whose budget holds the live sequences plus 1.5 sequences of cache share.
+    MemoryTiers t = host_only_32g();
+    t.host_available = (base.planned_total + share * 3 / 2) * 10 / 9 + 1;
+    r.prefix_cache_sequences = 1;
+    const auto one = plan_memory(qwen(), r, t);
+    ASSERT_TRUE(one.ok) << one.table();
+    EXPECT_EQ(one.sizes.prefix_cache_sequences, 1u);
+    EXPECT_EQ(one.tier_of(Component::PrefixCacheKv), halo::hardware::MemoryTier::Host);
+    EXPECT_EQ(one.planned_total, base.planned_total + share);
+
+    r.prefix_cache_sequences = 4;  // does not fit: shrunk, not refused
+    const auto shrunk = plan_memory(qwen(), r, t);
+    ASSERT_TRUE(shrunk.ok) << shrunk.table();
+    EXPECT_EQ(shrunk.sizes.prefix_cache_sequences, 1u);
+    EXPECT_TRUE(std::ranges::any_of(shrunk.notes, [](const std::string& n) {
+        return n.find("prefix-cache KV share shrunk from 4 to 1") != std::string::npos;
+    })) << shrunk.table();
+    const nlohmann::json j = shrunk;
+    EXPECT_EQ(j["sizes"]["prefix_cache_sequences"], 1u);
+
+    // The share is opportunistic: the budget searches do not trade context for it.
+    auto plain = r;
+    plain.prefix_cache_sequences = 0;
+    EXPECT_EQ(max_context_for_budget(qwen(), r, t), max_context_for_budget(qwen(), plain, t));
+
+    // If the live sequences alone do not fit, the refusal stands.
+    MemoryTiers small = host_only_32g();
+    small.host_available = base.planned_total / 2;
+    EXPECT_FALSE(plan_memory(qwen(), r, small).ok);
+}
+
+TEST(PlannerFootprint, RealPoolsBeyondThePlanAreRefusedAtStart) {
+    // The defect: pools sized for max_sequences + the cache share against a plan that only
+    // counted max_sequences. With 2 live sequences planned and 2x the KV allocated, the HOST
+    // budget is exceeded -- the runtime must refuse instead of zero-filling it.
+    auto r = mtp2(32768, 2, KvLayout::PerSequence);
+    const auto base = plan_memory(qwen(), r, host_only_32g());
+    ASSERT_TRUE(base.ok) << base.table();
+    const std::uint64_t planned_kv = base.sizes.kv + base.sizes.mtp_kv;
+    const std::uint64_t host_budget = base.tiers.back().budget;
+    ASSERT_GT(host_budget, base.planned_total);
+    const std::uint64_t slack = host_budget - base.planned_total;
+
+    RuntimeFootprint fits;
+    fits.kv_pools = planned_kv + slack;  // exactly the budget
+    EXPECT_NO_THROW(require_footprint_fits(base, fits));
+    RuntimeFootprint pools_2x;
+    pools_2x.kv_pools = 2 * planned_kv;
+    ASSERT_GT(planned_kv, slack);
+    try {
+        require_footprint_fits(base, pools_2x);
+        FAIL() << "expected MEMORY_ERROR";
+    } catch (const halo::Error& e) {
+        EXPECT_EQ(e.code(), halo::ErrorCode::Memory);
+        const std::string what = e.what();
+        EXPECT_NE(what.find("HOST"), std::string::npos) << what;
+        EXPECT_NE(what.find("--parallel"), std::string::npos) << what;
+    }
+    // Host memory outside the plan (the CPU checkpoint budget) counts too.
+    RuntimeFootprint extra;
+    extra.kv_pools = planned_kv;
+    extra.host_extra = slack + 1;
+    EXPECT_THROW(require_footprint_fits(base, extra), halo::Error);
+    extra.host_extra = slack;
+    EXPECT_NO_THROW(require_footprint_fits(base, extra));
+    // max_memory caps the real total, not the planned one.
+    EXPECT_NO_THROW(require_footprint_fits(base, fits, base.planned_total + slack));
+    EXPECT_THROW(require_footprint_fits(base, fits, base.planned_total + slack - 1), halo::Error);
+
+    // With the share planned, pools holding live sequences + share fit the same host.
+    r.prefix_cache_sequences = 2;
+    const auto with_share = plan_memory(qwen(), r, host_only_32g());
+    if (with_share.ok && with_share.sizes.prefix_cache_sequences == 2) {
+        RuntimeFootprint planned;
+        planned.kv_pools = with_share.sizes.kv + with_share.sizes.mtp_kv + with_share.sizes.prefix_cache_kv;
+        EXPECT_NO_THROW(require_footprint_fits(with_share, planned));
+    }
+}
+
+// GTT pages are OS RAM: a KV pool in GTT that grows past the plan is refused on HOST even if
+// the GTT budget still has room.
+TEST(PlannerFootprint, GttPoolsCountAgainstTheOsPool) {
+    MemoryTiers t;
+    t.topology = MemoryTopology::GttPrimary;
+    t.vram_total = 64 * MiB;  // too small for the GDN state or the KV: both go to GTT
+    t.vram_used = 0;
+    t.gtt_total = 100 * GiB;
+    t.gtt_used = 0;
+    t.host_total = 64 * GiB;
+    t.host_available = 40 * GiB;
+    PlanRequest r;
+    r.max_context = 4096;
+    const auto plan = plan_memory(qwen(), r, t);
+    ASSERT_TRUE(plan.ok) << plan.table();
+    ASSERT_EQ(plan.tier_of(Component::KvCache), halo::hardware::MemoryTier::Gtt);
+    RuntimeFootprint real;
+    real.kv_pools = plan.sizes.kv + 30 * GiB;  // fits the 90 GiB GTT budget, not the 36 GiB OS pool
+    try {
+        require_footprint_fits(plan, real);
+        FAIL() << "expected MEMORY_ERROR";
+    } catch (const halo::Error& e) {
+        EXPECT_NE(std::string(e.what()).find("HOST"), std::string::npos) << e.what();
+    }
+}

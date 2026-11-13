@@ -158,13 +158,17 @@ int cmd_inspect(const std::vector<std::string>& args, Context& ctx) {
         const auto draft = a.u64("mtp-draft", 0, 16).value_or(2);
         req.mtp_enabled = r.mtp_present && draft > 0;
         req.mtp_draft_depth = req.mtp_enabled ? static_cast<std::uint32_t>(draft) : 0;
+        // The runtime's prefix cache (on by default, one entry per sequence) keeps its share
+        // of KV in the same pools: plan it as the engine does.
+        req.prefix_cache_sequences = req.max_sequences;
         const auto hw = hardware::discover(discovery_options(a.value("root").value_or("/"), ctx.env));
         plan = memory::plan_memory(shape, req, hw.tiers);
         max_ctx = memory::max_context_for_budget(shape, req, hw.tiers);
         mem["request"] = {{"max_context", req.max_context},
                           {"max_sequences", req.max_sequences},
                           {"mtp_enabled", req.mtp_enabled},
-                          {"mtp_draft_depth", req.mtp_draft_depth}};
+                          {"mtp_draft_depth", req.mtp_draft_depth},
+                          {"prefix_cache_sequences", req.prefix_cache_sequences}};
         mem["topology"] = std::string(hardware::to_string(hw.tiers.topology));
         mem["plan"] = *plan;
         mem["max_context_for_budget"] = max_ctx;

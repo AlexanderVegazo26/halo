@@ -21,8 +21,10 @@
 // (hardware::discover, root "/"); a plan that does not fit is Error(Memory) at creation.
 // D-013 puts checkpoints in the GPU pool; with no GPU tier (the CPU reference on the dev
 // host) the planner assigns them none, and the CPU backend then budgets the planner's
-// requested count on the host instead (logged at creation). The real allocation (KV pools
-// incl. the prefix-cache share, checkpoint budget) is checked against max_memory_bytes.
+// requested count on the host instead (logged at creation). The plan includes the prefix
+// cache's KV share (shrunk to fit), and the real allocation (KV pools incl. that share and
+// the per-sequence slack, the host checkpoint budget) is always checked against the plan's
+// tier budgets and max_memory_bytes (memory::require_footprint_fits): Error(Memory) at creation.
 
 #include <cstddef>
 #include <cstdint>

@@ -99,6 +99,7 @@ std::string_view to_string(Component c) noexcept {
         case Component::LmHead: return "weights.lm_head";
         case Component::Embeddings: return "weights.embeddings";
         case Component::MtpWeights: return "weights.mtp";
+        case Component::PrefixCacheKv: return "prefix_cache_kv";
         case Component::PrefixCheckpoints: return "prefix_checkpoints";
         case Component::HostRuntimeOverhead: return "host_runtime_overhead";
     }
@@ -113,7 +114,8 @@ constexpr std::array kAllComponents{
     Component::Activations,       Component::Workspace,        Component::GpuRuntimeOverhead,
     Component::Norms,             Component::AttentionWeights, Component::GdnWeights,
     Component::FfnWeights,        Component::LmHead,           Component::Embeddings,
-    Component::MtpWeights,        Component::PrefixCheckpoints, Component::HostRuntimeOverhead,
+    Component::MtpWeights,        Component::PrefixCacheKv,    Component::PrefixCheckpoints,
+    Component::HostRuntimeOverhead,
 };
 }  // namespace
 
@@ -135,6 +137,7 @@ std::uint64_t SizeBreakdown::bytes(Component c) const noexcept {
         case Component::LmHead: return weights.lm_head;
         case Component::Embeddings: return weights.embeddings;
         case Component::MtpWeights: return weights.mtp;
+        case Component::PrefixCacheKv: return prefix_cache_kv;
         case Component::PrefixCheckpoints: return prefix_checkpoints;
         case Component::HostRuntimeOverhead: return host_runtime_overhead;
     }
@@ -172,6 +175,15 @@ SizeBreakdown compute_sizes(const ModelShape& m, const PlanRequest& r) {
     s.kv = mul_or_throw(s.kv_bytes_per_token, s.kv_cells, "KV cache bytes");
     if (r.mtp_enabled)
         s.mtp_kv = mul3(m.mtp_attn_layers, kv_per_layer_token, s.kv_cells, "MTP KV cache bytes");
+    if (r.prefix_cache_sequences > 0) {
+        // The prefix cache's extra sequences live in the same pools: max_context tokens of
+        // trunk (+ MTP) KV each.
+        const std::uint64_t per_token = add_or_throw(
+            s.kv_bytes_per_token, r.mtp_enabled ? mul_or_throw(m.mtp_attn_layers, kv_per_layer_token, "MTP KV per token") : 0,
+            "prefix-cache KV per token");
+        s.prefix_cache_sequences = r.prefix_cache_sequences;
+        s.prefix_cache_kv = mul3(per_token, r.max_context, r.prefix_cache_sequences, "prefix-cache KV bytes");
+    }
 
     // GDN state: one copy = recurrent (per value head d_k × d_v) + conv history, per sequence.
     const std::uint64_t rec_elems = mul3(m.n_v_heads, m.d_k, m.d_v, "GDN recurrent elements");
@@ -373,6 +385,9 @@ MemoryPlan plan_once(const ModelShape& shape, const PlanRequest& req, const hard
             a.overridden = true;
         } else if (is_host_only(c)) {
             cand = {MemoryTier::Host};
+        } else if (c == Component::PrefixCacheKv) {
+            // Blocks of the same pools as the live sequences: wherever the KV cache went.
+            cand = {plan.tier_of(Component::KvCache).value_or(gpu_pref.front())};
         } else if (c == Component::PrefixCheckpoints) {
             // Never the OS pool (architecture review M-3). In the carveout-primary layout GTT
             // pages *are* the OS pool, so checkpoints are VRAM-only there.
@@ -447,7 +462,9 @@ MemoryPlan plan_once(const ModelShape& shape, const PlanRequest& req, const hard
 
 }  // namespace
 
-MemoryPlan plan_memory(const ModelShape& shape, const PlanRequest& req, const hardware::MemoryTiers& hw) {
+namespace {
+
+MemoryPlan plan_with_checkpoints(const ModelShape& shape, const PlanRequest& req, const hardware::MemoryTiers& hw) {
     MemoryPlan plan = plan_once(shape, req, hw);
     const auto& pc = req.prefix_checkpoints;
     const std::uint32_t requested = plan.sizes.prefix_checkpoints_per_slot;
@@ -479,6 +496,86 @@ MemoryPlan plan_memory(const ModelShape& shape, const PlanRequest& req, const ha
     best.prefix_checkpoints_requested = requested;
     best.notes.push_back(std::format("prefix checkpoints shrunk from {} to {} per slot to fit the budget", requested, lo));
     return best;
+}
+
+}  // namespace
+
+MemoryPlan plan_memory(const ModelShape& shape, const PlanRequest& req, const hardware::MemoryTiers& hw) {
+    MemoryPlan plan = plan_with_checkpoints(shape, req, hw);
+    const std::uint32_t requested = req.prefix_cache_sequences;
+    if (plan.ok || requested == 0) return plan;
+    // The prefix cache's KV share is opportunistic: shrink it to the largest count that fits
+    // (demand is monotone in it) rather than refusing the live sequences.
+    PlanRequest r = req;
+    auto attempt = [&](std::uint32_t n) {
+        r.prefix_cache_sequences = n;
+        return plan_with_checkpoints(shape, r, hw);
+    };
+    if (!attempt(0).ok) {
+        plan.notes.emplace_back("does not fit even with no prefix-cache KV share");
+        return plan;
+    }
+    std::uint32_t lo = 0;          // fits
+    std::uint32_t hi = requested;  // does not fit
+    while (hi - lo > 1) {
+        const std::uint32_t mid = lo + (hi - lo) / 2;
+        if (attempt(mid).ok) lo = mid;
+        else hi = mid;
+    }
+    MemoryPlan best = attempt(lo);
+    best.notes.push_back(std::format("prefix-cache KV share shrunk from {} to {} sequence(s) to fit the budget", requested, lo));
+    return best;
+}
+
+void require_footprint_fits(const MemoryPlan& plan, const RuntimeFootprint& real, std::optional<std::uint64_t> max_memory) {
+    std::vector<TierBudget> tiers = plan.tiers;
+    const auto find = [&](MemoryTier t) -> TierBudget* {
+        if (t == MemoryTier::Pinned) t = MemoryTier::Host;
+        for (auto& b : tiers)
+            if (b.tier == t) return &b;
+        return nullptr;
+    };
+    TierBudget* host = find(MemoryTier::Host);
+    HALO_CHECK(host != nullptr, ErrorCode::Config, "memory plan has no HOST tier");
+    // Swap the KV estimates for the real pools (all of which sit on the KV cache's tier).
+    std::uint64_t planned_kv = 0;
+    for (const auto c : {Component::KvCache, Component::MtpKvCache, Component::PrefixCacheKv}) {
+        for (const auto& a : plan.allocations) {
+            if (a.component != c) continue;
+            if (TierBudget* t = find(a.tier)) t->planned = sat_sub(t->planned, a.bytes);
+            planned_kv += a.bytes;
+        }
+    }
+    TierBudget* kv_tier = find(plan.tier_of(Component::KvCache).value_or(MemoryTier::Host));
+    if (kv_tier == nullptr) kv_tier = host;
+    kv_tier->planned = add_or_throw(kv_tier->planned, real.kv_pools, "runtime footprint");
+    host->planned = add_or_throw(host->planned, real.host_extra, "runtime footprint");
+
+    const auto refuse = [&](std::string_view what, std::uint64_t demand, std::uint64_t budget) {
+        throw_error(ErrorCode::Memory,
+                    "the allocation does not fit the memory plan: {} needs {} ({} bytes) but its budget is {} ({} bytes); "
+                    "KV pools {} ({} planned, incl. the prefix-cache share and per-sequence slack), host memory outside the "
+                    "plan {}: lower --ctx or --parallel, disable the prefix cache (--no-prefix-cache), or store KV as fp16/q8",
+                    what, gib(demand), demand, gib(budget), budget, gib(real.kv_pools), gib(planned_kv), gib(real.host_extra));
+    };
+    std::uint64_t gtt_planned = 0;
+    for (const auto& t : tiers) {
+        if (t.tier == MemoryTier::Gtt) {
+            gtt_planned = t.planned;
+            if (t.planned > t.budget) refuse(hardware::to_string(t.tier), t.planned, t.budget);
+        }
+        // VRAM: the runtime deliberately lets the live sequences' KV use the free VRAM the plan
+        // leaves (its own guard bounds the pools by it), so the hard limit is what is available.
+        if (t.tier == MemoryTier::Vram && t.planned > t.available) refuse("VRAM (available)", t.planned, t.available);
+    }
+    const std::uint64_t host_demand = add_or_throw(host->planned, gtt_planned, "runtime footprint");
+    if (host_demand > host->budget) refuse(constraint_label("HOST"), host_demand, host->budget);
+    if (max_memory) {
+        const std::uint64_t total =
+            add_or_throw(add_or_throw(sat_sub(plan.planned_total, planned_kv), real.kv_pools, "runtime footprint"),
+                         real.host_extra, "runtime footprint");
+        if (total > *max_memory) refuse(constraint_label("MAX_MEMORY"), total, *max_memory);
+    }
 }
 
 MemoryPlan plan_memory_or_throw(const ModelShape& shape, const PlanRequest& request, const hardware::MemoryTiers& tiers) {
@@ -531,6 +628,7 @@ bool fits(const ModelShape& shape, const PlanRequest& r, const hardware::MemoryT
         // checkpoint shrink-to-fit trade the requested checkpoints for context/slots.
         PlanRequest strict = r;
         strict.prefix_checkpoints.shrink_to_fit = false;
+        strict.prefix_cache_sequences = 0;  // opportunistic share: a size fits without it
         return plan_memory(shape, strict, tiers).ok;
     } catch (const Error& e) {
         if (e.code() == ErrorCode::Config && std::string_view(e.what()).find("overflow") != std::string_view::npos)
@@ -614,6 +712,8 @@ void to_json(nlohmann::json& j, const MemoryPlan& p) {
            {"prefix_checkpoints_per_slot", s.prefix_checkpoints_per_slot},
            {"prefix_checkpoints_requested_per_slot", p.prefix_checkpoints_requested},
            {"prefix_checkpoints", s.prefix_checkpoints},
+           {"prefix_cache_sequences", s.prefix_cache_sequences},
+           {"prefix_cache_kv", s.prefix_cache_kv},
            {"logits", s.logits},
            {"activations", s.activations},
            {"workspace", s.workspace},

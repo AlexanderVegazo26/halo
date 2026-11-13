@@ -130,8 +130,13 @@ slack (8 blocks), so it is refused; fp16/q8 KV fits. The suggested agent profile
   cap, which raises the limit by the layer count (about 512Ki tokens of fp32 in total, 1Mi fp16). The halving
   loop that used to end at 8192 tokens is gone. `halo serve` prints `KV pool ... GiB in N segment(s)` at startup.
 - **Prefix cache stays on.** The pool is sized for every sequence at the full context; the prefix-cache share
-  (extra blocks for cached prefixes, evicted under pressure) is what shrinks first when the pool limit or the
-  free VRAM is reached.
+  (extra blocks for cached prefixes, evicted under pressure; by default one more sequence's worth per sequence)
+  is planned by the memory planner as `prefix_cache_kv` and is what shrinks first when the memory plan, the
+  pool limit or the free VRAM is reached.
+- **The real allocation is checked against the plan at start.** The KV pools as allocated (live sequences,
+  the prefix-cache share, the per-sequence copy-on-write / draft slack) and, on the CPU backend, the host
+  prefix-checkpoint budget must fit the planned tier budgets (and `max_memory`), or the engine fails with a
+  `MEMORY_ERROR` naming the tier instead of being OOM-killed while it zero-fills the pools.
 - **An explicit `--ctx` is honoured or refused.** When `--ctx` (or `HALO_CTX`, or `runtime.ctx`) is set and the
   model's trained context, the per-buffer cap or the free VRAM cannot honour it with `--parallel` sequences,
   the engine fails with a `CONFIG_ERROR` that names the limit (lower `--ctx` or `--parallel`, or use fp16/q8 KV).
@@ -150,7 +155,8 @@ slack (8 blocks), so it is refused; fp16/q8 KV fits. The suggested agent profile
 - **Memory estimate.** Runs the memory planner (`memory::plan_memory`) against the tiers
   that hardware discovery finds. It prints the placement table and the largest context
   that fits, for `--ctx` (default `min(32768, trained context)`) × `--parallel` (default 1),
-  with the MTP draft depth.
+  with the MTP draft depth and the prefix cache's KV share (`--parallel` extra sequences,
+  shrunk to fit like the runtime does).
 - **Refusals.** A plan that does not fit is printed as refused. The command still exits 0,
   because that is an answer, not a failure.
 - **`--json`** prints `{"report": …, "memory": {request, topology, plan,
