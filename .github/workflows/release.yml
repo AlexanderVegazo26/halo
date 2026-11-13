@@ -1,0 +1,173 @@
+name: Release
+
+# Builds the `halo` CLI for Linux x86-64 and attaches it to a GitHub release.
+#
+# Two archives per release, because the Vulkan build links the Vulkan loader and
+# will not start on a machine without libvulkan.so.1:
+#   halo-<version>-linux-x86_64-vulkan.tar.gz   CPU + Vulkan backends (the Strix Halo target)
+#   halo-<version>-linux-x86_64-cpu.tar.gz      CPU backend only, no GPU libraries needed
+#
+# Linux only: the sources use POSIX APIs without a Windows port (mmap, signals), so there is
+# no native Windows or macOS build to offer. The HIP backend is not built here either: it
+# needs ROCm, which a hosted runner does not have.
+#
+# A `v*` tag builds and creates a DRAFT release for a maintainer to review and publish.
+# A manual run only uploads workflow artifacts unless `publish` is ticked.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create a draft GitHub release from this run'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: vulkan
+            vulkan: 'ON'
+            packages: libvulkan-dev glslc spirv-tools
+          - variant: cpu
+            vulkan: 'OFF'
+            packages: ''
+    # Pinned, not ubuntu-latest: the binary needs the glibc and libstdc++ of the image it was
+    # built on (or newer), so the image is part of what a release promises.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the version from CMakeLists.txt
+        id: version
+        run: |
+          version="$(sed -n 's/^project(halo VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          [ -n "$version" ] || { echo "could not read the project version from CMakeLists.txt" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=halo-$version-linux-x86_64-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+
+      # The archive is named after the CMake version, so a tag that disagrees with it would
+      # publish v0.3.0 containing halo-0.2.0-*.tar.gz.
+      - name: Check the tag matches the project version
+        if: github.ref_type == 'tag'
+        run: |
+          if [ "${{ github.ref_name }}" != "v${{ steps.version.outputs.version }}" ]; then
+            echo "tag ${{ github.ref_name }} does not match project version ${{ steps.version.outputs.version }}" >&2
+            exit 1
+          fi
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake libsqlite3-dev ${{ matrix.packages }}
+
+      # x86-64-v3 (AVX2) is the same CPU target scripts/package.sh uses for the field kit.
+      # Tests and benchmarks are built and run by ci.yml, not here.
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DHALO_MARCH=x86-64-v3 \
+            -DHALO_BUILD_VULKAN=${{ matrix.vulkan }} -DHALO_BUILD_HIP=OFF \
+            -DHALO_BUILD_TESTS=OFF -DHALO_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build --target halo_cli_main
+
+      - name: Stage the archive
+        run: |
+          name="${{ steps.version.outputs.name }}"
+          stage="dist/$name"
+          cmake --install build --prefix "$stage"
+          cp README.md "$stage/"
+
+          # nlohmann_json, minja and cpp-httplib are compiled into the binary; their licences
+          # require the notice to travel with it.
+          mkdir -p "$stage/licenses"
+          found=0
+          for dep in build/_deps/*-src; do
+            [ -d "$dep" ] || continue
+            dep_name="$(basename "$dep" -src)"
+            for f in "$dep"/LICENSE* "$dep"/LICENCE* "$dep"/COPYING*; do
+              [ -f "$f" ] || continue
+              cp "$f" "$stage/licenses/$dep_name-$(basename "$f")"
+              found=$((found + 1))
+            done
+          done
+          [ "$found" -gt 0 ] || { echo "no third-party licence files found under build/_deps" >&2; exit 1; }
+
+          {
+            echo "halo ${{ steps.version.outputs.version }} (${{ matrix.variant }} build)"
+            echo "commit:   $GITHUB_SHA"
+            echo "built on: $(. /etc/os-release && echo "$PRETTY_NAME"), $(clang --version | head -n1)"
+            echo "cpu:      -march=x86-64-v3 (needs AVX2)"
+            echo
+            echo "Shared libraries the binary loads:"
+            ldd "$stage/bin/halo" | sed 's/ (0x[0-9a-f]*)//'
+          } > "$stage/BUILD-INFO.txt"
+          cat "$stage/BUILD-INFO.txt"
+
+      # The staged binary, not the build-tree one: this is the file people download.
+      - name: Smoke-test the staged binary
+        run: |
+          bin="dist/${{ steps.version.outputs.name }}/bin/halo"
+          out="$("$bin" version)"
+          echo "$out"
+          echo "$out" | grep -qx "halo ${{ steps.version.outputs.version }}" \
+            || { echo "the binary does not report version ${{ steps.version.outputs.version }}" >&2; exit 1; }
+
+      - name: Create the archive and its checksum
+        run: |
+          name="${{ steps.version.outputs.name }}"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: halo-*
+          merge-multiple: true
+
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_id) }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --generate-notes \
+              --draft
+          fi
