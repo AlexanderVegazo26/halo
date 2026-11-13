@@ -135,6 +135,11 @@ std::int32_t runner_up(std::span<const float> logits, std::int32_t best) {
 Speculator::Speculator(const models::Qwen35& model, SpecConfig cfg)
     : model_(&model), cfg_(cfg), cost_(CostModel::from(model)), gate_(cfg.gate, cost_.plain_step()) {}
 
+std::size_t usable_drafts(std::span<const std::int32_t> drafts) noexcept {
+    const auto bad = std::ranges::find_if(drafts, [](std::int32_t d) { return d < 0; });
+    return static_cast<std::size_t>(bad - drafts.begin());
+}
+
 bool tree_env_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("HALO_MTP_TREE");
@@ -245,10 +250,20 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                 s.mtp_flushed = true;
                 if (!reqs[idx[j]].forced_drafts.empty()) continue;
                 if (chained) {
-                    for (const cpu::TopKEntry& a : res.seqs[j].argmax) tick.out[idx[j]].drafts.push_back(a.index);
+                    // A poisoned depth (-1) ends the chain; the device chain fed id 0 past it, so
+                    // the deeper drafts are not continuations of anything: drop them too.
+                    for (const cpu::TopKEntry& a : res.seqs[j].argmax) {
+                        if (a.index < 0) break;
+                        tick.out[idx[j]].drafts.push_back(a.index);
+                    }
                     continue;
                 }
-                tick.out[idx[j]].drafts.push_back(res.seqs[j].argmax.at(0).index);
+                const std::int32_t d1 = res.seqs[j].argmax.at(0).index;
+                if (d1 < 0) {  // NaN-poisoned MTP row: no draft for this sequence this tick (usable_drafts)
+                    s.k = 0;
+                    continue;
+                }
+                tick.out[idx[j]].drafts.push_back(d1);
                 if (s.tree) s.alt = runner_up(res.seqs[j].logits, res.seqs[j].argmax.at(0).index);
                 if (s.k > 1) {
                     if (dev_hidden) {
@@ -296,7 +311,12 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
             metrics_.last_weight_passes += res.cost.weight_passes;
     metrics_.weight_passes += res.cost.weight_passes;
             for (std::size_t j = 0; j < at.size(); ++j) {
-                tick.out[at[j]].drafts.push_back(res.seqs[j].argmax.at(0).index);
+                const std::int32_t d = res.seqs[j].argmax.at(0).index;
+                if (d < 0) {  // NaN-poisoned MTP row: the chain ends at the previous depth (usable_drafts)
+                    tick.seqs[at[j]].k = depth - 1;
+                    continue;
+                }
+                tick.out[at[j]].drafts.push_back(d);
                 if (depth < tick.seqs[at[j]].k) {
                     if (dev_hidden) {
                         tick.seqs[at[j]].mtp_hidden_dev = std::move(res.seqs[j].hidden_device);
@@ -316,7 +336,11 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         const StepRequest& r = reqs[i];
         if (!r.forced_drafts.empty()) tick.out[i].drafts.assign(r.forced_drafts.begin(), r.forced_drafts.end());
         // An MTP sequence without an MTP depth-1 call (length 0) cannot draft; forced drafts keep k.
-        if (r.forced_drafts.empty()) tick.seqs[i].k = tick.out[i].drafts.size();
+        // Real drafts never carry a poisoned id into verify (belt and braces over the loops above).
+        if (r.forced_drafts.empty()) {
+            tick.out[i].drafts.resize(usable_drafts(tick.out[i].drafts));
+            tick.seqs[i].k = tick.out[i].drafts.size();
+        }
         // A tree needs a real chain (k >= 1), a valid d1 and a runner-up token; otherwise: a plain chain.
         Tick::Seq& s = tick.seqs[i];
         s.tree = s.tree && s.k >= 1 && s.alt >= 0 && tick.out[i].drafts.front() >= 0 && s.alt != tick.out[i].drafts.front() &&

@@ -169,6 +169,14 @@ struct SpecConfig {
 /// ring the one extra state a tree verify needs.
 [[nodiscard]] bool tree_env_enabled();
 
+/// Length of the usable prefix of an MTP draft chain: the drafts before the first negative id.
+/// A NaN-poisoned MTP logit row comes back as argmax index -1 (backend::decode_argmax and the
+/// LM head poison only that row). A draft is only a guess, so the chain ends before it -- no
+/// draft at all when the first is poisoned -- instead of feeding -1 to a deeper MTP depth or to
+/// the trunk verify, whose token check would fail the whole batched tick (every concurrent
+/// sequence) for one sequence's NaN.
+[[nodiscard]] std::size_t usable_drafts(std::span<const std::int32_t> drafts) noexcept;
+
 /// One sequence of a tick: either a decode step (feed the pending token `token`) or a
 /// prefill chunk (`prefill` non-empty).
 struct StepRequest {

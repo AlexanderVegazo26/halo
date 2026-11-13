@@ -841,6 +841,22 @@ TEST_F(Spec, BatchedTickEqualsEachSequenceAlone) {
 
 // ---- profit gate (FR-009) ------------------------------------------------------------------
 
+// A NaN-poisoned MTP row is argmax -1: the draft chain ends before it, so a poisoned id never
+// reaches a deeper MTP depth or the trunk verify (whose token check would fail the whole tick,
+// i.e. every concurrent sequence, through the engine's fail_all).
+TEST(UsableDraftsUnit, ChainEndsAtTheFirstPoisonedDraft) {
+    using halo::speculative::usable_drafts;
+    EXPECT_EQ(usable_drafts({}), 0u);
+    const std::int32_t clean[] = {5, 0, 7};
+    EXPECT_EQ(usable_drafts(clean), 3u);
+    const std::int32_t first[] = {-1, 4, 9};
+    EXPECT_EQ(usable_drafts(first), 0u) << "a poisoned first draft means no draft at all";
+    const std::int32_t middle[] = {3, -1, 9};
+    EXPECT_EQ(usable_drafts(middle), 1u);
+    const std::int32_t last[] = {3, 8, -7};
+    EXPECT_EQ(usable_drafts(last), 2u);
+}
+
 TEST(ProfitGateUnit, DisablesBelowThresholdReprobesAndReenables) {
     GateConfig c;
     c.mode = GateMode::Auto;
