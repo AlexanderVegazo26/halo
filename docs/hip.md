@@ -202,7 +202,7 @@ demonstrate-fail record in the M2 report).
 
 These are the types in the canonical pack, unsloth UD-Q4_K_XL (D-014).
 - **Source:** `/root/halo-ref/unsloth-ud-q4kxl.summary.json`, produced by
-  `python/tools/fetch_reference.py` from the real GGUF header (866 tensors). It is
+  `python/tools/fetch_gguf_headers.py` from the real GGUF header (866 tensors). It is
   consistent with D-007, and the byte total matches its 17.56 GB.
 - **How the table was made:** the byte counts are the ggml block geometry × element counts.
   I did not re-read the header with halo's own `model::GgufFile`.

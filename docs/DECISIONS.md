@@ -12,7 +12,7 @@ Sources used (fetched 2026-09-23):
 - **[LCPP]** llama.cpp commit `bd4f514db` — `src/models/qwen35.cpp`, `conversion/qwen.py`,
   `src/models/delta-net-base.cpp`. Same commit as the target machine's llama.cpp build.
 - **[GGUF]** Real GGUF headers fetched by HTTP Range (no weights) — see
-  `python/tools/fetch_reference.py`: ggml-org `Qwen3.8-27B-Q4_K_M.gguf`,
+  `python/tools/fetch_gguf_headers.py`: ggml-org `Qwen3.8-27B-Q4_K_M.gguf`,
   ggml-org `mtp-Qwen3.8-27B-Q4_0.gguf`, unsloth `Qwen3.8-27B-UD-Q4_K_XL.gguf`.
 - **[HW]** `docs/strix-halo-qwen38-engine-report.md` — measured on the actual EVO-X2.
 

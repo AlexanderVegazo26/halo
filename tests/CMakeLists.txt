@@ -1,7 +1,8 @@
 include(GoogleTest)
 
 # Reference data (real GGUF headers, golden tensors) lives outside the repo; see
-# python/tools/fetch_reference.py. Tests that need it read HALO_REF_DIR and call
+# python/tools/ (fetch_gguf_headers.py, fetch_hf_files.py, fetch_quant_blocks.py and the
+# make_*.py generators, e.g. make_tiny_model.py). Tests that need it read HALO_REF_DIR and call
 # GTEST_SKIP() with a message when it is absent — a skip is reported, never a pass.
 set(HALO_REF_DIR "$ENV{HOME}/halo-ref" CACHE PATH "Reference data directory")
 
