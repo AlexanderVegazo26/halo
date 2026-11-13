@@ -91,6 +91,16 @@ TEST(ApiServer, HealthModelsMetrics) {
     ASSERT_TRUE(h) << httplib::to_string(h.error());
     EXPECT_EQ(h->status, 200);
     EXPECT_EQ(Json::parse(h->body).at("status"), "ok");
+    // An engine whose backend device hung or was lost is not "ok": the probe says so (503).
+    ts.engine->healthy_flag = false;
+    h = ts.get("/health");
+    ASSERT_TRUE(h) << httplib::to_string(h.error());
+    EXPECT_EQ(h->status, 503);
+    EXPECT_EQ(Json::parse(h->body).at("status"), "unhealthy");
+    ts.engine->healthy_flag = true;
+    h = ts.get("/health");
+    ASSERT_TRUE(h) << httplib::to_string(h.error());
+    EXPECT_EQ(h->status, 200);
 
     auto m = ts.get("/v1/models");
     ASSERT_TRUE(m);

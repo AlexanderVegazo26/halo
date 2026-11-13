@@ -123,6 +123,13 @@ public:
     /// Thread-safe vkQueueSubmit of one command buffer signalling `fence`.
     void submit(VkCommandBuffer cmd, VkFence fence);
 
+    /// A submission on this device did not complete within its wait budget (a hung GPU or a
+    /// lost device): set by Stream when a bounded fence wait times out, never cleared. While it
+    /// is set, streams refuse to record, submit or wait (Error(Backend)) instead of blocking on
+    /// a fence that will not signal, and teardown skips the waits and frees it cannot do safely.
+    void mark_hung() noexcept { hung_.store(true, std::memory_order_relaxed); }
+    [[nodiscard]] bool hung() const noexcept { return hung_.load(std::memory_order_relaxed); }
+
     /// Synchronous GPU buffer-to-buffer copy on an internal command buffer (staging
     /// path). Waits on its own fence only — never on device idle.
     void copy_buffer_sync(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset,
@@ -189,6 +196,7 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     bool force_staging_ = false;
     bool coopmat_enabled_ = false;
+    std::atomic<bool> hung_{false};
 
     std::mutex queue_mutex_;
     mutable std::mutex transfer_mutex_;

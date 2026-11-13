@@ -62,11 +62,12 @@ Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx
 }
 
 Stream::~Stream() {
-    if (state_ == State::Submitted && fence_ != VK_NULL_HANDLE) {
-        const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
-        if (r != VK_SUCCESS) {
-            HALO_ERROR("vulkan", "~Stream: fence wait failed: {}", detail::result_string(r));
-        }
+    if (state_ == State::Submitted && fence_ != VK_NULL_HANDLE) discard();
+    if (state_ == State::Hung) {
+        // The pending submission still uses the command buffer, fence and descriptor sets:
+        // destroying them is invalid and may block. Leak them; Context teardown is skipped too.
+        HALO_ERROR("vulkan", "~Stream: the last submission never completed; leaking the stream's Vulkan objects");
+        return;
     }
     release();
 }
@@ -87,6 +88,10 @@ void Stream::release() noexcept {
 
 void Stream::ensure_recording() {
     if (state_ == State::Recording) return;
+    // A hung device (this stream's or another's submission never completed) cannot run more
+    // work: fail now instead of queueing behind it and waiting out another full timeout.
+    HALO_CHECK(state_ != State::Hung && !ctx_->hung(), ErrorCode::Backend,
+               "the Vulkan device is hung (a submission did not complete); restart the process");
     if (state_ == State::Submitted) wait();
     const VkDevice dev = ctx_->device();
     detail::vk_check(vkResetCommandBuffer(cmd_, 0), "vkResetCommandBuffer");
@@ -287,9 +292,17 @@ void Stream::copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
 }
 
 void Stream::discard() noexcept {
+    if (state_ == State::Hung) return;
     if (state_ == State::Submitted) {
-        const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
-        if (r != VK_SUCCESS) HALO_ERROR("vulkan", "Stream::discard: fence wait failed: {}", detail::result_string(r));
+        // Bounded: with UINT64_MAX a hung GPU froze the caller (the engine's only worker, which
+        // gets here from VkStream::wait()'s abort() after wait() already timed out) for good.
+        const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, kDiscardWaitNs);
+        if (r != VK_SUCCESS) {
+            HALO_ERROR("vulkan", "Stream::discard: fence wait failed: {}; marking the device hung", detail::result_string(r));
+            ctx_->mark_hung();
+            state_ = State::Hung;  // the command buffer is still pending: never reset or reuse it
+            return;
+        }
     }
     // A Recording command buffer is never submitted; ensure_recording() resets it (and the
     // descriptor pools) before the next recording begins.
@@ -336,6 +349,7 @@ void Stream::wait(std::uint64_t timeout_ns) {
     if (state_ != State::Submitted) return;
     const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, timeout_ns);
     if (r == VK_TIMEOUT) {
+        ctx_->mark_hung();
         throw_error(ErrorCode::Backend, "Stream::wait timed out after {} ns", timeout_ns);
     }
     detail::vk_check(r, "vkWaitForFences");

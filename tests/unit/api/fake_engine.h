@@ -66,6 +66,9 @@ public:
     const chat::ChatTemplate& chat_template() const override { return *tmpl_; }
     runtime::GenerateResult generate(const runtime::GenerateRequest& req, const runtime::TokenCallback& cb) override;
     runtime::EngineStats stats() const override;
+    bool healthy() const noexcept override { return healthy_flag.load(); }
+    /// What healthy() reports (a real engine turns false when its GPU device hangs).
+    std::atomic<bool> healthy_flag{true};
 
     /// (request, zero-based call index) -> what to emit. Default: "Hello." then EOS.
     std::function<Script(const runtime::GenerateRequest&, int)> script;

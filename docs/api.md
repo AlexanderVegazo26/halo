@@ -42,7 +42,7 @@ checked against the hosted OpenAI or Anthropic services. The response-shape fixt
 
 | Method and path | Purpose | API key required |
 |---|---|---|
-| `GET /health` | Liveness: `{"status":"ok"}`, or 503 `{"status":"stopping"}` during shutdown | no |
+| `GET /health` | Liveness: `{"status":"ok"}`, 503 `{"status":"stopping"}` during shutdown, or 503 `{"status":"unhealthy","reason":…}` once the engine's GPU device is hung or lost (a submission did not complete in its 120 s wait; restart the server) | no |
 | `GET /v1/models` | The served model, as one list entry | yes, if a key is configured |
 | `GET /metrics` | Prometheus text exposition, format 0.0.4 | yes, if a key is configured |
 | `POST /v1/chat/completions` | OpenAI chat, non-streaming or SSE | yes, if a key is configured |

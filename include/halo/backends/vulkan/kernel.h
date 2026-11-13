@@ -100,7 +100,9 @@ using GroupCount = std::array<std::uint32_t, 3>;
 class Stream {
 public:
     explicit Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps = 64);
-    /// Waits for in-flight work on this stream's fence (errors are logged, not thrown).
+    /// Waits for in-flight work on this stream's fence, at most kDiscardWaitNs (errors are
+    /// logged, not thrown). If the work never completes the context is marked hung and the
+    /// stream's Vulkan objects are left alone (a pending submission still uses them).
     ~Stream();
     Stream(const Stream&) = delete;
     Stream& operator=(const Stream&) = delete;
@@ -134,10 +136,16 @@ public:
 
     /// Submit the recording (no-op if nothing was recorded). Non-blocking.
     void submit();
-    /// Wait for the last submission. Throws Error(Backend) on timeout / device loss.
+    /// Wait for the last submission. Throws Error(Backend) on timeout / device loss; a timeout
+    /// marks the context hung (Context::hung()).
     void wait(std::uint64_t timeout_ns = 120'000'000'000ull);
+    /// Upper bound of the wait in discard() and ~Stream(). Short: discard() runs after wait()
+    /// already spent its whole budget on the same fence, on the engine's only worker thread.
+    static constexpr std::uint64_t kDiscardWaitNs = 5'000'000'000ull;
     /// Drop an unsubmitted recording (nothing of it executes) or, if a submission is in
-    /// flight, wait for it (errors are logged, not thrown). The stream is Idle afterwards.
+    /// flight, wait for it for at most kDiscardWaitNs (errors are logged, not thrown). The
+    /// stream is Idle afterwards -- unless the submission did not complete: then the context is
+    /// marked hung and this stream stays unusable (every later use throws Error(Backend)).
     void discard() noexcept;
     void submit_and_wait() {
         submit();
@@ -151,7 +159,7 @@ public:
     [[nodiscard]] std::uint32_t dispatch_count() const noexcept { return dispatches_; }
 
 private:
-    enum class State { Idle, Recording, Submitted };
+    enum class State { Idle, Recording, Submitted, Hung };
     void ensure_recording();
     void barrier();
     /// A barrier iff the op touching `buffers` (written per write_mask bits) hazards with

@@ -322,6 +322,12 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
 
 Context::~Context() {
     if (device_ == VK_NULL_HANDLE) return;
+    // A hung device never becomes idle: waiting for it (or destroying objects a pending
+    // submission still uses) would freeze the process on its way out. Leave it to process exit.
+    if (hung()) {
+        HALO_ERROR("vulkan", "~Context: the device is hung; skipping device teardown");
+        return;
+    }
     // Teardown only: all child objects hold a shared_ptr to this Context, so they are
     // gone; wait for anything still queued before destroying the device.
     vkDeviceWaitIdle(device_);

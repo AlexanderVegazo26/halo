@@ -170,6 +170,10 @@ public:
     virtual const chat::ChatTemplate& chat_template() const = 0;
     virtual GenerateResult generate(const GenerateRequest&, const TokenCallback&) = 0;
     virtual EngineStats stats() const = 0;
+    /// False once the engine can no longer serve requests and only a restart helps (the GPU
+    /// backend's device is hung or lost). Lock-free and cheap: /health polls it from HTTP
+    /// threads while the engine worker may be blocked.
+    [[nodiscard]] virtual bool healthy() const noexcept { return true; }
 };
 
 std::unique_ptr<Engine> create_engine(const EngineConfig&);

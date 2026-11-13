@@ -477,6 +477,10 @@ public:
     [[nodiscard]] virtual Kind kind() const noexcept = 0;
     [[nodiscard]] virtual std::string describe() const = 0;
     [[nodiscard]] virtual Limits limits() const noexcept = 0;
+    /// True once the device behind this backend is hung or lost (a submission did not complete
+    /// in its wait budget): every later stream fails, and only a restart helps. Sticky,
+    /// lock-free, callable from any thread. Host backends never report it.
+    [[nodiscard]] virtual bool lost() const noexcept { return false; }
 
     // ---- memory ----------------------------------------------------------------------
     /// Zero-filled on the CPU backend. Error(Memory) on failure.

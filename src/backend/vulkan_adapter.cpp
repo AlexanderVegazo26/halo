@@ -343,6 +343,7 @@ public:
     VulkanBackend& operator=(const VulkanBackend&) = delete;
 
     [[nodiscard]] Kind kind() const noexcept override { return Kind::Vulkan; }
+    [[nodiscard]] bool lost() const noexcept override { return ctx_->hung(); }
     [[nodiscard]] std::string describe() const override {
         const hv::DeviceInfo& i = ctx_->info();
         return std::format("vulkan ({}, {}{})", i.name, i.driver_name, i.correctness_only ? ", correctness-only CPU device" : "");

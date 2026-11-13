@@ -261,6 +261,7 @@ public:
     const chat::ChatTemplate& chat_template() const override { return *tmpl_; }
     GenerateResult generate(const GenerateRequest& req, const TokenCallback& cb) override;
     EngineStats stats() const override;
+    bool healthy() const noexcept override { return !(backend_ ? *backend_ : model_->backend()).lost(); }
 
 private:
     void run() noexcept;

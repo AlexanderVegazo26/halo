@@ -979,6 +979,12 @@ struct ApiServer::Impl {
             if (stopping.load()) {
                 res.status = 503;
                 res.set_content(R"({"status":"stopping"})", "application/json");
+            } else if (!engine.healthy()) {
+                // The engine cannot serve any more (GPU device hung or lost): a liveness probe
+                // must see that instead of "ok" in front of a dead worker.
+                res.status = 503;
+                res.set_content(R"({"status":"unhealthy","reason":"engine backend is hung or lost; restart the server"})",
+                                "application/json");
             } else {
                 res.set_content(R"({"status":"ok"})", "application/json");
             }
