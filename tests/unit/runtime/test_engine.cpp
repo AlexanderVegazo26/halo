@@ -10,6 +10,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
@@ -1113,4 +1114,99 @@ TEST_F(EngineTest, ResultSplitsTheRequestsNgramDraftsFromItsMtpDrafts) {
     EXPECT_GT(off.draft_tokens, 0u);
     EXPECT_EQ(e_off->stats().ngram_draft_tokens + e_off->stats().ngram_accepted_draft_tokens, 0u)
         << "ngram_draft = false: every draft is MTP";
+}
+
+// Tiny-model MTP drafts are never accepted, so above every accepted draft is an n-gram one and
+// a counter that took every accepted draft as n-gram would still pass. Here a second request's
+// drafts come from draft_hook (an oracle: two drafts, the second wrong, so exactly one accepted
+// per decode tick) beside the n-gram request on the same engine, alone and sharing decode ticks:
+// only the n-gram request's accepts may land in the n-gram counters. Batched, the hook request
+// starts first and outlasts the n-gram one (64 tokens at 2 per tick), so every n-gram hit shares
+// its tick with an accepting hook draft and an attribution taken per tick, not per sequence, fails.
+TEST_F(EngineTest, AcceptedNonNgramDraftsNeverCountAsNgram) {
+    const Toks p0 = prompt("p0"), p1 = prompt("p1");
+    const Toks q = recurring_prompt(p0, run(*engine_, greedy(p0, 24)).tokens);
+    const Toks ref1 = run(*engine_, greedy(p1, 64)).tokens;
+    ASSERT_EQ(ref1.size(), 64u);
+    std::vector<TickInfo> ticks;
+    std::mutex mu;
+    std::condition_variable ticked;
+    CpuEngineOptions o;
+    o.gate_mode = GateMode::Always;
+    o.ngram_draft = true;
+    o.draft_hook = [&](std::span<const std::int32_t> pr, std::span<const std::int32_t> gen) -> Toks {
+        if (!std::ranges::equal(pr, p1)) return {};  // q: falls through to the n-gram lookup
+        const std::size_t m = gen.size() - 1;         // pending = ref1[m]
+        Toks d;
+        for (std::size_t i = 0; i < 2 && m + 1 + i < ref1.size(); ++i) d.push_back(ref1[m + 1 + i]);
+        if (d.size() == 2) d[1] = (d[1] + 1) % 248320;
+        return d;
+    };
+    o.on_tick = [&](const TickInfo& t) {
+        {
+            const std::lock_guard lk(mu);
+            ticks.push_back(t);
+        }
+        ticked.notify_all();
+    };
+    EngineConfig c = base_cfg();
+    c.mtp_max_draft = 3;
+    auto e = make(o, c);
+
+    const GenerateResult a = run(*e, greedy(q, 24));
+    ASSERT_GT(a.ngram_accepted_draft_tokens, 0u)
+        << "premise: the recurring prompt's n-gram drafts get accepted (an empty draft_hook result must fall "
+           "through to the lookup)";
+    const halo::runtime::EngineStats s0 = e->stats();
+    const GenerateResult h = run(*e, greedy(p1, 64));
+    const halo::runtime::EngineStats s1 = e->stats();
+    EXPECT_EQ(h.tokens, ref1) << "oracle drafts changed greedy output";
+    ASSERT_GT(h.accepted_draft_tokens, 0u) << "premise: the oracle's drafts get accepted";
+    EXPECT_EQ(h.ngram_hits, 0u) << "a non-empty hook result skips the lookup; p1 never recurs anyway";
+    EXPECT_EQ(h.ngram_draft_tokens, 0u) << "hook drafts counted as n-gram drafts";
+    EXPECT_EQ(h.ngram_accepted_draft_tokens, 0u)
+        << "hook drafts accepted " << h.accepted_draft_tokens << ", counted as n-gram accepts";
+    EXPECT_EQ(s1.speculative_accepts - s0.speculative_accepts, h.accepted_draft_tokens);
+    EXPECT_EQ(s1.ngram_accepted_draft_tokens - s0.ngram_accepted_draft_tokens, 0u)
+        << "engine-wide n-gram accepts moved for a request with only hook drafts";
+    EXPECT_EQ(s1.ngram_draft_tokens - s0.ngram_draft_tokens, 0u);
+
+    // Batched: the attribution follows each sequence, not the tick.
+    {
+        const std::lock_guard lk(mu);
+        ticks.clear();
+    }
+    const halo::runtime::EngineStats sb0 = e->stats();
+    std::vector<GenerateResult> con(2);
+    std::thread tb([&] { con[1] = run(*e, greedy(p1, 64)); });
+    {
+        std::unique_lock lk(mu);
+        ticked.wait(lk, [&] { return std::ranges::any_of(ticks, [](const TickInfo& t) { return t.prefill_rows == 0; }); });
+    }
+    con[0] = run(*e, greedy(q, 24));
+    tb.join();
+    const halo::runtime::EngineStats sb1 = e->stats();
+    // Premise: q ran entirely inside the hook request's run, i.e. its ticks are one shared run
+    // (prefill included) followed by ticks of the hook request alone.
+    const auto is_shared = [](const TickInfo& t) { return t.sequences == 2; };
+    const auto first = std::ranges::find_if(ticks, is_shared);
+    const auto past = std::ranges::find_if_not(first, ticks.end(), is_shared);
+    ASSERT_NE(first, ticks.end()) << "the two requests never shared a tick";
+    EXPECT_TRUE(std::none_of(past, ticks.end(), is_shared))
+        << "premise: one contiguous run of shared ticks (the hook request decoded through all of q)";
+    EXPECT_NE(past, ticks.end()) << "premise: the hook request (64 tokens) outlasts the n-gram request (24)";
+    EXPECT_EQ(con[0].tokens, a.tokens);
+    EXPECT_EQ(con[1].tokens, ref1);
+    EXPECT_EQ(con[0].ngram_accepted_draft_tokens, a.ngram_accepted_draft_tokens) << "n-gram request batched";
+    EXPECT_EQ(con[0].ngram_draft_tokens, a.ngram_draft_tokens) << "n-gram request batched";
+    EXPECT_EQ(con[1].accepted_draft_tokens, h.accepted_draft_tokens) << "hook request batched";
+    EXPECT_EQ(con[1].ngram_draft_tokens, 0u) << "hook request batched: drafts counted as n-gram";
+    EXPECT_EQ(con[1].ngram_accepted_draft_tokens, 0u) << "hook request batched: accepts counted as n-gram";
+    EXPECT_EQ(sb1.ngram_accepted_draft_tokens - sb0.ngram_accepted_draft_tokens, con[0].ngram_accepted_draft_tokens)
+        << "engine-wide n-gram accepts = the n-gram request's only";
+    EXPECT_EQ(sb1.speculative_accepts - sb0.speculative_accepts,
+              con[0].accepted_draft_tokens + con[1].accepted_draft_tokens);
+    EXPECT_LT(sb1.ngram_accepted_draft_tokens - sb0.ngram_accepted_draft_tokens,
+              sb1.speculative_accepts - sb0.speculative_accepts)
+        << "both sources accepted, so the n-gram share is a strict part of all accepts";
 }

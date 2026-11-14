@@ -1181,7 +1181,10 @@ void CpuEngine::tick() {
             a.forced_ngram = false;
             if (opts_.draft_hook && a.r->fast_greedy && max_draft_ > 0) {
                 a.forced = opts_.draft_hook(a.r->req.prompt, a.generated);
-            } else if (ngram_draft_ && a.r->fast_greedy && max_draft_ > 0) {
+            }
+            // An empty hook result falls through to the prompt lookup (then MTP), so one engine
+            // can serve hook-drafted and n-gram-drafted requests side by side.
+            if (a.forced.empty() && ngram_draft_ && a.r->fast_greedy && max_draft_ > 0) {
                 a.forced = speculative::ngram_draft(a.r->req.prompt, a.generated, max_draft_);
                 ++ngram_lookups;
                 ++a.ngram_lookups;

@@ -106,14 +106,15 @@ struct CpuEngineOptions {
     /// Test seam: treat this id as EOS instead of the tokenizer's.
     std::optional<std::int32_t> eos_token;
     /// Test / external-drafter seam, worker thread: forced drafts for a greedy decode step
-    /// given (prompt, generated so far; pending = generated.back()). Empty = MTP drafting.
+    /// given (prompt, generated so far; pending = generated.back()). Empty = the n-gram lookup
+    /// when ngram_draft is on, else MTP drafting.
     /// At most mtp_max_draft are used.
     using DraftHook = std::function<std::vector<std::int32_t>(std::span<const std::int32_t>, std::span<const std::int32_t>)>;
     DraftHook draft_hook;
     /// Prompt-lookup drafts ahead of MTP for greedy decodes (speculative::ngram_draft, next.md
     /// step 11): a step whose context suffix recurs drafts the tokens that followed it instead of
     /// running the MTP head. nullopt = the HALO_NGRAM_DRAFT=1 env flag (default off). Needs
-    /// mtp_max_draft > 0; draft_hook, when set, takes precedence.
+    /// mtp_max_draft > 0; a non-empty draft_hook result takes precedence (the step skips the lookup).
     std::optional<bool> ngram_draft;
     /// Tree verification of the top-2 depth-1 drafts (SpecConfig::tree, next.md step 5).
     /// nullopt = the HALO_MTP_TREE env flag (read once, default off). Needs an fp32 KV cache:
