@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include "halo/core/error.h"
 #include "halo/runtime/cpu_engine.h"
 #include "halo/sampling/structured.h"
+#include "halo/speculative/ngram.h"
 #include "halo/template/chat_template.h"
 #include "halo/tokenizer/tokenizer.h"
 
@@ -722,4 +724,154 @@ TEST_F(EngineTest, AcceptedDraftsKeepTokensKvAndPrefixCacheConsistent) {
     EXPECT_EQ(r3.cached_prompt_tokens, p1.size() + r1.tokens.size() - 1);
     EXPECT_EQ(r3.tokens, g3) << "restored rows (from a sequence with accepted drafts) vs recompute";
     EXPECT_GT(r3.accepted_draft_tokens, 0u);
+}
+
+// ---- forced and prompt-lookup (n-gram) drafts on the GPU (next.md step 11) -----------------
+// CpuEngineOptions::ngram_draft (HALO_NGRAM_DRAFT=1) drafts the tokens that followed an earlier
+// occurrence of the context suffix (speculative::ngram_draft, unit-tested in test_ngram.cpp)
+// instead of running the MTP head; the step then verifies them as forced drafts, the same path
+// as draft_hook. The tiny model never repeats a 3-gram (no lookup hit in 300 greedy tokens from
+// p0/p1/p2), so the GPU checks are: forced drafts (an oracle hook, wrong at a rotating depth) are
+// verified and accepted over Vulkan exactly as greedy decoding needs, alone and batched with
+// MTP-drafted and sampled sequences; and n-gram drafting on, with no match, is bitwise
+// MTP-only drafting (same drafts, tokens and ticks) while it does search every greedy step.
+
+namespace {
+
+class VulkanEngine : public EngineTest {
+protected:
+    struct Built {
+        std::unique_ptr<Engine> engine;
+        std::vector<TickInfo> ticks;
+        std::mutex mu;
+    };
+    /// Vulkan engine, MTP drafting k = 3 with the gate forced on. Null = no Vulkan device.
+    static std::unique_ptr<Built> build(std::optional<bool> ngram,
+                                        CpuEngineOptions::DraftHook hook = {}) {
+#if defined(HALO_TEST_VULKAN)
+        auto b = std::make_unique<Built>();
+        EngineConfig c = base_cfg();
+        c.backend = "vulkan";
+        c.mtp_max_draft = 3;
+        CpuEngineOptions o;
+        o.gate_mode = GateMode::Always;
+        o.ngram_draft = ngram;
+        o.draft_hook = std::move(hook);
+        Built* raw = b.get();
+        o.on_tick = [raw](const TickInfo& t) {
+            const std::lock_guard lk(raw->mu);
+            raw->ticks.push_back(t);
+        };
+        try {
+            b->engine = make(o, c);
+        } catch (const halo::Error&) {
+            return nullptr;
+        }
+        return b;
+#else
+        (void)ngram;
+        (void)hook;
+        return nullptr;
+#endif
+    }
+    static std::size_t decode_ticks(const Built& b) {
+        std::size_t n = 0;
+        for (const TickInfo& t : b.ticks) n += t.prefill_rows == 0 ? 1 : 0;
+        return n;
+    }
+};
+
+}  // namespace
+
+TEST_F(VulkanEngine, ForcedDraftsAreVerifiedAndAcceptedBitwise) {
+    auto plain = build(false);
+    if (!plain) GTEST_SKIP() << "no Vulkan device (or built without the Vulkan backend)";
+    const Toks p1 = prompt("p1");
+    const GenerateResult ref = run(*plain->engine, greedy(p1, 40));
+    ASSERT_EQ(ref.tokens.size(), 40u);
+    ASSERT_EQ(ref.accepted_draft_tokens, 0u) << "control: tiny-model MTP drafts are never accepted";
+    // Oracle: the plain greedy continuation, one token wrong at depth 0, 1, 2 or none (rotating),
+    // so every acceptance count 0..3 occurs. Other prompts get no forced drafts (MTP drafts).
+    std::size_t step = 0;
+    auto hooked = build(false, [&](std::span<const std::int32_t> pr, std::span<const std::int32_t> gen) -> Toks {
+        if (!std::ranges::equal(pr, p1)) return {};
+        const std::size_t m = gen.size() - 1;  // pending = ref[m]
+        const std::size_t wrong = step++ % 4;
+        Toks d;
+        for (std::size_t i = 0; i < 3 && m + 1 + i < ref.tokens.size(); ++i) d.push_back(ref.tokens[m + 1 + i]);
+        if (wrong < d.size()) d[wrong] = (d[wrong] + 1) % 248320;
+        return d;
+    });
+    ASSERT_TRUE(hooked);
+    const GenerateResult got = run(*hooked->engine, greedy(p1, 40));
+    EXPECT_EQ(got.tokens, ref.tokens) << "forced drafts changed greedy output on Vulkan";
+    EXPECT_GT(got.accepted_draft_tokens, 0u);
+    std::vector<std::size_t> seen(4, 0);
+    for (const TickInfo& t : hooked->ticks) {
+        if (t.prefill_rows != 0) continue;
+        EXPECT_EQ(t.trunk_passes, 1u) << "one trunk forward per tick";
+        if (t.drafted > 0) ++seen[t.accepted];
+    }
+    for (std::size_t a = 0; a < seen.size(); ++a) EXPECT_GT(seen[a], 0u) << "acceptance " << a << " never happened";
+    EXPECT_LT(decode_ticks(*hooked), decode_ticks(*plain)) << "accepted drafts must save decode ticks";
+
+    // Batched: the forced-draft sequence shares ticks with an MTP-drafted greedy sequence and a
+    // sampled one; each must equal its result on the plain engine alone.
+    const Toks p0 = prompt("p0");
+    std::vector<GenerateRequest> reqs = {greedy(p1, 40), greedy(prompt("p2"), 16),
+                                         greedy(Toks(p0.end() - 30, p0.end()), 8)};
+    reqs[2].sampling.temperature = 0.9f;
+    reqs[2].sampling.top_k = 40;
+    reqs[2].sampling.seed = 7;
+    std::vector<GenerateResult> alone;
+    for (const auto& r : reqs) alone.push_back(run(*plain->engine, r));
+    step = 0;
+    hooked->ticks.clear();
+    std::vector<GenerateResult> con(reqs.size());
+    std::barrier start(static_cast<std::ptrdiff_t>(reqs.size()));
+    std::vector<std::thread> th;
+    for (std::size_t i = 0; i < reqs.size(); ++i) {
+        th.emplace_back([&, i] {
+            start.arrive_and_wait();
+            con[i] = run(*hooked->engine, reqs[i]);
+        });
+    }
+    for (auto& t : th) t.join();
+    for (std::size_t i = 0; i < reqs.size(); ++i) {
+        EXPECT_EQ(con[i].tokens, alone[i].tokens) << "request " << i << " batched with forced drafts vs alone";
+    }
+    EXPECT_GT(con[0].accepted_draft_tokens, 0u);
+    std::size_t shared = 0;
+    for (const TickInfo& t : hooked->ticks) shared += (t.prefill_rows == 0 && t.sequences > 1 && t.drafted > 3) ? 1 : 0;
+    EXPECT_GT(shared, 0u) << "no decode tick verified forced and MTP drafts of two sequences together";
+}
+
+TEST_F(VulkanEngine, NgramDraftingWithoutAMatchIsBitwiseMtpDrafting) {
+    auto off = build(false);
+    auto on = build(true);
+    if (!off || !on) GTEST_SKIP() << "no Vulkan device (or built without the Vulkan backend)";
+    for (const char* name : {"p0", "p1", "p2"}) {
+        SCOPED_TRACE(name);
+        const Toks p = prompt(name);
+        off->ticks.clear();
+        on->ticks.clear();
+        const auto s0 = on->engine->stats();
+        const GenerateResult a = run(*off->engine, greedy(p, 24));
+        const GenerateResult b = run(*on->engine, greedy(p, 24));
+        const auto s1 = on->engine->stats();
+        // Premise: no context suffix recurs, at any step of this run.
+        for (std::size_t j = 1; j <= a.tokens.size(); ++j) {
+            const std::span<const std::int32_t> gen(a.tokens.data(), j);
+            ASSERT_TRUE(halo::speculative::ngram_draft(p, gen, 3).empty()) << "lookup hit at generated token " << j;
+        }
+        EXPECT_EQ(b.tokens, a.tokens);
+        ASSERT_EQ(on->ticks.size(), off->ticks.size()) << "n-gram on changed the tick count";
+        for (std::size_t i = 0; i < on->ticks.size(); ++i) {
+            EXPECT_EQ(on->ticks[i].drafts, off->ticks[i].drafts) << "tick " << i << ": drafts are not the MTP drafts";
+            EXPECT_EQ(on->ticks[i].accepted, off->ticks[i].accepted) << "tick " << i;
+        }
+        EXPECT_EQ(s1.ngram_lookups - s0.ngram_lookups, decode_ticks(*on)) << "one lookup per greedy decode step";
+        EXPECT_EQ(s1.ngram_drafts - s0.ngram_drafts, 0u);
+    }
+    EXPECT_EQ(off->engine->stats().ngram_lookups, 0u) << "ngram_draft = false must not search (env ignored)";
 }

@@ -10,3 +10,7 @@ if(TARGET halo_backend_vulkan AND TARGET halo_models)
     LIBS halo_backend_vulkan_adapter halo_speculative)
   target_include_directories(test_vulkan_speculative PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)
 endif()
+# next.md step 11: prompt-lookup (n-gram) drafts, pure token logic (no model).
+halo_add_test(test_ngram
+  SOURCES test_ngram.cpp
+  LIBS halo_speculative)

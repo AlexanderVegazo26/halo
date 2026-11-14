@@ -108,7 +108,13 @@ struct CpuEngineOptions {
     /// Test / external-drafter seam, worker thread: forced drafts for a greedy decode step
     /// given (prompt, generated so far; pending = generated.back()). Empty = MTP drafting.
     /// At most mtp_max_draft are used.
-    std::function<std::vector<std::int32_t>(std::span<const std::int32_t>, std::span<const std::int32_t>)> draft_hook;
+    using DraftHook = std::function<std::vector<std::int32_t>(std::span<const std::int32_t>, std::span<const std::int32_t>)>;
+    DraftHook draft_hook;
+    /// Prompt-lookup drafts ahead of MTP for greedy decodes (speculative::ngram_draft, next.md
+    /// step 11): a step whose context suffix recurs drafts the tokens that followed it instead of
+    /// running the MTP head. nullopt = the HALO_NGRAM_DRAFT=1 env flag (default off). Needs
+    /// mtp_max_draft > 0; draft_hook, when set, takes precedence.
+    std::optional<bool> ngram_draft;
     /// Called on the worker thread after every tick. Must not block or call the engine.
     std::function<void(const TickInfo&)> on_tick;
     FaultInjection faults;  ///< tests only

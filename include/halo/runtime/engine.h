@@ -131,6 +131,9 @@ struct EngineStats {
     std::uint64_t ticks = 0;                       ///< batched forward ticks run
     std::uint64_t prefix_cache_reused_tokens = 0;  ///< prompt tokens restored instead of recomputed
     std::uint64_t mtp_fallbacks = 0;               ///< ticks retried with k = 0 after MTP-KV exhaustion
+    // Additive (next.md step 11): prompt-lookup drafts (CpuEngineOptions::ngram_draft).
+    std::uint64_t ngram_lookups = 0;               ///< greedy decode steps that searched the context
+    std::uint64_t ngram_drafts = 0;                ///< ... and found a match (its tokens drafted, not MTP)
     std::uint32_t last_tick_weight_passes = 0;     ///< trunk + MTP weight passes of the last tick
     std::uint64_t last_tick_predicted_bytes = 0;   ///< cost-model weight bytes of the last tick (D-011)
     // Additive (WS-G M4): kernel configuration in effect and where it came from (TRD §56).
