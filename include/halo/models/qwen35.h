@@ -210,6 +210,10 @@ struct Qwen35Options {
     /// cannot change). 0, or N >= n_vocab, = the full head. A step that asks for Full logits always
     /// gets the full head. nullopt = the HALO_MTP_DRAFT_VOCAB env var (default 0).
     std::optional<std::size_t> mtp_draft_vocab = std::nullopt;
+    /// next.md step 8: upload the Q5_K / Q6_K / IQ4_XS gemv weights in the tensor::gemv_repack plane
+    /// layout (Vulkan only; LM-head / embedding tables and fused-projection buffers stay raw).
+    /// nullopt = the HALO_REPACK env var (default off).
+    std::optional<bool> repack = std::nullopt;
 };
 
 /// Which fused projection forms the loaded layers actually contain (Qwen35Options::fuse_gemv).
@@ -243,6 +247,9 @@ public:
     /// Token rows an Argmax MTP draft scores (Qwen35Options::mtp_draft_vocab, else
     /// HALO_MTP_DRAFT_VOCAB, clamped to n_vocab; n_vocab when unset); 0 without an MTP block.
     [[nodiscard]] std::size_t mtp_draft_vocab() const noexcept;
+    /// Weight matrices loaded in the repacked layout (Qwen35Options::repack, else HALO_REPACK); 0 when off,
+    /// on a non-Vulkan backend, or when the model has no Q5_K / Q6_K / IQ4_XS gemv weights.
+    [[nodiscard]] std::size_t repacked_mats() const noexcept;
 
     [[nodiscard]] const model::Qwen35HParams& hparams() const noexcept;
     [[nodiscard]] const model::NormalizedModel& model() const noexcept { return *model_; }

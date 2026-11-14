@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -657,4 +658,69 @@ TEST_F(VulkanSpec, ReducedDraftVocabKeepsGreedyAndChainEqualsHostPath) {
     }
     EXPECT_GT(changed, 0u) << "the full head never drafted outside the first " << N << " rows: the prefix restriction went untested";
     std::printf("[draft vocab %zu of %zu] full-head drafts outside the prefix: %zu\n", N, V, changed);
+}
+
+// ---- next.md step 8: repacked weights (Qwen35Options::repack, HALO_REPACK) through the model -------
+
+// The kernel gate (VkHead.GemvRepacked*) holds Ops::gemv_repacked bitwise to the raw-layout tree gemv;
+// this is the model-level half: qwen35 loading its Q5_K / Q6_K / IQ4_XS gemv weights repacked must
+// emit the same greedy tokens and MTP drafts (k = 0 and 3) and leave the same trunk KV / GDN / hidden /
+// MTP KV, bit for bit, as the raw layout. The f32 tiny model never repacks, so this runs on the
+// quantized tiny models the Vulkan backend can load whole: tiny-q6_k (Q6_K gemvs) and tiny-iq4_xs
+// (IQ4_XS gemvs). tiny-q4_k_m / tiny-q5_k_m carry Q5_0 / Q5_1 tensors, which it has no matvec for, so
+// Q5_K repack stays covered by the kernel gate only. The raw side must take the same reduction as the _rp shaders (tree, no
+// cooperative-matrix GEMM), so the test skips when HALO_SUBGROUP_REDUCE or HALO_COOPMAT change that.
+TEST(VulkanRepack, QuantizedTinyModelsAreBitwiseTheRawLayout) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    if (const char* e = std::getenv("HALO_SUBGROUP_REDUCE"); e != nullptr && *e != '\0' && std::string(e) != "0")
+        GTEST_SKIP() << "HALO_SUBGROUP_REDUCE is set: raw gemvs use subgroupAdd, the _rp shaders the tree";
+    if (ctx->coopmat_enabled()) GTEST_SKIP() << "HALO_COOPMAT is on: raw K-quant prefill takes the fp16 GEMM, repacked never does";
+    const auto golden = halo::test::Golden::load();
+    if (!golden) GTEST_SKIP() << "golden data missing under " << halo::test::tiny_dir();
+    std::size_t files = 0;
+    for (const char* file : {"tiny-q6_k.gguf", "tiny-iq4_xs.gguf"}) {
+        SCOPED_TRACE(file);
+        const auto path = halo::test::tiny_dir() / file;
+        if (!std::filesystem::exists(path)) {
+            ADD_FAILURE() << "tiny model missing: " << path << " (the golden dir is present)";
+            continue;
+        }
+        const auto nm = halo::model::NormalizedModel::load(path);
+        const auto options = [](bool repack) {
+            return hm::Qwen35Options{.reuse_streams = false, .fuse_gemv = "", .mtp_draft_vocab = 0, .repack = repack};
+        };
+        const VkModel raw(ctx, nm, options(false));
+        const VkModel rp(ctx, nm, options(true));
+        ASSERT_EQ(raw.model->repacked_mats(), 0u) << file << ": repack = false must override HALO_REPACK";
+        ASSERT_GT(rp.model->repacked_mats(), 0u) << file << ": repack = true loaded no Q5_K / Q6_K / IQ4_XS gemv weight repacked";
+        {
+            hm::Qwen35 cpu(nm, nullptr, options(true));
+            EXPECT_EQ(cpu.repacked_mats(), 0u) << file << ": the CPU backend has no repacked gemv and must load raw";
+        }
+        ++files;
+        const std::size_t ks[] = {0, rp.model->has_mtp() ? std::size_t{3} : std::size_t{0}};
+        for (const char* p : {"p0", "p1", "p2"}) {
+            SCOPED_TRACE(p);
+            const Toks pr = golden->i32(std::string(p) + ".tokens");
+            for (const std::size_t k : ks) {
+                SCOPED_TRACE("k=" + std::to_string(k));
+                const GateMode mode = k == 0 ? GateMode::Off : GateMode::Always;
+                auto sa = raw.spec(mode, false, false);
+                auto sb = rp.spec(mode, false, false);
+                auto qa = raw.seq();
+                auto qb = rp.seq();
+                const SpecRun a = generate(sa, *qa, pr, k_tokens, k);
+                const SpecRun b = generate(sb, *qb, pr, k_tokens, k);
+                ASSERT_EQ(a.tokens.size(), k_tokens);
+                EXPECT_EQ(b.tokens, a.tokens) << file << " repacked greedy " << str(b.tokens) << " != raw layout " << str(a.tokens);
+                const auto d = first_draft_diff(b.drafts, a.drafts);
+                EXPECT_EQ(d, -1) << file << ": drafts of tick " << d << " differ from the raw layout: got "
+                                 << (d >= 0 && std::size_t(d) < b.drafts.size() ? str(b.drafts[d]) : "<none>") << ", raw "
+                                 << (d >= 0 && std::size_t(d) < a.drafts.size() ? str(a.drafts[d]) : "<none>");
+                expect_same_state(sb, *qb, sa, *qa, std::string(file) + " repacked vs raw");
+            }
+        }
+        std::printf("[repack %s] %zu Mats repacked, mtp %s\n", file, rp.model->repacked_mats(), rp.model->has_mtp() ? "yes" : "no");
+    }
+    EXPECT_EQ(files, 2u) << "not every quantized tiny model was checked";
 }

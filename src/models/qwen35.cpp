@@ -306,21 +306,17 @@ bool fuse_norm = false;
         return r;
     }
 
-    /// HALO_REPACK=1 (default off): only Mats consumed by gemv reach here (make_mat; embedding /
-    /// LM-head tables and the fused-projection buffers keep the raw GGUF layout). Vulkan backend and
-    /// Q5_K / Q6_K / IQ4_XS only; anything else returns false and the caller imports the raw bytes.
-    static bool repack_enabled() {
-        static const bool on = [] {
-            const char* e = std::getenv("HALO_REPACK");
-            return e != nullptr && *e != '\0' && std::string(e) != "0";
-        }();
-        return on;
-    }
+    // Qwen35Options::repack, else HALO_REPACK=1 (default off; set in the constructor before the
+    // layers load): only Mats consumed by gemv reach try_repack (make_mat; embedding / LM-head tables
+    // and the fused-projection buffers keep the raw GGUF layout). Vulkan backend and Q5_K / Q6_K /
+    // IQ4_XS only; anything else returns false and the caller imports the raw bytes.
+    bool repack = false;
+    mutable std::size_t n_repacked = 0;  // Mats loaded repacked (Qwen35::repacked_mats)
 
     /// Uploads `w` in the tensor::gemv_repack layout into r.buf and sets r.variant / r.stride.
     /// r.rows, r.cols and r.type must be set. No host copy is retained (allocate + upload).
     bool try_repack(Mat& r, const WeightRef& w) const {
-        if (!repack_enabled() || be->kind() != backend::Kind::Vulkan || !tensor::gemv_repack_supported(r.type) ||
+        if (!repack || be->kind() != backend::Kind::Vulkan || !tensor::gemv_repack_supported(r.type) ||
             r.cols % 256 != 0)
             return false;
         const std::size_t row_bytes = tensor::row_bytes(r.type, static_cast<std::int64_t>(r.cols));
@@ -339,6 +335,7 @@ bool fuse_norm = false;
         }
         r.variant = backend::kGemvRepacked;
         r.stride = stride;
+        ++n_repacked;
         return true;
     }
 
@@ -863,7 +860,12 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     // R == 1 decode would round differently from the R > 1 verify forward and MTP could change greedy output.
     if (const char* e = std::getenv("HALO_FUSE_NORM"))
         I.fuse_norm = *e != 0 && std::string_view(e) != "0" && I.limits.max_fused_norm_cols > 0;
-    // Before the layers load: it picks the weight layout.
+    // Before the layers load: both pick the weight layout.
+    if (options.repack) {
+        I.repack = *options.repack;
+    } else if (const char* e = std::getenv("HALO_REPACK")) {
+        I.repack = *e != '\0' && std::string_view(e) != "0";
+    }
     I.parse_fuse_env(options.fuse_gemv ? options.fuse_gemv->c_str() : std::getenv("HALO_FUSE_GEMV"));
     const auto& hp = m.hparams();
     I.hp = &hp;
@@ -954,6 +956,7 @@ bool Qwen35::reuse_streams() const noexcept { return impl_->reuse_streams; }
 FusedProjections Qwen35::fused_projections() const noexcept {
     return {.ffn = impl_->has_fused_ffn, .ba = impl_->has_fused_ba, .qkv = impl_->has_fused_qkv};
 }
+std::size_t Qwen35::repacked_mats() const noexcept { return impl_->n_repacked; }
 std::size_t Qwen35::mtp_draft_vocab() const noexcept {
     if (!impl_->mtp) return 0;
     return impl_->draft_vocab == 0 ? impl_->n_vocab : impl_->draft_vocab;
