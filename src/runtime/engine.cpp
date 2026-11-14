@@ -296,8 +296,8 @@ private:
     memory::MemoryPlan plan_;
     std::optional<std::int32_t> eos_;
     std::size_t max_draft_ = 0;
-    /// HALO_MTP_TREE=1 (opt-in): one extra trunk row per decode step (the runner-up leaf) and one extra
-    /// GDN ring state per sequence; 0 when off or without MTP drafting.
+    /// HALO_MTP_TREE=1 / CpuEngineOptions::mtp_tree (opt-in): one extra trunk row per decode step (the
+    /// runner-up leaf) and one extra GDN ring state per sequence; 0 when off or without MTP drafting.
     std::size_t tree_extra_ = 0;
     /// Prompt-lookup drafts ahead of MTP (opt-in: CpuEngineOptions::ngram_draft, else
     /// HALO_NGRAM_DRAFT=1). Greedy requests only.
@@ -424,7 +424,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     info_.has_mtp = model_->has_mtp();
     const bool mtp = cfg.mtp_enabled && model_->has_mtp() && cfg.mtp_max_draft > 0;
     max_draft_ = mtp ? static_cast<std::size_t>(cfg.mtp_max_draft) : 0;
-    tree_extra_ = max_draft_ > 0 && speculative::tree_env_enabled() ? 1 : 0;
+    tree_extra_ = max_draft_ > 0 && opts.mtp_tree.value_or(speculative::tree_env_enabled()) ? 1 : 0;
 
     // ---- memory plan (D-002: tier discovery, never assumption) --------------------------
     // `hw` was sampled above, before the backend opened and the weights were uploaded.
@@ -445,6 +445,13 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
                    "KV cache type {} (HALO_KV_FP16 / HALO_KV_TYPE) is implemented only on the Vulkan backend; this run uses "
                    "the {} backend (unset the variable or select --backend vulkan)",
                    backend::to_string(kv_type), backend::to_string(kvbe.kind()));
+        // Tree verification attends through attention_tree.comp, which reads fp32 KV only: the
+        // Speculator would silently verify plain chains (Speculator::tree_ok) while the plan still
+        // reserved the leaf's KV rows and GDN state. A contradictory opt-in pair is refused here.
+        HALO_CHECK(tree_extra_ == 0, ErrorCode::Config,
+                   "HALO_MTP_TREE=1 (tree verification) needs an fp32 KV cache, but the KV cache type is {} "
+                   "(HALO_KV_FP16 / HALO_KV_TYPE): unset one of them",
+                   backend::to_string(kv_type));
         HALO_INFO("runtime", "KV cache stored as {} (opt-in)", backend::to_string(kv_type));
     }
     pr.kv_dtype = kv_type == backend::KvType::F16 ? memory::DtypeSize::f16()

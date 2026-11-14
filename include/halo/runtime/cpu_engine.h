@@ -115,6 +115,10 @@ struct CpuEngineOptions {
     /// running the MTP head. nullopt = the HALO_NGRAM_DRAFT=1 env flag (default off). Needs
     /// mtp_max_draft > 0; draft_hook, when set, takes precedence.
     std::optional<bool> ngram_draft;
+    /// Tree verification of the top-2 depth-1 drafts (SpecConfig::tree, next.md step 5).
+    /// nullopt = the HALO_MTP_TREE env flag (read once, default off). Needs an fp32 KV cache:
+    /// with HALO_KV_FP16 / HALO_KV_TYPE=f16|q8 engine creation fails with Error(Config).
+    std::optional<bool> mtp_tree;
     /// Called on the worker thread after every tick. Must not block or call the engine.
     std::function<void(const TickInfo&)> on_tick;
     FaultInjection faults;  ///< tests only

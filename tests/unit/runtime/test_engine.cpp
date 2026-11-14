@@ -10,10 +10,13 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <mutex>
 #include <span>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -881,6 +884,96 @@ TEST_F(VulkanEngine, NgramDraftingWithoutAMatchIsBitwiseMtpDrafting) {
         EXPECT_EQ(s1.ngram_drafts - s0.ngram_drafts, 0u);
     }
     EXPECT_EQ(off->engine->stats().ngram_lookups, 0u) << "ngram_draft = false must not search (env ignored)";
+}
+
+// ---- HALO_MTP_TREE needs an fp32 KV cache ---------------------------------------------------
+// Tree verification attends through attention_tree.comp, which has no fp16 / q8 KV variant. With
+// HALO_KV_FP16=1 / HALO_KV_TYPE=f16|q8 the Speculator used to drop the tree silently (plain chain
+// verify) while the memory plan still reserved the leaf's KV row and GDN state: the contradictory
+// opt-in pair is now refused at engine creation with Error(Config), like HALO_KV_FP16 vs HALO_KV_TYPE.
+
+namespace {
+
+/// Sets (value != nullptr) or unsets an environment variable for one scope, restoring the old value.
+class ScopedEnv {
+public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        if (const char* old = std::getenv(name)) old_ = std::string(old);
+        if (value != nullptr) {
+            ::setenv(name, value, 1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+    ~ScopedEnv() {
+        if (old_) {
+            ::setenv(name_, old_->c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+    ScopedEnv(ScopedEnv&&) = delete;
+    ScopedEnv& operator=(ScopedEnv&&) = delete;
+
+private:
+    const char* name_;
+    std::optional<std::string> old_;
+};
+
+}  // namespace
+
+TEST_F(VulkanEngine, TreeVerificationWithAnFp16OrQ8KvCacheIsRefusedAtCreation) {
+#if defined(HALO_TEST_VULKAN)
+    const auto create = [](bool tree, int mtp_draft) {
+        EngineConfig c = base_cfg();
+        c.backend = "vulkan";
+        c.mtp_max_draft = mtp_draft;
+        CpuEngineOptions o;
+        o.gate_mode = GateMode::Always;
+        o.mtp_tree = tree;
+        return make(o, c);
+    };
+    {
+        // Control: tree verification over the default fp32 KV cache constructs and decodes.
+        const ScopedEnv fp16("HALO_KV_FP16", nullptr);
+        const ScopedEnv type("HALO_KV_TYPE", nullptr);
+        std::unique_ptr<Engine> e;
+        try {
+            e = create(true, 2);
+        } catch (const halo::Error& x) {
+            if (x.code() == halo::ErrorCode::Device || x.code() == halo::ErrorCode::Unsupported) {
+                GTEST_SKIP() << "no Vulkan device in this environment: " << x.what();
+            }
+            FAIL() << "mtp_tree over an fp32 KV cache must construct, got: " << x.what();
+        }
+        EXPECT_EQ(run(*e, greedy(prompt("p0"), 8)).tokens.size(), 8u) << "mtp_tree + fp32 KV: 8 greedy tokens expected";
+    }
+    struct Case {
+        const char* fp16;
+        const char* type;
+        const char* label;
+    };
+    for (const Case& k : {Case{"1", nullptr, "HALO_KV_FP16=1"}, Case{nullptr, "f16", "HALO_KV_TYPE=f16"},
+                          Case{nullptr, "q8", "HALO_KV_TYPE=q8"}}) {
+        const ScopedEnv fp16("HALO_KV_FP16", k.fp16);
+        const ScopedEnv type("HALO_KV_TYPE", k.type);
+        try {
+            (void)create(true, 2);
+            ADD_FAILURE() << "mtp_tree + " << k.label << ": engine creation must throw Error(Config), it constructed";
+        } catch (const halo::Error& x) {
+            EXPECT_EQ(x.code(), halo::ErrorCode::Config) << "mtp_tree + " << k.label << ": " << x.what();
+            EXPECT_NE(std::string_view(x.what()).find("HALO_MTP_TREE"), std::string_view::npos)
+                << "mtp_tree + " << k.label << ": the error must name HALO_MTP_TREE, got: " << x.what();
+        }
+        // The quantized cache alone, and the tree flag without MTP drafting (no tree), still construct.
+        EXPECT_NO_THROW((void)create(false, 2)) << k.label << " without mtp_tree must construct";
+        EXPECT_NO_THROW((void)create(true, 0)) << k.label << " + mtp_tree with MTP drafting off (no tree) must construct";
+    }
+#else
+    GTEST_SKIP() << "built without the Vulkan backend";
+#endif
 }
 
 
