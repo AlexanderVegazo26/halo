@@ -859,7 +859,8 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     }
     if (const char* e = std::getenv("HALO_FUSE_NORM"))
         I.fuse_norm = *e != 0 && std::string_view(e) != "0" && I.be->kind() == backend::Kind::Vulkan;
-    I.parse_fuse_env(std::getenv("HALO_FUSE_GEMV"));  // before the layers load: it picks the weight layout
+    // Before the layers load: it picks the weight layout.
+    I.parse_fuse_env(options.fuse_gemv ? options.fuse_gemv->c_str() : std::getenv("HALO_FUSE_GEMV"));
     const auto& hp = m.hparams();
     I.hp = &hp;
     I.E = hp.n_embd;
@@ -941,6 +942,9 @@ Qwen35::~Qwen35() = default;
 const model::Qwen35HParams& Qwen35::hparams() const noexcept { return *impl_->hp; }
 bool Qwen35::has_mtp() const noexcept { return impl_->mtp.has_value(); }
 bool Qwen35::reuse_streams() const noexcept { return impl_->reuse_streams; }
+FusedProjections Qwen35::fused_projections() const noexcept {
+    return {.ffn = impl_->has_fused_ffn, .ba = impl_->has_fused_ba, .qkv = impl_->has_fused_qkv};
+}
 std::size_t Qwen35::n_vocab() const noexcept { return impl_->n_vocab; }
 std::size_t Qwen35::n_embd() const noexcept { return impl_->E; }
 std::size_t Qwen35::gdn_chunk() const noexcept { return impl_->gdn_chunk; }

@@ -5,6 +5,11 @@
 //   SpecConfig::chain          (HALO_MTP_CHAIN)          every draft depth in one submit (mtp_draft_chain)
 //   Qwen35Options::reuse_streams (HALO_STREAM_REUSE)     pooled backend streams instead of one per forward
 //
+// and next.md step 6, Qwen35Options::fuse_gemv (HALO_FUSE_GEMV): gate|up, beta|alpha and q|k|v
+// loaded row-concatenated as one gemv each. Every W row is reduced by its own workgroup in a fixed
+// order, so fused rows must equal the separate gemvs' bit for bit, at R == 1 (decode, one fused
+// dispatch for qkv) and R > 1 (prefill / MTP verify, row slices of the fused buffer).
+//
 // None of them may change what greedy decoding emits: with each flag (and combined), for k = 1..3,
 // the drafts of every tick must equal the per-depth host path's drafts bit for bit, the emitted
 // tokens must equal plain greedy decoding (MTP off), and the sequence state (trunk KV, GDN state,
@@ -57,8 +62,10 @@ struct VkModel {
     std::unique_ptr<KvPool> kv_pool, mtp_pool;
 
     VkModel(const std::shared_ptr<halo::vulkan::Context>& ctx, const halo::model::NormalizedModel& nm, bool reuse)
+        : VkModel(ctx, nm, hm::Qwen35Options{.reuse_streams = reuse, .fuse_gemv = ""}) {}
+    VkModel(const std::shared_ptr<halo::vulkan::Context>& ctx, const halo::model::NormalizedModel& nm, const hm::Qwen35Options& o)
         : be(hb::make_vulkan_backend(ctx)) {
-        model = std::make_unique<hm::Qwen35>(nm, *be, hm::Qwen35Options{.reuse_streams = reuse});
+        model = std::make_unique<hm::Qwen35>(nm, *be, o);
         kv_pool = std::make_unique<KvPool>(model->kv_layout(), k_blocks);
         mtp_pool = std::make_unique<KvPool>(model->mtp_kv_layout(), k_blocks);
     }
@@ -260,6 +267,51 @@ TEST_F(VulkanSpec, StreamReuseIsBitwiseNeutral) {
                 const auto d = first_draft_diff(b.drafts, a.drafts);
                 EXPECT_EQ(d, -1) << "pooled drafts of tick " << d << " differ from fresh streams";
                 expect_same_state(sp, *qp, sf, *qf, "pooled vs fresh");
+            }
+        }
+    }
+}
+
+// next.md step 6: each fused projection form (and all three) must give the same tokens, drafts and
+// sequence state as the separate gemvs, with MTP off (R == 1 decode ticks) and k = 3 (R = 4 verify
+// forwards); the prompt prefill runs R > 1 in both.
+TEST_F(VulkanSpec, FusedProjectionsAreBitwiseTheSeparateGemvs) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel plain(ctx, *nm_, hm::Qwen35Options{.reuse_streams = false, .fuse_gemv = ""});
+    const hm::FusedProjections none = plain.model->fused_projections();
+    ASSERT_FALSE(none.ffn || none.ba || none.qkv) << "fuse_gemv = \"\" must override HALO_FUSE_GEMV and load no fused form";
+    struct Fuse {
+        const char* spec;
+        hm::FusedProjections expect;
+    };
+    const Fuse fusions[] = {{"ffn", {.ffn = true}}, {"ba", {.ba = true}}, {"qkv", {.qkv = true}},
+                            {"all", {.ffn = true, .ba = true, .qkv = true}}};
+    for (const Fuse& fu : fusions) {
+        SCOPED_TRACE(std::string("fuse_gemv=") + fu.spec);
+        const VkModel fused(ctx, *nm_, hm::Qwen35Options{.reuse_streams = false, .fuse_gemv = fu.spec});
+        const hm::FusedProjections got = fused.model->fused_projections();
+        ASSERT_EQ(got.ffn, fu.expect.ffn) << fu.spec << ": fused gate|up loaded";
+        ASSERT_EQ(got.ba, fu.expect.ba) << fu.spec << ": fused beta|alpha loaded (tiny model needs GDN layers)";
+        ASSERT_EQ(got.qkv, fu.expect.qkv) << fu.spec << ": fused q|k|v loaded (tiny model needs attention layers)";
+        for (const char* p : {"p0", "p1", "p2"}) {
+            SCOPED_TRACE(p);
+            const Toks pr = prompt(p);
+            for (const std::size_t k : {std::size_t{0}, std::size_t{3}}) {
+                SCOPED_TRACE("k=" + std::to_string(k));
+                const GateMode mode = k == 0 ? GateMode::Off : GateMode::Always;
+                auto sa = plain.spec(mode, false, false);
+                auto sb = fused.spec(mode, false, false);
+                auto qa = plain.seq();
+                auto qb = fused.seq();
+                const SpecRun a = generate(sa, *qa, pr, k_tokens, k);
+                const SpecRun b = generate(sb, *qb, pr, k_tokens, k);
+                ASSERT_EQ(a.tokens.size(), k_tokens);
+                EXPECT_EQ(b.tokens, a.tokens) << fu.spec << " greedy " << str(b.tokens) << " != separate gemvs " << str(a.tokens);
+                const auto d = first_draft_diff(b.drafts, a.drafts);
+                EXPECT_EQ(d, -1) << fu.spec << ": drafts of tick " << d << " differ from the separate gemvs: got "
+                                 << (d >= 0 && std::size_t(d) < b.drafts.size() ? str(b.drafts[d]) : "<none>") << ", separate "
+                                 << (d >= 0 && std::size_t(d) < a.drafts.size() ? str(a.drafts[d]) : "<none>");
+                expect_same_state(sb, *qb, sa, *qa, std::string("fused ") + fu.spec + " vs separate");
             }
         }
     }

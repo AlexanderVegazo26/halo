@@ -43,6 +43,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "halo/backends/cpu/ops.h"
@@ -200,6 +201,18 @@ struct Qwen35Options {
     /// nullopt = the HALO_STREAM_REUSE env var (default off), as before; set it to test both paths
     /// in one process.
     std::optional<bool> reuse_streams = std::nullopt;
+    /// next.md step 6: which same-input projections load row-concatenated as one gemv (Vulkan
+    /// only): "1" / "all", or a comma list of "ffn" (gate+up), "ba" (GDN beta+alpha), "qkv"
+    /// (attention q+k+v); "" / "0" = none. nullopt = the HALO_FUSE_GEMV env var (default off).
+    std::optional<std::string> fuse_gemv = std::nullopt;
+};
+
+/// Which fused projection forms the loaded layers actually contain (Qwen35Options::fuse_gemv).
+/// A requested fusion is skipped per layer when the backend is not Vulkan or the parts' types differ.
+struct FusedProjections {
+    bool ffn = false;
+    bool ba = false;
+    bool qkv = false;
 };
 
 class Qwen35 {
@@ -220,6 +233,8 @@ public:
     Qwen35& operator=(const Qwen35&) = delete;
     /// Whether forwards reuse pooled streams (Qwen35Options::reuse_streams, else HALO_STREAM_REUSE).
     [[nodiscard]] bool reuse_streams() const noexcept;
+    /// Fused projection forms present in the loaded layers (all false unless fuse_gemv / HALO_FUSE_GEMV asked).
+    [[nodiscard]] FusedProjections fused_projections() const noexcept;
 
     [[nodiscard]] const model::Qwen35HParams& hparams() const noexcept;
     [[nodiscard]] const model::NormalizedModel& model() const noexcept { return *model_; }
