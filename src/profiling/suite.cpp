@@ -318,12 +318,26 @@ private:
                 bool tau_known = true;
                 if (mtp) {
                     r.decode_effective_tps = tps;
-                    if (t.result.draft_tokens > 0) {
-                        r.mtp_acceptance = static_cast<double>(t.result.accepted_draft_tokens) /
-                                           static_cast<double>(t.result.draft_tokens);
+                    // draft_tokens / accepted_draft_tokens also count prompt-lookup (n-gram)
+                    // drafts; mtp_acceptance is the MTP head's share only. Null when the MTP
+                    // head proposed nothing (every draft came from n-gram matches).
+                    const std::size_t ngram_draft = std::min(t.result.ngram_draft_tokens, t.result.draft_tokens);
+                    const std::size_t ngram_acc =
+                        std::min(t.result.ngram_accepted_draft_tokens, t.result.accepted_draft_tokens);
+                    const std::size_t mtp_draft = t.result.draft_tokens - ngram_draft;
+                    const std::size_t mtp_acc = t.result.accepted_draft_tokens - ngram_acc;
+                    if (mtp_draft > 0) {
+                        r.mtp_acceptance = static_cast<double>(std::min(mtp_acc, mtp_draft)) /
+                                           static_cast<double>(mtp_draft);
                     }
                     r.extra["draft_tokens"] = t.result.draft_tokens;
                     r.extra["accepted_draft_tokens"] = t.result.accepted_draft_tokens;
+                    if (t.result.ngram_lookups > 0) {
+                        r.extra["ngram_lookups"] = t.result.ngram_lookups;
+                        r.extra["ngram_hits"] = t.result.ngram_hits;
+                        r.extra["ngram_draft_tokens"] = t.result.ngram_draft_tokens;
+                        r.extra["ngram_accepted_draft_tokens"] = t.result.ngram_accepted_draft_tokens;
+                    }
                     // τ = generated / verification steps, steps = generated - accepted (each
                     // step emits accepted + 1 tokens). Not derivable when the counters are
                     // inconsistent; then η is left null rather than guessed.

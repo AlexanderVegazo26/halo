@@ -147,6 +147,11 @@ The model suite applies the byte model per record:
   verification step emits accepted + 1 tokens. It is recorded as `extra.tau_observed`.
   This step semantics is an assumption about the engine; it has only been exercised
   against a fake engine, not against the real HALO engine or llama-server.
+  τ counts every accepted draft, but `mtp_acceptance` is the MTP head's share only:
+  (accepted − n-gram accepted) / (drafted − n-gram drafted). With prompt-lookup drafts on
+  (`HALO_NGRAM_DRAFT`), the n-gram counters are recorded as `extra.ngram_lookups`,
+  `extra.ngram_hits`, `extra.ngram_draft_tokens` and `extra.ngram_accepted_draft_tokens`;
+  when every draft came from n-gram matches, `mtp_acceptance` is null.
 
 `predicted_bytes_per_token` is B_step / (S·τ).
 

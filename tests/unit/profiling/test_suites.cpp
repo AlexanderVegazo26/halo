@@ -33,6 +33,12 @@ struct FakeOptions {
     int fail_from_call = 0;         ///< >0: the N-th generate() call and later report Error
     bool prefix_cache = false;      ///< longest-common-prefix reuse against earlier prompts
     bool speculate_in_plain_decode = false;
+    // Prompt-lookup share of the speculative counters (GenerateResult::ngram_*), reported only
+    // when ngram_lookups > 0. draft/accepted are absolute counts, part of the totals above.
+    std::size_t ngram_lookups = 0;
+    std::size_t ngram_hits = 0;
+    std::size_t ngram_draft_tokens = 0;
+    std::size_t ngram_accepted_draft_tokens = 0;
 };
 
 class FakeEngine final : public rt::Engine {
@@ -88,6 +94,12 @@ public:
             // tau = gen / steps = 2; two drafts proposed per step.
             r.accepted_draft_tokens = r.tokens.size() / 2;
             r.draft_tokens = 2 * (r.tokens.size() - r.accepted_draft_tokens);
+        }
+        if (o_.ngram_lookups > 0) {
+            r.ngram_lookups = o_.ngram_lookups;
+            r.ngram_hits = o_.ngram_hits;
+            r.ngram_draft_tokens = o_.ngram_draft_tokens;
+            r.ngram_accepted_draft_tokens = o_.ngram_accepted_draft_tokens;
         }
         return r;
     }
@@ -327,6 +339,64 @@ TEST(ModelSuite, MtpDecodeDerivesTauForEfficiency) {
     DecodeByteModel m = c.efficiency->byte_model;
     m.context_tokens = 256;
     EXPECT_NEAR(s->metrics.at("efficiency").stats.mean, 100.0 * m.bytes_per_token(2.0) / 256e9, 1e-12);
+}
+
+TEST(ModelSuite, MtpAcceptanceCountsOnlyTheMtpHeadsDraftsWhenNgramDraftsRan) {
+    // 16 generated, 8 of 16 drafts accepted in total; 6 drafts (5 accepted) came from
+    // n-gram matches, so the MTP head proposed 10 and 3 were accepted: 0.3, not the
+    // overall 0.5 or the n-gram 5/6. tau still uses every accepted draft: 16 / 8 = 2.
+    ManualClock clock;
+    FakeEngine e(clock, {.has_mtp = true,
+                         .ngram_lookups = 9,
+                         .ngram_hits = 2,
+                         .ngram_draft_tokens = 6,
+                         .ngram_accepted_draft_tokens = 5});
+    auto c = model_config({ModelMode::MtpDecode});
+    c.contexts = {256};
+    const SuiteArtifact a = run_model_suite(e, c, clock);
+    const RunSummary* s = find_summary(a, "mtp_decode", Phase::Steady, 256);
+    ASSERT_NE(s, nullptr);
+    EXPECT_DOUBLE_EQ(s->metrics.at("mtp_acceptance").stats.mean, 0.3)
+        << "mtp_acceptance must be MTP accepted (8 - 5) / MTP drafted (16 - 6)";
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.tau_observed").stats.mean, 2.0);
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.draft_tokens").stats.mean, 16.0);
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.accepted_draft_tokens").stats.mean, 8.0);
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.ngram_lookups").stats.mean, 9.0);
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.ngram_hits").stats.mean, 2.0);
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.ngram_draft_tokens").stats.mean, 6.0);
+    EXPECT_DOUBLE_EQ(s->metrics.at("extra.ngram_accepted_draft_tokens").stats.mean, 5.0);
+}
+
+TEST(ModelSuite, MtpAcceptanceIsNullWhenEveryDraftCameFromNgramMatches) {
+    ManualClock clock;
+    FakeEngine e(clock, {.has_mtp = true,
+                         .ngram_lookups = 4,
+                         .ngram_hits = 4,
+                         .ngram_draft_tokens = 16,
+                         .ngram_accepted_draft_tokens = 8});
+    auto c = model_config({ModelMode::MtpDecode});
+    c.contexts = {256};
+    const SuiteArtifact a = run_model_suite(e, c, clock);
+    ASSERT_FALSE(a.records.empty());
+    for (const auto& r : a.records) {
+        EXPECT_FALSE(r.mtp_acceptance) << "the MTP head proposed no drafts in record rep " << r.repetition
+                                       << ": acceptance is unmeasured (null), not "
+                                       << r.mtp_acceptance.value_or(-1.0);
+        EXPECT_EQ(r.extra.at("ngram_draft_tokens"), 16) << "n-gram counters must still be recorded";
+    }
+}
+
+TEST(ModelSuite, MtpDecodeRecordsNoNgramCountersWhenNoLookupRan) {
+    ManualClock clock;
+    FakeEngine e(clock, {.has_mtp = true});
+    auto c = model_config({ModelMode::MtpDecode});
+    c.contexts = {256};
+    const SuiteArtifact a = run_model_suite(e, c, clock);
+    ASSERT_FALSE(a.records.empty());
+    for (const auto& r : a.records) {
+        EXPECT_FALSE(r.extra.contains("ngram_lookups")) << r.extra.dump();
+        EXPECT_FALSE(r.extra.contains("ngram_draft_tokens")) << r.extra.dump();
+    }
 }
 
 TEST(ModelSuite, MtpDecodeSkippedWithoutMtpAndSpeculationInPlainDecodeNoted) {
