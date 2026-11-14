@@ -208,7 +208,14 @@ slack (8 blocks), so it is refused; fp16/q8 KV fits. The suggested agent profile
     tokens parsed.
   - The runtime settings in the configuration table above also apply.
 - **Summary.** A one-line summary goes to stderr: tokens, time, decode tok/s, and the
-  finish reason.
+  finish reason. When speculative decoding drafted, looked up or fell back during the request,
+  a second line follows with this request's counts: draft tokens accepted of proposed (and the
+  rate), n-gram hits of lookups (`HALO_NGRAM_DRAFT`) and MTP fallbacks. It is the way to
+  measure MTP / n-gram acceptance on a real model, e.g.
+  `[halo] drafts 9 accepted of 12 proposed (75.0%)`. Only greedy requests draft, so measure
+  with `--temperature 0` (the default 0.7 samples and prints no draft line). With n-gram
+  drafting on, the label reads `drafts (MTP + n-gram)` because the counts cover both sources.
+  A failed request prints its error instead of this line.
 - **Runtime.** `run` needs the runtime.
 
 ### `halo serve [--model M] [options]`

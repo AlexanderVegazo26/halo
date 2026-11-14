@@ -15,9 +15,12 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -104,21 +107,37 @@ fs::path temp_file(const std::string& name, const std::string& content) {
 #define REQUIRE_FILE(p) \
     if (!fs::exists(p)) GTEST_SKIP() << "reference file missing: " << (p).string()
 
+/// Optional overrides for SharedEngine: patch each GenerateResult, and report stats() as
+/// `before` until generate() has run and `after` from then on (a real engine's counters
+/// across one request).
+struct EngineHooks {
+    std::function<void(runtime::GenerateResult&)> on_result;
+    std::optional<std::pair<runtime::EngineStats, runtime::EngineStats>> stats;
+};
+
 /// An Engine that forwards to a shared FakeEngine, so tests can inspect it after the CLI has
 /// destroyed the engine it was given.
 class SharedEngine final : public runtime::Engine {
 public:
-    explicit SharedEngine(std::shared_ptr<FakeEngine> e) : e_(std::move(e)) {}
+    explicit SharedEngine(std::shared_ptr<FakeEngine> e, EngineHooks h = {}) : e_(std::move(e)), h_(std::move(h)) {}
     const runtime::ModelInfo& model() const override { return e_->model(); }
     const tokenizer::Tokenizer& tokenizer() const override { return e_->tokenizer(); }
     const chat::ChatTemplate& chat_template() const override { return e_->chat_template(); }
     runtime::GenerateResult generate(const runtime::GenerateRequest& r, const runtime::TokenCallback& cb) override {
-        return e_->generate(r, cb);
+        ran_ = true;
+        runtime::GenerateResult res = e_->generate(r, cb);
+        if (h_.on_result) h_.on_result(res);
+        return res;
     }
-    runtime::EngineStats stats() const override { return e_->stats(); }
+    runtime::EngineStats stats() const override {
+        if (h_.stats) return ran_ ? h_.stats->second : h_.stats->first;
+        return e_->stats();
+    }
 
 private:
     std::shared_ptr<FakeEngine> e_;
+    EngineHooks h_;
+    bool ran_ = false;
 };
 
 struct FakeFactory {
@@ -596,6 +615,108 @@ TEST(CliRun, StreamsContentAndHidesReasoning) {
     r = cli_run({"run", "m.gguf", "-p", "x"}, CliOptions().with_factory(ff.factory()));
     EXPECT_EQ(r.rc, 1);
     EXPECT_NE(r.err.find("device lost"), std::string::npos);
+}
+
+struct Drafts {
+    std::size_t proposed = 0, accepted = 0;
+};
+
+/// `halo run --raw` over a FakeEngine whose request reports `d` draft tokens and whose stats
+/// move from `before` to `after` across it; `fail` ends the request with FinishReason::Error.
+CliResult run_with_stats(Drafts d, const runtime::EngineStats& before, const runtime::EngineStats& after,
+                         bool fail = false) {
+    auto fake = std::shared_ptr<FakeEngine>(FakeEngine::synthetic(4096).release());
+    fake->script = [fail](const auto&, int) {
+        Script s = sc("abcdefgh");
+        if (fail) {
+            s.finish = runtime::FinishReason::Error;
+            s.error_text = "device lost";
+        }
+        return s;
+    };
+    EngineHooks h;
+    h.on_result = [d](runtime::GenerateResult& r) {
+        r.draft_tokens = d.proposed;
+        r.accepted_draft_tokens = d.accepted;
+    };
+    h.stats = std::pair{before, after};
+    return cli_run({"run", "m.gguf", "-p", "x", "--raw", "--temperature", "0"},
+                   CliOptions().with_factory([=](const runtime::EngineConfig&) -> std::unique_ptr<runtime::Engine> {
+                       return std::make_unique<SharedEngine>(fake, h);
+                   }));
+}
+
+std::size_t count_lines_with(const std::string& text, const std::string& needle) {
+    std::size_t n = 0;
+    std::istringstream in(text);
+    for (std::string line; std::getline(in, line);) n += line.find(needle) != std::string::npos ? 1 : 0;
+    return n;
+}
+
+TEST(CliRun, SummarizesThisRequestsSpeculativeDraftsOnStderr) {
+    // Engine counters already non-zero before the request (an engine that warmed up or served
+    // before): the n-gram / fallback clauses report only this request's share.
+    runtime::EngineStats before;
+    before.speculative_attempts = 100;
+    before.speculative_accepts = 90;
+    before.ngram_lookups = 7;
+    before.ngram_drafts = 1;
+    runtime::EngineStats after = before;
+    after.speculative_attempts += 20;  // engine-wide; the line must use the request's 12 / 9
+    after.speculative_accepts += 17;
+    after.ngram_lookups += 3;
+    after.ngram_drafts += 2;
+    after.mtp_fallbacks = 1;
+    const CliResult r = run_with_stats({.proposed = 12, .accepted = 9}, before, after);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(r.out, "abcdefgh\n") << "the draft summary must not reach stdout";
+    EXPECT_NE(r.err.find("[halo] drafts (MTP + n-gram) 9 accepted of 12 proposed (75.0%), n-gram hits 2 of 3 "
+                         "lookups, 1 MTP fallback\n"),
+              std::string::npos)
+        << "expected the request's 9/12 drafts (not the engine-wide 17/20), 2/3 n-gram hits (deltas), 1 fallback; "
+           "stderr:\n"
+        << r.err;
+    // It follows the tok/s line.
+    EXPECT_LT(r.err.find("tok/s decode"), r.err.find("[halo] drafts")) << r.err;
+}
+
+TEST(CliRun, DraftSummaryOmitsUnusedPartsAndIsAbsentForPlainDecode) {
+    runtime::EngineStats before;
+    before.ticks = 3;
+    before.speculative_attempts = 40;  // earlier requests drafted; this one did not
+    runtime::EngineStats after = before;
+    after.ticks += 9;
+    CliResult r = run_with_stats({}, before, after);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(count_lines_with(r.err, "[halo] "), 1u) << "plain decode keeps the single summary line; stderr:\n"
+                                                        << r.err;
+    EXPECT_EQ(r.err.find("drafts"), std::string::npos) << r.err;
+
+    // MTP only, nothing accepted: no n-gram or fallback clause, no "(MTP + n-gram)" label.
+    r = run_with_stats({.proposed = 6, .accepted = 0}, before, after);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.err.find("[halo] drafts 0 accepted of 6 proposed (0.0%)\n"), std::string::npos) << r.err;
+
+    // Plural fallbacks.
+    runtime::EngineStats fb = after;
+    fb.mtp_fallbacks = 2;
+    r = run_with_stats({.proposed = 4, .accepted = 1}, before, fb);
+    EXPECT_NE(r.err.find("[halo] drafts 1 accepted of 4 proposed (25.0%), 2 MTP fallbacks\n"), std::string::npos)
+        << r.err;
+
+    // A failed request ends with its error, not with partial draft counts.
+    r = run_with_stats({.proposed = 8, .accepted = 3}, before, after, /*fail=*/true);
+    EXPECT_EQ(r.rc, 1) << r.err;
+    EXPECT_EQ(r.err.find("drafts"), std::string::npos) << "no draft line for a failed request; stderr:\n" << r.err;
+    EXPECT_NE(r.err.find("halo: generation failed: device lost"), std::string::npos) << r.err;
+
+    // n-gram lookups without a single draft: no percentage to divide by zero.
+    after.ngram_lookups = 5;
+    r = run_with_stats({}, before, after);
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.err.find("[halo] drafts (MTP + n-gram) 0 accepted of 0 proposed, n-gram hits 0 of 5 lookups\n"),
+              std::string::npos)
+        << r.err;
 }
 
 #if HALO_CLI_HAVE_API

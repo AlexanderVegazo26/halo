@@ -139,7 +139,7 @@ What exllamav2 does, and whether each idea transfers to HALO:
    - run `scripts/build.sh` with `test_vulkan` and the forward differential tests;
    - greedy output must be token-identical with MTP on and off, and must match the CPU reference on the tiny goldens.
 2. **Speed:** run the same command before and after each change:
-   `build-dev/tools/halo/halo run <model> -p "<13-tok prompt>" --raw --temperature 0 --backend vulkan -n 128 --ctx 4096 --parallel 1`, with and without `--mtp-draft 0`. Baseline: 16.79 / 10.97 tok/s.
+   `build-dev/tools/halo/halo run <model> -p "<13-tok prompt>" --raw --temperature 0 --backend vulkan -n 128 --ctx 4096 --parallel 1`, with and without `--mtp-draft 0`. Baseline: 16.79 / 10.97 tok/s. Since 2026-11-14 the run also prints the request's draft acceptance on stderr (`[halo] drafts A accepted of P proposed (R%)`, plus n-gram hits and MTP fallbacks; `docs/cli.md`), so record the acceptance rate beside tok/s for steps 2, 5 and 11. Only take numbers when `gpu_busy_percent` is near 0 before the run.
 3. **Attribution:** re-profile with `HALO_VK_OP_TIMINGS` and aggregate by kernel, as in the table above. Also confirm the per-tick wall time and fence count drop.
 4. Commit each step separately, with the before and after tok/s in the message, matching the repo's existing convention.
 
