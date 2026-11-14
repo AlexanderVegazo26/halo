@@ -2,7 +2,7 @@
 // queues drained on the caller's thread, prefix cache (KV sharing + GDN checkpoints),
 // MTP speculative decoding with a k = 0 fallback on MTP-KV exhaustion.
 // BI-6: the forward runs on the backend named by EngineConfig::backend (cpu | vulkan |
-// hip; "auto" = vulkan when the build has it and a device answers, else cpu). GDN/conv state
+// hip; "auto" = vulkan, and an error when no Vulkan device opens: never a CPU fallback). GDN/conv state
 // (the §5.3 ring) and the KV pools are State-arena buffers of that backend (WS-BI-2):
 // device-resident on GPU backends, zero-copy host memory on the CPU backend.
 
@@ -137,23 +137,24 @@ std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
 }
 #endif
 
-/// Resolves backend "auto": Vulkan when this build has it and a device can be opened, else
-/// cpu (with a warning that names why). When Vulkan is chosen the constructed backend is handed
-/// back through *out so the probe's device context is reused, not opened twice. A test-supplied
-/// backend_factory keeps "auto" on cpu, as before.
+/// Resolves backend "auto" to Vulkan. halo is GPU-only: when the build has no Vulkan backend or
+/// no device opens, this throws instead of falling back to the CPU. The constructed backend is
+/// handed back through *out so the device context is opened once. A test-supplied
+/// backend_factory keeps "auto" on cpu: unit tests drive the CPU reference engine on tiny models.
 std::string resolve_auto_backend(const CpuEngineOptions& opts, std::unique_ptr<backend::Backend>* out) {
     if (opts.backend_factory) return "cpu";
 #if defined(HALO_RUNTIME_VULKAN)
     try {
         *out = make_gpu_backend("vulkan");
-        return "vulkan";
     } catch (const Error& e) {
-        HALO_WARN("runtime", "backend 'auto': no usable Vulkan device ({}); falling back to cpu", e.what());
+        throw_error(ErrorCode::Device, "halo runs on the GPU only, and no Vulkan device could be opened: {}", e.what());
     }
+    return "vulkan";
 #else
     (void)out;
+    throw_error(ErrorCode::Unsupported,
+                "halo runs on the GPU only, and this build has no Vulkan backend (configure with HALO_BUILD_VULKAN=ON)");
 #endif
-    return "cpu";
 }
 
 // ---- memory plan inputs --------------------------------------------------------------

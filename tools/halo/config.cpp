@@ -63,7 +63,7 @@ std::vector<ConfigKey> make_keys() {
     return {
         s("model.path", "model", "HALO_MODEL", nullptr, "trunk GGUF"),
         s("model.mtp", "mtp", "HALO_MTP", nullptr, "separate MTP GGUF (D-006)"),
-        s("runtime.backend", "backend", "HALO_BACKEND", "auto", "cpu | vulkan | hip | auto"),
+        s("runtime.backend", "backend", "HALO_BACKEND", "auto", "auto | vulkan | hip (GPU only; auto = vulkan)"),
         u("runtime.threads", "threads", "HALO_THREADS", 0, 0, 1024, "CPU threads (0 = auto)"),
         u("runtime.ctx", "ctx", "HALO_CTX", 32768, 1, 1u << 20, "maximum context per sequence"),
         u("runtime.parallel", "parallel", "HALO_PARALLEL", 4, 1, 256, "concurrent sequences"),
@@ -331,8 +331,12 @@ runtime::EngineConfig engine_config(const ResolvedConfig& c, const std::filesyst
     e.model_path = *model;
     e.mtp_path = c.str("model.mtp");
     e.backend = c.str("runtime.backend").value_or("auto");
-    HALO_CHECK(e.backend == "auto" || e.backend == "cpu" || e.backend == "vulkan" || e.backend == "hip",
-               ErrorCode::Config, "runtime.backend must be auto, cpu, vulkan or hip (got '{}')", e.backend);
+    // halo runs the model on the GPU only. The CPU backend is the differential-test reference
+    // (ADR-001), never a serving path.
+    HALO_CHECK(e.backend != "cpu", ErrorCode::Config,
+               "halo runs the model on the GPU only: runtime.backend 'cpu' is not allowed (use auto, vulkan or hip)");
+    HALO_CHECK(e.backend == "auto" || e.backend == "vulkan" || e.backend == "hip",
+               ErrorCode::Config, "runtime.backend must be auto, vulkan or hip (got '{}')", e.backend);
     e.threads = static_cast<int>(c.u64("runtime.threads"));
     e.max_context = c.u64("runtime.ctx");
     e.max_context_explicit = c.has("runtime.ctx") && c.source("runtime.ctx") != "default";  // flag, env or config file

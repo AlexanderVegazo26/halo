@@ -1,7 +1,7 @@
 #pragma once
 // CPU reference Engine (WS-G M3): options and observability beyond the engine.h contract.
-// create_engine(cfg) == create_cpu_engine(cfg, {}); backend "auto" resolves to vulkan when built and
-// a device opens, else cpu.
+// create_engine(cfg) == create_cpu_engine(cfg, {}); backend "auto" resolves to vulkan, and is an
+// error (never a CPU fallback) when no Vulkan device opens. "cpu" is the test reference only.
 //
 // Scheduling (ARCHITECTURE "Scheduler", review H-1): one worker thread. Each tick issues
 // ONE batched trunk forward over every active sequence — decode rows (with MTP drafts for

@@ -300,6 +300,21 @@ TEST(CliConfig, ServePrintConfigEndToEnd) {
     EXPECT_EQ(r.out.find("sk-secret-123"), std::string::npos);
 }
 
+TEST(CliConfig, CpuBackendIsRefusedHaloIsGpuOnly) {
+    FakeFactory ff;
+    for (const auto* how : {"flag", "env"}) {
+        const bool flag = std::string(how) == "flag";
+        std::vector<std::string> args = {"run", "m.gguf", "-p", "hi"};
+        if (flag) args.insert(args.end(), {"--backend", "cpu"});
+        auto opts = CliOptions().with_factory(ff.factory());
+        if (!flag) opts.env["HALO_BACKEND"] = "cpu";
+        const auto r = cli_run(args, opts);
+        EXPECT_NE(r.rc, 0) << how;
+        EXPECT_NE(r.err.find("GPU only"), std::string::npos) << how << ": " << r.err;
+    }
+    EXPECT_TRUE(ff.configs->empty()) << "no engine may be created on the CPU";
+}
+
 TEST(CliConfig, EngineAndServerConfigMapping) {
     FakeFactory ff;
     const auto file = temp_file("serve.json", R"({"runtime":{"backend":"vulkan","parallel":2},"server":{"max_queue":3}})");

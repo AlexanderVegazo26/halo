@@ -60,9 +60,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 `inspect` prints the memory plan for the `--ctx` and `--parallel` you give it. The defaults
 (`--ctx 32768 --parallel 4`) plan for far more memory than `--ctx 4096 --parallel 1`, so start
-small. The backend defaults to `auto`, which runs on the GPU through Vulkan when the build
-has the Vulkan backend and a device opens, and otherwise falls back to the CPU backend with a
-warning; pass `--backend cpu` to force the CPU (see "Where the GPU work stands").
+small. halo runs the model on the GPU only: the backend defaults to `auto`, which means
+Vulkan, and halo exits with an error rather than fall back to the CPU when no Vulkan device
+opens. `--backend cpu` is refused (see "Where the GPU work stands").
 
 ## What it does
 
@@ -90,9 +90,9 @@ warning; pass `--backend cpu` to force the CPU (see "Where the GPU work stands")
 HALO does not try to be a general-purpose serving framework. There is no model-swapping, no
 multi-tenant scheduling policy, no plugin system for third-party kernels. The HTTP API binds
 to loopback by default and requires an explicit opt-in plus an API key to listen elsewhere.
-`--backend auto` (the default) selects the Vulkan backend when it is compiled in and a device
-opens, else the CPU backend. `--backend hip` stays an explicit opt-in (see "Where the GPU work
-stands" below).
+halo is GPU-only: `--backend auto` (the default) is Vulkan, `--backend hip` is an explicit
+opt-in, and `--backend cpu` is refused. The CPU backend exists only as the reference the GPU
+kernels are tested against (see "Where the GPU work stands" below).
 
 ## Layout
 
@@ -175,9 +175,10 @@ behind loopback-by-default: `docs/api.md`.
 
 ## Where the GPU work stands
 
-With `--backend auto` (the default) the engine runs on Vulkan when the build has it and a
-device opens, and falls back to the CPU reference backend otherwise (`src/runtime/engine.cpp`,
-`resolve_auto_backend`); `--backend cpu` forces the CPU path. ADR-001 stages GPU enablement so each backend's kernels are proven
+halo runs the model on the GPU only. `--backend auto` (the default) is Vulkan; when no Vulkan
+device opens, halo stops with an error instead of falling back (`src/runtime/engine.cpp`,
+`resolve_auto_backend`), and `--backend cpu` is refused by the CLI. The CPU backend remains the
+reference implementation the tests check every GPU kernel against. ADR-001 stages GPU enablement so each backend's kernels are proven
 against the CPU path before they are trusted:
 
 - the CPU backend is the complete, tested reference implementation every other backend is

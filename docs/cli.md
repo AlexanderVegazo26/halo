@@ -58,7 +58,7 @@ their settings in this order:
 |---|---|---|---|
 | `model.path` | `--model` or the positional argument | `HALO_MODEL` | none (required) |
 | `model.mtp` | `--mtp` | `HALO_MTP` | none |
-| `runtime.backend` | `--backend` | `HALO_BACKEND` | `auto` (Vulkan if built and a device opens, else cpu) |
+| `runtime.backend` | `--backend` | `HALO_BACKEND` | `auto` (= Vulkan; GPU only, `cpu` is refused) |
 | `runtime.threads` | `--threads` | `HALO_THREADS` | 0 (auto) |
 | `runtime.ctx` | `--ctx` | `HALO_CTX` | 32768 |
 | `runtime.parallel` | `--parallel` | `HALO_PARALLEL` | 4 |
