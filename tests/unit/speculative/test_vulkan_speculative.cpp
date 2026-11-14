@@ -10,6 +10,11 @@
 // order, so fused rows must equal the separate gemvs' bit for bit, at R == 1 (decode, one fused
 // dispatch for qkv) and R > 1 (prefill / MTP verify, row slices of the fused buffer).
 //
+// And next.md step 5, SpecConfig::tree (HALO_MTP_TREE): the verify forward carries [x, d1..dk, d1']
+// with d1' a second child of x, attended through attention_tree.comp (virtual keys in plain-decode
+// order), and a kept runner-up moves its KV row and GDN ring slot into place. Greedy output and
+// the committed state must equal plain decoding exactly, whichever branch wins.
+//
 // None of them may change what greedy decoding emits: with each flag (and combined), for k = 1..3,
 // the drafts of every tick must equal the per-depth host path's drafts bit for bit, the emitted
 // tokens must equal plain greedy decoding (MTP off), and the sequence state (trunk KV, GDN state,
@@ -22,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -69,8 +75,8 @@ struct VkModel {
         kv_pool = std::make_unique<KvPool>(model->kv_layout(), k_blocks);
         mtp_pool = std::make_unique<KvPool>(model->mtp_kv_layout(), k_blocks);
     }
-    [[nodiscard]] std::unique_ptr<SequenceState> seq() const {
-        return std::make_unique<SequenceState>(*kv_pool, mtp_pool.get(), model->gdn_shape(), k_slots);
+    [[nodiscard]] std::unique_ptr<SequenceState> seq(std::size_t slots = k_slots) const {
+        return std::make_unique<SequenceState>(*kv_pool, mtp_pool.get(), model->gdn_shape(), slots);
     }
     [[nodiscard]] Speculator spec(GateMode mode, bool device_hidden, bool chain) const {
         SpecConfig c;
@@ -78,6 +84,17 @@ struct VkModel {
         c.gate.mode = mode;
         c.device_hidden = device_hidden;
         c.chain = chain;
+        return Speculator(*model, c);
+    }
+    /// Tree verification on (next.md step 5); the sequence needs max_draft + 2 GDN slots for the leaf.
+    /// chain stays off explicitly: HALO_MTP_CHAIN drafts yield no runner-up, so tree_ok refuses them.
+    [[nodiscard]] Speculator spec_tree(std::size_t max_draft, bool device_hidden) const {
+        SpecConfig c;
+        c.max_draft = max_draft;
+        c.gate.mode = GateMode::Always;
+        c.device_hidden = device_hidden;
+        c.chain = false;
+        c.tree = true;
         return Speculator(*model, c);
     }
 };
@@ -124,6 +141,26 @@ SpecRun generate(Speculator& sp, SequenceState& s, std::span<const std::int32_t>
         run.tokens.insert(run.tokens.end(), t.out[0].tokens.begin(), t.out[0].tokens.end());
     }
     return run;
+}
+
+/// Plain decode of `toks` one at a time (the reference history); returns the argmaxes.
+Toks feed_plain(Speculator& sp, SequenceState& s, std::span<const std::int32_t> toks) {
+    Toks out;
+    for (const std::int32_t t : toks) {
+        StepRequest r;
+        r.seq = &s;
+        r.token = t;
+        out.push_back(step1(sp, r).out.at(0).tokens.at(0));
+    }
+    return out;
+}
+
+/// Prefill `p` (the first generated token is discarded: the caller already knows it).
+void prefill(Speculator& sp, SequenceState& s, std::span<const std::int32_t> p) {
+    StepRequest r;
+    r.seq = &s;
+    r.prefill = p;
+    (void)step1(sp, r);
 }
 
 /// The sequence's K and V rows [0, length) of every layer. The pool is device-resident on Vulkan,
@@ -314,5 +351,157 @@ TEST_F(VulkanSpec, FusedProjectionsAreBitwiseTheSeparateGemvs) {
                 expect_same_state(sb, *qb, sa, *qa, std::string("fused ") + fu.spec + " vs separate");
             }
         }
+    }
+}
+
+// ---- next.md step 5: tree verification (SpecConfig::tree, HALO_MTP_TREE) on the device -------
+
+// Greedy generation with trees on (real MTP drafts plus their runner-up leaves) equals plain greedy
+// decoding, token for token and state for state, for k = 1..3, with the host or device hidden. On
+// this random tiny model the chain is almost always rejected at d1, so most ticks also test whether
+// the runner-up d1' is the trunk's argmax: either way the leaf row went through attention_tree.comp.
+TEST_F(VulkanSpec, TreeGreedyEqualsPlainGreedy) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel vk(ctx, *nm_, /*reuse=*/false);
+    ASSERT_TRUE(vk.model->has_mtp()) << "tiny-f32.gguf has no MTP head";
+    ASSERT_EQ(vk.kv_pool->layout().type, hb::KvType::F32) << "attention_tree.comp is fp32-only: tree_ok refuses other KV";
+    for (const char* p : {"p0", "p1", "p2"}) {
+        SCOPED_TRACE(p);
+        const Toks pr = prompt(p);
+        auto off = vk.spec(GateMode::Off, false, false);
+        auto so = vk.seq();
+        const SpecRun plain = generate(off, *so, pr, k_tokens, 0);
+        ASSERT_EQ(plain.tokens.size(), k_tokens);
+        for (const bool dh : {false, true}) {
+            for (std::size_t k = 1; k <= 3; ++k) {
+                SCOPED_TRACE(std::string(dh ? "device_hidden" : "host hidden") + " k=" + std::to_string(k));
+                auto on = vk.spec_tree(k, dh);
+                ASSERT_TRUE(on.config().tree);
+                ASSERT_FALSE(*on.config().chain) << "explicit chain = false must override HALO_MTP_CHAIN";
+                auto s = vk.seq(k + 2);
+                const SpecRun got = generate(on, *s, pr, k_tokens, k);
+                EXPECT_EQ(got.tokens, plain.tokens) << "tree greedy " << str(got.tokens) << " != plain " << str(plain.tokens);
+                EXPECT_GT(on.metrics().tree_steps, 0u) << "no tick verified a tree on Vulkan (tree_ok refused?)";
+                expect_same_state(on, *s, off, *so, "tree vs plain");
+                std::printf("[%s %s k=%zu] ticks %zu, tree steps %llu, leaf kept %llu, accepted %llu\n", p,
+                            dh ? "dh" : "host", k, got.drafts.size(), static_cast<unsigned long long>(on.metrics().tree_steps),
+                            static_cast<unsigned long long>(on.metrics().tree_leaf_kept),
+                            static_cast<unsigned long long>(on.metrics().accepted));
+            }
+        }
+    }
+    // A ring with no room for the leaf state (k + 1 slots) silently verifies a plain chain, still identical.
+    const Toks pr = prompt("p1");
+    auto off = vk.spec(GateMode::Off, false, false);
+    auto so = vk.seq();
+    const SpecRun plain = generate(off, *so, pr, k_tokens, 0);
+    auto on = vk.spec_tree(2, false);
+    auto s = vk.seq(3);
+    EXPECT_EQ(generate(on, *s, pr, k_tokens, 2).tokens, plain.tokens) << "k + 1 slots: plain-chain fallback";
+    EXPECT_EQ(on.metrics().tree_steps, 0u) << "a tree was verified without a GDN slot for its leaf";
+}
+
+// The runner-up branch on the device: force d1 wrong and d1' == the trunk's true next token. verify
+// must accept the leaf and emit [t0, argmax(leaf row)] -- the leaf row's logits come from
+// attention_tree.comp seeing [history, x, d1'] only -- and commit must leave the sequence
+// bit-identical to plain decoding [x, d1'] (KV row moved from L+k+1 to L+1, GDN state = the leaf's
+// ring slot, hidden of the leaf row). Keeping only x (n_keep = 1) is decode-1.
+TEST_F(VulkanSpec, TreeRunnerUpBranchIsKeptAndEqualsPlainDecode) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel vk(ctx, *nm_, /*reuse=*/false);
+    const std::size_t V = vk.model->n_vocab();
+    for (const char* p : {"p0", "p1"}) {  // p0: 150 tokens, the history crosses KV blocks
+        SCOPED_TRACE(p);
+        const Toks pr = prompt(p);
+        auto off = vk.spec(GateMode::Off, false, false);
+        auto gs = vk.seq();
+        const Toks g = generate(off, *gs, pr, 12, 0).tokens;
+        for (const std::size_t kK : {std::size_t{1}, std::size_t{3}}) {
+            for (const std::size_t keep : {std::size_t{2}, std::size_t{1}}) {
+                SCOPED_TRACE("k=" + std::to_string(kK) + " keep=" + std::to_string(keep));
+                const std::size_t m = 3;  // pending token g[m], history = prompt + g[0..m)
+                auto sp = vk.spec_tree(kK, false);
+                auto s = vk.seq(kK + 2);
+                prefill(sp, *s, pr);
+                (void)feed_plain(sp, *s, std::span(g).first(m));
+                StepRequest q;
+                q.seq = s.get();
+                q.token = g[m];
+                q.max_draft = kK;
+                const std::span<const StepRequest> reqs(&q, 1);
+                Tick t;
+                sp.draft(reqs, t);
+                ASSERT_TRUE(t.seqs.at(0).tree) << "the tree was not armed on Vulkan";
+                ASSERT_EQ(t.out.at(0).drafts.size(), kK);
+                const std::int32_t truth = g[m + 1];
+                t.out[0].drafts[0] = static_cast<std::int32_t>((static_cast<std::size_t>(truth) + 1) % V);  // d1 wrong
+                t.seqs[0].alt = truth;                                                                     // d1' right
+                sp.verify(reqs, t);
+                ASSERT_TRUE(t.seqs[0].alt_win) << "verify did not take the runner-up d1' == " << truth;
+                EXPECT_EQ(t.out[0].accepted, 1u);
+                EXPECT_EQ(t.out[0].n_keep, 2u);
+                EXPECT_EQ(t.out[0].tokens, (Toks{g[m + 1], g[m + 2]}))
+                    << "leaf row argmax (attention_tree.comp) != plain decode's next token";
+                const std::array<std::size_t, 1> nk = {keep};
+                sp.commit(reqs, t, keep == 2 ? std::span<const std::size_t>() : std::span<const std::size_t>(nk));
+                EXPECT_EQ(s->length(), pr.size() + m + keep);
+                EXPECT_EQ(sp.metrics().tree_leaf_kept, keep == 2 ? 1u : 0u);
+                auto ref = vk.seq();
+                auto off2 = vk.spec(GateMode::Off, false, false);
+                prefill(off2, *ref, pr);
+                (void)feed_plain(off2, *ref, std::span(g).first(m + keep));  // x, and d1' == g[m+1] when kept
+                expect_same_state(sp, *s, off2, *ref, "kept leaf vs plain decode");
+                // The next tick continues correctly from the committed state.
+                StepRequest q2;
+                q2.seq = s.get();
+                q2.token = keep == 2 ? g[m + 2] : g[m + 1];
+                q2.max_draft = kK;
+                const Tick t2 = step1(sp, q2);
+                EXPECT_EQ(t2.out.at(0).tokens.at(0), keep == 2 ? g[m + 3] : g[m + 2]) << "tick after the commit";
+            }
+        }
+    }
+}
+
+// The runner-up is never kept when it would be wrong: d1 right (the chain wins, all k + 1 tokens
+// kept), or d1 and d1' both wrong (one token, plain decode).
+TEST_F(VulkanSpec, TreeChainWinsOrBothWrongEqualsPlainDecode) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel vk(ctx, *nm_, /*reuse=*/false);
+    const std::size_t V = vk.model->n_vocab();
+    constexpr std::size_t kK = 2;
+    const Toks pr = prompt("p1");
+    auto off = vk.spec(GateMode::Off, false, false);
+    auto gs = vk.seq();
+    const Toks g = generate(off, *gs, pr, k_tokens, 0).tokens;
+    const std::size_t m = 4;
+    for (const bool chain_right : {true, false}) {
+        SCOPED_TRACE(chain_right ? "chain right" : "both wrong");
+        auto sp = vk.spec_tree(kK, false);
+        auto s = vk.seq(kK + 2);
+        prefill(sp, *s, pr);
+        (void)feed_plain(sp, *s, std::span(g).first(m));
+        StepRequest q;
+        q.seq = s.get();
+        q.token = g[m];
+        q.max_draft = kK;
+        const std::span<const StepRequest> reqs(&q, 1);
+        Tick t;
+        sp.draft(reqs, t);
+        ASSERT_TRUE(t.seqs.at(0).tree);
+        Toks d(g.begin() + static_cast<std::ptrdiff_t>(m + 1), g.begin() + static_cast<std::ptrdiff_t>(m + 1 + kK));
+        if (!chain_right) d[0] = static_cast<std::int32_t>((static_cast<std::size_t>(d[0]) + 1) % V);
+        t.out.at(0).drafts = d;
+        t.seqs[0].alt = static_cast<std::int32_t>((static_cast<std::size_t>(g[m + 1]) + 2) % V);  // wrong, distinct from a forged d1
+        sp.verify(reqs, t);
+        EXPECT_FALSE(t.seqs[0].alt_win) << "a wrong runner-up was kept";
+        sp.commit(reqs, t);
+        const std::size_t kept = chain_right ? kK + 1 : 1;
+        EXPECT_EQ(t.out[0].tokens, Toks(g.begin() + static_cast<std::ptrdiff_t>(m + 1), g.begin() + static_cast<std::ptrdiff_t>(m + 1 + kept)));
+        auto ref = vk.seq();
+        auto off2 = vk.spec(GateMode::Off, false, false);
+        prefill(off2, *ref, pr);
+        (void)feed_plain(off2, *ref, std::span(g).first(m + kept));
+        expect_same_state(sp, *s, off2, *ref, chain_right ? "chain win vs plain" : "both wrong vs plain");
     }
 }
