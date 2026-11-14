@@ -95,7 +95,7 @@ What exllamav2 does, and whether each idea transfers to HALO:
   - This removes the funnel-shift path Q6_K currently needs for its 210 B blocks.
 - **Target:** take the matvecs from ~200 GB/s toward llama.cpp's ~244 GB/s ceiling on this machine.
 - **Pairs with step 1:** repack while rewriting the batched path.
-- **Implemented (opt-in, unmeasured):** `HALO_REPACK=1` repacks the `make_mat` Mats (Q5_K/Q6_K/IQ4_XS, Vulkan only) with `tensor::gemv_repack` (`include/halo/tensor/repack.h` documents the plane layouts) and gemv runs them as Vulkan gemv variant `backend::kGemvRepacked` (shaders `matvec_{q5_k,q6_k,iq4_xs}_rp`; same apply/reduction expression as the raw kernels). Fused-projection buffers (`HALO_FUSE_GEMV`) and tables stay raw. Not yet run on a device: needs a bitwise gate vs the raw kernels, then a decode measurement.
+- **Implemented (opt-in, unmeasured):** `HALO_REPACK=1` repacks the `make_mat` Mats (Q5_K/Q6_K/IQ4_XS, Vulkan only) with `tensor::gemv_repack` (`include/halo/tensor/repack.h` documents the plane layouts) and gemv runs them as Vulkan gemv variant `backend::kGemvRepacked` (shaders `matvec_{q5_k,q6_k,iq4_xs}_rp`; same apply/reduction expression as the raw kernels). Fused-projection buffers (`HALO_FUSE_GEMV`) and tables stay raw. Kernel bitwise gate vs the raw kernels: done on RADV 2026-11-14 (VkHead.GemvRepacked*). Still to do: a model-level check (qwen35 with `HALO_REPACK=1`: greedy tokens equal to raw) and a decode measurement on an idle GPU.
 
 ### 9. Quantized KV cache: fp16, then Q8 or Q4 with group scales
 - HALO stores KV in **fp32**, 64 KiB per token.
@@ -155,7 +155,7 @@ All new paths are opt-in (env flag, default off) except the `stream.cpp` per-dis
 | 5 tokens/tick | `HALO_MTP_TREE=1` (chain + one runner-up leaf); `--mtp-draft 3` needs no code |
 | 6 fusion | `HALO_FUSE_GEMV=1\|all\|ffn,ba,qkv` (gemv-level; SwiGLU/gates not folded into the epilogue). **GPU-verified 2026-11-14 (RADV):** on the tiny f32 model, each form (ffn, ba, qkv) and all three give tokens, MTP drafts (k = 3) and trunk KV / GDN / hidden / MTP KV bit for bit equal to the separate gemvs, at R == 1 (one fused qkv dispatch) and R > 1 (row slices); `Qwen35Options::fuse_gemv` overrides the env per instance and `Qwen35::fused_projections()` reports what loaded (VulkanSpec.FusedProjectionsAreBitwiseTheSeparateGemvs). tok/s not measured (GPU busy) |
 | 7 prefill | `HALO_COOPMAT=1` cooperative-matrix GEMM (q4_k/q5_k/q6_k), chunked-GDN step-6 speedup |
-| 8 repack | `HALO_REPACK=1` |
+| 8 repack | `HALO_REPACK=1`. **GPU-verified 2026-11-14 (RADV):** `Ops::gemv_repacked` over `tensor::gemv_repack` rows is bit for bit the raw-layout tree gemv for Q5_K / Q6_K / IQ4_XS at 1, 3 and 20 blocks per row (padded and unpadded strides), n_vec 1-17, view offsets 0/8/48, with subgroup_reduce on or off (the `_rp` shaders always use the tree reduction), and as row slabs stepping by the repacked stride (VkHead.GemvRepacked*); layout mutants in repack.cpp fail it. Not yet loaded through qwen35 on a device; tok/s not measured (GPU busy) |
 | 9 KV | `HALO_KV_FP16=1` / `HALO_KV_TYPE=q8`; per-layer pool segments (next2.md 2a) |
 | 10 norm fusion | `HALO_FUSE_NORM=1` (FFN gate/up at R==1 only) |
 | 11 n-gram | `HALO_NGRAM_DRAFT=1` |

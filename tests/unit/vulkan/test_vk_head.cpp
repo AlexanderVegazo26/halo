@@ -19,10 +19,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -31,6 +33,7 @@
 #include "halo/backends/vulkan/ops.h"
 #include "halo/core/error.h"
 #include "halo/tensor/quant.h"
+#include "halo/tensor/repack.h"
 #include "reference.h"
 #include "vk_test_util.h"
 
@@ -515,4 +518,156 @@ TEST(VkHead, GemvSplitsWeightsLargerThanOneBindingIntoRowSlabs) {
         ys.push_back(std::move(y));
     }
     for (std::size_t i = 1; i < ys.size(); ++i) EXPECT_TRUE(bitwise(ys[i], ys[0])) << "split run " << i;
+}
+
+// ---------------------------------------------------------------- repacked GEMV (next.md step 8)
+
+TEST(VkHead, GemvRepackedIsBitwiseTheRawGemv) {
+    // HALO_REPACK=1 uploads Q5_K / Q6_K / IQ4_XS Mats in the planar tensor::gemv_repack layout and runs
+    // matvec_<type>_rp (Ops::gemv_repacked). The layout only reorders bytes, so every output must be bit
+    // for bit the raw-layout tree-reduction gemv on the original blocks: the flag cannot change greedy
+    // output. Covered: block counts 1, 3, 20 (row padding 0 or > 0: Q6_K 210 B blocks, IQ4_XS 408 B
+    // rows), n_vec 1..17 (decode, MTP verify, more than one dispatch chunk), view offsets (below), and
+    // subgroup_reduce on (the _rp shaders keep the tree
+    // reduction, so a repacked Mat is bitwise the same with or without HALO_SUBGROUP_REDUCE).
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops tree(ctx, hv::OpsOptions{.subgroup_reduce = false});
+    // View offsets: 48 is 16-aligned but (on most devices) not a multiple of the binding alignment, so the
+    // shader sees a 16-aligned remainder; 8 is accepted where the binding alignment absorbs it (RADV: 4),
+    // because rows only need to start 16-aligned relative to the bound range.
+    std::vector<std::uint64_t> leads{0, 48};
+    if (8 % ctx->info().min_storage_buffer_offset_alignment == 0) leads.push_back(8);
+    for (const bool sg : {false, true}) {
+        hv::Ops ops(ctx, hv::OpsOptions{.subgroup_reduce = sg});
+        SCOPED_TRACE(sg ? "Ops with subgroup_reduce on" : "Ops with subgroup_reduce off");
+        for (const ref::WType t : {ref::WType::Q5_K, ref::WType::Q6_K, ref::WType::IQ4_XS}) {
+            const halo::DType dt = ref::dtype(t);
+            for (const std::uint32_t cols : {256u, 768u, 5120u}) {
+                const std::uint32_t rows = 37;
+                std::mt19937 rng(static_cast<unsigned>(t) * 1000 + cols);
+                const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+                const std::size_t rb = halo::tensor::row_bytes(dt, cols);
+                const std::size_t stride = halo::tensor::gemv_repack_row_stride(dt, cols);
+                ASSERT_EQ(stride % 16, 0u) << tname(t) << " cols " << cols << ": repacked row stride " << stride;
+                ASSERT_GE(stride, rb) << tname(t) << " cols " << cols;
+                hv::Buffer braw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+                for (const std::uint64_t lead : leads) {
+                    std::vector<std::byte> packed(lead + rows * stride, std::byte{0xA5});
+                    halo::tensor::gemv_repack(dt, std::as_bytes(std::span(w.bytes)).first(rows * rb), rows, cols,
+                                              std::span(packed).subspan(lead));
+                    const std::span<const std::uint8_t> packed_u8(reinterpret_cast<const std::uint8_t*>(packed.data()),
+                                                                  packed.size());
+                    hv::Buffer brp = upload(ctx, packed_u8);
+                    const hv::BufferView wrp(brp, lead, (rows - 1) * stride + rb, stride);
+                    for (const std::uint32_t n_vec : {1u, 3u, 8u, 17u}) {
+                        const std::string what = std::string(tname(t)) + " cols " + std::to_string(cols) + " n_vec " +
+                                                 std::to_string(n_vec) + " view offset " + std::to_string(lead) +
+                                                 (sg ? " (sg Ops)" : "");
+                        SCOPED_TRACE(what);
+                        std::vector<float> x;
+                        for (std::uint32_t v = 0; v < n_vec; ++v) {
+                            const auto xv = ref::random_vec(cols, rng);
+                            x.insert(x.end(), xv.begin(), xv.end());
+                        }
+                        hv::Buffer bx = upload(ctx, std::span<const float>(x));
+                        const std::uint64_t ybytes = std::uint64_t{n_vec} * rows * 4;
+                        hv::Buffer yraw = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
+                        hv::Buffer yrp = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
+                        hv::Stream s(ctx);
+                        tree.gemv(s, hv::GemvArgs{dt, braw, bx, yraw, rows, cols, n_vec});
+                        ops.gemv_repacked(s, hv::GemvArgs{dt, wrp, bx, yrp, rows, cols, n_vec});
+                        s.submit_and_wait();
+                        const auto a = download<float>(yraw, std::size_t{n_vec} * rows);
+                        const auto b = download<float>(yrp, std::size_t{n_vec} * rows);
+                        std::size_t diff = 0, first = a.size();
+                        for (std::size_t i = 0; i < a.size(); ++i) {
+                            if (std::memcmp(&a[i], &b[i], 4) != 0) {
+                                ++diff;
+                                first = std::min(first, i);
+                            }
+                        }
+                        EXPECT_EQ(diff, 0u) << what << ": " << diff << " of " << a.size()
+                                            << " outputs differ from the raw gemv; first at vector " << first / rows
+                                            << " row " << first % rows << ": raw "
+                                            << (first < a.size() ? a[first] : 0.0f) << " repacked "
+                                            << (first < b.size() ? b[first] : 0.0f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(VkHead, GemvRepackedSplitsIntoRowSlabsAtTheRepackedStride) {
+    // A repacked W larger than one binding runs as row slabs stepping by the repacked stride (not the
+    // GGUF row size): the split result stays bitwise the unsplit one and the raw gemv.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const std::uint32_t rows = 29, cols = 512, n_vec = 3;
+    const halo::DType dt = halo::DType::Q6_K;  // 420 B rows, 432 B repacked stride
+    std::mt19937 rng(77);
+    const ref::Weights w = ref::random_weights(ref::WType::Q6_K, rows, cols, rng, 14);
+    const std::size_t rb = halo::tensor::row_bytes(dt, cols);
+    const std::size_t stride = halo::tensor::gemv_repack_row_stride(dt, cols);
+    ASSERT_NE(stride, rb) << "this case needs row padding";
+    std::vector<std::byte> packed(rows * stride);
+    halo::tensor::gemv_repack(dt, std::as_bytes(std::span(w.bytes)).first(rows * rb), rows, cols, packed);
+    std::vector<float> x;
+    for (std::uint32_t v = 0; v < n_vec; ++v) {
+        const auto xv = ref::random_vec(cols, rng);
+        x.insert(x.end(), xv.begin(), xv.end());
+    }
+    hv::Buffer braw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+    hv::Buffer brp =
+        upload(ctx, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(packed.data()), packed.size()));
+    hv::Buffer bx = upload(ctx, std::span<const float>(x));
+    const std::size_t n = std::size_t{n_vec} * rows;
+    std::vector<float> want;
+    {
+        hv::Ops tree(ctx, hv::OpsOptions{.subgroup_reduce = false});
+        hv::Buffer by = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+        hv::Stream s(ctx);
+        tree.gemv(s, hv::GemvArgs{dt, braw, bx, by, rows, cols, n_vec});
+        s.submit_and_wait();
+        want = download<float>(by, n);
+    }
+    for (const std::uint64_t limit : {std::uint64_t{0}, std::uint64_t{3000}, std::uint64_t{1000}}) {
+        hv::OpsOptions o;
+        o.max_binding_bytes = limit;
+        hv::Ops ops(ctx, o);
+        hv::Buffer by = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+        hv::Stream s(ctx);
+        ops.gemv_repacked(s, hv::GemvArgs{dt, hv::BufferView(brp, 0, (rows - 1) * stride + rb, stride), bx, by, rows,
+                                          cols, n_vec});
+        if (limit != 0) EXPECT_GT(s.dispatch_count(), 1u) << "max_binding_bytes " << limit << ": W was not split";
+        s.submit_and_wait();
+        EXPECT_TRUE(bitwise(download<float>(by, n), want)) << "max_binding_bytes " << limit << ": repacked != raw gemv";
+    }
+}
+
+TEST(VkHead, GemvRepackedRejectsUnsupportedTypesAndMisalignedRows) {
+    // Repacked bytes are not GGUF blocks: gemv_repacked never falls back to the raw kernels, it throws.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    const std::uint32_t rows = 4, cols = 256;
+    const std::uint64_t stride = halo::tensor::gemv_repack_row_stride(halo::DType::Q5_K, cols);  // 176
+    hv::Buffer w = hv::Buffer::create(ctx, 1024 + rows * 224, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer x = hv::Buffer::create(ctx, cols * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer y = hv::Buffer::create(ctx, rows * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx);
+    const auto args = [&](halo::DType t, std::uint64_t off, std::uint64_t st) {
+        return hv::GemvArgs{t, hv::BufferView(w, off, (rows - 1) * st + halo::tensor::row_bytes(t, cols), st), x, y,
+                            rows, cols, 1};
+    };
+    EXPECT_NO_THROW(ops.gemv_repacked(s, args(halo::DType::Q5_K, 16, stride)));
+    EXPECT_THROW(ops.gemv_repacked(s, args(halo::DType::Q4_K, 0, 144)), halo::Error) << "Q4_K has no repacked layout";
+    // Rows must start 16-aligned relative to the bound range: the view offset's remainder past the binding
+    // alignment. A remainder of 4 can only be produced where that alignment is larger than 4.
+    const std::uint64_t align = ctx->info().min_storage_buffer_offset_alignment;
+    if (align > 4) {
+        EXPECT_THROW(ops.gemv_repacked(s, args(halo::DType::Q5_K, align + 4, stride)), halo::Error)
+            << "view offset " << align + 4 << " leaves a 4-byte remainder past the binding alignment " << align;
+    }
+    EXPECT_THROW(ops.gemv_repacked(s, args(halo::DType::Q5_K, 0, stride + 8)), halo::Error)
+        << "row stride 184 is not 16-aligned";
+    s.submit_and_wait();
 }

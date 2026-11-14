@@ -581,9 +581,12 @@ public:
     /// [QUANT_GEMV / MATMUL] batched; see GemvArgs. matvec() is gemv with n_vec = 1.
     void gemv(Stream& stream, const GemvArgs& args);
     /// [QUANT_GEMV / MATMUL] over W in the planar layout of tensor::gemv_repack (halo/tensor/repack.h):
-    /// wtype in {Q5_K, Q6_K, IQ4_XS}, W rows args.w.row_stride bytes apart (a multiple of 16; the
-    /// view offset must be 16-aligned too), runs matvec_<type>_rp. Bitwise equal to gemv() on the
-    /// original blocks. Never falls back to the raw-layout kernels: bad alignment or type throws.
+    /// wtype in {Q5_K, Q6_K, IQ4_XS}, W rows args.w.row_stride bytes apart (a multiple of 16), runs
+    /// matvec_<type>_rp. Rows must start 16-aligned relative to the bound range: the view offset's
+    /// remainder past minStorageBufferOffsetAlignment must be a multiple of 16 (on RADV, alignment 4,
+    /// any 4-aligned offset binds at remainder 0). Always the tree reduction, so bitwise equal to gemv()
+    /// on the original blocks with subgroup_reduce off, whatever this Ops' subgroup_reduce is
+    /// (VkHead.GemvRepacked*). Never falls back to the raw-layout kernels: bad alignment or type throws.
     void gemv_repacked(Stream& stream, const GemvArgs& args);
     /// [LOGITS_MATMUL + ARGMAX] see LmHeadArgs.
     void lm_head(Stream& stream, const LmHeadArgs& args);
