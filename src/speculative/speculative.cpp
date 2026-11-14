@@ -133,7 +133,10 @@ std::int32_t runner_up(std::span<const float> logits, std::int32_t best) {
 }  // namespace
 
 Speculator::Speculator(const models::Qwen35& model, SpecConfig cfg)
-    : model_(&model), cfg_(cfg), cost_(CostModel::from(model)), gate_(cfg.gate, cost_.plain_step()) {}
+    : model_(&model), cfg_(cfg), cost_(CostModel::from(model)), gate_(cfg.gate, cost_.plain_step()) {
+    if (!cfg_.device_hidden) cfg_.device_hidden = device_hidden_enabled();
+    if (!cfg_.chain) cfg_.chain = chain_enabled();
+}
 
 std::size_t usable_drafts(std::span<const std::int32_t> drafts) noexcept {
     const auto bad = std::ranges::find_if(drafts, [](std::int32_t d) { return d < 0; });
@@ -150,7 +153,7 @@ bool tree_env_enabled() {
 
 bool Speculator::tree_ok(const StepRequest& r, std::size_t k) const {
     if (!cfg_.tree || k == 0 || !is_decode(r) || !r.greedy || !r.forced_drafts.empty() || r.max_emit < 2) return false;
-    if (chain_enabled()) return false;  // HALO_MTP_CHAIN drafts through mtp_draft_chain, which yields no runner-up
+    if (cfg_.chain.value_or(false)) return false;  // HALO_MTP_CHAIN drafts through mtp_draft_chain, which yields no runner-up
     if (k + 2 > cpu::kMaxTreeRows || !r.seq->gdn.fits_tree_leaf(k + 1)) return false;
     if (r.seq->kv.pool().layout().type != backend::KvType::F32) return false;  // attention_tree.comp is fp32-only
     const backend::Kind kind = model_->backend().kind();
@@ -210,8 +213,8 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         toks.push_back(std::move(t));
         hid.push_back(std::move(h));
     }
-    const bool dev_hidden = device_hidden_enabled();
-    const bool chained = chain_enabled() && model_->backend().limits().lm_head_ids;
+    const bool dev_hidden = cfg_.device_hidden.value_or(false);
+    const bool chained = cfg_.chain.value_or(false) && model_->backend().limits().lm_head_ids;
     try {
         if (!idx.empty()) {
             std::vector<MtpStep> steps(idx.size());

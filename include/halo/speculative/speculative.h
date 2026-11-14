@@ -66,6 +66,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -162,6 +163,11 @@ struct SpecConfig {
     /// Opt-in tree verification (HALO_MTP_TREE=1; the engine sets this from tree_env_enabled()):
     /// verify the top-2 depth-1 candidates in ONE trunk forward. See "Tree verification" above.
     bool tree = false;
+    /// next.md step 4 host round-trips. nullopt = the env vars HALO_MTP_DEVICE_HIDDEN / HALO_MTP_CHAIN
+    /// (read once, default off), as before; the Speculator resolves both at construction, so
+    /// config() reports what runs. Set them to test every path in one process.
+    std::optional<bool> device_hidden = std::nullopt;  ///< MTP hidden stays on the device between draft depths
+    std::optional<bool> chain = std::nullopt;          ///< all draft depths in one submit (needs Limits::lm_head_ids)
 };
 
 /// True when the environment variable HALO_MTP_TREE is set to something other than "" / "0"

@@ -196,6 +196,10 @@ struct Qwen35Options {
     /// GGUF LM-head row count. 0 = no clamp (the head's full row count is the vocabulary).
     /// Excludes padded rows from the fused greedy argmax; never affects full logits output.
     std::size_t valid_vocab = 0;
+    /// next.md step 4: keep a small pool of backend streams instead of creating one per forward.
+    /// nullopt = the HALO_STREAM_REUSE env var (default off), as before; set it to test both paths
+    /// in one process.
+    std::optional<bool> reuse_streams = std::nullopt;
 };
 
 class Qwen35 {
@@ -214,6 +218,8 @@ public:
     ~Qwen35();
     Qwen35(const Qwen35&) = delete;
     Qwen35& operator=(const Qwen35&) = delete;
+    /// Whether forwards reuse pooled streams (Qwen35Options::reuse_streams, else HALO_STREAM_REUSE).
+    [[nodiscard]] bool reuse_streams() const noexcept;
 
     [[nodiscard]] const model::Qwen35HParams& hparams() const noexcept;
     [[nodiscard]] const model::NormalizedModel& model() const noexcept { return *model_; }
