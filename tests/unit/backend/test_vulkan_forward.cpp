@@ -38,6 +38,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -132,7 +133,8 @@ struct Worst {
 
 class Diff {
 public:
-    Diff(Side& vk, Side& cpu, hm::GdnPath path) : vk_(vk), cpu_(cpu), path_(path) {}
+    /// tau: the relative L2 bound (k_tau for the fp32 forward); near-ties are margins within 10 tau x max|logit|.
+    Diff(Side& vk, Side& cpu, hm::GdnPath path, double tau = k_tau) : vk_(vk), cpu_(cpu), path_(path), tau_(tau) {}
 
     /// make(Side&) -> steps over that side's sequences; runs both and compares everything.
     template <class Make>
@@ -201,7 +203,7 @@ private:
 
     void check(const std::string& what, double r) {
         worst_.add(r, what);
-        EXPECT_LE(r, k_tau) << what << ": relative L2 " << r;
+        EXPECT_LE(r, tau_) << what << ": relative L2 " << r << " (tau " << tau_ << ")";
     }
 
     void compare_results(const std::string& what, const hm::StepResult& rv, const hm::StepResult& rc,
@@ -233,7 +235,7 @@ private:
                     std::partial_sort(l.begin(), l.begin() + 2, l.end(), std::greater<>());
                     double mx = 0;
                     for (float x : l) mx = std::max(mx, std::abs(double(x)));
-                    near_tie = double(l[0]) - double(l[1]) <= 1e-3 * mx;
+                    near_tie = double(l[0]) - double(l[1]) <= 10 * tau_ * mx;
                 }
                 if (near_tie) {
                     ++near_ties;
@@ -278,6 +280,7 @@ private:
     Side& vk_;
     Side& cpu_;
     hm::GdnPath path_;
+    double tau_;
     Worst worst_;
 };
 
@@ -299,22 +302,19 @@ struct Case {
 void PrintTo(const Case& c, std::ostream* os) { *os << c.file << (c.path == hm::GdnPath::Recurrent ? " recurrent" : " chunked"); }
 
 class VulkanForward : public ::testing::TestWithParam<Case> {};
+class VulkanCoopmatForward : public ::testing::TestWithParam<Case> {};
 
-}  // namespace
+/// A Vulkan context with the cooperative-matrix prefill GEMM explicitly on or off (never the env).
+std::shared_ptr<halo::vulkan::Context> vk_context(bool coopmat) {
+    halo::vulkan::ContextOptions o;
+    o.coopmat = coopmat;
+    return halo::vulkan::Context::create(o);
+}
 
-TEST_P(VulkanForward, MatchesCpuBackend) {
-    HALO_VK_CONTEXT_OR_SKIP(ctx);
-    const Case& c = GetParam();
-    const auto p = halo::test::tiny_dir() / c.file;
-    if (!std::filesystem::exists(p)) GTEST_SKIP() << "tiny model missing: " << p;
-    const auto nm = halo::model::NormalizedModel::load(p);
-    if (const std::string t = unsupported_type(nm); !t.empty()) {
-        GTEST_SKIP() << c.file << ": weight type " << t << " is not implemented by the Vulkan backend";
-    }
-    Side vk(hb::make_vulkan_backend(ctx), nm);
-    Side cpu(hb::make_cpu_backend(nullptr), nm);
+/// The ADR §6.3 operation sequence on both sides, every result and state compared within `tau`.
+void run_scenario(Side& vk, Side& cpu, const Case& c, double tau, const char* label) {
     const std::size_t V = vk.model->n_vocab();
-    Diff d(vk, cpu, c.path);
+    Diff d(vk, cpu, c.path, tau);
     const bool chunked = c.path != hm::GdnPath::Recurrent;
 
     // 1. Prefill 70 rows on seq 0 (GDN chunk 64 + partial, KV blocks of 16 + partial).
@@ -374,9 +374,18 @@ TEST_P(VulkanForward, MatchesCpuBackend) {
         vk.model->forward(sv, rv);
         cpu.model->forward(sc, rc);
         ASSERT_EQ(rv.seqs[0].argmax.size(), 1u);
-        EXPECT_EQ(rv.seqs[0].argmax[0].index, rc.seqs[0].argmax[0].index) << "decode after rollback";
-        EXPECT_LE(rel_l2(rv.seqs[0].hidden, rc.seqs[0].hidden), k_tau) << "decode after rollback hidden";
-        EXPECT_LE(rel_l2(rv.seqs[0].logits, rc.seqs[0].logits), k_tau) << "decode after rollback logits";
+        if (rv.seqs[0].argmax[0].index != rc.seqs[0].argmax[0].index) {
+            std::vector<float> l = rc.seqs[0].logits;
+            std::partial_sort(l.begin(), l.begin() + 2, l.end(), std::greater<>());
+            double mx = 0;
+            for (float x : l) mx = std::max(mx, std::abs(double(x)));
+            EXPECT_LE(double(l[0]) - double(l[1]), 10 * tau * mx)
+                << "decode after rollback: vk token " << rv.seqs[0].argmax[0].index << " != cpu token " << rc.seqs[0].argmax[0].index
+                << " and the cpu top-2 margin is not a near-tie";
+            ++d.near_ties;
+        }
+        EXPECT_LE(rel_l2(rv.seqs[0].hidden, rc.seqs[0].hidden), tau) << "decode after rollback hidden";
+        EXPECT_LE(rel_l2(rv.seqs[0].logits, rc.seqs[0].logits), tau) << "decode after rollback logits";
         hv_ = rv.seqs[0].hidden;
         hc_ = rc.seqs[0].hidden;
     }
@@ -387,9 +396,137 @@ TEST_P(VulkanForward, MatchesCpuBackend) {
         d.mtp("mtp", tm, hv_, hc_, 0, static_cast<std::int32_t>(vk.seqs[0]->kv.length()));
     }
 
-    std::cout << "[vk-forward] " << c.file << (chunked ? " chunked" : " recurrent") << ": worst relative L2 = " << d.worst().v
-              << " (" << d.worst().where << "), near-ties " << d.near_ties << ", tau = " << k_tau << "\n";
+    std::cout << "[" << label << "] " << c.file << (chunked ? " chunked" : " recurrent") << ": worst relative L2 = " << d.worst().v
+              << " (" << d.worst().where << "), near-ties " << d.near_ties << ", tau = " << tau << "\n";
 }
+
+/// Loads c.file, or skips (missing, or a weight type the Vulkan backend lacks).
+std::optional<halo::model::NormalizedModel> load_case(const Case& c) {
+    const auto p = halo::test::tiny_dir() / c.file;
+    if (!std::filesystem::exists(p)) {
+        std::cout << "tiny model missing: " << p << "\n";
+        return std::nullopt;
+    }
+    auto nm = halo::model::NormalizedModel::load(p);
+    if (const std::string t = unsupported_type(nm); !t.empty()) {
+        std::cout << c.file << ": weight type " << t << " is not implemented by the Vulkan backend\n";
+        return std::nullopt;
+    }
+    return nm;
+}
+
+/// The scenario's 70-row prefill alone on seq 0 (hidden + full logits of the last row).
+hm::StepResult prefill70(Side& s, hm::GdnPath path) {
+    const auto t0 = tokens(70, s.model->n_vocab(), 1);
+    const std::vector<std::size_t> last{69};
+    std::vector<hm::SeqStep> st{hm::SeqStep{t0, {}, &s.seqs[0]->kv, &s.seqs[0]->gdn, last, hm::LogitsMode::Full, true, 0, path}};
+    hm::StepResult r;
+    s.model->forward(st, r);
+    return r;
+}
+
+/// A trunk layer gemv weight of a type the matmul_cm_* GEMM covers (Q4_K / Q5_K / Q6_K, Ops::gemv_impl).
+bool has_kquant_gemv(const halo::model::NormalizedModel& m) {
+    const auto kq = [](const halo::model::WeightRef* r) {
+        const halo::DType t = r->type();
+        return r->present() && (t == halo::DType::Q4_K || t == halo::DType::Q5_K || t == halo::DType::Q6_K);
+    };
+    for (const auto& l : m.layers()) {
+        for (const auto* r : {&l.ffn_gate, &l.ffn_up, &l.ffn_down})
+            if (kq(r)) return true;
+        if (l.kind == halo::model::LayerKind::FullAttention) {
+            for (const auto* r : {&l.attn.q, &l.attn.k, &l.attn.v, &l.attn.output})
+                if (kq(r)) return true;
+        } else {
+            for (const auto* r : {&l.gdn.qkv, &l.gdn.gate, &l.gdn.beta, &l.gdn.alpha, &l.gdn.out})
+                if (kq(r)) return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+// next.md step 7 at model level: the VkHead.Coopmat* kernel gate holds matmul_cm_* to the fp16-product bound,
+// but no test had run a model forward with the GEMM on (HALO_COOPMAT=1 failed MatchesCpuBackend's fp32
+// tau = 1e-4: 1e-3..3.5e-3 on tiny-q6_k). Pass condition, from the fp16 rounding model (not fitted to those numbers):
+//   - every compared tensor within tau_cm = 1e-2 relative L2 of the CPU forward. Derivation: the GEMM rounds
+//     x and the dequantized W to fp16 (RNE, u_h = 2^-11 ~ 4.9e-4), so each product is off by <= 2 u_h and a
+//     gemv output by ~sqrt(2) u_h ~ 7e-4 relative L2 for rows without heavy cancellation; a prefill of the
+//     tiny model runs ~9 layers x ~6 K-quant gemvs, adding as a random walk through scale-invariant norms:
+//     sqrt(54) x 7e-4 ~ 5e-3 -> tau_cm = 1e-2 (2x). Decode / verify rows (n_vec <= 8) keep the fp32 matvec,
+//     but read the KV and GDN state the prefill left, so they are held to the same bound.
+//   - argmax equal unless the CPU top-2 margin is within 10 tau_cm x max|logit| (near-ties are printed).
+//   - the GEMM ran: the coopmat prefill is not bit for bit the fp32-matvec prefill on the same device.
+// tiny-q6_k (66 Q6_K + 6 Q8_0 tensors) and tiny-iq4_xs (IQ4_XS / IQ4_NL plus one Q5_K layer weight, as llama.cpp
+// mixes it, so the GEMM runs on that one gemv only);
+// tiny-q4_k_m / tiny-q5_k_m carry Q5_0 / Q5_1 tensors the Vulkan backend cannot load.
+TEST_P(VulkanCoopmatForward, StaysWithinTheFp16BoundOfTheCpuForward) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto on = vk_context(true);
+    if (!on->coopmat_enabled()) GTEST_SKIP() << "device '" << on->info().name << "' lacks cooperative matrices";
+    const Case& c = GetParam();
+    const auto nm = load_case(c);
+    if (!nm) GTEST_SKIP() << c.file << " missing or not loadable over Vulkan (see output)";
+    ASSERT_TRUE(has_kquant_gemv(*nm)) << c.file << " has no Q4_K / Q5_K / Q6_K layer weight: the GEMM would never run";
+    constexpr double k_tau_cm = 1e-2;
+    {
+        Side vk(hb::make_vulkan_backend(on), *nm);
+        Side cpu(hb::make_cpu_backend(nullptr), *nm);
+        run_scenario(vk, cpu, c, k_tau_cm, "vk-coopmat-forward");
+    }
+    // The GEMM really ran: same device, coopmat off, same prefill -> different bits.
+    Side cm(hb::make_vulkan_backend(on), *nm);
+    Side mv(hb::make_vulkan_backend(vk_context(false)), *nm);
+    const hm::StepResult a = prefill70(cm, c.path), b = prefill70(mv, c.path);
+    ASSERT_EQ(a.seqs.size(), 1u);
+    ASSERT_EQ(b.seqs.size(), 1u);
+    EXPECT_FALSE(a.seqs[0].hidden == b.seqs[0].hidden && a.seqs[0].logits == b.seqs[0].logits)
+        << c.file << ": the coopmat prefill is bit for bit the fp32 matvec prefill, so matmul_cm_* never ran";
+    std::cout << "[vk-coopmat-forward] " << c.file << " coopmat vs fp32 matvec prefill logits relative L2 = "
+              << rel_l2(a.seqs[0].logits, b.seqs[0].logits) << "\n";
+}
+
+// The other half of the gate: a model with no K-quant gemv (tiny-q8_0) never takes the GEMM, so coopmat on
+// must leave its prefill (hidden, logits, trunk KV) bit for bit the fp32 matvec prefill.
+TEST(VulkanCoopmatGate, ModelsWithoutKQuantGemvsAreBitwiseUnchanged) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto on = vk_context(true);
+    if (!on->coopmat_enabled()) GTEST_SKIP() << "device '" << on->info().name << "' lacks cooperative matrices";
+    const Case c{"tiny-q8_0.gguf", hm::GdnPath::Auto};
+    const auto nm = load_case(c);
+    if (!nm) GTEST_SKIP() << c.file << " missing or not loadable over Vulkan (see output)";
+    ASSERT_FALSE(has_kquant_gemv(*nm)) << c.file << " now has K-quant layer weights: pick a model without them";
+    Side cm(hb::make_vulkan_backend(on), *nm);
+    Side mv(hb::make_vulkan_backend(vk_context(false)), *nm);
+    const hm::StepResult a = prefill70(cm, c.path), b = prefill70(mv, c.path);
+    ASSERT_EQ(a.seqs.size(), 1u);
+    ASSERT_EQ(b.seqs.size(), 1u);
+    EXPECT_TRUE(a.seqs[0].hidden == b.seqs[0].hidden) << c.file << ": coopmat on changed the prefill hidden";
+    EXPECT_TRUE(a.seqs[0].logits == b.seqs[0].logits) << c.file << ": coopmat on changed the prefill logits";
+    EXPECT_TRUE(cm.kv_pool->read_all() == mv.kv_pool->read_all()) << c.file << ": coopmat on changed the trunk KV";
+}
+
+// The fp32 forward: the context pins the cooperative-matrix GEMM off, so HALO_COOPMAT in the environment
+// cannot swap in the fp16 prefill this tau = 1e-4 bound was not derived for (VulkanCoopmatForward is its gate).
+TEST_P(VulkanForward, MatchesCpuBackend) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto ctx = vk_context(false);
+    const Case& c = GetParam();
+    const auto nm = load_case(c);
+    if (!nm) GTEST_SKIP() << c.file << " missing or not loadable over Vulkan (see output)";
+    Side vk(hb::make_vulkan_backend(ctx), *nm);
+    Side cpu(hb::make_cpu_backend(nullptr), *nm);
+    run_scenario(vk, cpu, c, k_tau, "vk-forward");
+}
+
+INSTANTIATE_TEST_SUITE_P(Tiny, VulkanCoopmatForward,
+                         ::testing::Values(Case{"tiny-q6_k.gguf", hm::GdnPath::Recurrent}, Case{"tiny-q6_k.gguf", hm::GdnPath::Auto},
+                                           Case{"tiny-iq4_xs.gguf", hm::GdnPath::Auto}),
+                         [](const auto& info) {
+                             std::string n = info.param.file.substr(5, info.param.file.size() - 10);
+                             return n + (info.param.path == hm::GdnPath::Recurrent ? "_recurrent" : "_chunked");
+                         });
 
 INSTANTIATE_TEST_SUITE_P(Tiny, VulkanForward,
                          ::testing::Values(Case{"tiny-f32.gguf", hm::GdnPath::Recurrent}, Case{"tiny-f32.gguf", hm::GdnPath::Auto},
