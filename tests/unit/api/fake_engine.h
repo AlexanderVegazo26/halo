@@ -35,6 +35,9 @@ struct Script {
     ErrorCode throw_code = ErrorCode::Backend;  ///< Api / Unsupported mimic an engine-side request rejection
     std::optional<runtime::FinishReason> finish;  ///< report this instead of Stop/Length
     std::string error_text;                  ///< GenerateResult::error with finish == Error
+    /// Speculative counters this call reports (GenerateResult fields of the same names).
+    std::size_t draft_tokens = 0, accepted_draft_tokens = 0, ngram_lookups = 0, ngram_hits = 0,
+                ngram_draft_tokens = 0, ngram_accepted_draft_tokens = 0, mtp_fallbacks = 0;
 };
 
 struct RecordedCall {

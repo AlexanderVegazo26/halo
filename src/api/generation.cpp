@@ -247,6 +247,13 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
         const std::size_t tokens_before = out.completion_tokens;
         try {
             result = engine.generate(r, cb);
+            out.draft_tokens += result->draft_tokens;
+            out.accepted_draft_tokens += result->accepted_draft_tokens;
+            out.ngram_lookups += result->ngram_lookups;
+            out.ngram_hits += result->ngram_hits;
+            out.ngram_draft_tokens += result->ngram_draft_tokens;
+            out.ngram_accepted_draft_tokens += result->ngram_accepted_draft_tokens;
+            out.mtp_fallbacks += result->mtp_fallbacks;
         } catch (const std::exception& e) {
             result.reset();
             out.cause = StopCause::Error;
@@ -363,8 +370,6 @@ GenerationOutcome run_generation(runtime::Engine& engine, const GenerationSpec& 
     out.stop_sequence = stopper.matched();
     if (result) {
         out.decode_tps = result->decode_tps;
-        out.draft_tokens = result->draft_tokens;
-        out.accepted_draft_tokens = result->accepted_draft_tokens;
     }
     if ((out.cause == StopCause::Length || out.cause == StopCause::Deadline) && out.message.content.empty() &&
         out.message.tool_calls.empty() && out.reasoning_tokens > 0) {

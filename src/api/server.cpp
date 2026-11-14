@@ -97,6 +97,28 @@ std::string anthropic_stop_reason(const GenerationOutcome& o) {
     }
 }
 
+// Non-standard top-level `speculative` (docs/api.md), next to `warnings` and outside the
+// standard `usage` object so strict usage schemas keep parsing: this request's draft tokens per
+// source, only when the engine drafted, searched for an n-gram draft, or fell back from MTP.
+// "mtp" is every draft that was not an n-gram match.
+void add_speculative(Json& j, const GenerationOutcome& o) {
+    if (o.draft_tokens == 0 && o.ngram_lookups == 0 && o.mtp_fallbacks == 0) return;
+    const std::size_t ngram_drafted = std::min(o.ngram_draft_tokens, o.draft_tokens);
+    const std::size_t ngram_accepted = std::min(o.ngram_accepted_draft_tokens, o.accepted_draft_tokens);
+    j["speculative"] = Json{
+        {"draft_tokens", o.draft_tokens},
+        {"accepted_draft_tokens", o.accepted_draft_tokens},
+        {"mtp",
+         {{"draft_tokens", o.draft_tokens - ngram_drafted},
+          {"accepted_draft_tokens", o.accepted_draft_tokens - ngram_accepted},
+          {"fallbacks", o.mtp_fallbacks}}},
+        {"ngram",
+         {{"lookups", o.ngram_lookups},
+          {"hits", o.ngram_hits},
+          {"draft_tokens", ngram_drafted},
+          {"accepted_draft_tokens", ngram_accepted}}}};
+}
+
 Json openai_usage(const GenerationOutcome& o) {
     return Json{{"prompt_tokens", o.prompt_tokens},
                 {"completion_tokens", o.completion_tokens},
@@ -193,6 +215,7 @@ public:
     void finish(const GenerationOutcome& o) {
         Json last = chunk(Json::object(), openai_finish(o));
         if (const Json w = warnings_json(m_, o); !w.empty()) last["warnings"] = w;
+        add_speculative(last, o);
         if (!w_.data(last)) return;
         if (m_.include_usage) {
             Json u = base();
@@ -233,6 +256,7 @@ public:
     void finish(const GenerationOutcome& o) {
         Json last = chunk("", openai_finish(o));
         if (const Json w = warnings_json(m_, o); !w.empty()) last["warnings"] = w;
+        add_speculative(last, o);
         if (!w_.data(last)) return;
         if (m_.include_usage) {
             Json u = {{"id", m_.id}, {"object", "text_completion"}, {"created", m_.created}, {"model", m_.model}};
@@ -302,6 +326,7 @@ public:
                               {"stop_sequence", o.stop_sequence ? Json(*o.stop_sequence) : Json(nullptr)}}},
                    {"usage", {{"output_tokens", o.completion_tokens}}}};
         if (const Json w = warnings_json(m_, o); !w.empty()) md["warnings"] = w;
+        add_speculative(md, o);
         if (!w_.event("message_delta", md)) return;
         (void)w_.event("message_stop", Json{{"type", "message_stop"}});
     }
@@ -678,6 +703,7 @@ struct ApiServer::Impl {
                                                     {"finish_reason", openai_finish(o)}}})},
                       {"usage", openai_usage(o)}};
             if (const Json w = warnings_json(m, o); !w.empty()) j["warnings"] = w;
+            add_speculative(j, o);
             res.set_content(dump(j), "application/json");
             return;
         }
@@ -728,6 +754,7 @@ struct ApiServer::Impl {
                                                 {"finish_reason", openai_finish(o)}}})},
                   {"usage", openai_usage(o)}};
         if (const Json w = warnings_json(m, o); !w.empty()) j["warnings"] = w;
+        add_speculative(j, o);
         return j;
     }
 
@@ -755,6 +782,7 @@ struct ApiServer::Impl {
                   {"stop_sequence", o.stop_sequence ? Json(*o.stop_sequence) : Json(nullptr)},
                   {"usage", anthropic_usage(o)}};
         if (const Json w = warnings_json(m, o); !w.empty()) j["warnings"] = w;
+        add_speculative(j, o);
         return j;
     }
 

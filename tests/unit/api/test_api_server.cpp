@@ -822,5 +822,146 @@ TEST(ApiAnthropic, BudgetContinuationSkippedWhenContextIsFull) {
     EXPECT_EQ(Json::parse(r->body).at("content").at(1).at("text"), "ok");
 }
 
+// The top-level `speculative` extension (docs/api.md): the per-request draft counters per
+// source, so a client sees MTP and n-gram acceptance for its own request even while the engine
+// serves others. It sits beside `warnings`, never inside the standard `usage` object.
+Script drafting(std::string text, std::size_t drafted, std::size_t accepted, std::size_t ngram_drafted,
+                std::size_t ngram_accepted, std::size_t lookups, std::size_t hits, std::size_t fallbacks,
+                bool eos = true) {
+    Script s = sc(std::move(text), std::chrono::milliseconds(0), eos);
+    s.draft_tokens = drafted;
+    s.accepted_draft_tokens = accepted;
+    s.ngram_draft_tokens = ngram_drafted;
+    s.ngram_accepted_draft_tokens = ngram_accepted;
+    s.ngram_lookups = lookups;
+    s.ngram_hits = hits;
+    s.mtp_fallbacks = fallbacks;
+    return s;
+}
+
+Json expected_speculative(std::size_t drafted, std::size_t accepted, std::size_t ngram_drafted,
+                          std::size_t ngram_accepted, std::size_t lookups, std::size_t hits, std::size_t fallbacks) {
+    return Json{{"draft_tokens", drafted},
+                {"accepted_draft_tokens", accepted},
+                {"mtp",
+                 {{"draft_tokens", drafted - ngram_drafted},
+                  {"accepted_draft_tokens", accepted - ngram_accepted},
+                  {"fallbacks", fallbacks}}},
+                {"ngram",
+                 {{"lookups", lookups},
+                  {"hits", hits},
+                  {"draft_tokens", ngram_drafted},
+                  {"accepted_draft_tokens", ngram_accepted}}}};
+}
+
+TEST(ApiSpeculative, ChatCompletionSplitsDraftsIntoMtpAndNgram) {
+    TestServer ts;
+    ts.engine->script = [](const auto&, int) { return drafting("Hello.", 12, 9, 5, 4, 7, 2, 1); };
+    auto r = ts.post("/v1/chat/completions", user_chat("hi"));
+    ASSERT_EQ(r->status, 200) << r->body;
+    const Json j = Json::parse(r->body);
+    ASSERT_TRUE(j.contains("speculative")) << "a request that drafted reports a top-level speculative: " << j.dump();
+    // Literal values (not the helper): MTP = 12 - 5 drafted, 9 - 4 accepted.
+    const Json want = Json::parse(R"({"draft_tokens":12,"accepted_draft_tokens":9,
+        "mtp":{"draft_tokens":7,"accepted_draft_tokens":5,"fallbacks":1},
+        "ngram":{"lookups":7,"hits":2,"draft_tokens":5,"accepted_draft_tokens":4}})");
+    EXPECT_EQ(j.at("speculative"), want) << j.dump();
+    EXPECT_FALSE(j.at("usage").contains("speculative")) << "the standard usage object stays standard: " << j.dump();
+}
+
+TEST(ApiSpeculative, AbsentWhenTheRequestNeverDrafted) {
+    TestServer ts;
+    ts.engine->script = [](const auto&, int) { return sc("Hello."); };
+    auto r = ts.post("/v1/chat/completions", user_chat("hi"));
+    ASSERT_EQ(r->status, 200) << r->body;
+    EXPECT_FALSE(Json::parse(r->body).contains("speculative"))
+        << "no drafting, lookups or fallbacks: no extension key: " << r->body;
+    // A request that only searched for n-gram drafts (no hit) still reports its lookups.
+    ts.engine->script = [](const auto&, int) { return drafting("Hello.", 0, 0, 0, 0, 3, 0, 0); };
+    r = ts.post("/v1/chat/completions", user_chat("hi"));
+    ASSERT_EQ(r->status, 200) << r->body;
+    EXPECT_EQ(Json::parse(r->body).value("speculative", Json()), expected_speculative(0, 0, 0, 0, 3, 0, 0))
+        << r->body;
+}
+
+TEST(ApiSpeculative, SumsBothEngineCallsOfAReasoningBudgetClose) {
+    // The budget close makes a second engine call; the first call's drafts must not be lost.
+    TestServer ts;
+    ts.engine->script = [](const auto&, int call) {
+        return call == 0 ? drafting(std::string(100, 'r'), 10, 6, 4, 3, 5, 2, 0, false)
+                         : drafting("Answer.", 3, 2, 1, 1, 2, 1, 1);
+    };
+    Json b = user_chat("hi");
+    b["max_tokens"] = 40;
+    auto r = ts.post("/v1/chat/completions", b);
+    ASSERT_EQ(r->status, 200) << r->body;
+    ASSERT_EQ(ts.engine->calls().size(), 2u) << "the budget close should continue in a second call";
+    EXPECT_EQ(Json::parse(r->body).value("speculative", Json()), expected_speculative(13, 8, 5, 4, 7, 3, 1))
+        << "counters summed over both calls; got " << r->body;
+}
+
+TEST(ApiSpeculative, StreamsCarryItBesideWarnings) {
+    TestServer ts;
+    ts.engine->script = [](const auto&, int) { return drafting("Hello.", 6, 4, 2, 2, 3, 1, 0); };
+    const Json want = expected_speculative(6, 4, 2, 2, 3, 1, 0);
+    // The chunk with finish_reason carries it, with or without include_usage.
+    const auto finish_chunk = [](const std::vector<Json>& ev) -> Json {
+        for (const auto& e : ev) {
+            if (!e.at("choices").empty() && !e.at("choices").at(0).at("finish_reason").is_null()) return e;
+        }
+        return Json();
+    };
+    for (const bool include_usage : {false, true}) {
+        Json b = user_chat("hi");
+        b["stream"] = true;
+        if (include_usage) b["stream_options"] = {{"include_usage", true}};
+        const auto s = post_stream(ts, "/v1/chat/completions", b);
+        ASSERT_EQ(s.status, 200) << s.body;
+        bool done = false;
+        const auto ev = data_events(s.body, done);
+        const Json fin = finish_chunk(ev);
+        ASSERT_TRUE(fin.is_object()) << s.body;
+        EXPECT_EQ(fin.value("speculative", Json()), want) << "chat finish chunk, include_usage " << include_usage
+                                                          << ": " << fin.dump();
+        if (include_usage) EXPECT_FALSE(ev.back().at("usage").contains("speculative")) << ev.back().dump();
+    }
+    {
+        const auto s = post_stream(ts, "/v1/completions", Json{{"prompt", "x"}, {"stream", true}});
+        ASSERT_EQ(s.status, 200) << s.body;
+        bool done = false;
+        const Json fin = finish_chunk(data_events(s.body, done));
+        ASSERT_TRUE(fin.is_object()) << s.body;
+        EXPECT_EQ(fin.value("speculative", Json()), want) << "completions finish chunk: " << fin.dump();
+    }
+    {
+        Json b = user_messages("hi");
+        b["stream"] = true;
+        const auto s = post_stream(ts, "/v1/messages", b);
+        ASSERT_EQ(s.status, 200) << s.body;
+        bool seen = false;
+        for (const auto& e : parse_sse(s.body)) {
+            if (e.event != "message_delta") continue;
+            seen = true;
+            const Json md = Json::parse(e.data);
+            EXPECT_EQ(md.value("speculative", Json()), want) << "message_delta: " << e.data;
+            EXPECT_FALSE(md.at("usage").contains("speculative")) << e.data;
+        }
+        EXPECT_TRUE(seen) << s.body;
+    }
+}
+
+TEST(ApiSpeculative, NonStreamedCompletionsAndMessagesCarryIt) {
+    TestServer ts;
+    ts.engine->script = [](const auto&, int) { return drafting("Hello.", 8, 5, 0, 0, 0, 0, 0); };
+    auto r = ts.post("/v1/messages", user_messages("hi"));
+    ASSERT_EQ(r->status, 200) << r->body;
+    EXPECT_EQ(Json::parse(r->body).value("speculative", Json()), expected_speculative(8, 5, 0, 0, 0, 0, 0))
+        << "all-MTP drafting: the ngram block is zero; got " << r->body;
+    r = ts.post("/v1/completions", Json{{"prompt", "x"}});
+    ASSERT_EQ(r->status, 200) << r->body;
+    EXPECT_EQ(Json::parse(r->body).value("speculative", Json()), expected_speculative(8, 5, 0, 0, 0, 0, 0))
+        << "completions: " << r->body;
+}
+
 }  // namespace
 }  // namespace halo::test

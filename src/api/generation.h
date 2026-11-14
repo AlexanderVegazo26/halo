@@ -102,7 +102,12 @@ struct GenerationOutcome {
     std::vector<std::string> warnings;
     double ttft_ms = 0.0;               // measured by the API (includes engine queueing)
     double decode_tps = 0.0;
+    // Speculative-decoding counters summed over every engine call of the request (the
+    // reasoning-budget continuation is a second call); engine.h GenerateResult has the meanings.
+    // The ngram_* draft counts are the n-gram share of draft_tokens / accepted_draft_tokens.
     std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
+    std::size_t ngram_lookups = 0, ngram_hits = 0, ngram_draft_tokens = 0, ngram_accepted_draft_tokens = 0;
+    std::size_t mtp_fallbacks = 0;
     std::string error;         // internal detail (logs only)
     std::string public_error;  // safe to show the client (set with cause == Error)
     /// Set when the engine rejected the request itself before producing any token

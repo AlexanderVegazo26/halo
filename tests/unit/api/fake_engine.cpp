@@ -201,6 +201,13 @@ runtime::GenerateResult FakeEngine::generate(const runtime::GenerateRequest& req
 
     runtime::GenerateResult r;
     r.prompt_tokens = req.prompt.size();
+    r.draft_tokens = s.draft_tokens;
+    r.accepted_draft_tokens = s.accepted_draft_tokens;
+    r.ngram_lookups = s.ngram_lookups;
+    r.ngram_hits = s.ngram_hits;
+    r.ngram_draft_tokens = s.ngram_draft_tokens;
+    r.ngram_accepted_draft_tokens = s.ngram_accepted_draft_tokens;
+    r.mtp_fallbacks = s.mtp_fallbacks;
     const auto started = std::chrono::steady_clock::now();
     const auto finish_call = [&] {
         std::lock_guard lk(mu_);

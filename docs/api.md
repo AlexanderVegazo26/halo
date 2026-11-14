@@ -256,6 +256,8 @@ the engine calls once per generated token.
   `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`.
 - A non-standard `warnings` array appears only when there is something to report: a
   reasoning budget close, a clamped `max_tokens`, a time limit, or empty content.
+- A non-standard `speculative` object appears when the request drafted (see "Speculative
+  decoding counters").
 
 **Streaming:**
 - The first `chat.completion.chunk` has `delta: {"role":"assistant","content":""}`.
@@ -385,6 +387,37 @@ It is a superset of the OpenAI and Anthropic list shapes.
   - `halo_engine_speculative_acceptance_ratio`
   - `halo_engine_ngram_{lookups,hits}_total` (prompt-lookup drafting: decode steps that searched, and found a match)
   - `halo_engine_ngram_{draft_tokens,accepted_draft_tokens}_total` (the n-gram share of the speculative counters; MTP = the rest)
+
+### Speculative decoding counters
+
+Responses get a non-standard top-level `speculative` object, next to `warnings` and never
+inside the standard `usage` object, when the request drafted tokens, searched for an n-gram
+draft, or dropped MTP because the MTP KV ran out. It is on the non-streamed body of every
+route, on the OpenAI stream chunk that carries `finish_reason`, and on the Anthropic
+`message_delta` event. Requests that did none of these have no `speculative` key. The counts
+cover only this request, summed over every engine call it made (a reasoning-budget close
+makes a second one):
+
+```json
+"speculative": {
+  "draft_tokens": 12, "accepted_draft_tokens": 9,
+  "mtp":   {"draft_tokens": 7, "accepted_draft_tokens": 5, "fallbacks": 1},
+  "ngram": {"lookups": 7, "hits": 2, "draft_tokens": 5, "accepted_draft_tokens": 4}
+}
+```
+
+- `draft_tokens` / `accepted_draft_tokens`: drafts verified and accepted, from every source.
+  They are counted when the engine verifies them, so drafts accepted in the step where the
+  request stopped (a stop sequence, a reasoning-budget close, the client going away) count
+  even if those tokens were not sent.
+- `mtp`: every draft that was not an n-gram match (on an engine built with the test-only
+  `draft_hook`, its drafts land here too). `fallbacks` counts engine steps that dropped MTP
+  because the MTP KV was full and retried without it (MTP then stays off for the rest of that
+  engine call; a budget-close continuation starts with MTP again).
+- `ngram`: prompt-lookup drafting (`HALO_NGRAM_DRAFT`); `lookups` are decode steps that
+  searched the context, `hits` those that found a match and drafted from it.
+- Acceptance per source is `accepted_draft_tokens / draft_tokens` of that block. The
+  engine-wide totals are the `halo_engine_speculative_*` and `halo_engine_ngram_*` metrics.
 
 Hardware and kernel metrics (PRD §13) are not exposed in v0.2.
 
