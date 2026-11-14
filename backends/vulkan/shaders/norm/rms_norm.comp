@@ -3,6 +3,9 @@
 // same operation order as cpu::rms_norm). One workgroup per row; fixed-order shared-memory
 // tree reduction (deterministic). Operands are views (element offset remainder + row
 // stride from the host, code review S-1).
+// The sum of squares, inv and the scaled product are `precise`: left free, the compiler contracted and
+// rewrote them differently here and in matmul/matvec_*_normed.comp (1 ulp apart), and HALO_FUSE_NORM
+// relies on the two being bit for bit equal (VkHead.GemvFusedNorm*).
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
@@ -32,7 +35,7 @@ void main() {
     const uint xb = pc.x_off + row * pc.x_stride;
     const uint yb = pc.y_off + row * pc.y_stride;
 
-    float acc = 0.0;
+    precise float acc = 0.0;
     for (uint i = tid; i < pc.cols; i += WG) {
         const float v = x[xb + i];
         acc += v * v;
@@ -43,8 +46,9 @@ void main() {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    const float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
+    precise float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
     for (uint i = tid; i < pc.cols; i += WG) {
-        y[yb + i] = (x[xb + i] * inv) * w[pc.w_off + i];
+        precise float r = (x[xb + i] * inv) * w[pc.w_off + i];
+        y[yb + i] = r;
     }
 }

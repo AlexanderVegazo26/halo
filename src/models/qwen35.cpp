@@ -180,12 +180,14 @@ struct Qwen35::Impl {
     // Only the engine worker thread drives a model, the mutex is defensive.
     static constexpr std::size_t kMaxPooledStreams = 4;
     bool reuse_streams = false;
-// HALO_FUSE_NORM=1 (default off, read once in the constructor; Vulkan only): the post-attention
-// add + rms_norm feeding the FFN gate/up gemvs becomes a plain add, and those gemvs (R == 1,
-// unfused non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS Mats) compute rms_norm(x) * post_norm themselves in
-// their prologue (GemvArgs::norm_w). The row RMS is the separate kernel's (same tree) but each
-// gemv recomputes it; results match the separate path up to what the gemv's own reduction does
-// with an input that may differ in the last ulp (none expected at reduce_workgroup == 256).
+// HALO_FUSE_NORM=1 (default off, read once in the constructor; only where Limits::max_fused_norm_cols > 0):
+// the post-attention add + rms_norm feeding the FFN gate/up gemvs becomes a plain add, and those
+// gemvs (R == 1, unfused non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS Mats) compute rms_norm(x) * post_norm
+// themselves in their prologue (GemvArgs::norm_w). Each gemv recomputes the row RMS with the
+// separate kernel's tree; the result is bit for bit rms_norm + the unfused gemv (GPU-verified,
+// VkHead.GemvFusedNorm*), which the backend guarantees only with the tree reduction at
+// reduce_workgroup 256 and up to Limits::max_fused_norm_cols, so R == 1 decode stays bitwise the
+// R > 1 verify forward.
 bool fuse_norm = false;
     mutable std::mutex stream_mu;
     mutable std::vector<std::unique_ptr<backend::Stream>> stream_pool;
@@ -482,7 +484,7 @@ bool fuse_norm = false;
     [[nodiscard]] bool norm_fusable(const Mat& w) const {
         return w.present() && w.variant == 0 && w.stride == 0 &&
                (w.type == DType::Q4_K || w.type == DType::Q5_K || w.type == DType::Q6_K || w.type == DType::IQ4_XS) &&
-               w.cols <= 16384;
+               w.cols <= limits.max_fused_norm_cols;
     }
 
     /// Scratch activations of one call, sized for R rows and reused by every layer (stream
@@ -857,8 +859,10 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
     } else if (const char* e = std::getenv("HALO_STREAM_REUSE")) {
         I.reuse_streams = *e != '\0' && std::string_view(e) != "0";
     }
+    // Only where the fused gemv is bitwise the separate norm + gemv (Limits::max_fused_norm_cols): otherwise an
+    // R == 1 decode would round differently from the R > 1 verify forward and MTP could change greedy output.
     if (const char* e = std::getenv("HALO_FUSE_NORM"))
-        I.fuse_norm = *e != 0 && std::string_view(e) != "0" && I.be->kind() == backend::Kind::Vulkan;
+        I.fuse_norm = *e != 0 && std::string_view(e) != "0" && I.limits.max_fused_norm_cols > 0;
     // Before the layers load: it picks the weight layout.
     I.parse_fuse_env(options.fuse_gemv ? options.fuse_gemv->c_str() : std::getenv("HALO_FUSE_GEMV"));
     const auto& hp = m.hparams();

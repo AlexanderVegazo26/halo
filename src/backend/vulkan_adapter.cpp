@@ -358,6 +358,11 @@ public:
         l.max_rope_dims = std::numeric_limits<std::uint32_t>::max();  // host cos/sin table; rot <= head_dim
         l.gdn_chunked = true;
         l.lm_head_ids = true;
+        // matvec_<type>_normed always reduces with the shared-memory tree, and its row RMS matches
+        // rms_norm.comp only at WG 256: with subgroupAdd matvecs or another reduce workgroup, fusing would
+        // make R == 1 decode differ from the R > 1 verify forward (MTP on/off greedy output).
+        l.max_fused_norm_cols =
+            !ops_.subgroup_reduce() && options_.ops.reduce_workgroup == 256 ? ops_.fused_norm_max_cols() : 0u;
         l.max_import_bytes = ctx_->info().max_memory_allocation_size;  // RADV: 4 GiB
         // A KV pool buffer is bound whole as one storage-buffer descriptor (ops_paged.cpp
         // pool_operand): it must fit both the allocation cap and maxStorageBufferRange.

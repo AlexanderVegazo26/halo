@@ -3,6 +3,9 @@
 // the rms_norm kernel's reduction over h (same order, so y == Ops::rms_norm(h) bitwise).
 // h may alias a or b exactly: each invocation reads a[i], b[i] and then writes h[i]; the
 // normalisation re-reads only h values this invocation wrote.
+// The sum of squares, inv and the scaled product are `precise`: left free, the compiler contracted and
+// rewrote them differently here and in matmul/matvec_*_normed.comp (1 ulp apart), and HALO_FUSE_NORM
+// relies on the two being bit for bit equal (VkHead.GemvFusedNorm*).
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
@@ -31,7 +34,7 @@ void main() {
     const uint bb = pc.b_off + row * pc.b_stride;
     const uint hb = pc.h_off + row * pc.h_stride;
     const uint yb = pc.y_off + row * pc.y_stride;
-    float acc = 0.0;
+    precise float acc = 0.0;
     for (uint i = tid; i < pc.cols; i += WG) {
         precise float v = a[ab + i] + b[bb + i];
         h[hb + i] = v;
@@ -43,8 +46,9 @@ void main() {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    const float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
+    precise float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
     for (uint i = tid; i < pc.cols; i += WG) {
-        y[yb + i] = (h[hb + i] * inv) * w[pc.w_off + i];
+        precise float r = (h[hb + i] * inv) * w[pc.w_off + i];
+        y[yb + i] = r;
     }
 }

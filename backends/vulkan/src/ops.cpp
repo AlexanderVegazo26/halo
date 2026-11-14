@@ -190,17 +190,28 @@ void Ops::gemv(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "
 
 void Ops::gemv_repacked(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "gemv(repacked)", true); }
 
+std::uint32_t Ops::fused_norm_max_cols() const noexcept {
+    // matvec_<type>_normed shared memory, in floats: x[XCOLS] + rn[256] + red[WG] + redb[1] (BATCHED = 0) +
+    // IQ4_XS's sh_kv[16]. WG is the K-quant gemv workgroup gemv_impl picks (64 unless gemv_workgroup).
+    const std::uint64_t wg = options_.gemv_workgroup != 0 ? options_.gemv_workgroup : 64;
+    const std::uint64_t fixed = 256 + wg + 1 + 16;
+    const std::uint64_t floats = ctx_->info().max_shared_memory / k_f32;
+    return floats <= fixed ? 0u : static_cast<std::uint32_t>(std::min<std::uint64_t>(16384, floats - fixed));
+}
+
 void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool repacked) {
     HALO_CHECK(a.rows > 0 && a.cols > 0 && a.n_vec > 0, ErrorCode::Kernel, "{}: empty shape {}x{} n_vec={}", op,
                a.rows, a.cols, a.n_vec);
     // The repacked layout (halo/tensor/repack.h) keeps the row footprint of the GGUF layout, so
     // row_bytes and every extent check below are unchanged; only the shader differs ("_rp").
     const bool normed = !a.norm_w.empty();
-    HALO_CHECK(!normed || (!repacked && a.n_vec == 1 && a.cols <= 16384 &&
+    HALO_CHECK(!normed || (!repacked && a.n_vec == 1 && a.cols <= fused_norm_max_cols() &&
                            (a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K ||
                             a.wtype == DType::IQ4_XS)),
                ErrorCode::Unsupported,
-               "{}: fused norm needs a non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS weight, n_vec == 1 and cols <= 16384", op);
+               "{}: fused norm needs a non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS weight, n_vec == 1 and cols <= {} (got "
+               "cols {}, n_vec {})",
+               op, fused_norm_max_cols(), a.cols, a.n_vec);
     HALO_CHECK(!repacked || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K || a.wtype == DType::IQ4_XS,
                ErrorCode::Unsupported, "{}: no repacked matvec for weight type id {} (Q5_K, Q6_K, IQ4_XS)", op,
                static_cast<std::uint32_t>(a.wtype));

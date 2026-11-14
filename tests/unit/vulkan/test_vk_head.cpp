@@ -23,9 +23,11 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "halo/backends/cpu/ops.h"
@@ -671,3 +673,151 @@ TEST(VkHead, GemvRepackedRejectsUnsupportedTypesAndMisalignedRows) {
         << "row stride 184 is not 16-aligned";
     s.submit_and_wait();
 }
+
+// ---------------------------------------------------------------- fused-norm GEMV (next.md step 10)
+
+namespace {
+
+/// One fused-norm case: `n_vec` raw rows x (lead `x_lead` floats, row stride cols + 7), norm weight nw
+/// (lead `nw_lead` floats). Returns {fused per row, rms_norm then the batched tree gemv}: the unfused
+/// forward a model runs at R == n_vec, whose rows the fused R == 1 decode must reproduce bit for bit.
+struct NormedRun {
+    std::vector<float> fused, separate;
+};
+
+NormedRun normed_case(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, hv::Ops& tree, ref::WType t,
+                      std::uint32_t rows, std::uint32_t cols, std::uint32_t n_vec, std::uint32_t x_lead,
+                      std::uint32_t nw_lead, std::mt19937& rng) {
+    const halo::DType dt = ref::dtype(t);
+    const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+    const std::uint32_t xs = cols + 7;
+    std::vector<float> x(x_lead + std::size_t{n_vec} * xs, 1e30f);  // gaps poisoned: must never be read
+    for (std::uint32_t v = 0; v < n_vec; ++v) {
+        // Row magnitudes far apart (1e-3 .. 1e2): the RMS, not the raw scale, sets the gemv input.
+        const float scale = v % 3 == 0 ? 1.0f : v % 3 == 1 ? 1e2f : 1e-3f;
+        const auto xv = ref::random_vec(cols, rng, scale);
+        std::copy(xv.begin(), xv.end(), x.begin() + x_lead + std::size_t{v} * xs);
+    }
+    std::vector<float> nw(nw_lead + std::size_t{cols}, 1e30f);
+    const auto nv = ref::random_vec(cols, rng, 2.0f);
+    std::copy(nv.begin(), nv.end(), nw.begin() + nw_lead);
+    const float eps = 1e-6f;
+
+    hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+    hv::Buffer bx = upload(ctx, std::span<const float>(x));
+    hv::Buffer bnw = upload(ctx, std::span<const float>(nw));
+    const std::size_t n = std::size_t{n_vec} * rows;
+    hv::Buffer bxn = hv::Buffer::create(ctx, std::uint64_t{n_vec} * cols * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer ysep = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+    hv::Buffer yfused = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+    hv::Stream s(ctx);
+    const hv::BufferView nwv(bnw, std::uint64_t{nw_lead} * 4, std::uint64_t{cols} * 4);
+    tree.rms_norm(s, hv::BufferView(bx, std::uint64_t{x_lead} * 4, 0, std::uint64_t{xs} * 4), nwv,
+                  hv::BufferView(bxn, 0, 0, std::uint64_t{cols} * 4), n_vec, cols, eps);
+    tree.gemv(s, hv::GemvArgs{dt, bw, bxn, ysep, rows, cols, n_vec});
+    for (std::uint32_t v = 0; v < n_vec; ++v) {
+        hv::GemvArgs g{dt, bw, hv::BufferView(bx, (x_lead + std::uint64_t{v} * xs) * 4, std::uint64_t{cols} * 4),
+                       hv::BufferView(yfused, std::uint64_t{v} * rows * 4, std::uint64_t{rows} * 4), rows, cols, 1};
+        g.norm_w = nwv;
+        g.norm_eps = eps;
+        ops.gemv(s, g);
+    }
+    s.submit_and_wait();
+    return {download<float>(yfused, n), download<float>(ysep, n)};
+}
+
+std::string first_diff(std::span<const float> a, std::span<const float> b, std::uint32_t rows) {
+    std::size_t diff = 0, first = a.size();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::memcmp(&a[i], &b[i], 4) != 0) {
+            ++diff;
+            first = std::min(first, i);
+        }
+    }
+    if (diff == 0) return {};
+    return std::to_string(diff) + " of " + std::to_string(a.size()) + " outputs differ; first at vector " +
+           std::to_string(first / rows) + " row " + std::to_string(first % rows) + ": fused " +
+           std::to_string(a[first]) + " separate " + std::to_string(b[first]);
+}
+
+}  // namespace
+
+TEST(VkHead, GemvFusedNormIsBitwiseRmsNormThenTheBatchedGemv) {
+    // HALO_FUSE_NORM=1 replaces the FFN gate/up input norm at R == 1 with the gemv's own prologue
+    // (matvec_<type>_normed), while R > 1 forwards (MTP verify, prefill) keep rms_norm + the batched gemv.
+    // Greedy output with MTP on and off stays identical only if every fused row is bit for bit that
+    // row of the unfused batch. Covered: the four fusable types, cols 256 / 768 / 5120 (the 27B's
+    // n_embd) / the device's fused_norm_max_cols rounded down to whole blocks (the staged row nearly fills
+    // shared memory), rows far apart in magnitude, and x / norm_w view offsets (element remainders the
+    // shader must add). Before the norm math was `precise` on both sides, about a third of the outputs
+    // were 1 ulp off: the compiler contracted / rewrote the separate and fused RMS differently.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops tree(ctx, hv::OpsOptions{.subgroup_reduce = false});
+    ASSERT_EQ(tree.options().reduce_workgroup, 256u) << "the bitwise claim is for the default reduce workgroup";
+    const std::uint32_t cap = tree.fused_norm_max_cols() / 256 * 256;
+    ASSERT_GE(cap, 5120u) << "fused_norm_max_cols " << tree.fused_norm_max_cols() << ": the 27B's n_embd must fuse";
+    for (const ref::WType t : {ref::WType::Q4_K, ref::WType::Q5_K, ref::WType::Q6_K, ref::WType::IQ4_XS}) {
+        for (const std::uint32_t cols : {256u, 768u, 5120u, cap}) {
+            for (const auto [x_lead, nw_lead] : {std::pair{0u, 0u}, std::pair{3u, 5u}}) {
+                const std::string what = std::string(tname(t)) + " cols " + std::to_string(cols) + " x lead " +
+                                         std::to_string(x_lead) + " norm_w lead " + std::to_string(nw_lead);
+                SCOPED_TRACE(what);
+                std::mt19937 rng(static_cast<unsigned>(t) * 7919 + cols + x_lead);
+                const NormedRun r = normed_case(ctx, tree, tree, t, 37, cols, 4, x_lead, nw_lead, rng);
+                EXPECT_EQ(first_diff(r.fused, r.separate, 37), "") << what;
+                for (const float y : r.fused) ASSERT_TRUE(std::isfinite(y)) << what << ": non-finite fused output";
+            }
+        }
+    }
+}
+
+TEST(VkHead, GemvFusedNormKeepsTheTreeReductionAndSplitsIntoRowSlabs) {
+    // The _normed shaders have no subgroupAdd form: with subgroup_reduce on they still give the tree result
+    // (so a model must not fuse there: Limits::max_fused_norm_cols is 0, VulkanBackend test). A W larger than one
+    // binding runs as row slabs that each recompute the norm: still bitwise the unsplit result.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops tree(ctx, hv::OpsOptions{.subgroup_reduce = false});
+    hv::Ops sg(ctx, hv::OpsOptions{.subgroup_reduce = true});
+    hv::OpsOptions small;
+    small.subgroup_reduce = false;
+    small.max_binding_bytes = 3000;  // Q4_K 768 cols = 432 B rows: several slabs
+    hv::Ops slabs(ctx, small);
+    for (hv::Ops* ops : {&sg, &slabs}) {
+        const std::string what = ops == &sg ? "Ops with subgroup_reduce on" : "W split into row slabs";
+        std::mt19937 rng(4242);
+        const NormedRun r = normed_case(ctx, *ops, tree, ref::WType::Q4_K, 53, 768, 3, 3, 5, rng);
+        EXPECT_EQ(first_diff(r.fused, r.separate, 53), "") << what;
+    }
+}
+
+TEST(VkHead, GemvFusedNormRejectsWhatItCannotFuse) {
+    // A fused norm the shader cannot honour must throw, never silently run an unnormalized gemv, and never
+    // reach the driver with a row that cannot fit in shared memory (RADV's compiler dies with SIGFPE).
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    const std::uint32_t max_cols = ops.fused_norm_max_cols();
+    ASSERT_GT(max_cols, 0u);
+    // The cap and the first whole-block width past it (Q4_K rows are 256-column blocks).
+    const std::uint32_t at_cap = max_cols / 256 * 256, rows = 4, cols = (max_cols / 256 + 1) * 256;
+    std::cout << "[vk-head] fused_norm_max_cols " << max_cols << " (max_shared_memory "
+              << ctx->info().max_shared_memory << " B)\n";
+    hv::Buffer w = hv::Buffer::create(ctx, rows * halo::tensor::row_bytes(halo::DType::Q4_K, cols) + 64,
+                                      hv::MemoryUsage::DeviceLocal);
+    hv::Buffer x = hv::Buffer::create(ctx, 2 * cols * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer nw = hv::Buffer::create(ctx, cols * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer y = hv::Buffer::create(ctx, 2 * rows * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx);
+    const auto args = [&](halo::DType t, std::uint32_t c, std::uint32_t n_vec) {
+        hv::GemvArgs g{t, hv::BufferView(w, 0, rows * halo::tensor::row_bytes(t, c)), x, y, rows, c, n_vec};
+        g.norm_w = hv::BufferView(nw, 0, std::uint64_t{c} * 4);
+        return g;
+    };
+    EXPECT_NO_THROW(ops.gemv(s, args(halo::DType::Q4_K, at_cap, 1))) << "cols " << at_cap << " is within the cap";
+    EXPECT_THROW(ops.gemv(s, args(halo::DType::Q4_K, cols, 1)), halo::Error) << "cols " << cols << " > " << max_cols;
+    EXPECT_THROW(ops.gemv(s, args(halo::DType::Q4_K, 256, 2)), halo::Error) << "n_vec 2: the fused form is decode only";
+    EXPECT_THROW(ops.gemv(s, args(halo::DType::F32, 256, 1)), halo::Error) << "F32 has no _normed shader";
+    EXPECT_THROW(ops.gemv(s, args(halo::DType::Q8_0, 256, 1)), halo::Error) << "Q8_0 has no _normed shader";
+    EXPECT_THROW(ops.gemv_repacked(s, args(halo::DType::Q5_K, 256, 1)), halo::Error) << "repacked rows are not GGUF blocks";
+    s.submit_and_wait();
+}
+

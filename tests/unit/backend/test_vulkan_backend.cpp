@@ -190,6 +190,29 @@ TEST(VulkanBackend, IdentityLimitsVariantsAndZeroFill) {
     }
 }
 
+TEST(VulkanBackend, FusedNormIsOfferedOnlyWhereItIsBitwiseTheSeparateGemv) {
+    // HALO_FUSE_NORM: qwen35 fuses the FFN input norm into the R == 1 gemvs only up to Limits::max_fused_norm_cols,
+    // where the fused result equals rms_norm + the unfused gemv bit for bit (VkHead.GemvFusedNorm*). The
+    // _normed shaders reduce with the shared-memory tree at the RMS of rms_norm.comp's WG 256, so with
+    // subgroupAdd matvecs (HALO_SUBGROUP_REDUCE) or another reduce workgroup, R == 1 decode would round
+    // differently from the R > 1 MTP verify and could change greedy output.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    EXPECT_EQ(hb::make_vulkan_backend(ctx, {.ops = {.subgroup_reduce = false}})->limits().max_fused_norm_cols,
+              hv::Ops(ctx, hv::OpsOptions{.subgroup_reduce = false}).fused_norm_max_cols())
+        << "tree reduction, reduce_workgroup 256: the fused norm is bitwise the separate path up to the LDS cap";
+    hv::OpsOptions wg128{.subgroup_reduce = false};
+    wg128.reduce_workgroup = 128;
+    EXPECT_EQ(hb::make_vulkan_backend(ctx, {.ops = wg128})->limits().max_fused_norm_cols, 0u)
+        << "reduce_workgroup 128: rms_norm's RMS no longer matches the _normed prologue's 256-lane tree";
+    if (hv::Ops(ctx, hv::OpsOptions{.subgroup_reduce = true}).subgroup_reduce()) {
+        EXPECT_EQ(hb::make_vulkan_backend(ctx, {.ops = {.subgroup_reduce = true}})->limits().max_fused_norm_cols, 0u)
+            << "subgroupAdd matvecs: the _normed shaders still use the tree, so decode != verify";
+    } else {
+        std::cout << "[vk-backend] subgroupAdd matvec unsupported on this device: sg case not run\n";
+    }
+    EXPECT_EQ(hb::make_cpu_backend(nullptr)->limits().max_fused_norm_cols, 0u) << "the CPU backend rejects norm_w";
+}
+
 TEST(VulkanBackend, ImportsAreDeviceMirrorsWrittenBackAtWait) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     auto be = hb::make_vulkan_backend(ctx);

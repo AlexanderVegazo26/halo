@@ -74,11 +74,12 @@ struct QI4Block {
 
 // Same arithmetic as rms_norm.comp with its default WG = 256: 256 virtual lanes (lane l sums
 // elements l, l+256, ...) reduced by the same fixed tree, so inv_rms is bitwise equal to the
-// separate norm's when the host's reduce_workgroup is 256; x*inv then *w is the same op order.
+// separate norm's when the host's reduce_workgroup is 256; x*inv then *w is the same op order. All of it
+// is `precise`, as in rms_norm.comp: otherwise the compiler builds the two differently (1 ulp apart).
 void norm_prologue() {
     const uint tid = gl_LocalInvocationID.x;
     for (uint l = tid; l < 256u; l += WG) {
-        float a = 0.0;
+        precise float a = 0.0;
         for (uint i = l; i < pc.cols; i += 256u) {
             const float v = xr[pc.xr_off + i];
             a += v * v;
@@ -90,8 +91,11 @@ void norm_prologue() {
         for (uint l = tid; l < s; l += WG) rn[l] += rn[l + s];
         barrier();
     }
-    const float inv = 1.0 / sqrt(rn[0] / float(pc.cols) + pc.eps);
-    for (uint i = tid; i < pc.cols; i += WG) x[i] = (xr[pc.xr_off + i] * inv) * nw[pc.nw_off + i];
+    precise float inv = 1.0 / sqrt(rn[0] / float(pc.cols) + pc.eps);
+    for (uint i = tid; i < pc.cols; i += WG) {
+        precise float r = (xr[pc.xr_off + i] * inv) * nw[pc.nw_off + i];
+        x[i] = r;
+    }
     barrier();
 }
 

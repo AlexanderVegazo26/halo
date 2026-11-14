@@ -228,6 +228,12 @@ struct Limits {
     std::uint64_t max_pool_buffer_bytes = 0;
     /// LmHeadArgs::ids is implemented (dense int32 winning ids written in stream order; CPU, Vulkan).
     bool lm_head_ids = false;
+    /// Largest `cols` of a gemv with GemvArgs::norm_w (the fused input norm, HALO_FUSE_NORM) whose result is
+    /// bit for bit rms_norm then the backend's own unfused gemv; 0 = no such gemv. Vulkan: the staged row
+    /// must fit in shared memory, and only with the tree reduction at reduce_workgroup 256 (the _normed
+    /// shaders have no subgroupAdd form). Models fuse only within it: a fused R == 1 decode must stay
+    /// bitwise the unfused R > 1 MTP verify forward, or MTP could change greedy output.
+    std::uint32_t max_fused_norm_cols = 0;
 };
 
 // ---------------------------------------------------------------------------------------

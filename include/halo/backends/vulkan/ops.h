@@ -460,8 +460,9 @@ struct GemvArgs {
     std::uint32_t n_vec = 1;
     /// HALO_FUSE_NORM (opt-in): when set, the gemv computes y = W * (rms_norm(x) * norm_w) itself: `x` is then
     /// the RAW input row and norm_w a [cols] fp32 view. Only n_vec == 1, wtype in {Q4_K, Q5_K, Q6_K, IQ4_XS},
-    /// cols <= 16384, never gemv_repacked / lm_head (all throw otherwise). Runs matvec_<type>_normed; the
-    /// row RMS is bitwise the separate rms_norm kernel's when reduce_workgroup == 256 (see the shader).
+    /// cols <= Ops::fused_norm_max_cols() (the staged row must fit in shared memory), never gemv_repacked /
+    /// lm_head (all throw otherwise). Runs matvec_<type>_normed; with reduce_workgroup == 256 and the tree
+    /// reduction (subgroup_reduce off) y is bit for bit rms_norm then the unfused gemv (VkHead.GemvFusedNorm*).
     BufferView norm_w{};
     float norm_eps = 1e-6f;
 };
@@ -518,6 +519,10 @@ public:
     /// Whether gemv uses the subgroupAdd matvec shaders: OpsOptions::subgroup_reduce (or its env
     /// default) AND the device supports them.
     [[nodiscard]] bool subgroup_reduce() const noexcept { return subgroup_reduce_; }
+    /// Largest `cols` a fused-norm gemv (GemvArgs::norm_w) accepts on this device: its shader stages the
+    /// whole normalized row in shared memory beside its reductions, so this is min(16384, what fits in
+    /// maxComputeSharedMemorySize). A pipeline past it would not compile (RADV crashes with SIGFPE).
+    [[nodiscard]] std::uint32_t fused_norm_max_cols() const noexcept;
     /// The resolved gated_delta_rule_decode options: OpsOptions::gdn_decode_reg / gdn_dv_tile, or their env
     /// defaults (read per Ops, so one process can run every variant).
     [[nodiscard]] bool gdn_decode_reg() const noexcept { return gdn_decode_reg_; }
