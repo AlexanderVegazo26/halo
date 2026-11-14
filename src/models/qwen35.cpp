@@ -935,7 +935,12 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
         t.lm_head = I.make_table(mw->lm_head);
         t.bytes = t.block.bytes + mw->eh_proj.n_bytes() + mw->enorm.n_bytes() + mw->hnorm.n_bytes() +
                   (mw->head_norm_origin == model::MtpTensorOrigin::NextnBlock ? mw->head_norm.n_bytes() : 0);
-        if (const char* e = std::getenv("HALO_MTP_DRAFT_VOCAB")) I.draft_vocab = std::strtoull(e, nullptr, 10);
+        if (options.mtp_draft_vocab) {
+            I.draft_vocab = *options.mtp_draft_vocab;
+        } else if (const char* e = std::getenv("HALO_MTP_DRAFT_VOCAB")) {
+            I.draft_vocab = std::strtoull(e, nullptr, 10);
+        }
+        if (I.draft_vocab > I.n_vocab) I.draft_vocab = 0;  // >= the head = the full head
         I.mtp = std::move(t);
         I.note_forms(I.mtp->block);
     }
@@ -948,6 +953,10 @@ bool Qwen35::has_mtp() const noexcept { return impl_->mtp.has_value(); }
 bool Qwen35::reuse_streams() const noexcept { return impl_->reuse_streams; }
 FusedProjections Qwen35::fused_projections() const noexcept {
     return {.ffn = impl_->has_fused_ffn, .ba = impl_->has_fused_ba, .qkv = impl_->has_fused_qkv};
+}
+std::size_t Qwen35::mtp_draft_vocab() const noexcept {
+    if (!impl_->mtp) return 0;
+    return impl_->draft_vocab == 0 ? impl_->n_vocab : impl_->draft_vocab;
 }
 std::size_t Qwen35::n_vocab() const noexcept { return impl_->n_vocab; }
 std::size_t Qwen35::n_embd() const noexcept { return impl_->E; }

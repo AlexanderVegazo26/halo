@@ -205,6 +205,11 @@ struct Qwen35Options {
     /// only): "1" / "all", or a comma list of "ffn" (gate+up), "ba" (GDN beta+alpha), "qkv"
     /// (attention q+k+v); "" / "0" = none. nullopt = the HALO_FUSE_GEMV env var (default off).
     std::optional<std::string> fuse_gemv = std::nullopt;
+    /// next.md step 2: MTP drafts score only the first N token rows of the MTP head (a contiguous
+    /// prefix of the row-major matrix; the trunk head still verifies every draft, so greedy output
+    /// cannot change). 0, or N >= n_vocab, = the full head. A step that asks for Full logits always
+    /// gets the full head. nullopt = the HALO_MTP_DRAFT_VOCAB env var (default 0).
+    std::optional<std::size_t> mtp_draft_vocab = std::nullopt;
 };
 
 /// Which fused projection forms the loaded layers actually contain (Qwen35Options::fuse_gemv).
@@ -235,6 +240,9 @@ public:
     [[nodiscard]] bool reuse_streams() const noexcept;
     /// Fused projection forms present in the loaded layers (all false unless fuse_gemv / HALO_FUSE_GEMV asked).
     [[nodiscard]] FusedProjections fused_projections() const noexcept;
+    /// Token rows an Argmax MTP draft scores (Qwen35Options::mtp_draft_vocab, else
+    /// HALO_MTP_DRAFT_VOCAB, clamped to n_vocab; n_vocab when unset); 0 without an MTP block.
+    [[nodiscard]] std::size_t mtp_draft_vocab() const noexcept;
 
     [[nodiscard]] const model::Qwen35HParams& hparams() const noexcept;
     [[nodiscard]] const model::NormalizedModel& model() const noexcept { return *model_; }
