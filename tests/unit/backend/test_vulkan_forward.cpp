@@ -108,12 +108,19 @@ struct Side {
     std::unique_ptr<KvPool> kv_pool, mtp_pool;
     std::vector<std::unique_ptr<TestSeq>> seqs;
 
-    Side(std::unique_ptr<hb::Backend> b, const halo::model::NormalizedModel& nm) : be(std::move(b)) {
+    /// kv: the element format of both KV pools (the engine gives the trunk and MTP pools the same one). F16 / Q8
+    /// pools are device-resident with no host image, so they get no sentinel fill and cannot be read back.
+    Side(std::unique_ptr<hb::Backend> b, const halo::model::NormalizedModel& nm, hb::KvType kv = hb::KvType::F32)
+        : be(std::move(b)) {
         model = std::make_unique<hm::Qwen35>(nm, *be);
-        kv_pool = std::make_unique<KvPool>(model->kv_layout(), k_blocks);
-        mtp_pool = std::make_unique<KvPool>(model->mtp_kv_layout(), k_blocks);
-        for (KvPool* p : {kv_pool.get(), mtp_pool.get()}) {
-            std::fill_n(p->k_rows(0, 0), p->total_blocks() * p->layout().block_floats(), k_sentinel);
+        auto kl = model->kv_layout(), ml = model->mtp_kv_layout();
+        kl.type = ml.type = kv;
+        kv_pool = std::make_unique<KvPool>(kl, k_blocks);
+        mtp_pool = std::make_unique<KvPool>(ml, k_blocks);
+        if (kv == hb::KvType::F32) {
+            for (KvPool* p : {kv_pool.get(), mtp_pool.get()}) {
+                std::fill_n(p->k_rows(0, 0), p->total_blocks() * p->layout().block_floats(), k_sentinel);
+            }
         }
         for (std::size_t i = 0; i < 3; ++i) seqs.push_back(std::make_unique<TestSeq>(*kv_pool, *mtp_pool, model->gdn_shape(), k_slots));
     }
@@ -169,7 +176,7 @@ public:
         fake[0].logit_rows = rows;
         fake[0].logits = hm::LogitsMode::Full;
         compare_results(what, rv, rc, fake);
-        check("mtp pool", rel_l2_masked(pool_image(*vk_.mtp_pool), pool_image(*cpu_.mtp_pool)));
+        if (pools_readable()) check("mtp pool", rel_l2_masked(pool_image(*vk_.mtp_pool), pool_image(*cpu_.mtp_pool)));
     }
 
     /// The same host-side state operation on both sides.
@@ -183,6 +190,8 @@ public:
 
 private:
     static std::vector<float> pool_image(const KvPool& p) { return p.read_all(); }  // downloads on the Vulkan side
+    /// fp16 / q8 pools have no read-back (KvPool::read_all throws): their effect is checked through the outputs.
+    [[nodiscard]] bool pools_readable() const { return vk_.kv_pool->layout().type == hb::KvType::F32; }
 
     /// Sentinel positions must match exactly; relative L2 over the written ones.
     double rel_l2_masked(std::span<const float> vk, std::span<const float> cpu) {
@@ -249,7 +258,7 @@ private:
     }
 
     void compare_state(const std::string& what) {
-        check(what + " trunk KV pool", rel_l2_masked(pool_image(*vk_.kv_pool), pool_image(*cpu_.kv_pool)));
+        if (pools_readable()) check(what + " trunk KV pool", rel_l2_masked(pool_image(*vk_.kv_pool), pool_image(*cpu_.kv_pool)));
         const auto shape = vk_.model->gdn_shape();
         for (std::size_t si = 0; si < vk_.seqs.size(); ++si) {
             auto& gv = vk_.seqs[si]->gdn;
@@ -302,6 +311,18 @@ struct Case {
 void PrintTo(const Case& c, std::ostream* os) { *os << c.file << (c.path == hm::GdnPath::Recurrent ? " recurrent" : " chunked"); }
 
 class VulkanForward : public ::testing::TestWithParam<Case> {};
+
+struct KvCase {
+    std::string file;
+    hm::GdnPath path;
+    hb::KvType kv;
+};
+
+void PrintTo(const KvCase& c, std::ostream* os) {
+    *os << c.file << (c.path == hm::GdnPath::Recurrent ? " recurrent " : " chunked ") << hb::to_string(c.kv);
+}
+
+class VulkanKvQuantForward : public ::testing::TestWithParam<KvCase> {};
 class VulkanCoopmatForward : public ::testing::TestWithParam<Case> {};
 
 /// A Vulkan context with the cooperative-matrix prefill GEMM explicitly on or off (never the env).
@@ -507,6 +528,48 @@ TEST(VulkanCoopmatGate, ModelsWithoutKQuantGemvsAreBitwiseUnchanged) {
     EXPECT_TRUE(cm.kv_pool->read_all() == mv.kv_pool->read_all()) << c.file << ": coopmat on changed the trunk KV";
 }
 
+// next.md step 9 at model level: VkKv.* holds kv_write_f16 / kv_write_q8 and attention_f16 / attention_q8 to
+// their op contracts, but no test had run a model forward over an fp16 or q8 KV pool (HALO_KV_FP16=1 /
+// HALO_KV_TYPE=q8). Both pools (trunk and MTP) take the format, as in the engine; the CPU side keeps fp32.
+// Pass condition, from the storage rounding model (fixed before the first measurement, not fitted):
+//   - every compared tensor within tau_kv of the CPU forward. Derivation: the tiny model reads stored K and V in
+//     2 attention layers (3 and 7) plus the MTP block, i.e. up to 6 rounded K / V tensors per step, adding as a random walk
+//     (the attention output is a convex mix of V rows and lands in a residual, so this over-estimates):
+//       f16: RNE to half, |rel err| <= u_h = 2^-11, rms ~ u_h / sqrt(3) ~ 2.8e-4 per stored row;
+//            sqrt(6) x 2.8e-4 ~ 6.9e-4 -> 2x -> tau_f16 = 2e-3 (rounded up);
+//       q8:  per-32 group scale max|x| / 127, rounding error uniform within half a step: rms (max|x| / 127) / sqrt(12),
+//            ~ 2.5 x rms|x| / 440 ~ 5.7e-3 per stored row (max / rms ~ 2.5 for 32 values);
+//            sqrt(6) x 5.7e-3 ~ 1.4e-2 -> 2x -> tau_q8 = 3e-2 (rounded up).
+//     KV pools are not compared (device-resident fp16 / q8 has no read-back); GDN rings, hidden rows and logits are.
+//   - argmax equal unless the CPU top-2 margin is within 10 tau_kv x max|logit| (near-ties are printed).
+//   - the format was used: the prefill is not bit for bit the fp32-KV Vulkan prefill on the same device.
+// The context pins the cooperative-matrix GEMM off so HALO_COOPMAT cannot add its fp16 prefill error.
+TEST_P(VulkanKvQuantForward, StaysWithinTheKvRoundingBoundOfTheCpuForward) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto ctx = vk_context(false);
+    const KvCase& k = GetParam();
+    const Case c{k.file, k.path};
+    const auto nm = load_case(c);
+    if (!nm) GTEST_SKIP() << c.file << " missing or not loadable over Vulkan (see output)";
+    const double tau = k.kv == hb::KvType::F16 ? 2e-3 : 3e-2;
+    const std::string label = std::string("vk-kv-") + std::string(hb::to_string(k.kv)) + "-forward";
+    {
+        Side vk(hb::make_vulkan_backend(ctx), *nm, k.kv);
+        Side cpu(hb::make_cpu_backend(nullptr), *nm);
+        run_scenario(vk, cpu, c, tau, label.c_str());
+    }
+    // The pool format really took effect: same device, fp32 KV, same prefill -> different bits.
+    Side q(hb::make_vulkan_backend(ctx), *nm, k.kv);
+    Side f(hb::make_vulkan_backend(ctx), *nm);
+    const hm::StepResult a = prefill70(q, c.path), b = prefill70(f, c.path);
+    ASSERT_EQ(a.seqs.size(), 1u);
+    ASSERT_EQ(b.seqs.size(), 1u);
+    EXPECT_FALSE(a.seqs[0].hidden == b.seqs[0].hidden && a.seqs[0].logits == b.seqs[0].logits)
+        << c.file << ": the " << hb::to_string(k.kv) << "-KV prefill is bit for bit the fp32-KV prefill, so the pool format was ignored";
+    std::cout << "[" << label << "] " << c.file << " vs fp32-KV prefill logits relative L2 = " << rel_l2(a.seqs[0].logits, b.seqs[0].logits)
+              << "\n";
+}
+
 // The fp32 forward: the context pins the cooperative-matrix GEMM off, so HALO_COOPMAT in the environment
 // cannot swap in the fp16 prefill this tau = 1e-4 bound was not derived for (VulkanCoopmatForward is its gate).
 TEST_P(VulkanForward, MatchesCpuBackend) {
@@ -539,4 +602,17 @@ INSTANTIATE_TEST_SUITE_P(Tiny, VulkanForward,
                              std::string n = info.param.file.substr(5, info.param.file.size() - 10);
                              std::replace(n.begin(), n.end(), '.', '_');
                              return n + (info.param.path == hm::GdnPath::Recurrent ? "_recurrent" : "_chunked");
+                         });
+
+INSTANTIATE_TEST_SUITE_P(Tiny, VulkanKvQuantForward,
+                         ::testing::Values(KvCase{"tiny-f32.gguf", hm::GdnPath::Recurrent, hb::KvType::F16},
+                                           KvCase{"tiny-f32.gguf", hm::GdnPath::Auto, hb::KvType::F16},
+                                           KvCase{"tiny-f32.gguf", hm::GdnPath::Recurrent, hb::KvType::Q8},
+                                           KvCase{"tiny-f32.gguf", hm::GdnPath::Auto, hb::KvType::Q8},
+                                           KvCase{"tiny-q6_k.gguf", hm::GdnPath::Auto, hb::KvType::F16},
+                                           KvCase{"tiny-q6_k.gguf", hm::GdnPath::Auto, hb::KvType::Q8}),
+                         [](const auto& info) {
+                             std::string n = info.param.file.substr(5, info.param.file.size() - 10);
+                             return n + (info.param.path == hm::GdnPath::Recurrent ? "_recurrent_" : "_chunked_") +
+                                    std::string(hb::to_string(info.param.kv));
                          });
