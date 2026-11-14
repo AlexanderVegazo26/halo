@@ -441,6 +441,9 @@ bool fuse_norm = false;
         /// The last sync() completed (fence waited without throwing). Only then may the stream be
         /// pooled: after a failed submit/wait (e.g. device lost) it is destroyed instead.
         bool clean = false;
+        /// Trunk gemvs may take the HALO_COOPMAT GEMM (GemvArgs::allow_gemm): set by forward() only
+        /// when every step is a prefill, so decode / verify rows stay bitwise their n_vec = 1 gemv.
+        bool allow_gemm = false;
 
         Step(const Impl& impl, StepCost& c) : I(impl), s(impl.acquire_stream()), cost(c) {}
         Step(const Step&) = delete;
@@ -476,6 +479,7 @@ bool fuse_norm = false;
     /// `norm` != nullptr: x is the RAW row and the gemv applies rms_norm(x) * norm itself (see fuse_norm).
     void gemv(Step& st, TensorRef x, std::size_t R, const Mat& w, TensorRef y, const Vec* norm = nullptr) const {
         backend::GemvArgs g{w.type, w.ref(), x, y, w.rows, w.cols, u32(R), {w.variant}};
+        g.allow_gemm = st.allow_gemm;
         if (norm != nullptr) {
             g.norm_w = norm->ref();
             g.norm_eps = eps;
@@ -564,7 +568,9 @@ bool fuse_norm = false;
         const std::uint64_t ws = w.stride != 0 ? w.stride : rb;  // repacked rows are `stride` apart
         TensorRef wr = w.ref().shifted(row0 * ws);
         wr.bytes = nrows == 0 ? 0 : (nrows - 1) * ws + rb;
-        be->gemv(*st.s, backend::GemvArgs{w.type, wr, x, y, u32(nrows), w.cols, u32(R), {w.variant}});
+        backend::GemvArgs g{w.type, wr, x, y, u32(nrows), w.cols, u32(R), {w.variant}};
+        g.allow_gemm = st.allow_gemm;
+        be->gemv(*st.s, g);
         st.cost.weight_bytes += nrows * rb;
         st.cost.activation_bytes += cpu::traffic_matmul(R, w.cols, nrows, 0).total();
     }
@@ -818,8 +824,9 @@ bool fuse_norm = false;
         st.arena.push_back(be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
         const TensorRef res = TensorRef::of(*st.arena.back());
         const WeightRef& w = head_w.ref;
-        be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{w.type(), TensorRef::of(*head_w.buf), xs, logits, u32(vocab_rows),
-                                                                 u32(E), u32(n), {}},
+        backend::GemvArgs hg{w.type(), TensorRef::of(*head_w.buf), xs, logits, u32(vocab_rows), u32(E), u32(n), {}};
+        hg.allow_gemm = st.allow_gemm;
+        be->lm_head(*st.s, backend::LmHeadArgs{hg,
                                                res,
                                                u32(std::min<std::size_t>(valid_vocab, vocab_rows)),
                                                {},
@@ -1129,6 +1136,7 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     cost.weight_passes = 1;
     const std::size_t E = I.E;
     Impl::Step st(I, cost);
+    st.allow_gemm = std::all_of(steps.begin(), steps.end(), [](const SeqStep& s) { return s.prefill; });
     std::vector<std::int32_t> ids(R), pos(R);
     std::vector<std::vector<std::int32_t>> tree_par(steps.size());  // per-step copies of tree_parents (imported below)
     for (std::size_t si = 0; si < steps.size(); ++si) {

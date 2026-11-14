@@ -287,6 +287,11 @@ struct GemvArgs {
     /// dependence on the reduce workgroup (see shaders matmul/matvec_*_normed.comp).
     TensorRef norm_w{};
     float norm_eps = 1e-6f;
+    /// The caller accepts the cooperative-matrix GEMM's fp16 numerics for these rows (Vulkan with
+    /// HALO_COOPMAT only; other backends ignore it). Off (the default), every row is bitwise its own
+    /// n_vec == 1 gemv whatever the batch, which decode and MTP verify rows rely on. qwen35 sets it
+    /// only in a forward whose every step is a prefill (SeqStep::prefill).
+    bool allow_gemm = false;
 };
 
 /// GDN gates (= the qwen35 sequence: beta_out = cpu::sigmoid(beta); t = alpha + dt_bias;

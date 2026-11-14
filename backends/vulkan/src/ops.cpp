@@ -250,9 +250,10 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     // Prefill: more than one matvec dispatch's worth of vectors on a K-quant weight runs as a
     // tiled cooperative-matrix GEMM (fp16 tiles, fp32 accumulate; shaders/common/matmul_cm_main.glsl).
     // Opt-in (HALO_COOPMAT=1, and the device must have enabled the extension at context creation:
-    // Context::coopmat_enabled()); numerics differ from the fp32 matvec, so never the default.
+    // Context::coopmat_enabled()); numerics differ from the fp32 matvec, so never the default,
+    // and only when the caller allows it (GemvArgs::allow_gemm: prefill rows, never decode / verify).
     // (Never on repacked weights: matmul_cm reads the raw GGUF blocks; those run the _rp matvec.)
-    if (!repacked && a.n_vec > k_gemv_max_vec && ctx_->coopmat_enabled() &&
+    if (a.allow_gemm && !repacked && a.n_vec > k_gemv_max_vec && ctx_->coopmat_enabled() &&
         (a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K)) {
         struct CmPush {
             std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;

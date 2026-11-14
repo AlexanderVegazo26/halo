@@ -724,3 +724,89 @@ TEST(VulkanRepack, QuantizedTinyModelsAreBitwiseTheRawLayout) {
     }
     EXPECT_EQ(files, 2u) << "not every quantized tiny model was checked";
 }
+
+// HALO_COOPMAT through the speculator: the GEMM gate counts a forward's rows across all its sequences, so a
+// batched decode / verify tick (here 3 sequences x (1 + 3 drafts) = 12 rows) used to run the trunk gemvs and
+// the LM head as the fp16 GEMM, and each sequence's greedy tokens and state depended on its batch neighbours.
+// Only prompt steps (SeqStep::prefill, which the speculator sets for prefill requests) may take it now.
+// Pass condition, on a coopmat context and tiny-q6_k (Q6_K gemvs the GEMM covers):
+//   - 3 sequences decoded speculatively (k = 3) in one batch emit the same tokens, and leave trunk KV, GDN
+//     state, carried hidden and MTP KV bit for bit equal to each sequence decoded plainly alone;
+//   - a 20-token prefill through the speculator still takes the GEMM: its trunk KV differs from the same
+//     prefill on a context without cooperative matrices (so the gate did not just switch the GEMM off).
+TEST(VulkanSpecCoopmat, BatchedSpeculativeTicksAreBitwisePlainDecodeAndPrefillStillTakesTheGemm) {
+    halo::vulkan::ContextOptions o_on, o_off;
+    o_on.coopmat = true;
+    o_off.coopmat = false;
+    HALO_VK_CONTEXT_OR_SKIP(on, o_on);
+    if (!on->coopmat_enabled()) GTEST_SKIP() << "device '" << on->info().name << "' lacks cooperative matrices";
+    const auto path = halo::test::tiny_dir() / "tiny-q6_k.gguf";
+    if (!std::filesystem::exists(path)) GTEST_SKIP() << "tiny model missing: " << path;
+    const auto nm = halo::model::NormalizedModel::load(path);
+    const VkModel batched(on, nm, /*reuse=*/false), alone(on, nm, /*reuse=*/false);
+    ASSERT_TRUE(batched.model->has_mtp()) << "tiny-q6_k.gguf has no MTP head";
+    constexpr std::size_t n_seq = 3, k = 3, n_tokens = 10, prompt_len = 20;
+    std::vector<Toks> prompts(n_seq);
+    for (std::size_t i = 0; i < n_seq; ++i) {
+        std::uint32_t x = 977u * static_cast<std::uint32_t>(i + 1);
+        for (std::size_t j = 0; j < prompt_len; ++j) {
+            x = x * 1664525u + 1013904223u;
+            prompts[i].push_back(static_cast<std::int32_t>((x >> 8) % batched.model->n_vocab()));
+        }
+    }
+
+    auto sp = batched.spec(GateMode::Always, false, false);
+    std::vector<std::unique_ptr<SequenceState>> seqs;
+    std::vector<Toks> got(n_seq);
+    std::vector<float> kv_after_prefill;
+    for (std::size_t i = 0; i < n_seq; ++i) {
+        seqs.push_back(batched.seq());
+        StepRequest pre;
+        pre.seq = seqs[i].get();
+        pre.prefill = prompts[i];
+        got[i] = step1(sp, pre).out.at(0).tokens;
+        if (i == 0) kv_after_prefill = dump_kv(seqs[0]->kv);
+    }
+    std::size_t ticks = 0;
+    while (true) {
+        std::vector<StepRequest> reqs;
+        std::vector<std::size_t> who;
+        for (std::size_t i = 0; i < n_seq; ++i) {
+            if (got[i].size() >= n_tokens) continue;
+            StepRequest r;
+            r.seq = seqs[i].get();
+            r.token = got[i].back();
+            r.max_draft = k;
+            r.max_emit = n_tokens - got[i].size();
+            reqs.push_back(r);
+            who.push_back(i);
+        }
+        if (reqs.empty()) break;
+        ASSERT_LT(ticks++, 4 * n_tokens) << "batched speculative decoding made no progress";
+        Tick t;
+        sp.step(reqs, t);
+        for (std::size_t j = 0; j < who.size(); ++j) {
+            ASSERT_FALSE(t.out.at(j).tokens.empty()) << "seq " << who[j] << " emitted no token in tick " << ticks;
+            got[who[j]].insert(got[who[j]].end(), t.out[j].tokens.begin(), t.out[j].tokens.end());
+        }
+    }
+    EXPECT_GT(sp.metrics().drafted, 0u) << "MTP drafting never ran, so no verify tick was batched";
+
+    auto off = alone.spec(GateMode::Off, false, false);
+    for (std::size_t i = 0; i < n_seq; ++i) {
+        SCOPED_TRACE("seq " + std::to_string(i));
+        auto s = alone.seq();
+        const SpecRun plain = generate(off, *s, prompts[i], n_tokens, 0);
+        EXPECT_EQ(got[i], plain.tokens) << "batched speculative greedy " << str(got[i]) << " != plain alone " << str(plain.tokens);
+        expect_same_state(sp, *seqs[i], off, *s, "batched speculative vs plain alone (HALO_COOPMAT on)");
+    }
+
+    HALO_VK_CONTEXT_OR_SKIP(no_cm, o_off);
+    const VkModel fp32(no_cm, nm, /*reuse=*/false);
+    auto sp32 = fp32.spec(GateMode::Off, false, false);
+    auto s32 = fp32.seq();
+    prefill(sp32, *s32, prompts[0]);
+    EXPECT_FALSE(dump_kv(s32->kv) == kv_after_prefill)
+        << "the speculator's 20-token prefill on the coopmat context is bit for bit the fp32 matvec prefill: "
+           "prefill requests no longer reach the GEMM (SeqStep::prefill not set?)";
+}

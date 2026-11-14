@@ -883,6 +883,7 @@ TEST(VkHead, CoopmatGemmIsTheFp16RoundedProductWithFp32Accumulation) {
                     g.rows = rows;
                     g.cols = cols;
                     g.n_vec = n_vec;
+                    g.allow_gemm = true;  // the prefill opt-in (GemvArgs::allow_gemm)
                     ops.gemv(s, g);
                     s.submit_and_wait();
                     const auto yb = download<float>(by, yinit.size());
@@ -928,9 +929,10 @@ TEST(VkHead, CoopmatGemmIsTheFp16RoundedProductWithFp32Accumulation) {
 
 TEST(VkHead, CoopmatOnlyReplacesKQuantGemvsOverEightVectors) {
     // The GEMM is not bitwise the matvec, so where it may run is part of the contract: only K-quant
-    // (Q4_K / Q5_K / Q6_K) gemvs with n_vec > 8 on a context that enabled it. Decode (n_vec 1), MTP
-    // verify (n_vec <= 8) and every other weight type keep the matvec, whose batch rows are bitwise
-    // their own n_vec = 1 matvec; coopmat = false never enables it, whatever HALO_COOPMAT says.
+    // (Q4_K / Q5_K / Q6_K) gemvs with n_vec > 8 that opt in (GemvArgs::allow_gemm, prefill rows) on a
+    // context that enabled it. Without the opt-in (decode / MTP verify, which can exceed 8 vectors:
+    // mtp_max_draft 8, or several sequences per forward) and for every other weight type the batch rows
+    // stay bitwise their own n_vec = 1 matvec; coopmat = false never enables it, whatever HALO_COOPMAT says.
     if (auto why = hv::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
     EXPECT_FALSE(coopmat_context(false)->coopmat_enabled()) << "ContextOptions::coopmat = false enabled it";
     const auto ctx = coopmat_context(true);
@@ -941,34 +943,38 @@ TEST(VkHead, CoopmatOnlyReplacesKQuantGemvsOverEightVectors) {
                                ref::WType::IQ4_XS, ref::WType::Q3_K}) {
         const bool kquant = t == ref::WType::Q4_K || t == ref::WType::Q5_K || t == ref::WType::Q6_K;
         for (const std::uint32_t n_vec : {1u, 8u, 9u, 20u}) {
-            const std::string what = std::string(tname(t)) + " n_vec " + std::to_string(n_vec);
-            SCOPED_TRACE(what);
-            std::mt19937 rng(static_cast<unsigned>(t) * 31 + n_vec);
-            const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
-            std::vector<float> x;
-            for (std::uint32_t v = 0; v < n_vec; ++v) {
-                const auto xv = ref::random_vec(cols, rng);
-                x.insert(x.end(), xv.begin(), xv.end());
-            }
-            hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
-            hv::Buffer bx = upload(ctx, std::span<const float>(x));
-            const std::uint64_t ybytes = std::uint64_t{n_vec} * rows * 4;
-            hv::Buffer yb = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
-            hv::Buffer y1 = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
-            hv::Stream s(ctx);
-            ops.gemv(s, hv::GemvArgs{ref::dtype(t), bw, bx, yb, rows, cols, n_vec});
-            for (std::uint32_t v = 0; v < n_vec; ++v) {
-                ops.matvec(s, ref::dtype(t), bw, hv::BufferView(bx, std::uint64_t{v} * cols * 4, cols * 4),
-                           hv::BufferView(y1, std::uint64_t{v} * rows * 4, rows * 4), rows, cols);
-            }
-            s.submit_and_wait();
-            const auto a = download<float>(yb, std::size_t{n_vec} * rows);
-            const auto b = download<float>(y1, std::size_t{n_vec} * rows);
-            if (kquant && n_vec > 8) {
-                EXPECT_FALSE(bitwise(a, b)) << what << ": bitwise the per-vector matvec, so the GEMM did not run";
-            } else {
-                EXPECT_TRUE(bitwise(a, b)) << what << ": not bitwise the per-vector matvec, so the GEMM (or "
-                                                      "something else) replaced the matvec where it must not";
+            for (const bool allow : {true, false}) {
+                const std::string what = std::string(tname(t)) + " n_vec " + std::to_string(n_vec) + (allow ? " allow_gemm" : " exact");
+                SCOPED_TRACE(what);
+                std::mt19937 rng(static_cast<unsigned>(t) * 31 + n_vec);
+                const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+                std::vector<float> x;
+                for (std::uint32_t v = 0; v < n_vec; ++v) {
+                    const auto xv = ref::random_vec(cols, rng);
+                    x.insert(x.end(), xv.begin(), xv.end());
+                }
+                hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+                hv::Buffer bx = upload(ctx, std::span<const float>(x));
+                const std::uint64_t ybytes = std::uint64_t{n_vec} * rows * 4;
+                hv::Buffer yb = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
+                hv::Buffer y1 = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
+                hv::Stream s(ctx);
+                hv::GemvArgs g{ref::dtype(t), bw, bx, yb, rows, cols, n_vec};
+                g.allow_gemm = allow;
+                ops.gemv(s, g);
+                for (std::uint32_t v = 0; v < n_vec; ++v) {
+                    ops.matvec(s, ref::dtype(t), bw, hv::BufferView(bx, std::uint64_t{v} * cols * 4, cols * 4),
+                               hv::BufferView(y1, std::uint64_t{v} * rows * 4, rows * 4), rows, cols);
+                }
+                s.submit_and_wait();
+                const auto a = download<float>(yb, std::size_t{n_vec} * rows);
+                const auto b = download<float>(y1, std::size_t{n_vec} * rows);
+                if (kquant && n_vec > 8 && allow) {
+                    EXPECT_FALSE(bitwise(a, b)) << what << ": bitwise the per-vector matvec, so the GEMM did not run";
+                } else {
+                    EXPECT_TRUE(bitwise(a, b)) << what << ": not bitwise the per-vector matvec, so the GEMM (or "
+                                                          "something else) replaced the matvec where it must not";
+                }
             }
         }
     }

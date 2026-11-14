@@ -451,7 +451,8 @@ inline constexpr std::uint32_t k_status_nan = 2u;
 /// n_vec > 1 is the batched form (prefill chunks, MTP verify): each workgroup dequantizes its
 /// W row once and applies it to up to 8 vectors per dispatch (larger n_vec is split into
 /// dispatches of 8). The per-vector arithmetic is exactly the n_vec = 1 matvec's, so a
-/// vector's result does not depend on the batch it is in (tested bitwise).
+/// vector's result does not depend on the batch it is in (tested bitwise), unless allow_gemm
+/// lets a K-quant n_vec > 8 gemv run as the HALO_COOPMAT GEMM.
 struct GemvArgs {
     DType wtype = DType::F32;
     BufferView w{}, x{}, y{};
@@ -465,6 +466,11 @@ struct GemvArgs {
     /// reduction (subgroup_reduce off) y is bit for bit rms_norm then the unfused gemv (VkHead.GemvFusedNorm*).
     BufferView norm_w{};
     float norm_eps = 1e-6f;
+    /// Opt-in to the cooperative-matrix GEMM (fp16 tiles, not bitwise the matvec): only then may a
+    /// Q4_K / Q5_K / Q6_K gemv with n_vec > 8 on a coopmat-enabled context take it. Off, the batch
+    /// rows stay bitwise their n_vec = 1 matvec, which decode and MTP verify need: a verify of
+    /// mtp_max_draft 8 (9 rows) or several sequences' rows in one forward exceed 8 vectors.
+    bool allow_gemm = false;
 };
 
 /// [LOGITS_MATMUL + ARGMAX] (cpu::matmul then cpu::argmax per vector; = cpu::matmul_argmax):

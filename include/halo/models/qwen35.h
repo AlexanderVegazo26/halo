@@ -129,6 +129,11 @@ struct SeqStep {
     /// truncate to L + m (chain rows kept, commit_rows_kept(k+1, m)) or, to keep [x, d1'], call
     /// Qwen35::kv_move_row(kv, L+k+1, L+1), truncate to L+2 and GdnState::commit_tree_leaf(k+1).
     std::span<const std::int32_t> tree_parents{};
+    /// Prompt rows, not decode / verify rows. Only a forward whose every step sets it may run its
+    /// gemvs as the HALO_COOPMAT GEMM (fp16, not bitwise the matvec); otherwise every row is bitwise
+    /// the same row decoded alone, which greedy speculative decoding relies on (a verify of 9 rows,
+    /// or several sequences' rows in one forward, would otherwise exceed the GEMM's 8-vector gate).
+    bool prefill = false;
 };
 
 /// One sequence of an MTP step (D-005): row i = MTP(embed(tokens[i]), hidden[i]) at RoPE

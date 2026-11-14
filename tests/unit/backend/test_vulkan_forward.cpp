@@ -342,8 +342,10 @@ void run_scenario(Side& vk, Side& cpu, const Case& c, double tau, const char* la
     const auto t0 = tokens(70, V, 1);
     const std::vector<std::size_t> last{69};
     const auto paths = d.forward("prefill 70", [&](Side& s) {
-        return std::vector<hm::SeqStep>{hm::SeqStep{t0, {}, &s.seqs[0]->kv, &s.seqs[0]->gdn, last, hm::LogitsMode::Full, true, 0,
-                                                    hm::GdnPath::Auto}};
+        std::vector<hm::SeqStep> st{hm::SeqStep{t0, {}, &s.seqs[0]->kv, &s.seqs[0]->gdn, last, hm::LogitsMode::Full, true, 0,
+                                                hm::GdnPath::Auto}};
+        st[0].prefill = true;  // prompt rows: the only forward HALO_COOPMAT's GEMM may serve
+        return st;
     }, /*capture=*/true);
     ASSERT_EQ(paths.size(), 1u);
     EXPECT_EQ(paths[0], chunked ? hm::GdnPath::Chunked : hm::GdnPath::Recurrent) << "the prefill ran the intended GDN form";
@@ -441,6 +443,7 @@ hm::StepResult prefill70(Side& s, hm::GdnPath path) {
     const auto t0 = tokens(70, s.model->n_vocab(), 1);
     const std::vector<std::size_t> last{69};
     std::vector<hm::SeqStep> st{hm::SeqStep{t0, {}, &s.seqs[0]->kv, &s.seqs[0]->gdn, last, hm::LogitsMode::Full, true, 0, path}};
+    st[0].prefill = true;
     hm::StepResult r;
     s.model->forward(st, r);
     return r;
@@ -475,8 +478,9 @@ bool has_kquant_gemv(const halo::model::NormalizedModel& m) {
 //     x and the dequantized W to fp16 (RNE, u_h = 2^-11 ~ 4.9e-4), so each product is off by <= 2 u_h and a
 //     gemv output by ~sqrt(2) u_h ~ 7e-4 relative L2 for rows without heavy cancellation; a prefill of the
 //     tiny model runs ~9 layers x ~6 K-quant gemvs, adding as a random walk through scale-invariant norms:
-//     sqrt(54) x 7e-4 ~ 5e-3 -> tau_cm = 1e-2 (2x). Decode / verify rows (n_vec <= 8) keep the fp32 matvec,
-//     but read the KV and GDN state the prefill left, so they are held to the same bound.
+//     sqrt(54) x 7e-4 ~ 5e-3 -> tau_cm = 1e-2 (2x). Decode / verify rows (any forward with a step that is not
+//     SeqStep::prefill) keep the fp32 matvec, but read the KV and GDN state the prefill left, so they are held
+//     to the same bound.
 //   - argmax equal unless the CPU top-2 margin is within 10 tau_cm x max|logit| (near-ties are printed).
 //   - the GEMM ran: the coopmat prefill is not bit for bit the fp32-matvec prefill on the same device.
 // tiny-q6_k (66 Q6_K + 6 Q8_0 tensors) and tiny-iq4_xs (IQ4_XS / IQ4_NL plus one Q5_K layer weight, as llama.cpp
@@ -526,6 +530,73 @@ TEST(VulkanCoopmatGate, ModelsWithoutKQuantGemvsAreBitwiseUnchanged) {
     EXPECT_TRUE(a.seqs[0].hidden == b.seqs[0].hidden) << c.file << ": coopmat on changed the prefill hidden";
     EXPECT_TRUE(a.seqs[0].logits == b.seqs[0].logits) << c.file << ": coopmat on changed the prefill logits";
     EXPECT_TRUE(cm.kv_pool->read_all() == mv.kv_pool->read_all()) << c.file << ": coopmat on changed the trunk KV";
+}
+
+// The GEMM is gated on the batch size (n_vec > 8), but a forward's gemvs carry the rows of every step in it:
+// three sequences verifying 3 rows each (R = 9), or one verify of mtp_max_draft 8 (9 rows), crossed that
+// gate, so with HALO_COOPMAT=1 a verify row's hidden / logits depended on what else shared the forward and
+// were not the rows plain decoding computes (the speculative greedy == plain greedy contract). Now only a
+// forward whose every step is SeqStep::prefill may take the GEMM. Pass condition: the R = 9 batched verify
+// gives every sequence's hidden rows, full logits and argmax bit for bit equal to the same verify run alone
+// (R = 3, never the GEMM), on a coopmat context and a model whose gemvs the GEMM covers.
+TEST(VulkanCoopmatGate, VerifyRowsOfABatchedForwardAreBitwiseTheSameVerifyAlone) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto on = vk_context(true);
+    if (!on->coopmat_enabled()) GTEST_SKIP() << "device '" << on->info().name << "' lacks cooperative matrices";
+    const Case c{"tiny-q6_k.gguf", hm::GdnPath::Auto};
+    const auto nm = load_case(c);
+    if (!nm) GTEST_SKIP() << c.file << " missing or not loadable over Vulkan (see output)";
+    ASSERT_TRUE(has_kquant_gemv(*nm)) << c.file << " has no Q4_K / Q5_K / Q6_K layer weight: the GEMM could never run";
+    constexpr std::size_t n_seq = 3, k_rows = 3;  // 9 rows > the 8-vector gate; k_rows state slots <= k_slots
+    static_assert(n_seq * k_rows > 8 && k_rows <= k_slots);
+    Side batched(hb::make_vulkan_backend(on), *nm);
+    Side alone(hb::make_vulkan_backend(on), *nm);
+    const std::size_t V = batched.model->n_vocab();
+    std::vector<std::vector<std::int32_t>> prompt(n_seq), verify(n_seq);
+    for (std::size_t i = 0; i < n_seq; ++i) {
+        prompt[i] = tokens(12 + i, V, static_cast<std::uint32_t>(60 + i));
+        verify[i] = tokens(k_rows, V, static_cast<std::uint32_t>(70 + i));
+    }
+    const std::vector<std::size_t> none{}, rows{0, 1, 2};
+    // Identical prompts on both sides, one sequence per forward (the same numerics on both).
+    for (Side* s : {&batched, &alone}) {
+        for (std::size_t i = 0; i < n_seq; ++i) {
+            std::vector<hm::SeqStep> st{hm::SeqStep{prompt[i], {}, &s->seqs[i]->kv, &s->seqs[i]->gdn, none, hm::LogitsMode::None,
+                                                    false, 0, hm::GdnPath::Auto}};
+            st[0].prefill = true;
+            hm::StepResult r;
+            s->model->forward(st, r);
+        }
+    }
+    const auto verify_step = [&](Side& s, std::size_t i) {
+        return hm::SeqStep{verify[i], {}, &s.seqs[i]->kv, &s.seqs[i]->gdn, rows, hm::LogitsMode::Full, true, k_rows,
+                           hm::GdnPath::Recurrent};
+    };
+    std::vector<hm::SeqStep> all;
+    for (std::size_t i = 0; i < n_seq; ++i) all.push_back(verify_step(batched, i));
+    hm::StepResult rb;
+    batched.model->forward(all, rb);
+    ASSERT_EQ(rb.seqs.size(), n_seq);
+    for (std::size_t i = 0; i < n_seq; ++i) {
+        SCOPED_TRACE("seq " + std::to_string(i));
+        std::vector<hm::SeqStep> one{verify_step(alone, i)};
+        hm::StepResult ra;
+        alone.model->forward(one, ra);
+        ASSERT_EQ(ra.seqs.size(), 1u);
+        const hm::SeqOutput& b = rb.seqs[i];
+        const hm::SeqOutput& a = ra.seqs[0];
+        ASSERT_EQ(b.hidden.size(), a.hidden.size());
+        ASSERT_EQ(b.logits.size(), a.logits.size());
+        ASSERT_EQ(b.argmax.size(), a.argmax.size());
+        EXPECT_TRUE(b.hidden == a.hidden) << c.file << " seq " << i << ": the " << n_seq * k_rows
+                                          << "-row batched verify's hidden rows differ from the same verify alone (relative L2 "
+                                          << rel_l2(b.hidden, a.hidden) << "): a decode / verify forward took the coopmat GEMM";
+        EXPECT_TRUE(b.logits == a.logits) << c.file << " seq " << i << ": batched verify logits differ from the verify alone "
+                                          << "(relative L2 " << rel_l2(b.logits, a.logits) << ")";
+        for (std::size_t j = 0; j < a.argmax.size(); ++j) {
+            EXPECT_EQ(b.argmax[j].index, a.argmax[j].index) << c.file << " seq " << i << " row " << j << ": batched verify token";
+        }
+    }
 }
 
 // next.md step 9 at model level: VkKv.* holds kv_write_f16 / kv_write_q8 and attention_f16 / attention_q8 to

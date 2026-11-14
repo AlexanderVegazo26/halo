@@ -959,7 +959,9 @@ private:
         const Ref y = want_y ? r.f32(a.y, a.n_vec, a.rows, Access::Write, "y") : Ref{};
         r.no_overlap(y, x);
         r.no_overlap(y, w);
-        return hv::GemvArgs{a.wtype, w.view, x.view, y.view, a.rows, a.cols, a.n_vec};
+        hv::GemvArgs g{a.wtype, w.view, x.view, y.view, a.rows, a.cols, a.n_vec};
+        g.allow_gemm = a.allow_gemm;
+        return g;
     }
 
     struct PoolRefs {

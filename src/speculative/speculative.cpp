@@ -400,6 +400,7 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
             if (r.want_output) rows[i].push_back(s.fed.size() - 1);
             st.logits = !r.want_output ? LogitsMode::None : r.greedy ? LogitsMode::Argmax : LogitsMode::Full;
             st.gdn_path = models::GdnPath::Auto;
+            st.prefill = true;
         }
         st.logit_rows = rows[i];
     }
