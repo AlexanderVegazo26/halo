@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -24,8 +25,10 @@ nlohmann::json minimal() {
                                                {"turns", {{{"role", "user"}, {"text", "hello"}}}}}})}};
 }
 
+// Per-process names: two suites (e.g. the ASan and TSan lanes) running on one machine share
+// /tmp, and a fixed name lets one process delete or overwrite the other's fixture mid-test.
 std::filesystem::path temp_file(const std::string& name) {
-    return std::filesystem::temp_directory_path() / ("halo_wsj_" + name);
+    return std::filesystem::temp_directory_path() / ("halo_wsj_" + std::to_string(::getpid()) + "_" + name);
 }
 
 }  // namespace
