@@ -47,6 +47,16 @@ bool subgroup_reduce_env() {
     const char* e = std::getenv("HALO_SUBGROUP_REDUCE");
     return e != nullptr && *e != '\0' && std::string_view(e) != "0";
 }
+// OpsOptions::gdn_decode_reg / gdn_dv_tile defaults (next.md step 3, both off): HALO_GDN_REG=1 and
+// HALO_GDN_DV_TILE=<columns per workgroup>.
+bool gdn_decode_reg_env() {
+    const char* e = std::getenv("HALO_GDN_REG");
+    return e != nullptr && e[0] == '1';
+}
+std::uint32_t gdn_dv_tile_env() {
+    const char* e = std::getenv("HALO_GDN_DV_TILE");
+    return e != nullptr ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+}
 // Largest chunk of the chunked GDN (the HIP backend's cap too; qwen35 prefill uses 64).
 constexpr std::uint32_t k_gdn_max_chunk = 64;
 
@@ -108,6 +118,8 @@ Ops::Ops(std::shared_ptr<Context> ctx, OpsOptions options) : ctx_(std::move(ctx)
     HALO_CHECK(std::uint64_t{rw} * 12 <= info.max_shared_memory, ErrorCode::Kernel,
                "Ops: reduce_workgroup={} exceeds shared memory", rw);
     subgroup_reduce_ = options_.subgroup_reduce.value_or(subgroup_reduce_env()) && subgroup_reduce_supported(info);
+    gdn_decode_reg_ = options_.gdn_decode_reg.value_or(gdn_decode_reg_env());
+    gdn_dv_tile_ = options_.gdn_dv_tile.value_or(gdn_dv_tile_env());
     // Tuning knob for the gemv/matvec workgroup size (specialization constant 0).
     if (const char* env = std::getenv("HALO_VK_GEMV_WG"); env != nullptr && *env != '\0')
         options_.gemv_workgroup = static_cast<std::uint32_t>(std::stoul(env));
@@ -387,25 +399,15 @@ void Ops::gdn_impl(Stream& stream, const GdnDecodeArgs& a, const GdnChunkedArgs*
 
     const DeviceInfo& info = ctx_->info();
     const std::uint32_t wg = options_.gdn_workgroup;
-    // Decode: split each head's d_v columns over workgroups of `dv_tile` columns (opt-in:
-    // HALO_GDN_DV_TILE=32, default 0 = one group per head; unmeasured). The chunked kernel is one group per head.
+    // Decode: split each head's d_v columns over workgroups of `dv_tile` columns (OpsOptions::gdn_dv_tile,
+    // default 0 = one group per head). The chunked kernel is one group per head.
     std::uint32_t dv_tile = a.d_v;
-    if (chunked == nullptr) {
-        static const std::uint32_t want = [] {
-            const char* e = std::getenv("HALO_GDN_DV_TILE");
-            return e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
-        }();
-        if (want > 0 && want < a.d_v) dv_tile = want;
-    }
-    // Opt-in register-resident decode variant (HALO_GDN_REG=1, default off; unmeasured): one thread
-    // per d_v column holding its d_k state rows in registers, so the state is read/written once per
-    // dispatch. Needs d_k <= k_gdn_reg_max_dk (register pressure) and dv_tile <= workgroup size.
+    if (chunked == nullptr && gdn_dv_tile_ > 0 && gdn_dv_tile_ < a.d_v) dv_tile = gdn_dv_tile_;
+    // Register-resident decode variant (OpsOptions::gdn_decode_reg, default off): one thread per d_v column
+    // holding its d_k state rows in registers, so the state is read/written once per dispatch. Needs
+    // d_k <= k_gdn_reg_max_dk (register pressure) and dv_tile <= workgroup size.
     constexpr std::uint32_t k_gdn_reg_max_dk = 128;
-    static const bool gdn_reg_env = [] {
-        const char* e = std::getenv("HALO_GDN_REG");
-        return e != nullptr && e[0] == '1';
-    }();
-    const bool use_reg = chunked == nullptr && gdn_reg_env && a.d_k <= k_gdn_reg_max_dk;
+    const bool use_reg = chunked == nullptr && gdn_decode_reg_ && a.d_k <= k_gdn_reg_max_dk;
     if (use_reg) dv_tile = std::min(dv_tile, wg);
     const std::uint32_t dv_tiles = (a.d_v + dv_tile - 1) / dv_tile;
     const GroupCount groups = grid_1d(chunked == nullptr ? a.n_v * dv_tiles : a.n_v, info.max_workgroup_count[0],

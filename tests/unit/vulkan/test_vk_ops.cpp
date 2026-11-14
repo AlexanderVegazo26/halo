@@ -451,9 +451,12 @@ std::vector<float> random_state(const GdnDims& d, std::mt19937& rng) {
 }
 
 // Single-dispatch-per-step continuity: `steps` separate decode calls, state in place.
+// `opt` selects the decode variant (gdn_decode_reg / gdn_dv_tile); its gdn_workgroup is replaced by `wg`.
 void gdn_continuity(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, std::uint32_t steps,
-                    std::uint32_t wg, const std::string& label, const GdnGates& gates = k_fast_decay) {
-    hv::Ops ops(ctx, hv::OpsOptions{.gdn_workgroup = wg});
+                    std::uint32_t wg, const std::string& label, const GdnGates& gates = k_fast_decay,
+                    hv::OpsOptions opt = {}) {
+    opt.gdn_workgroup = wg;
+    hv::Ops ops(ctx, opt);
     std::mt19937 rng(77 + d.n_v + d.d_k);
     const auto s0 = random_state(d, rng);
     std::vector<double> s_ref(s0.begin(), s0.end());  // fp64: bound scale only
@@ -521,8 +524,8 @@ namespace {
 
 // T-row call with K slots vs the CPU reference run row by row.
 void gdn_multi_row(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, std::uint32_t T, std::uint32_t K,
-                   const std::string& label) {
-    hv::Ops ops(ctx);
+                   const std::string& label, const hv::OpsOptions& opt = {}) {
+    hv::Ops ops(ctx, opt);
     std::mt19937 rng(9000 + T * 10 + K);
     const auto s0 = random_state(d, rng);
     std::vector<GdnRow> rows;
@@ -765,8 +768,9 @@ bool bit_eq(std::span<const float> a, std::span<const float> b) {
 /// values must be bit-identical (same arithmetic, modular slot addressing), the input slot
 /// untouched, unwritten physical slots sentinel.
 void gdn_ring_case(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, std::uint32_t T, std::uint32_t K,
-                   std::uint32_t P, std::uint32_t live, bool chunked, const std::string& label) {
-    hv::Ops ops(ctx);
+                   std::uint32_t P, std::uint32_t live, bool chunked, const std::string& label,
+                   const hv::OpsOptions& opt = {}) {
+    hv::Ops ops(ctx, opt);
     std::mt19937 rng(31000 + T * 100 + K * 10 + P + live + chunked);
     const auto s0 = random_state(d, rng);
     std::vector<GdnRow> rows;
@@ -1128,4 +1132,159 @@ TEST(VkOps, ChainedNormMatvecArgmaxInOneSubmission) {
     const auto st = compare(logits, logits_cpu, [&](std::size_t i) { return f * scale[i] + ct::kDenormFloor; });
     report("chained norm->q8_0 matvec", st);
     EXPECT_LE(st.max_ratio, 1.0);
+}
+
+// ---- gated_delta_rule_decode variants (next.md step 3): the register-resident shader
+// (OpsOptions::gdn_decode_reg) and the d_v column split (OpsOptions::gdn_dv_tile). Each must hold the
+// same CPU bound as the reference shader, keep the ring == slot-form contract, and the tile split must
+// be bitwise-neutral (columns are independent). Options are explicit, so these run whatever the
+// HALO_GDN_* env says.
+
+namespace {
+
+struct GdnVariant {
+    const char* name;
+    bool reg;
+    std::uint32_t tile;
+};
+
+// tile 48 does not divide d_v = 128 (a short last tile); 32 is the next.md value; 5 splits the small
+// dims (d_v = 8) unevenly too.
+constexpr std::array<GdnVariant, 6> k_gdn_variants{{{"reg", true, 0},
+                                                    {"tile32", false, 32},
+                                                    {"tile48", false, 48},
+                                                    {"tile5", false, 5},
+                                                    {"reg+tile32", true, 32},
+                                                    {"reg+tile5", true, 5}}};
+
+hv::OpsOptions gdn_variant_options(const GdnVariant& v) {
+    hv::OpsOptions o;
+    o.gdn_decode_reg = v.reg;
+    o.gdn_dv_tile = v.tile;
+    return o;
+}
+
+hv::OpsOptions gdn_reference_options() {
+    hv::OpsOptions o;
+    o.gdn_decode_reg = false;
+    o.gdn_dv_tile = 0;
+    return o;
+}
+
+struct GdnDecodeResult {
+    std::vector<float> out, state, slots;
+};
+
+// One T-row decode with K slots (state_out separate from the input) under `opt`.
+GdnDecodeResult gdn_decode_once(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, std::uint32_t T,
+                                std::uint32_t K, std::uint32_t seed, const hv::OpsOptions& opt) {
+    hv::Ops ops(ctx, opt);
+    std::mt19937 rng(seed);
+    const auto s0 = random_state(d, rng);
+    std::vector<GdnRow> rows;
+    for (std::uint32_t t = 0; t < T; ++t) rows.push_back(gdn_row(d, rng, k_slow_decay));
+    const GdnRow all = concat(rows);
+    const std::size_t S = d.state_elems();
+    const std::size_t out_elems = std::size_t{T} * d.n_v * d.d_v;
+    GdnBuffers b = gdn_upload(ctx, all, out_elems);
+    // Outputs start as a per-run sentinel: a fresh buffer may reuse the previous run's freed memory, which
+    // would hide elements a variant never writes.
+    const auto filled = [&](std::size_t n) {
+        return upload(ctx, std::span<const float>(std::vector<float>(n, -1000.0f - static_cast<float>(seed % 997))),
+                      hv::MemoryUsage::HostCached);
+    };
+    b.out = filled(out_elems);
+    hv::Buffer state_in = upload(ctx, std::span<const float>(s0), hv::MemoryUsage::HostVisible);
+    hv::Buffer state_out = filled(S);
+    hv::Buffer slots = filled(std::max<std::size_t>(std::size_t{K} * S, 1));
+    hv::GdnDecodeArgs a = gdn_args(b, state_in, d, T);
+    a.state_out = hv::BufferView(state_out);
+    if (K > 0) a.state_slots = hv::BufferView(slots);
+    a.n_slots = K;
+    hv::Stream s(ctx);
+    ops.gated_delta_rule_decode(s, a);
+    s.submit_and_wait();
+    return {download<float>(b.out, out_elems), download<float>(state_out, S),
+            download<float>(slots, std::size_t{K} * S)};
+}
+
+std::size_t first_bit_diff(std::span<const float> a, std::span<const float> b) {
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (std::bit_cast<std::uint32_t>(a[i]) != std::bit_cast<std::uint32_t>(b[i])) return i;
+    return a.size();
+}
+
+}  // namespace
+
+TEST(VkGdn, DecodeOptionsOverrideTheEnvPerOps) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    for (const auto& v : k_gdn_variants) {
+        const hv::Ops ops(ctx, gdn_variant_options(v));
+        EXPECT_EQ(ops.gdn_decode_reg(), v.reg) << v.name;
+        EXPECT_EQ(ops.gdn_dv_tile(), v.tile) << v.name;
+    }
+    const hv::Ops ref(ctx, gdn_reference_options());
+    EXPECT_FALSE(ref.gdn_decode_reg());
+    EXPECT_EQ(ref.gdn_dv_tile(), 0u);
+}
+
+TEST(VkGdn, DecodeVariantsHoldTheCpuBound) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const GdnDims real{48, 16, 128, 128}, small{6, 2, 16, 8};
+    for (const auto& v : k_gdn_variants) {
+        const hv::OpsOptions o = gdn_variant_options(v);
+        const std::string n = std::string(" [") + v.name + "]";
+        gdn_continuity(ctx, real, 20, 128, "gdn real dims 20 steps slow decay" + n, k_slow_decay, o);
+        gdn_continuity(ctx, small, 20, 64, "gdn small dims 20 steps" + n, k_fast_decay, o);
+        gdn_continuity(ctx, {6, 2, 16, 40}, 3, 16, "gdn small dims wg16 (d_v > wg)" + n, k_fast_decay, o);
+        gdn_multi_row(ctx, real, 4, 3, "gdn real T=4 K=3" + n, o);
+        gdn_multi_row(ctx, small, 5, 5, "gdn small T=5 K=5" + n, o);
+        gdn_multi_row(ctx, small, 3, 6, "gdn small T=3 K=6 (slots beyond T untouched)" + n, o);
+        gdn_multi_row(ctx, small, 7, 0, "gdn small T=7 no slots" + n, o);
+    }
+}
+
+TEST(VkGdn, DecodeVariantsRingFormMatchesSlotFormBitwise) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const GdnDims small{6, 2, 16, 8};
+    for (const auto& v : k_gdn_variants) {
+        const hv::OpsOptions o = gdn_variant_options(v);
+        const std::string n = std::string(" [") + v.name + "]";
+        gdn_ring_case(ctx, small, 1, 0, 2, 1, false, "decode ring T=1 K=0 P=2 live=1 (wrap)" + n, o);
+        gdn_ring_case(ctx, small, 4, 3, 4, 2, false, "decode ring T=4 K=3 P=4 live=2" + n, o);
+        gdn_ring_case(ctx, small, 3, 5, 6, 5, false, "decode ring T=3 K=5 P=6 live=5 (wrap)" + n, o);
+        gdn_ring_case(ctx, {48, 16, 128, 128}, 4, 3, 4, 1, false, "decode ring real dims T=4 K=3" + n, o);
+    }
+}
+
+TEST(VkGdn, DecodeVariantsAreBitwiseTheReferenceShader) {
+    // Columns are independent and every variant keeps the reference's per-element operation order
+    // (gated_delta_rule_decode_reg.comp header), so out, final state and slots must match bit for bit:
+    // switching a flag must not change greedy output.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    struct Case {
+        GdnDims d;
+        std::uint32_t T, K;
+        const char* label;
+    };
+    const std::array<Case, 3> cases{{{{48, 16, 128, 128}, 4, 3, "real T=4 K=3"},
+                                     {{48, 16, 128, 128}, 1, 0, "real T=1 (decode step)"},
+                                     {{6, 2, 16, 40}, 5, 5, "small d_v=40 T=5 K=5"}}};
+    for (const auto& c : cases) {
+        const std::uint32_t seed = 52000 + c.T * 10 + c.K + c.d.d_v;
+        const GdnDecodeResult ref = gdn_decode_once(ctx, c.d, c.T, c.K, seed, gdn_reference_options());
+        for (const auto& v : k_gdn_variants) {
+            const GdnDecodeResult got = gdn_decode_once(ctx, c.d, c.T, c.K, seed, gdn_variant_options(v));
+            const auto check = [&](std::span<const float> g, std::span<const float> r, const char* what) {
+                ASSERT_EQ(g.size(), r.size());
+                const std::size_t i = first_bit_diff(g, r);
+                EXPECT_EQ(i, g.size()) << c.label << " [" << v.name << "] " << what << " differs from the reference "
+                                       << "shader at element " << i << ": " << (i < g.size() ? g[i] : 0.0f)
+                                       << " vs " << (i < r.size() ? r[i] : 0.0f);
+            };
+            check(got.out, ref.out, "out");
+            check(got.state, ref.state, "final state");
+            check(got.slots, ref.slots, "slots");
+        }
+    }
 }

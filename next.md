@@ -150,7 +150,7 @@ All new paths are opt-in (env flag, default off) except the `stream.cpp` per-dis
 |---|---|
 | 1 batched matvec | shared-tree fusion (default); `HALO_SUBGROUP_REDUCE=1` subgroupAdd + unrolled NV variants (q4_k/q5_k/q6_k/iq4_xs). **GPU-verified 2026-11-14 (RADV):** within the CPU bound for n_vec 1-17; it now also runs the n_vec = 1 chunks, because R=1 on the tree shader and R>1 on subgroupAdd broke the bitwise batch == single contract (MTP verify vs decode); `OpsOptions::subgroup_reduce` overrides the env (VkHead gemv test covers both). Qwen3.8-27B greedy 64 tokens identical with MTP on/off and vs the tree path. tok/s not measured (GPU busy) |
 | 2 draft head | `HALO_MTP_DRAFT_VOCAB=32768` (first-N-ids prefix; not a frequency list) |
-| 3 GDN decode | `HALO_GDN_DV_TILE=32`; `HALO_GDN_REG=1` register-resident state kernel (d_k <= 128) |
+| 3 GDN decode | `HALO_GDN_DV_TILE=32`; `HALO_GDN_REG=1` register-resident state kernel (d_k <= 128). **GPU-verified 2026-11-14 (RADV):** both (and combined, incl. uneven tiles 48/5 and d_v > workgroup) hold the CPU bound over 20 steps and multi-row slots, keep ring == slot form, and are bitwise the reference shader (out, final state, slots), so a flag cannot change greedy output; `OpsOptions::gdn_decode_reg` / `gdn_dv_tile` override the env per Ops (VkGdn.DecodeVariants*). tok/s not measured (GPU busy) |
 | 4 host round-trips | mid-forward sync removed; `HALO_STREAM_REUSE=1`; `HALO_MTP_DEVICE_HIDDEN=1`; `HALO_MTP_CHAIN=1` (chained drafts, one submit for the draft phase; verify still its own forward) |
 | 5 tokens/tick | `HALO_MTP_TREE=1` (chain + one runner-up leaf); `--mtp-draft 3` needs no code |
 | 6 fusion | `HALO_FUSE_GEMV=1\|all\|ffn,ba,qkv` (gemv-level; SwiGLU/gates not folded into the epilogue) |

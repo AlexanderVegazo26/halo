@@ -98,6 +98,16 @@ struct OpsOptions {
     /// reduction order only. nullopt = the HALO_SUBGROUP_REDUCE env var (default off). Needs arithmetic
     /// subgroup ops in compute with subgroupSize >= 32; otherwise ignored (see Ops::subgroup_reduce()).
     std::optional<bool> subgroup_reduce = std::nullopt;
+    /// gated_delta_rule_decode register-resident state shader (next.md step 3): one thread per d_v column
+    /// keeps its d_k state rows in registers for all T rows. Used only when d_k <= 128; otherwise the
+    /// reference shader runs. Same per-element operation order as the reference. nullopt = the HALO_GDN_REG
+    /// env var ("1" = on, default off). The chunked (prefill) form is unaffected.
+    std::optional<bool> gdn_decode_reg = std::nullopt;
+    /// gated_delta_rule_decode: d_v columns per workgroup (next.md step 3), so the grid is n_v * ceil(d_v /
+    /// tile) groups instead of n_v. Columns are independent, so any tile is bitwise-neutral. 0, or a value
+    /// >= d_v, = one group per head. With gdn_decode_reg the tile is also capped at gdn_workgroup. nullopt =
+    /// the HALO_GDN_DV_TILE env var (default 0). The chunked (prefill) form is unaffected.
+    std::optional<std::uint32_t> gdn_dv_tile = std::nullopt;
 };
 
 /// Byte size of one row of `cols` elements of weight type `t` (F32, Q8_0, Q4_K, Q5_K,
@@ -508,6 +518,10 @@ public:
     /// Whether gemv uses the subgroupAdd matvec shaders: OpsOptions::subgroup_reduce (or its env
     /// default) AND the device supports them.
     [[nodiscard]] bool subgroup_reduce() const noexcept { return subgroup_reduce_; }
+    /// The resolved gated_delta_rule_decode options: OpsOptions::gdn_decode_reg / gdn_dv_tile, or their env
+    /// defaults (read per Ops, so one process can run every variant).
+    [[nodiscard]] bool gdn_decode_reg() const noexcept { return gdn_decode_reg_; }
+    [[nodiscard]] std::uint32_t gdn_dv_tile() const noexcept { return gdn_dv_tile_; }
 
     /// [RMS_NORM] y[r,i] = (x[r,i] * rsqrt(mean_i(x[r,·]²) + eps)) * w[i], like cpu::rms_norm.
     /// x, y: `rows` rows of `cols` fp32 (row strides from the views); w: [cols]. Plain x̂·w
@@ -589,6 +603,8 @@ private:
     std::shared_ptr<Context> ctx_;
     OpsOptions options_;
     bool subgroup_reduce_ = false;
+    bool gdn_decode_reg_ = false;
+    std::uint32_t gdn_dv_tile_ = 0;
     std::map<std::string, std::unique_ptr<Kernel>> kernels_;
 };
 
