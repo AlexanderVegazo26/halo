@@ -415,13 +415,16 @@ def model_steps(b: Bundle, halo: str) -> None:
     b.step("run-greedy", run_common, category="model", timeout=7200,
            env_extra={**trace, "HALO_LOG_FILE": str(mdir / "run-greedy.log.jsonl")},
            note="backend auto; the backend that actually ran is read from the trace log (SUMMARY.md checklist)")
+    # halo runs the model on the GPU only: `--backend vulkan` must work on the EVO-X2; the HIP
+    # forward is not wired yet, so a clean 'not available' error is its expected result.
+    probe_expect = {"hip": ("fail", "probe: the HIP forward is not wired yet; a clean 'not available' error is expected"),
+                    "vulkan": ("pass-on-gpu-host", "probe: halo is GPU-only, the Vulkan forward must run on the GPU host")}
     for be in ("hip", "vulkan"):
         b.step(f"run-backend-{be}", [halo, "run", a.model] + mtp + ["-p", "hi", "-n", "1", "--temperature", "0",
                                                                     "--ctx", "512", "--parallel", "1", "--backend", be],
-               category="model", timeout=1800, expect="fail",
+               category="model", timeout=1800, expect=probe_expect[be][0],
                env_extra={**trace, "HALO_LOG_FILE": str(mdir / f"run-backend-{be}.log.jsonl")},
-               note="probe: the model forward is not wired to the GPU yet (ADR-001 BI-1..BI-6); a clean "
-                    "'not available' error is the expected result today")
+               note=probe_expect[be][1])
     bench = [halo, "bench", "model", "--model", a.model] + mtp + [
         "--host-label", a.host_label, "--power-mode", a.power_mode, "--modes", "decode", "--contexts", str(a.ctx),
         "--concurrency", "1", "--prompt-tokens", str(a.bench_prompt_tokens), "--decode-tokens", str(a.bench_decode_tokens),
@@ -612,7 +615,7 @@ def checklist(b: Bundle) -> list[dict[str, str]]:
         rg = _step(b, "run-greedy")
         err = C.read_text(b.root / rg["stderr"]) if rg and "stderr" in rg else ""
         m = re.search(r"\[halo\] prompt .*", err)
-        add("halo run (greedy, trace log)", "exit 0; backend that ran = cpu (GPU forward not wired, BI-6)",
+        add("halo run (greedy, trace log)", "exit 0; backend that ran = vulkan (halo is GPU-only)",
             (f"exit {rg.get('exit_code')}; " if rg else "") + (m.group(0) if m else "no summary line"),
             "OK" if rg and rg["verdict"] == "OK" else "MISMATCH", "model/*run-greedy")
         if rg and rg.get("status") != "skipped":
@@ -626,21 +629,26 @@ def checklist(b: Bundle) -> list[dict[str, str]]:
                     ran = "cpu"
                     ev = ["inferred: --backend hip and --backend vulkan both fail with 'cpu reference only'"] + ev
             b.facts["run_greedy_backend"] = {"ran": ran, "evidence": ev}
-            add("Backend that ran `halo run` (from the trace log)", "cpu until ADR-001 BI-6 wires the GPU forward",
+            add("Backend that ran `halo run` (from the trace log)", "vulkan (halo is GPU-only, no CPU fallback)",
                 f"{ran}; " + (" / ".join(ev[:2]) if ev else "no backend-related log line"),
-                "OK" if ran == "cpu" else ("CHECK (GPU forward now runs?)" if ran.startswith("gpu") else "UNKNOWN"),
+                "OK" if ran.startswith("gpu") else ("MISMATCH (ran on the CPU)" if ran == "cpu" else "UNKNOWN"),
                 "model/run-greedy.log.jsonl")
         for be in ("hip", "vulkan"):
             s = _step(b, f"run-backend-{be}")
             if s:
                 e = C.read_text(b.root / s["stderr"]).strip().splitlines()
-                add(f"halo run --backend {be}", "clean 'not available' error until BI-6",
+                if be == "vulkan":
+                    want, grade = "exit 0 on the GPU", {"OK": "OK", "EXPECTED-FAIL": "N/A (dev host)"}
+                else:
+                    want, grade = "clean 'not available' error until the HIP forward is wired", {
+                        "EXPECTED-FAIL": "OK", "UNEXPECTED-PASS": "CHECK (HIP backend now runs?)"}
+                add(f"halo run --backend {be}", want,
                     f"exit {s.get('exit_code')}: {(e[-1] if e else '')[:160]}",
-                    {"EXPECTED-FAIL": "OK", "UNEXPECTED-PASS": "CHECK (GPU backend now runs?)"}.get(s["verdict"], "MISMATCH"),
+                    grade.get(s["verdict"], "MISMATCH"),
                     f"model/*run-backend-{be}")
         bm = _read_json(b.root / "model" / "bench-model.json")
         if isinstance(bm, dict):
-            add("halo bench model artifact", "written (smoke; CPU engine)", f"valid={bm.get('valid')}, conformant={bm.get('conformant')}",
+            add("halo bench model artifact", "written (smoke; Vulkan)", f"valid={bm.get('valid')}, conformant={bm.get('conformant')}",
                 "INFO", "model/bench-model.json")
         lbj = _read_json(b.root / (_step(b, "llama-bench") or {}).get("stdout", "none")) if _step(b, "llama-bench") else None
         if isinstance(lbj, list):

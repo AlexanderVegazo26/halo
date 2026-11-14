@@ -8,7 +8,7 @@ formats and the Anthropic Messages format, and it has a few utility routes. The 
 
 ```
 halo serve --model model.gguf [--mtp mtp.gguf] [--host 127.0.0.1] [--port 8080] [--ctx N]
-           [--parallel N] [--backend auto|cpu|vulkan|hip] [--cors-origins a,b]
+           [--parallel N] [--backend auto|vulkan|hip] [--cors-origins a,b]
            [--allowed-hosts h1,h2] [--served-model-name NAME] [--max-queue N]
            [--max-concurrent N] [--max-body-bytes N] [--max-tokens-cap N]
            [--default-max-tokens N] [--request-timeout S] [--allow-unauthenticated-remote]

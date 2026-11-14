@@ -37,7 +37,7 @@ Every suite returns a `SuiteArtifact` (JSON schema `halo.bench.artifact/1`) with
 
 ```
 halo bench micro  [--warmup N=5] [--iterations N=20] [--filter REGEX]
-halo bench model  --model PATH [--mtp PATH] [--backend cpu|vulkan|hip]
+halo bench model  --model PATH [--mtp PATH] [--backend auto|vulkan|hip]
                   [--modes load_time,prompt,decode,mtp_decode,concurrency,prefix_replay,cancellation_storm]
                   [--contexts 4096,32768,131072,262144] [--concurrency 1,2,4,8]
                   [--prompt-tokens 512] [--decode-tokens 128] [--repetitions 3] [--warmup 1]

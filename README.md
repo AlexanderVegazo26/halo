@@ -13,19 +13,18 @@ and autotuning.
 ## Download
 
 Prebuilt Linux x86-64 binaries are attached to each release on the
-[Releases page](https://github.com/AlexanderVegazo26/halo/releases). Each release has two
-archives, because the Vulkan build will not start on a machine without the Vulkan loader:
+[Releases page](https://github.com/AlexanderVegazo26/halo/releases). halo runs the model on
+the GPU only, so each release has one archive, the Vulkan build:
 
-| File | Backends | Shared libraries it needs |
+| File | Backend | Shared libraries it needs |
 |---|---|---|
-| `halo-<version>-linux-x86_64-vulkan.tar.gz` | CPU and Vulkan | `libvulkan.so.1` plus a Vulkan driver (Mesa RADV on the EVO-X2), `libsqlite3.so.0`, glibc, libstdc++ |
-| `halo-<version>-linux-x86_64-cpu.tar.gz` | CPU only | `libsqlite3.so.0`, glibc, libstdc++ |
+| `halo-<version>-linux-x86_64-vulkan.tar.gz` | Vulkan | `libvulkan.so.1` plus a Vulkan driver (Mesa RADV on the EVO-X2), `libsqlite3.so.0`, glibc, libstdc++ |
 
-Both are built on Ubuntu 24.04 with clang and `-march=x86-64-v3`: they need a CPU with AVX2
-and a distribution whose glibc and libstdc++ are at least as new as Ubuntu 24.04's. An archive
+It is built on Ubuntu 24.04 with clang and `-march=x86-64-v3`: it needs a CPU with AVX2
+and a distribution whose glibc and libstdc++ are at least as new as Ubuntu 24.04's. The archive
 unpacks to `bin/halo`, `share/halo/workloads/` (the reference benchmark workloads),
 `licenses/` (the notices of the third-party code compiled in) and `BUILD-INFO.txt` (the commit
-and the exact shared libraries the binary loads). A `.sha256` file sits beside each archive:
+and the exact shared libraries the binary loads). A `.sha256` file sits beside it:
 
 ```bash
 sha256sum -c halo-<version>-linux-x86_64-vulkan.tar.gz.sha256

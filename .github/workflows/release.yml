@@ -2,10 +2,10 @@ name: Release
 
 # Builds the `halo` CLI for Linux x86-64 and attaches it to a GitHub release.
 #
-# Two archives per release, because the Vulkan build links the Vulkan loader and
-# will not start on a machine without libvulkan.so.1:
-#   halo-<version>-linux-x86_64-vulkan.tar.gz   CPU + Vulkan backends (the Strix Halo target)
-#   halo-<version>-linux-x86_64-cpu.tar.gz      CPU backend only, no GPU libraries needed
+# One archive per release: halo-<version>-linux-x86_64-vulkan.tar.gz (the Strix Halo target).
+# halo runs the model on the GPU only (`--backend auto` = Vulkan, `--backend cpu` is refused),
+# so a build without Vulkan could not run a model and is not shipped. The binary links the
+# Vulkan loader and needs libvulkan.so.1 plus a Vulkan driver (RADV) on the machine.
 #
 # Linux only: the sources use POSIX APIs without a Windows port (mmap, signals), so there is
 # no native Windows or macOS build to offer. The HIP backend is not built here either: it
@@ -40,9 +40,6 @@ jobs:
           - variant: vulkan
             vulkan: 'ON'
             packages: libvulkan-dev glslc spirv-tools
-          - variant: cpu
-            vulkan: 'OFF'
-            packages: ''
     # Pinned, not ubuntu-latest: the binary needs the glibc and libstdc++ of the image it was
     # built on (or newer), so the image is part of what a release promises.
     runs-on: ubuntu-24.04

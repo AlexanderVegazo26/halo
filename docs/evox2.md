@@ -234,9 +234,10 @@ HALO_LOG_LEVEL=trace HALO_LOG_FORMAT=json HALO_LOG_FILE=run.log.jsonl \
   bin/halo run ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf -p "Hello" -n 64 --temperature 0 --ctx 4096 --parallel 1
 ```
 
-Today this runs the CPU reference engine (see section 6). Its speed on the 27B model has not
-been measured yet (it is a reference implementation, not a fast path); the weights file is
-17.6 GB and is memory-mapped. The last stderr line is the summary (tokens, time, decode tok/s,
+This runs on the GPU: `--backend auto` (the default) is Vulkan, and halo exits with an error
+instead of falling back to the CPU when no Vulkan device opens (`--backend cpu` is refused). The
+log line `backend 'auto' resolved to 'vulkan'` confirms it. The weights file is 17.6 GB and is
+memory-mapped. The last stderr line is the summary (tokens, time, decode tok/s,
 finish reason).
 
 ### Step 5: serve on loopback only (D-017)
@@ -270,12 +271,12 @@ you changed on the machine between runs.
 
 Be clear about what the current code does on the EVO-X2:
 
-- **The model forward does not run on the GPU yet.** ADR-001 (BI-1..BI-6) is in progress;
-  until BI-6 wires the qwen35 forward to a GPU backend, `halo run`, `halo serve` and `halo bench
-  model` use the **CPU reference engine**. `collect.sh` reads the backend that actually ran from
-  the trace log and shows it in the checklist; `--backend hip` / `--backend vulkan` are probed
-  and are expected to fail with a clean "not available" error. Any tok/s number from `halo run`
-  or `bench model` today is a CPU number, not a HALO GPU result.
+- **The model runs on the GPU only.** `halo run`, `halo serve` and `halo bench model` use the
+  Vulkan backend (`--backend auto`); there is no CPU fallback and `--backend cpu` is refused. The
+  CPU backend is only the reference the tests check the GPU kernels against. `collect.sh` reads
+  the backend that actually ran from the trace log and expects Vulkan; the `--backend vulkan`
+  probe must exit 0 on the EVO-X2, and `--backend hip` is expected to fail with a clean "not
+  available" error until the HIP forward is wired.
 - **The useful GPU evidence today is:**
   - the HIP device tests (`test_hip_*`, the `...Device...` tests): they SKIP on the dev host
     with "no HIP device (dev host, D-001)" and must **run and pass** on the EVO-X2. This is the
@@ -286,13 +287,13 @@ Be clear about what the current code does on the EVO-X2:
   - the memory-tier and bandwidth measurements: `HALO_BANDWIDTH_FULL=1` host bandwidth, the
     GTT/carveout allocation tests, the VRAM/GTT sizes (the ~96 GiB carveout, D-002);
   - the llama.cpp same-file baseline (the engine report measured ~20 tok/s decode with MTP);
-  - the CPU-engine run of the real model (correct text, memory plan, trace log).
+  - the Vulkan run of the real model (correct text, memory plan, trace log).
 - **The checklist (`SUMMARY.md` section 2) on a healthy EVO-X2:** gfx1151 in KFD and rocminfo;
   `HSA_OVERRIDE_GFX_VERSION` unset; VRAM ~96 GiB; RADV sees the GPU; every kit binary resolves
   its libraries; unit tests 0 failed / 0 crashed; HIP device tests passed with none skipped for
   "no device"; the full bandwidth benchmark ran; Vulkan tests on RADV passed with no
   "Vulkan unavailable" skip; no GPU errors/faults/resets in the kernel log; `halo run` exit 0 on
-  the CPU backend.
+  the Vulkan backend.
 - **Skips that are normal on the EVO-X2:** tests that need a llama.cpp or Ollama binary when
   none was given; `a HIP device is present; the no-device path is not reachable` (the test of the
   dev-host path); reference-data skips if `halo-ref` was not unpacked.
