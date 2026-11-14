@@ -27,9 +27,12 @@
 #include <bit>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -37,6 +40,8 @@
 
 #include "halo/backend/backend.h"
 #include "halo/core/error.h"
+#include "halo/model/gguf.h"
+#include "halo/model/model.h"
 #include "legacy_qwen35.h"
 #include "tiny_golden.h"
 
@@ -585,6 +590,79 @@ TEST_F(BackendLimits, MtpSharesTheTrunkTablesWhenTheyAreTheSameTensor) {
         << "token_embd (" << nm_->token_embd().n_bytes() << " B): imported once for the trunk and the MTP embedding";
     // Sharing changes no accounting: a draft still reads the whole head.
     EXPECT_EQ(m.mtp_head_bytes(), m.lm_head_bytes()) << "the MTP head is the trunk's";
+}
+
+// next.md step 2 option A, the copy case. A separate MTP file (python/tools/split_mtp_gguf.py)
+// carries its own token_embd / output, byte for byte the trunk's; with use_mtp_file_head they
+// are the MTP's tables (MtpTensorOrigin::MtpFile): other tensors, the same bytes. Each must
+// still be imported once. A copy that differs in one byte is a real separate table and keeps
+// its own import.
+TEST_F(BackendLimits, MtpSharesTheTrunkTablesWhenASeparateCopyHasTheSameBytes) {
+    const auto dir = halo::test::tiny_dir() / "split";
+    const auto trunk_path = dir / "tiny-f32-trunk.gguf", mtp_path = dir / "tiny-f32-mtp.gguf";
+    if (!std::filesystem::exists(trunk_path) || !std::filesystem::exists(mtp_path)) {
+        GTEST_SKIP() << dir << " missing (python/tools/split_mtp_gguf.py)";
+    }
+    // `flip`: the output.weight byte to invert in the MTP file's image (nullopt: a byte-identical copy).
+    const auto load = [&](std::optional<std::uint64_t> flip) {
+        auto nm = halo::model::NormalizedModel::load(trunk_path);
+        auto mtp = halo::model::GgufFile::open(mtp_path);
+        std::vector<std::byte> img(mtp.file_size());
+        {
+            std::ifstream in(mtp_path, std::ios::binary);
+            in.read(reinterpret_cast<char*>(img.data()), static_cast<std::streamsize>(img.size()));
+            EXPECT_TRUE(in.good()) << "read " << mtp_path;
+        }
+        if (flip) {
+            const halo::model::GgufTensorInfo* t = mtp.find_tensor("output.weight");
+            EXPECT_NE(t, nullptr) << mtp_path << " should carry its own output.weight";
+            if (t != nullptr) img.at(mtp.data_offset() + t->offset + *flip) ^= std::byte{0x01};
+        }
+        nm.attach_mtp(halo::model::GgufFile::parse(std::move(img), halo::model::GgufMode::Full, mtp_path.string()), true);
+        return nm;
+    };
+    const auto imports_of = [](const LimitedBackend& be, std::span<const std::byte> t) {
+        return std::count_if(be.readonly_imports.begin(), be.readonly_imports.end(),
+                             [&](std::span<const std::byte> s) { return s.data() == t.data() && s.size() == t.size(); });
+    };
+    const auto same_bytes = [](std::span<const std::byte> a, std::span<const std::byte> b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+    };
+
+    {
+        const auto nm = load(std::nullopt);
+        const halo::model::MtpWeights* mw = nm.mtp();
+        ASSERT_NE(mw, nullptr) << "trunk + " << mtp_path << " should have an MTP";
+        ASSERT_EQ(mw->lm_head_origin, halo::model::MtpTensorOrigin::MtpFile) << "use_mtp_file_head picks the file's output";
+        ASSERT_EQ(mw->embedding_origin, halo::model::MtpTensorOrigin::MtpFile) << "use_mtp_file_head picks the file's token_embd";
+        ASSERT_NE(mw->lm_head.data().data(), nm.output().data().data()) << "the MTP head must be a separate tensor here";
+        ASSERT_NE(mw->embedding.data().data(), nm.token_embd().data().data()) << "the MTP embedding must be a separate tensor";
+        ASSERT_TRUE(same_bytes(mw->lm_head.data(), nm.output().data())) << "split_mtp_gguf.py copies output byte for byte";
+        ASSERT_TRUE(same_bytes(mw->embedding.data(), nm.token_embd().data())) << "split_mtp_gguf.py copies token_embd";
+        LimitedBackend be(*cpu_, full_);
+        const Qwen35 m(nm, be);
+        ASSERT_TRUE(m.has_mtp());
+        EXPECT_EQ(imports_of(be, nm.output().data()), 1) << "trunk output: imported once";
+        EXPECT_EQ(imports_of(be, mw->lm_head.data()), 0)
+            << "the MTP file's output (" << mw->lm_head.n_bytes() << " B, same bytes): shares the trunk head's import";
+        EXPECT_EQ(imports_of(be, nm.token_embd().data()), 1) << "trunk token_embd: imported once";
+        EXPECT_EQ(imports_of(be, mw->embedding.data()), 0)
+            << "the MTP file's token_embd (" << mw->embedding.n_bytes() << " B, same bytes): shares the trunk's import";
+        EXPECT_EQ(m.mtp_head_bytes(), m.lm_head_bytes()) << "a draft still reads the whole head";
+    }
+    // The last byte: a compare that skipped the tail (or only checked size/type/shape) would share it.
+    const std::uint64_t last = nm_->output().n_bytes() - 1;
+    {
+        const auto nm = load(last);
+        const halo::model::MtpWeights* mw = nm.mtp();
+        ASSERT_NE(mw, nullptr);
+        ASSERT_FALSE(same_bytes(mw->lm_head.data(), nm.output().data())) << "byte " << last << " of the copy was flipped";
+        LimitedBackend be(*cpu_, full_);
+        const Qwen35 m(nm, be);
+        EXPECT_EQ(imports_of(be, nm.output().data()), 1) << "trunk output: imported once";
+        EXPECT_EQ(imports_of(be, mw->lm_head.data()), 1) << "an MTP head differing in byte " << last << " keeps its own import";
+        EXPECT_EQ(imports_of(be, mw->embedding.data()), 0) << "the unchanged embedding copy is still shared";
+    }
 }
 
 // Contract change (documented in qwen35.h): a chunk above the CPU backend's 1024 now fails at

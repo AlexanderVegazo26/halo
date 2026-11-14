@@ -360,14 +360,19 @@ bool fuse_norm = false;
 
     Table make_table(const WeightRef& w) const { return Table{w, be->import_host_readonly(w.data())}; }
 
-    /// `w`'s table, sharing `trunk`'s buffer when `w` is the same tensor bytes. A pack without its
-    /// own nextn embedding / shared head resolves the MTP's to the trunk's token_embd / output
-    /// (MtpTensorOrigin::Trunk, e.g. the 27B UD pack); importing those again cost a second device
-    /// copy (0.67 + 0.97 GiB on the 27B) that the memory plan does not count (next.md step 2 A).
+    /// `w`'s table, sharing `trunk`'s buffer when `w` holds the same bytes in the same layout
+    /// (next.md step 2 A). A pack without its own nextn embedding / shared head resolves the
+    /// MTP's to the trunk's token_embd / output (MtpTensorOrigin::Trunk, e.g. the 27B UD pack: the
+    /// same tensor); a separate MTP file's token_embd / output copies (MtpTensorOrigin::MtpFile)
+    /// and a nextn head written as a copy of the trunk's are separate but byte-identical tensors.
+    /// Importing either again cost a second device copy (0.67 + 0.97 GiB on the 27B) that the
+    /// memory plan does not count. The byte compare stops at the first difference, so a real
+    /// separate head costs one early-exit scan at load.
     Table share_table(const WeightRef& w, const Table& trunk) const {
         const std::span<const std::byte> a = w.data(), b = trunk.ref.data();
-        if (a.data() == b.data() && a.size() == b.size() && w.type() == trunk.ref.type() && w.ne(0) == trunk.ref.ne(0) &&
-            w.ne(1) == trunk.ref.ne(1)) {
+        const bool same_layout = a.size() == b.size() && w.type() == trunk.ref.type() && w.ne(0) == trunk.ref.ne(0) &&
+                                 w.ne(1) == trunk.ref.ne(1);
+        if (same_layout && (a.data() == b.data() || std::memcmp(a.data(), b.data(), a.size()) == 0)) {
             return Table{w, trunk.buf};
         }
         return make_table(w);
