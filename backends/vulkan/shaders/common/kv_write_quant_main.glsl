@@ -8,7 +8,7 @@
 //
 // The pool is bound as uint words; no invocation writes a word another one writes (there is no
 // 8/16-bit storage here, so a sub-word read-modify-write would be a race):
-//   KV_TYPE 1 (f16): two halves per word (packHalf2x16, round-to-nearest-even); row = kv_dim/2
+//   KV_TYPE 1 (f16): two halves per word (f32_to_f16_rne below, round-to-nearest-even); row = kv_dim/2
 //     words. One invocation owns one word. Values beyond +-65504 become +-inf.
 //   KV_TYPE 2 (q8):  each 32-element group is 9 words [fp32 scale | 32 x int8, 4 per word];
 //     row = kv_dim/32*9 words. One invocation owns one group: scale = max|x| / 127,
@@ -43,11 +43,31 @@ layout(push_constant) uniform Push {
 } pc;
 
 #if KV_TYPE == 1
+// fp32 -> fp16 bits, round to nearest even, in integer arithmetic (tensor::fp32_to_fp16 bit for
+// bit: overflow to +-inf from the 65520 midpoint up, NaN -> 0x7E00 | sign, half subnormals).
+// Not packHalf2x16: GLSL leaves its rounding to the implementation and RADV truncates toward
+// zero (v_cvt_pkrtz: 65520 -> 65504, every inexact value 1 ulp short half the time), which
+// biased the fp16 pool toward zero (VkKv.KvWriteF16StoresRoundToNearestEvenHalves).
+uint f32_to_f16_rne(float f) {
+    const uint x = floatBitsToUint(f);
+    const uint sign = (x >> 16) & 0x8000u;
+    const uint ax = x & 0x7FFFFFFFu;
+    if (ax > 0x7F800000u) return sign | 0x7E00u;   // NaN
+    if (ax >= 0x477FF000u) return sign | 0x7C00u;  // >= 65520 (incl. inf): rounds past 65504
+    if (ax < 0x38800000u) {                        // below 2^-14: half subnormal (or 0x0400)
+        // |f| * 2^24 is exact (a power-of-two scale) and roundEven rounds half to even.
+        return sign | uint(roundEven(uintBitsToFloat(ax) * 16777216.0));
+    }
+    // Normal: rebias the exponent (127 -> 15), add half an ulp minus one plus the kept lsb, and
+    // drop 13 mantissa bits; a mantissa carry correctly bumps the exponent.
+    return sign | ((ax + 0xC8000FFFu + ((ax >> 13) & 1u)) >> 13);
+}
+
 // Copies one row (src element base sb, dst word base db).
 void write_row(uint db, uint sb, bool is_k) {
     for (uint p = gl_LocalInvocationID.x; p < pc.kv_dim / 2u; p += WG) {
         const vec2 x = is_k ? vec2(k[sb + 2u * p], k[sb + 2u * p + 1u]) : vec2(v[sb + 2u * p], v[sb + 2u * p + 1u]);
-        pool[db + p] = packHalf2x16(x);
+        pool[db + p] = f32_to_f16_rne(x.x) | (f32_to_f16_rne(x.y) << 16);
     }
 }
 #else

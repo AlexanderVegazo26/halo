@@ -332,7 +332,7 @@ struct GetRowsArgs {
 /// block_table[s / block_tokens] (uint32 ids), token s % block_tokens.
 ///
 /// Element format (KvType, opt-in): F32 is the default. F16 stores two halves per 32-bit word
-/// (kv_dim even). Q8 stores each 32-element group as 9 words [fp32 scale | 32 x int8 packed 4
+/// (kv_dim even), rounded to nearest even (tensor::fp32_to_fp16; not packHalf2x16, which RADV truncates). Q8 stores each 32-element group as 9 words [fp32 scale | 32 x int8 packed 4
 /// per word], value = scale * q, scale = max|x| / 127 (kv_dim a multiple of 32; 1.125 B per
 /// element; a whole row is kv_dim/32*9 words). F16 / Q8 run separate shaders (kv_write_f16 /
 /// kv_write_q8, attention_f16 / attention_q8); the F32 shaders are untouched.
