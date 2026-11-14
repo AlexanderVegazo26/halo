@@ -638,6 +638,8 @@ std::pair<runtime::EngineStats, runtime::EngineStats> busy_engine_stats() {
     after.speculative_accepts += 37;
     after.ngram_lookups += 29;
     after.ngram_drafts += 11;
+    after.ngram_draft_tokens += 23;
+    after.ngram_accepted_draft_tokens += 13;
     after.mtp_fallbacks += 5;
     after.ticks = 40;
     return {before, after};

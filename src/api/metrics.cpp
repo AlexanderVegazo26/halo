@@ -76,10 +76,20 @@ std::string Metrics::render(const runtime::EngineStats& e, std::size_t queued, s
     metric(out, "halo_engine_prefix_cache_misses_total", "counter", "Prefix-cache misses.", e.prefix_cache_misses);
     metric(out, "halo_engine_prefix_cache_hit_ratio", "gauge", "hits / (hits + misses) since start.",
            ratio(e.prefix_cache_hits, e.prefix_cache_hits + e.prefix_cache_misses));
-    metric(out, "halo_engine_speculative_attempts_total", "counter", "MTP draft tokens proposed.", e.speculative_attempts);
-    metric(out, "halo_engine_speculative_accepts_total", "counter", "MTP draft tokens accepted.", e.speculative_accepts);
+    metric(out, "halo_engine_speculative_attempts_total", "counter", "Draft tokens proposed (MTP and n-gram).",
+           e.speculative_attempts);
+    metric(out, "halo_engine_speculative_accepts_total", "counter", "Draft tokens accepted (MTP and n-gram).",
+           e.speculative_accepts);
     metric(out, "halo_engine_speculative_acceptance_ratio", "gauge", "accepts / attempts since start.",
            ratio(e.speculative_accepts, e.speculative_attempts));
+    metric(out, "halo_engine_ngram_lookups_total", "counter", "Greedy decode steps that searched the context for an n-gram draft.",
+           e.ngram_lookups);
+    metric(out, "halo_engine_ngram_hits_total", "counter", "n-gram lookups that found a match (drafted instead of MTP).",
+           e.ngram_drafts);
+    metric(out, "halo_engine_ngram_draft_tokens_total", "counter", "Draft tokens proposed from n-gram matches.",
+           e.ngram_draft_tokens);
+    metric(out, "halo_engine_ngram_accepted_draft_tokens_total", "counter", "n-gram draft tokens accepted.",
+           e.ngram_accepted_draft_tokens);
     return out;
 }
 

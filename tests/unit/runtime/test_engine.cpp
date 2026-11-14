@@ -1059,6 +1059,10 @@ TEST_F(EngineTest, ResultSplitsTheRequestsNgramDraftsFromItsMtpDrafts) {
     EXPECT_EQ(a.ngram_lookups, s1.ngram_lookups - s0.ngram_lookups);
     EXPECT_EQ(a.ngram_hits, s1.ngram_drafts - s0.ngram_drafts);
     EXPECT_EQ(a.draft_tokens, s1.speculative_attempts - s0.speculative_attempts);
+    EXPECT_EQ(a.ngram_draft_tokens, s1.ngram_draft_tokens - s0.ngram_draft_tokens)
+        << "EngineStats::ngram_draft_tokens is the engine-wide sum of the requests' n-gram drafts";
+    EXPECT_EQ(a.ngram_accepted_draft_tokens, s1.ngram_accepted_draft_tokens - s0.ngram_accepted_draft_tokens);
+    EXPECT_EQ(a.accepted_draft_tokens, s1.speculative_accepts - s0.speculative_accepts);
 
     // Batched with a request whose context never recurs: each keeps its own counts.
     const Toks p1 = prompt("p1");
@@ -1069,6 +1073,7 @@ TEST_F(EngineTest, ResultSplitsTheRequestsNgramDraftsFromItsMtpDrafts) {
         const std::lock_guard lk(mu);
         ticks.clear();
     }
+    const halo::runtime::EngineStats sb0 = e->stats();
     std::vector<GenerateResult> con(2);
     std::barrier start(2);
     std::thread tb([&] {
@@ -1078,6 +1083,11 @@ TEST_F(EngineTest, ResultSplitsTheRequestsNgramDraftsFromItsMtpDrafts) {
     start.arrive_and_wait();
     con[0] = run(*e, greedy(q, 24));
     tb.join();
+    const halo::runtime::EngineStats sb1 = e->stats();
+    EXPECT_EQ(sb1.ngram_draft_tokens - sb0.ngram_draft_tokens, con[0].ngram_draft_tokens + con[1].ngram_draft_tokens)
+        << "batched: the engine-wide n-gram drafts are the sum of both requests'";
+    EXPECT_EQ(sb1.ngram_accepted_draft_tokens - sb0.ngram_accepted_draft_tokens,
+              con[0].ngram_accepted_draft_tokens + con[1].ngram_accepted_draft_tokens);
     EXPECT_TRUE(std::ranges::any_of(ticks, [](const TickInfo& t) { return t.prefill_rows == 0 && t.sequences == 2; }))
         << "the two requests never shared a decode tick";
     EXPECT_EQ(con[0].tokens, a.tokens);
@@ -1096,8 +1106,11 @@ TEST_F(EngineTest, ResultSplitsTheRequestsNgramDraftsFromItsMtpDrafts) {
     CpuEngineOptions o_off;
     o_off.gate_mode = GateMode::Always;
     o_off.ngram_draft = false;
-    const GenerateResult off = run(*make(o_off, c_off), greedy(q, 24));
+    auto e_off = make(o_off, c_off);
+    const GenerateResult off = run(*e_off, greedy(q, 24));
     EXPECT_EQ(off.tokens, a.tokens);
     EXPECT_EQ(off.ngram_lookups + off.ngram_hits + off.ngram_draft_tokens + off.ngram_accepted_draft_tokens, 0u);
     EXPECT_GT(off.draft_tokens, 0u);
+    EXPECT_EQ(e_off->stats().ngram_draft_tokens + e_off->stats().ngram_accepted_draft_tokens, 0u)
+        << "ngram_draft = false: every draft is MTP";
 }

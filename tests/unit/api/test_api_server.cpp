@@ -124,7 +124,9 @@ TEST(ApiServer, HealthModelsMetrics) {
     for (const char* needle :
          {"# TYPE halo_api_requests_total counter", "halo_api_requests_total{route=\"/v1/chat/completions\",status=\"200\"} 1",
           "halo_api_time_to_first_token_seconds_count 1", "halo_engine_prefix_cache_hit_ratio 0.75",
-          "halo_engine_speculative_acceptance_ratio 0.7", "halo_api_completion_tokens_total ",
+          "halo_engine_speculative_acceptance_ratio 0.7", "halo_engine_ngram_lookups_total 9",
+          "halo_engine_ngram_hits_total 4", "halo_engine_ngram_draft_tokens_total 6",
+          "halo_engine_ngram_accepted_draft_tokens_total 5", "halo_api_completion_tokens_total ",
           "halo_api_queued_requests 0"}) {
         EXPECT_NE(x->body.find(needle), std::string::npos) << needle << "\n" << x->body;
     }

@@ -304,6 +304,10 @@ runtime::EngineStats FakeEngine::stats() const {
     st.prefix_cache_misses = 1;
     st.speculative_attempts = 10;
     st.speculative_accepts = 7;
+    st.ngram_lookups = 9;
+    st.ngram_drafts = 4;
+    st.ngram_draft_tokens = 6;
+    st.ngram_accepted_draft_tokens = 5;
     return st;
 }
 

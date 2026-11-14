@@ -1157,6 +1157,7 @@ void CpuEngine::tick() {
     std::vector<speculative::StepRequest> reqs(n);
     const std::span<const std::int32_t> eos_span = eos_ ? std::span<const std::int32_t>(&*eos_, 1) : std::span<const std::int32_t>();
     std::size_t trunk_rows = 0, mtp_rows = 0, prefill_rows = 0, ngram_lookups = 0, ngram_drafts = 0;
+    std::size_t ngram_draft_tokens = 0, ngram_accepted = 0;
     for (Active& a : active_) who.push_back(&a);
     for (std::size_t i = 0; i < n; ++i) {
         Active& a = *who[i];
@@ -1295,6 +1296,8 @@ void CpuEngine::tick() {
             if (a.forced_ngram) {
                 a.ngram_drafted += o.drafts.size();
                 a.ngram_accepted += o.accepted;
+                ngram_draft_tokens += o.drafts.size();
+                ngram_accepted += o.accepted;
             }
             if (a.r->fast_greedy) {
                 // H1: same check as the prefill branch above, before any of this sequence's
@@ -1344,6 +1347,8 @@ void CpuEngine::tick() {
         if (fallback) ++stats_.mtp_fallbacks;
         stats_.ngram_lookups += ngram_lookups;
         stats_.ngram_drafts += ngram_drafts;
+        stats_.ngram_draft_tokens += ngram_draft_tokens;
+        stats_.ngram_accepted_draft_tokens += ngram_accepted;
         stats_.last_tick_weight_passes = info.weight_passes;
         stats_.last_tick_predicted_bytes = info.predicted_bytes;
     }

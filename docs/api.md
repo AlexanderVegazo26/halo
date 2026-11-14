@@ -381,8 +381,10 @@ It is a superset of the OpenAI and Anthropic list shapes.
   - `halo_engine_tokens_generated_total`
   - `halo_engine_prefix_cache_{hits,misses}_total`
   - `halo_engine_prefix_cache_hit_ratio`
-  - `halo_engine_speculative_{attempts,accepts}_total`
+  - `halo_engine_speculative_{attempts,accepts}_total` (draft tokens from every source: MTP and n-gram)
   - `halo_engine_speculative_acceptance_ratio`
+  - `halo_engine_ngram_{lookups,hits}_total` (prompt-lookup drafting: decode steps that searched, and found a match)
+  - `halo_engine_ngram_{draft_tokens,accepted_draft_tokens}_total` (the n-gram share of the speculative counters; MTP = the rest)
 
 Hardware and kernel metrics (PRD §13) are not exposed in v0.2.
 
