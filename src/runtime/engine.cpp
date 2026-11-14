@@ -2,7 +2,7 @@
 // queues drained on the caller's thread, prefix cache (KV sharing + GDN checkpoints),
 // MTP speculative decoding with a k = 0 fallback on MTP-KV exhaustion.
 // BI-6: the forward runs on the backend named by EngineConfig::backend (cpu | vulkan |
-// hip; "auto" = cpu until a measured GPU default policy exists, WS-BI-4). GDN/conv state
+// hip; "auto" = vulkan when the build has it and a device answers, else cpu). GDN/conv state
 // (the §5.3 ring) and the KV pools are State-arena buffers of that backend (WS-BI-2):
 // device-resident on GPU backends, zero-copy host memory on the CPU backend.
 
@@ -117,9 +117,8 @@ std::size_t ceil_div(std::size_t a, std::size_t b) { return (a + b - 1) / b; }
 // ---- backend selection (BI-6) ----------------------------------------------------------
 
 #if defined(HALO_RUNTIME_VULKAN) || defined(HALO_RUNTIME_HIP)
-/// Constructs the GPU backend named by EngineConfig::backend. "auto" never selects one:
-/// there is no measured default policy yet (WS-BI-4), so a GPU backend is explicit opt-in.
-/// Throws Error(Device) when the device/driver is missing.
+/// Constructs the GPU backend named by EngineConfig::backend ("auto" is resolved before this
+/// is called, see resolve_auto_backend). Throws Error(Device) when the device/driver is missing.
 std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
 #if defined(HALO_RUNTIME_VULKAN)
     if (name == "vulkan") return backend::make_vulkan_backend(vulkan::Context::create({}));
@@ -137,6 +136,25 @@ std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
     throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", name);
 }
 #endif
+
+/// Resolves backend "auto": Vulkan when this build has it and a device can be opened, else
+/// cpu (with a warning that names why). When Vulkan is chosen the constructed backend is handed
+/// back through *out so the probe's device context is reused, not opened twice. A test-supplied
+/// backend_factory keeps "auto" on cpu, as before.
+std::string resolve_auto_backend(const CpuEngineOptions& opts, std::unique_ptr<backend::Backend>* out) {
+    if (opts.backend_factory) return "cpu";
+#if defined(HALO_RUNTIME_VULKAN)
+    try {
+        *out = make_gpu_backend("vulkan");
+        return "vulkan";
+    } catch (const Error& e) {
+        HALO_WARN("runtime", "backend 'auto': no usable Vulkan device ({}); falling back to cpu", e.what());
+    }
+#else
+    (void)out;
+#endif
+    return "cpu";
+}
 
 // ---- memory plan inputs --------------------------------------------------------------
 
@@ -345,15 +363,19 @@ private:
 // ---------------------------------------------------------------------------------------
 
 CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cfg_(cfg), opts_(opts) {
-    const bool cpu_path = cfg.backend == "cpu" || cfg.backend == "auto";
-    HALO_CHECK(cpu_path || cfg.backend == "vulkan" || cfg.backend == "hip", ErrorCode::Unsupported,
-               "unknown backend '{}' (cpu | vulkan | hip | auto)", cfg.backend);
+    HALO_CHECK(cfg_.backend == "cpu" || cfg_.backend == "auto" || cfg_.backend == "vulkan" || cfg_.backend == "hip",
+               ErrorCode::Unsupported, "unknown backend '{}' (cpu | vulkan | hip | auto)", cfg_.backend);
+    if (cfg_.backend == "auto") {
+        cfg_.backend = resolve_auto_backend(opts, &backend_);
+        HALO_INFO("runtime", "backend 'auto' resolved to '{}'", cfg_.backend);
+    }
+    const bool cpu_path = cfg_.backend == "cpu";
     if (!cpu_path && !opts.backend_factory) {
 #if !defined(HALO_RUNTIME_VULKAN)
-        HALO_CHECK(cfg.backend != "vulkan", ErrorCode::Unsupported, "backend 'vulkan' is not available in this build");
+        HALO_CHECK(cfg_.backend != "vulkan", ErrorCode::Unsupported, "backend 'vulkan' is not available in this build");
 #endif
 #if !defined(HALO_RUNTIME_HIP)
-        HALO_CHECK(cfg.backend != "hip", ErrorCode::Unsupported, "backend 'hip' is not available in this build");
+        HALO_CHECK(cfg_.backend != "hip", ErrorCode::Unsupported, "backend 'hip' is not available in this build");
 #endif
     }
     HALO_CHECK(cfg.max_sequences >= 1 && cfg.max_context >= 2, ErrorCode::Config,
@@ -380,16 +402,18 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     if (cpu_path) {
         model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
     } else {
-        if (opts_.backend_factory) {
+        if (backend_) {
+            // already opened by resolve_auto_backend
+        } else if (opts_.backend_factory) {
             backend_ = opts_.backend_factory();
         } else {
 #if defined(HALO_RUNTIME_VULKAN) || defined(HALO_RUNTIME_HIP)
-            backend_ = make_gpu_backend(cfg.backend);
+            backend_ = make_gpu_backend(cfg_.backend);
 #else
-            throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", cfg.backend);
+            throw_error(ErrorCode::Unsupported, "backend '{}' is not available in this build", cfg_.backend);
 #endif
         }
-        HALO_INFO("runtime", "backend '{}' selected; GDN + KV state is device-resident (WS-BI-2)", cfg.backend);
+        HALO_INFO("runtime", "backend '{}' selected; GDN + KV state is device-resident (WS-BI-2)", cfg_.backend);
         model_ = std::make_unique<models::Qwen35>(*nm_, *backend_, mo);
     }
     const auto piece = [&](std::optional<std::int32_t> id) { return id ? tok_->token_to_piece(*id) : std::string(); };
@@ -660,7 +684,7 @@ EngineStats CpuEngine::stats() const {
 void CpuEngine::apply_profile() {
     threads_ = cfg_.threads > 0 ? static_cast<std::size_t>(cfg_.threads) : cpu::ThreadPool::default_threads();
     gdn_chunk_ = 64;
-    if (cfg_.backend != "cpu" && cfg_.backend != "auto") {
+    if (cfg_.backend != "cpu") {
         // GPU backends: kernel-variant selection is WS-BI-4's KernelPlan; the profile DB's
         // cpu tunables (threads, GDN chunk) do not apply.
         tuning_ = "n/a (gpu backend)";

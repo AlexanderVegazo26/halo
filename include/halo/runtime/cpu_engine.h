@@ -1,6 +1,7 @@
 #pragma once
 // CPU reference Engine (WS-G M3): options and observability beyond the engine.h contract.
-// create_engine(cfg) == create_cpu_engine(cfg, {}) for backend "cpu" / "auto".
+// create_engine(cfg) == create_cpu_engine(cfg, {}); backend "auto" resolves to vulkan when built and
+// a device opens, else cpu.
 //
 // Scheduling (ARCHITECTURE "Scheduler", review H-1): one worker thread. Each tick issues
 // ONE batched trunk forward over every active sequence — decode rows (with MTP drafts for
@@ -111,7 +112,7 @@ struct CpuEngineOptions {
     FaultInjection faults;  ///< tests only
     /// Test seam (BI-6): overrides GPU backend construction when cfg.backend is
     /// "vulkan"/"hip" (e.g. HIP emulation, a Vulkan context with test options).
-    /// Null = the real factories. Ignored for "cpu"/"auto".
+    /// Null = the real factories. Ignored for "cpu"; when set, "auto" stays on cpu.
     std::function<std::unique_ptr<backend::Backend>()> backend_factory;
 };
 

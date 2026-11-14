@@ -60,8 +60,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 `inspect` prints the memory plan for the `--ctx` and `--parallel` you give it. The defaults
 (`--ctx 32768 --parallel 4`) plan for far more memory than `--ctx 4096 --parallel 1`, so start
-small. The backend defaults to `auto`, which today always means the CPU backend; pass
-`--backend vulkan` to run on the GPU (see "Where the GPU work stands").
+small. The backend defaults to `auto`, which runs on the GPU through Vulkan when the build
+has the Vulkan backend and a device opens, and otherwise falls back to the CPU backend with a
+warning; pass `--backend cpu` to force the CPU (see "Where the GPU work stands").
 
 ## What it does
 
@@ -89,9 +90,9 @@ small. The backend defaults to `auto`, which today always means the CPU backend;
 HALO does not try to be a general-purpose serving framework. There is no model-swapping, no
 multi-tenant scheduling policy, no plugin system for third-party kernels. The HTTP API binds
 to loopback by default and requires an explicit opt-in plus an API key to listen elsewhere.
-The CPU backend is what the engine uses unless told otherwise: `--backend auto` (the default)
-never selects a GPU backend, because there is no measured default policy yet. `--backend vulkan`
-and `--backend hip` are explicit opt-ins (see "Where the GPU work stands" below).
+`--backend auto` (the default) selects the Vulkan backend when it is compiled in and a device
+opens, else the CPU backend. `--backend hip` stays an explicit opt-in (see "Where the GPU work
+stands" below).
 
 ## Layout
 
@@ -174,9 +175,9 @@ behind loopback-by-default: `docs/api.md`.
 
 ## Where the GPU work stands
 
-The engine runs the CPU reference backend unless a GPU backend is named: `--backend auto`
-never selects one, because there is no measured default policy yet (`src/runtime/engine.cpp`,
-`make_gpu_backend`). ADR-001 stages GPU enablement so each backend's kernels are proven
+With `--backend auto` (the default) the engine runs on Vulkan when the build has it and a
+device opens, and falls back to the CPU reference backend otherwise (`src/runtime/engine.cpp`,
+`resolve_auto_backend`); `--backend cpu` forces the CPU path. ADR-001 stages GPU enablement so each backend's kernels are proven
 against the CPU path before they are trusted:
 
 - the CPU backend is the complete, tested reference implementation every other backend is
