@@ -34,7 +34,7 @@ The run was 44 forwards: 1 prefill, 15 verify (R=3) and 28 MTP drafts. That come
 
 ### 2. Cheaper MTP draft head (~−9 ms/tick)
 - Each draft runs `head()` (`src/models/qwen35.cpp:879-881`) over `M.lm_head`, which is the full 248,320-row Q6_K matrix, about 1 GiB.
-- **Option A (low risk):** if the MTP `lm_head` is byte-identical to the trunk head, dedupe it at load in `qwen35.cpp:605-616`. This saves 1 GiB of VRAM but no time.
+- **Option A (low risk):** if the MTP `lm_head` is byte-identical to the trunk head, dedupe it at load in `qwen35.cpp:605-616`. This saves 1 GiB of VRAM but no time. **Done 2026-11-14:** a pack without its own nextn shared head / embedding (the 27B UD pack and the tiny models: `MtpTensorOrigin::Trunk`) resolves them to the trunk's `output` / `token_embd`, and qwen35 imported each a second time (a second Vulkan device copy, 0.97 + 0.67 GiB on the 27B, not counted by the memory plan). `Impl::share_table` now reuses the trunk's buffer when the MTP tensor is the same tensor bytes (BackendLimits.MtpSharesTheTrunkTablesWhenTheyAreTheSameTensor). A nextn head that is a separate but byte-identical copy is still imported twice.
 - **Main fix:** a reduced-vocab draft head, the FR-Spec technique.
   - At load, build a sub-matrix of the ~32k most frequent tokens. Rank frequency by tokenizer merge rank, or use a shipped list.
   - Drafts take the argmax over the sub-vocab and map it back to full token ids.

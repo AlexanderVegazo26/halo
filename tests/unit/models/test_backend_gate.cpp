@@ -461,7 +461,8 @@ INSTANTIATE_TEST_SUITE_P(
 // Backend Limits (ADR-001 §5.2): checked at construction.
 // ---------------------------------------------------------------------------------------
 
-/// The CPU backend with other Limits (every call forwards to it).
+/// The CPU backend with other Limits (every call forwards to it); records the host spans of its
+/// read-only imports.
 class LimitedBackend final : public hb::Backend {
 public:
     LimitedBackend(hb::Backend& inner, hb::Limits limits) : in_(inner), lim_(limits) {}
@@ -470,7 +471,10 @@ public:
     [[nodiscard]] hb::Limits limits() const noexcept override { return lim_; }
     std::unique_ptr<hb::Buffer> allocate(std::uint64_t b, hb::Tier t) override { return in_.allocate(b, t); }
     std::unique_ptr<hb::Buffer> import_host(std::span<std::byte> b) override { return in_.import_host(b); }
-    std::unique_ptr<hb::Buffer> import_host_readonly(std::span<const std::byte> b) override { return in_.import_host_readonly(b); }
+    std::unique_ptr<hb::Buffer> import_host_readonly(std::span<const std::byte> b) override {
+        readonly_imports.push_back(b);
+        return in_.import_host_readonly(b);
+    }
     std::unique_ptr<hb::Stream> create_stream() override { return in_.create_stream(); }
     void upload(hb::Stream& s, hb::TensorRef d, std::span<const std::byte> b) override { in_.upload(s, d, b); }
     void download(hb::Stream& s, hb::TensorRef d, std::span<std::byte> b) override { in_.download(s, d, b); }
@@ -495,6 +499,8 @@ public:
     void argmax(hb::Stream& s, const hb::ArgmaxArgs& a) override { in_.argmax(s, a); }
     void top_k(hb::Stream& s, const hb::TopKArgs& a) override { in_.top_k(s, a); }
     void copy(hb::Stream& s, const hb::CopyArgs& a) override { in_.copy(s, a); }
+
+    std::vector<std::span<const std::byte>> readonly_imports;
 
 private:
     hb::Backend& in_;
@@ -555,6 +561,30 @@ TEST_F(BackendLimits, EveryLimitIsCheckedAtConstruction) {
     nochunk.gdn_chunked = false;
     nochunk.max_gdn_chunk = 0;
     EXPECT_EQ(construct(nochunk), std::nullopt);
+}
+
+// next.md step 2 option A. A pack without its own nextn embedding / shared head (the 27B UD pack,
+// and the tiny models) resolves the MTP's to the trunk's token_embd / output. Each table must be
+// imported once and shared: a second import was a second device copy on Vulkan (0.67 + 0.97 GiB
+// on the 27B) that the memory plan does not count.
+TEST_F(BackendLimits, MtpSharesTheTrunkTablesWhenTheyAreTheSameTensor) {
+    const halo::model::MtpWeights* mw = nm_->mtp();
+    ASSERT_NE(mw, nullptr) << "tiny-f32.gguf should carry an MTP block";
+    ASSERT_EQ(mw->lm_head_origin, halo::model::MtpTensorOrigin::Trunk) << "tiny-f32 MTP head should be the trunk output";
+    ASSERT_EQ(mw->embedding_origin, halo::model::MtpTensorOrigin::Trunk) << "tiny-f32 MTP embedding should be token_embd";
+    LimitedBackend be(*cpu_, full_);
+    const Qwen35 m(*nm_, be);
+    ASSERT_TRUE(m.has_mtp());
+    const auto imports_of = [&](std::span<const std::byte> t) {
+        return std::count_if(be.readonly_imports.begin(), be.readonly_imports.end(),
+                             [&](std::span<const std::byte> s) { return s.data() == t.data() && s.size() == t.size(); });
+    };
+    EXPECT_EQ(imports_of(nm_->output().data()), 1)
+        << "output (" << nm_->output().n_bytes() << " B): imported once for the trunk LM head and the MTP head";
+    EXPECT_EQ(imports_of(nm_->token_embd().data()), 1)
+        << "token_embd (" << nm_->token_embd().n_bytes() << " B): imported once for the trunk and the MTP embedding";
+    // Sharing changes no accounting: a draft still reads the whole head.
+    EXPECT_EQ(m.mtp_head_bytes(), m.lm_head_bytes()) << "the MTP head is the trunk's";
 }
 
 // Contract change (documented in qwen35.h): a chunk above the CPU backend's 1024 now fails at

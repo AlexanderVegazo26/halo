@@ -106,10 +106,11 @@ struct LayerW {
     std::uint64_t bytes = 0;  // stored bytes of every weight of the layer
 };
 
-/// A token-row table (embedding / LM head) imported read-only.
+/// A token-row table (embedding / LM head) imported read-only. Shared: the MTP head and
+/// embedding reuse the trunk's buffer when they are the same tensor (Impl::share_table).
 struct Table {
     WeightRef ref;
-    std::unique_ptr<Buffer> buf;
+    std::shared_ptr<Buffer> buf;
 };
 
 struct MtpW {
@@ -358,6 +359,19 @@ bool fuse_norm = false;
     }
 
     Table make_table(const WeightRef& w) const { return Table{w, be->import_host_readonly(w.data())}; }
+
+    /// `w`'s table, sharing `trunk`'s buffer when `w` is the same tensor bytes. A pack without its
+    /// own nextn embedding / shared head resolves the MTP's to the trunk's token_embd / output
+    /// (MtpTensorOrigin::Trunk, e.g. the 27B UD pack); importing those again cost a second device
+    /// copy (0.67 + 0.97 GiB on the 27B) that the memory plan does not count (next.md step 2 A).
+    Table share_table(const WeightRef& w, const Table& trunk) const {
+        const std::span<const std::byte> a = w.data(), b = trunk.ref.data();
+        if (a.data() == b.data() && a.size() == b.size() && w.type() == trunk.ref.type() && w.ne(0) == trunk.ref.ne(0) &&
+            w.ne(1) == trunk.ref.ne(1)) {
+            return Table{w, trunk.buf};
+        }
+        return make_table(w);
+    }
 
     AttnW load_attn(const model::AttentionWeights& w) const {
         if (fuse_qkv) {
@@ -933,8 +947,8 @@ Qwen35::Qwen35(const model::NormalizedModel& m, std::unique_ptr<backend::Backend
                        mw->lm_head.ne(1) == hp.n_vocab,
                    ErrorCode::Model, "qwen35: MTP embedding/head shape mismatch");
         (void)weight_matrix(mw->lm_head);
-        t.embedding = I.make_table(mw->embedding);
-        t.lm_head = I.make_table(mw->lm_head);
+        t.embedding = I.share_table(mw->embedding, I.embd);
+        t.lm_head = I.share_table(mw->lm_head, I.lm_head);
         t.bytes = t.block.bytes + mw->eh_proj.n_bytes() + mw->enorm.n_bytes() + mw->hnorm.n_bytes() +
                   (mw->head_norm_origin == model::MtpTensorOrigin::NextnBlock ? mw->head_norm.n_bytes() : 0);
         if (options.mtp_draft_vocab) {
