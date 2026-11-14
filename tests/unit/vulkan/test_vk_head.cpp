@@ -34,6 +34,7 @@
 #include "halo/backends/cpu/weight_matrix.h"
 #include "halo/backends/vulkan/ops.h"
 #include "halo/core/error.h"
+#include "halo/tensor/fp16.h"
 #include "halo/tensor/quant.h"
 #include "halo/tensor/repack.h"
 #include "reference.h"
@@ -821,3 +822,154 @@ TEST(VkHead, GemvFusedNormRejectsWhatItCannotFuse) {
     s.submit_and_wait();
 }
 
+
+// ---------------------------------------------------------------- cooperative-matrix prefill GEMM (HALO_COOPMAT)
+
+namespace {
+
+// Round-to-nearest-even to fp16 and back: what `float16_t(v)` must do to x and the dequantized W in
+// matmul_cm_main.glsl before the tensor cores multiply them.
+float to_half(float v) { return halo::tensor::fp16_to_fp32(halo::tensor::fp32_to_fp16(v)); }
+
+std::shared_ptr<hv::Context> coopmat_context(bool on) {
+    hv::ContextOptions o;
+    o.coopmat = on;
+    return hv::Context::create(o);
+}
+
+}  // namespace
+
+TEST(VkHead, CoopmatGemmIsTheFp16RoundedProductWithFp32Accumulation) {
+    // next.md step 7: with cooperative matrices enabled, gemv on a Q4_K / Q5_K / Q6_K weight with more than
+    // 8 vectors (prefill) runs matmul_cm_<type>: x and the dequantized W are rounded to fp16 and the
+    // products accumulated in fp32. A product of two halves is exact in fp32, so against the fp64 sum of
+    // h(W[r,c]) * h(x[t][c]) (h = fp16 round-to-nearest-even) the only error left is the fp32
+    // summation: |vk - ref| <= (cols + 4) u sum_c |h(W) h(x)|. The fp32 matvec misses that bound by
+    // ~100x (its inputs are not rounded to fp16), so passing it also proves the GEMM ran. Edge tiles
+    // (n_vec and rows not multiples of the 32 x 32 subgroup tile), strided x / y views with a lead,
+    // and that nothing outside the y rows is written.
+    if (auto why = hv::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto ctx = coopmat_context(true);
+    if (!ctx->coopmat_enabled()) {
+        GTEST_SKIP() << "device '" << ctx->info().name
+                     << "' lacks f16 x f16 -> f32 16x16x16 cooperative matrices: matmul_cm_* never runs there";
+    }
+    hv::Ops ops(ctx);
+    for (const ref::WType t : {ref::WType::Q4_K, ref::WType::Q5_K, ref::WType::Q6_K}) {
+        for (const std::uint32_t cols : {256u, 1280u}) {
+            for (const std::uint32_t rows : {37u, 64u}) {
+                for (const std::uint32_t n_vec : {9u, 31u, 32u, 33u, 70u}) {
+                    const std::string what = std::string(tname(t)) + " rows " + std::to_string(rows) + " cols " +
+                                             std::to_string(cols) + " n_vec " + std::to_string(n_vec);
+                    SCOPED_TRACE(what);
+                    std::mt19937 rng(static_cast<unsigned>(t) * 10007 + cols * 101 + rows * 7 + n_vec);
+                    const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+                    const std::uint32_t xs = cols + 5, ys = rows + 3, lead = 3;
+                    std::vector<float> xbuf(lead + std::size_t{n_vec} * xs, 1e30f);
+                    for (std::uint32_t v = 0; v < n_vec; ++v) {
+                        const auto xv = ref::random_vec(cols, rng);
+                        std::copy(xv.begin(), xv.end(), xbuf.begin() + lead + std::size_t{v} * xs);
+                    }
+                    hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+                    hv::Buffer bx = upload(ctx, std::span<const float>(xbuf));
+                    const std::vector<float> yinit(lead + std::size_t{n_vec} * ys, -7.0f);
+                    hv::Buffer by = upload(ctx, std::span<const float>(yinit), hv::MemoryUsage::HostCached);
+                    hv::Stream s(ctx);
+                    hv::GemvArgs g;
+                    g.wtype = ref::dtype(t);
+                    g.w = bw;
+                    g.x = hv::BufferView(bx, lead * 4, 0, xs * 4);
+                    g.y = hv::BufferView(by, lead * 4, 0, ys * 4);
+                    g.rows = rows;
+                    g.cols = cols;
+                    g.n_vec = n_vec;
+                    ops.gemv(s, g);
+                    s.submit_and_wait();
+                    const auto yb = download<float>(by, yinit.size());
+                    for (std::uint32_t i = 0; i < lead; ++i) ASSERT_EQ(yb[i], -7.0f) << "y lead " << i << " written";
+                    std::vector<float> hw(w.deq.size());
+                    std::transform(w.deq.begin(), w.deq.end(), hw.begin(), to_half);
+                    double worst = 0;
+                    std::size_t bad = 0;
+                    std::string first_bad;
+                    for (std::uint32_t v = 0; v < n_vec; ++v) {
+                        const float* xv = xbuf.data() + lead + std::size_t{v} * xs;
+                        const float* got = yb.data() + lead + std::size_t{v} * ys;
+                        for (std::uint32_t r = 0; r < ys - rows; ++r) {
+                            ASSERT_EQ(got[rows + r], -7.0f) << "vector " << v << ": gap row " << rows + r
+                                                            << " past the " << rows << " weight rows was written";
+                        }
+                        for (std::uint32_t r = 0; r < rows; ++r) {
+                            double exact = 0, scale = 0;
+                            for (std::uint32_t c = 0; c < cols; ++c) {
+                                const double p = double(hw[std::size_t{r} * cols + c]) * double(to_half(xv[c]));
+                                exact += p;
+                                scale += std::fabs(p);
+                            }
+                            const double d = std::fabs(double(got[r]) - exact);
+                            const double b = (cols + 4.0) * ref::k_u * scale + k_floor;
+                            worst = std::max(worst, d / b);
+                            if (!(d <= b) && bad++ == 0) {
+                                first_bad = "vector " + std::to_string(v) + " row " + std::to_string(r) +
+                                            ": got " + std::to_string(got[r]) + ", fp16-product reference " +
+                                            std::to_string(exact) + ", |diff| " + std::to_string(d) + " > bound " +
+                                            std::to_string(b);
+                            }
+                        }
+                    }
+                    EXPECT_EQ(bad, 0u) << what << ": " << bad << " of " << std::size_t{n_vec} * rows
+                                       << " outputs outside the fp32-accumulation bound; first: " << first_bad;
+                    std::cout << "[vk-head] coopmat " << what << ": worst |vk-ref|/bound = " << worst << "\n";
+                }
+            }
+        }
+    }
+}
+
+TEST(VkHead, CoopmatOnlyReplacesKQuantGemvsOverEightVectors) {
+    // The GEMM is not bitwise the matvec, so where it may run is part of the contract: only K-quant
+    // (Q4_K / Q5_K / Q6_K) gemvs with n_vec > 8 on a context that enabled it. Decode (n_vec 1), MTP
+    // verify (n_vec <= 8) and every other weight type keep the matvec, whose batch rows are bitwise
+    // their own n_vec = 1 matvec; coopmat = false never enables it, whatever HALO_COOPMAT says.
+    if (auto why = hv::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    EXPECT_FALSE(coopmat_context(false)->coopmat_enabled()) << "ContextOptions::coopmat = false enabled it";
+    const auto ctx = coopmat_context(true);
+    if (!ctx->coopmat_enabled()) GTEST_SKIP() << "device '" << ctx->info().name << "' lacks cooperative matrices";
+    hv::Ops ops(ctx);
+    const std::uint32_t rows = 37, cols = 512;
+    for (const ref::WType t : {ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q5_K, ref::WType::Q6_K,
+                               ref::WType::IQ4_XS, ref::WType::Q3_K}) {
+        const bool kquant = t == ref::WType::Q4_K || t == ref::WType::Q5_K || t == ref::WType::Q6_K;
+        for (const std::uint32_t n_vec : {1u, 8u, 9u, 20u}) {
+            const std::string what = std::string(tname(t)) + " n_vec " + std::to_string(n_vec);
+            SCOPED_TRACE(what);
+            std::mt19937 rng(static_cast<unsigned>(t) * 31 + n_vec);
+            const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+            std::vector<float> x;
+            for (std::uint32_t v = 0; v < n_vec; ++v) {
+                const auto xv = ref::random_vec(cols, rng);
+                x.insert(x.end(), xv.begin(), xv.end());
+            }
+            hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+            hv::Buffer bx = upload(ctx, std::span<const float>(x));
+            const std::uint64_t ybytes = std::uint64_t{n_vec} * rows * 4;
+            hv::Buffer yb = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
+            hv::Buffer y1 = hv::Buffer::create(ctx, ybytes, hv::MemoryUsage::HostCached);
+            hv::Stream s(ctx);
+            ops.gemv(s, hv::GemvArgs{ref::dtype(t), bw, bx, yb, rows, cols, n_vec});
+            for (std::uint32_t v = 0; v < n_vec; ++v) {
+                ops.matvec(s, ref::dtype(t), bw, hv::BufferView(bx, std::uint64_t{v} * cols * 4, cols * 4),
+                           hv::BufferView(y1, std::uint64_t{v} * rows * 4, rows * 4), rows, cols);
+            }
+            s.submit_and_wait();
+            const auto a = download<float>(yb, std::size_t{n_vec} * rows);
+            const auto b = download<float>(y1, std::size_t{n_vec} * rows);
+            if (kquant && n_vec > 8) {
+                EXPECT_FALSE(bitwise(a, b)) << what << ": bitwise the per-vector matvec, so the GEMM did not run";
+            } else {
+                EXPECT_TRUE(bitwise(a, b)) << what << ": not bitwise the per-vector matvec, so the GEMM (or "
+                                                      "something else) replaced the matvec where it must not";
+            }
+        }
+    }
+}

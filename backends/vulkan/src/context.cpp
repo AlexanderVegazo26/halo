@@ -272,15 +272,21 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
     cm_v12.shaderFloat16 = VK_TRUE;
     cm_v12.vulkanMemoryModel = VK_TRUE;
     const char* cm_extensions[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
-    if (const auto cm_env = detail::getenv_str("HALO_COOPMAT"); cm_env && *cm_env == "1") {
+    const bool want_coopmat = options.coopmat.has_value() ? *options.coopmat : [] {
+        const auto cm_env = detail::getenv_str("HALO_COOPMAT");
+        return cm_env && *cm_env == "1";
+    }();
+    if (want_coopmat) {
         if (coopmat_supported(ctx->instance_->handle(), ctx->physical_, ctx->info_)) {
             dci.pNext = &cm_v12;
             dci.enabledExtensionCount = 1;
             dci.ppEnabledExtensionNames = cm_extensions;
             ctx->coopmat_enabled_ = true;
-            HALO_INFO("vulkan", "HALO_COOPMAT=1: VK_KHR_cooperative_matrix enabled (fp16 tiles, fp32 accumulate)");
+            HALO_INFO("vulkan", "cooperative matrices (HALO_COOPMAT / ContextOptions::coopmat): "
+                                "VK_KHR_cooperative_matrix enabled (fp16 tiles, fp32 accumulate)");
         } else {
-            HALO_WARN("vulkan", "HALO_COOPMAT=1 ignored: device lacks VK_KHR_cooperative_matrix f16/f32 16x16x16 "
+            HALO_WARN("vulkan", "cooperative matrices (HALO_COOPMAT / ContextOptions::coopmat) ignored: device "
+                                "lacks VK_KHR_cooperative_matrix f16/f32 16x16x16 "
                                 "subgroup matrices (or shaderFloat16 / vulkanMemoryModel / subgroupSize >= 32)");
         }
     }

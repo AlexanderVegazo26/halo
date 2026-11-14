@@ -93,6 +93,10 @@ struct ContextOptions {
     /// Initial VkPipelineCache contents (e.g. from a previous run). Ignored with a log
     /// line when the driver rejects it; the driver validates its own header.
     std::vector<std::byte> pipeline_cache_data;
+    /// Enable VK_KHR_cooperative_matrix for the matmul_cm_* prefill GEMMs (next.md step 7). nullopt:
+    /// HALO_COOPMAT == "1". true on a device without f16 x f16 -> f32 16x16x16 subgroup matrices only
+    /// logs a warning (coopmat_enabled() stays false); false never enables it, whatever the env says.
+    std::optional<bool> coopmat;
 };
 
 class Context : public std::enable_shared_from_this<Context> {
