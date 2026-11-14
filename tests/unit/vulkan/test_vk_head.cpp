@@ -86,70 +86,81 @@ bool bitwise(std::span<const float> a, std::span<const float> b) {
 
 TEST(VkHead, GemvBatchedMatchesCpuMatmulAndEqualsPerVectorMatvecBitwise) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
-    hv::Ops ops(ctx);
-    const std::uint32_t wg = ops.options().reduce_workgroup;
-    for (const ref::WType t : {ref::WType::F32, ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q5_K, ref::WType::Q6_K,
-                               ref::WType::IQ4_XS, ref::WType::IQ4_NL, ref::WType::Q3_K, ref::WType::IQ3_S}) {
-        for (const std::uint32_t n_vec : {1u, 3u, 8u, 11u, 17u}) {
-            SCOPED_TRACE(std::string(tname(t)) + " n_vec " + std::to_string(n_vec));
-            const std::uint32_t rows = 37, cols = t == ref::WType::F32 ? 300 : 512;
-            std::mt19937 rng(static_cast<unsigned>(t) * 100 + n_vec);
-            const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
-            // x: n_vec vectors with a row stride > cols, at a lead of 3 floats; y likewise.
-            const std::uint32_t xs = cols + 5, ys = rows + 3, lead = 3;
-            std::vector<float> xbuf(lead + std::size_t{n_vec} * xs, 1e30f);
-            std::vector<float> xd(std::size_t{n_vec} * cols);  // dense copy for the CPU
-            for (std::uint32_t v = 0; v < n_vec; ++v) {
-                const auto xv = ref::random_vec(cols, rng);
-                std::copy(xv.begin(), xv.end(), xbuf.begin() + lead + std::size_t{v} * xs);
-                std::copy(xv.begin(), xv.end(), xd.begin() + std::size_t{v} * cols);
-            }
-            std::vector<float> ycpu(std::size_t{n_vec} * rows);
-            hc::matmul(hc::ConstRows(xd.data(), n_vec, cols, cols), weight_matrix(w, t, rows, cols),
-                       hc::Rows(ycpu.data(), n_vec, rows, rows));
-
-            hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
-            hv::Buffer bx = upload(ctx, std::span<const float>(xbuf));
-            const std::vector<float> yinit(lead + std::size_t{n_vec} * ys, -7.0f);
-            hv::Buffer by = upload(ctx, std::span<const float>(yinit), hv::MemoryUsage::HostCached);
-            hv::Buffer by1 = hv::Buffer::create(ctx, std::uint64_t{n_vec} * rows * 4, hv::MemoryUsage::HostCached);
-            hv::Stream s(ctx);
-            hv::GemvArgs g;
-            g.wtype = ref::dtype(t);
-            g.w = bw;
-            g.x = hv::BufferView(bx, lead * 4, 0, xs * 4);
-            g.y = hv::BufferView(by, lead * 4, 0, ys * 4);
-            g.rows = rows;
-            g.cols = cols;
-            g.n_vec = n_vec;
-            ops.gemv(s, g);
-            for (std::uint32_t v = 0; v < n_vec; ++v) {  // the same vectors one at a time
-                ops.matvec(s, ref::dtype(t), bw, hv::BufferView(bx, (lead + std::uint64_t{v} * xs) * 4, cols * 4),
-                           hv::BufferView(by1, std::uint64_t{v} * rows * 4, rows * 4), rows, cols);
-            }
-            s.submit_and_wait();
-            const auto yb = download<float>(by, yinit.size());
-            const auto y1 = download<float>(by1, std::size_t{n_vec} * rows);
-            const double f = sum_factor(cols, wg) + sum_factor(cols, k_cpu_lanes);
-            double worst = 0;
-            for (std::uint32_t v = 0; v < n_vec; ++v) {
-                const float* got = yb.data() + lead + std::size_t{v} * ys;
-                EXPECT_TRUE(bitwise(std::span(got, rows), std::span(y1.data() + std::size_t{v} * rows, rows)))
-                    << "vector " << v << " of the batch != its own matvec";
-                for (std::uint32_t r = 0; r < ys - rows; ++r) EXPECT_EQ(got[rows + r], -7.0f) << "gap written";
-                const float* xv = xd.data() + std::size_t{v} * cols;
-                for (std::uint32_t r = 0; r < rows; ++r) {
-                    double scale = 0;
-                    for (std::uint32_t c = 0; c < cols; ++c)
-                        scale += double(w.mag[std::size_t{r} * cols + c]) * std::fabs(double(xv[c]));
-                    const double d = std::fabs(double(got[r]) - double(ycpu[std::size_t{v} * rows + r]));
-                    const double b = f * scale + k_floor;
-                    worst = std::max(worst, d / b);
-                    EXPECT_LE(d, b) << "v " << v << " r " << r;
+    // Both reductions: the shared-memory tree (default) and subgroupAdd (OpsOptions::subgroup_reduce,
+    // next.md step 1). Each must hold the CPU bound AND keep a batch row bitwise its own n_vec = 1 matvec,
+    // which MTP verify (R > 1) vs plain decode (R = 1) relies on for identical greedy output.
+    for (const bool sg : {false, true}) {
+        hv::Ops ops(ctx, hv::OpsOptions{.subgroup_reduce = sg});
+        if (sg && !ops.subgroup_reduce()) {
+            std::cout << "[vk-head] subgroupAdd matvec unsupported on this device: tree only\n";
+            continue;
+        }
+        SCOPED_TRACE(sg ? "subgroupAdd reduction" : "tree reduction");
+        const std::uint32_t wg = ops.options().reduce_workgroup;
+        for (const ref::WType t : {ref::WType::F32, ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q5_K,
+                                   ref::WType::Q6_K, ref::WType::IQ4_XS, ref::WType::IQ4_NL, ref::WType::Q3_K,
+                                   ref::WType::IQ3_S}) {
+            for (const std::uint32_t n_vec : {1u, 3u, 8u, 11u, 17u}) {
+                SCOPED_TRACE(std::string(tname(t)) + " n_vec " + std::to_string(n_vec));
+                const std::uint32_t rows = 37, cols = t == ref::WType::F32 ? 300 : 512;
+                std::mt19937 rng(static_cast<unsigned>(t) * 100 + n_vec);
+                const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+                // x: n_vec vectors with a row stride > cols, at a lead of 3 floats; y likewise.
+                const std::uint32_t xs = cols + 5, ys = rows + 3, lead = 3;
+                std::vector<float> xbuf(lead + std::size_t{n_vec} * xs, 1e30f);
+                std::vector<float> xd(std::size_t{n_vec} * cols);  // dense copy for the CPU
+                for (std::uint32_t v = 0; v < n_vec; ++v) {
+                    const auto xv = ref::random_vec(cols, rng);
+                    std::copy(xv.begin(), xv.end(), xbuf.begin() + lead + std::size_t{v} * xs);
+                    std::copy(xv.begin(), xv.end(), xd.begin() + std::size_t{v} * cols);
                 }
+                std::vector<float> ycpu(std::size_t{n_vec} * rows);
+                hc::matmul(hc::ConstRows(xd.data(), n_vec, cols, cols), weight_matrix(w, t, rows, cols),
+                           hc::Rows(ycpu.data(), n_vec, rows, rows));
+
+                hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+                hv::Buffer bx = upload(ctx, std::span<const float>(xbuf));
+                const std::vector<float> yinit(lead + std::size_t{n_vec} * ys, -7.0f);
+                hv::Buffer by = upload(ctx, std::span<const float>(yinit), hv::MemoryUsage::HostCached);
+                hv::Buffer by1 = hv::Buffer::create(ctx, std::uint64_t{n_vec} * rows * 4, hv::MemoryUsage::HostCached);
+                hv::Stream s(ctx);
+                hv::GemvArgs g;
+                g.wtype = ref::dtype(t);
+                g.w = bw;
+                g.x = hv::BufferView(bx, lead * 4, 0, xs * 4);
+                g.y = hv::BufferView(by, lead * 4, 0, ys * 4);
+                g.rows = rows;
+                g.cols = cols;
+                g.n_vec = n_vec;
+                ops.gemv(s, g);
+                for (std::uint32_t v = 0; v < n_vec; ++v) {  // the same vectors one at a time
+                    ops.matvec(s, ref::dtype(t), bw, hv::BufferView(bx, (lead + std::uint64_t{v} * xs) * 4, cols * 4),
+                               hv::BufferView(by1, std::uint64_t{v} * rows * 4, rows * 4), rows, cols);
+                }
+                s.submit_and_wait();
+                const auto yb = download<float>(by, yinit.size());
+                const auto y1 = download<float>(by1, std::size_t{n_vec} * rows);
+                const double f = sum_factor(cols, wg) + sum_factor(cols, k_cpu_lanes);
+                double worst = 0;
+                for (std::uint32_t v = 0; v < n_vec; ++v) {
+                    const float* got = yb.data() + lead + std::size_t{v} * ys;
+                    EXPECT_TRUE(bitwise(std::span(got, rows), std::span(y1.data() + std::size_t{v} * rows, rows)))
+                        << "vector " << v << " of the batch != its own matvec";
+                    for (std::uint32_t r = 0; r < ys - rows; ++r) EXPECT_EQ(got[rows + r], -7.0f) << "gap written";
+                    const float* xv = xd.data() + std::size_t{v} * cols;
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        double scale = 0;
+                        for (std::uint32_t c = 0; c < cols; ++c)
+                            scale += double(w.mag[std::size_t{r} * cols + c]) * std::fabs(double(xv[c]));
+                        const double d = std::fabs(double(got[r]) - double(ycpu[std::size_t{v} * rows + r]));
+                        const double b = f * scale + k_floor;
+                        worst = std::max(worst, d / b);
+                        EXPECT_LE(d, b) << "v " << v << " r " << r;
+                    }
+                }
+                std::cout << "[vk-head] gemv" << (sg ? "(sg) " : " ") << tname(t) << " n_vec " << n_vec
+                          << ": worst |vk-cpu|/bound = " << worst << "\n";
             }
-            std::cout << "[vk-head] gemv " << tname(t) << " n_vec " << n_vec << ": worst |vk-cpu|/bound = " << worst
-                      << "\n";
         }
     }
 }

@@ -34,17 +34,18 @@ constexpr std::uint32_t k_argmax_per_thread = 16;
 constexpr std::uint32_t k_argmax_words = 3;
 // Vectors per gemv dispatch (matvec_quant_main.glsl MAX_VEC).
 constexpr std::uint32_t k_gemv_max_vec = 8;
-// HALO_SUBGROUP_REDUCE=1 (default off): batched (n_vec > 1) matvecs of Q4_K / Q5_K / Q6_K / IQ4_XS use the
-// matvec_<type>_sg shaders (subgroupAdd reduction, NV specialized to the dispatch's vector count) when the
-// device offers arithmetic subgroup ops in compute shaders with subgroupSize >= 32 (the shaders stay correct
-// for any workgroup / subgroup ratio above that). Results differ from the tree shaders in reduction order.
-bool subgroup_reduce_enabled(const DeviceInfo& info) {
-    static const bool requested = [] {
-        const char* e = std::getenv("HALO_SUBGROUP_REDUCE");
-        return e != nullptr && *e != '\0' && std::string_view(e) != "0";
-    }();
-    return requested && info.subgroup_size >= 32 && (info.subgroup_ops & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0 &&
+// OpsOptions::subgroup_reduce (default: HALO_SUBGROUP_REDUCE=1, off): matvecs of Q4_K / Q5_K / Q6_K / IQ4_XS
+// use the matvec_<type>_sg shaders (subgroupAdd reduction, NV specialized to the dispatch's vector count) when
+// the device offers arithmetic subgroup ops in compute shaders with subgroupSize >= 32 (the shaders stay
+// correct for any workgroup / subgroup ratio above that). Results differ from the tree shaders in reduction
+// order, so the n_vec == 1 chunks take the _sg shader too: a batch row must stay bitwise its own matvec.
+bool subgroup_reduce_supported(const DeviceInfo& info) {
+    return info.subgroup_size >= 32 && (info.subgroup_ops & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0 &&
            (info.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+}
+bool subgroup_reduce_env() {
+    const char* e = std::getenv("HALO_SUBGROUP_REDUCE");
+    return e != nullptr && *e != '\0' && std::string_view(e) != "0";
 }
 // Largest chunk of the chunked GDN (the HIP backend's cap too; qwen35 prefill uses 64).
 constexpr std::uint32_t k_gdn_max_chunk = 64;
@@ -106,6 +107,7 @@ Ops::Ops(std::shared_ptr<Context> ctx, OpsOptions options) : ctx_(std::move(ctx)
     // argmax: three WG-wide shared arrays (value, index, NaN flag); rms_norm/matvec use one.
     HALO_CHECK(std::uint64_t{rw} * 12 <= info.max_shared_memory, ErrorCode::Kernel,
                "Ops: reduce_workgroup={} exceeds shared memory", rw);
+    subgroup_reduce_ = options_.subgroup_reduce.value_or(subgroup_reduce_env()) && subgroup_reduce_supported(info);
     // Tuning knob for the gemv/matvec workgroup size (specialization constant 0).
     if (const char* env = std::getenv("HALO_VK_GEMV_WG"); env != nullptr && *env != '\0')
         options_.gemv_workgroup = static_cast<std::uint32_t>(std::stoul(env));
@@ -286,17 +288,19 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     const std::array bindings{ow.binding, ox.binding, oy.binding};
     const DeviceInfo& info = ctx_->info();
     const GroupCount groups = grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]);
-    // HALO_SUBGROUP_REDUCE=1: batched chunks (n > 1) of the four hot K-quant types run the *_sg shader
-    // (subgroupAdd reduction, spec constant 2 = the chunk's vector count so the vector loops unroll).
-    const bool sg_reduce = !repacked && a.n_vec > 1 &&
+    // subgroup_reduce_: EVERY chunk (n_vec == 1 and a lone trailing vector too) of the four hot K-quant types
+    // runs the *_sg shader (subgroupAdd reduction, spec constant 2 = the chunk's vector count so the vector
+    // loops unroll). A vector's arithmetic there doesn't depend on NV, so a batch row is bitwise its own
+    // n_vec == 1 matvec, as on the tree path; mixing the two shaders would break that (MTP verify vs decode).
+    const bool sg_reduce = !repacked &&
                            (a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K ||
                             a.wtype == DType::IQ4_XS) &&
-                           subgroup_reduce_enabled(info);
+                           subgroup_reduce_;
     // Up to k_gemv_max_vec vectors per dispatch (matvec_quant_main.glsl MAX_VEC). Offsets of
     // later chunks stay inside the index range operand() checked for the whole extent.
     for (std::uint32_t t0 = 0; t0 < a.n_vec; t0 += k_gemv_max_vec) {
         const std::uint32_t n = std::min(k_gemv_max_vec, a.n_vec - t0);
-        const Kernel& kc = (sg_reduce && n > 1) ? kernel(shader + "_sg", 3, sizeof(Push), {{0, wg}, {2, n}}, {wg, 1, 1}) : k;
+        const Kernel& kc = sg_reduce ? kernel(shader + "_sg", 3, sizeof(Push), {{0, wg}, {2, n}}, {wg, 1, 1}) : k;
         const Push push{a.rows,
                         a.cols,
                         n,

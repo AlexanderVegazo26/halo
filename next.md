@@ -148,7 +148,7 @@ All new paths are opt-in (env flag, default off) except the `stream.cpp` per-dis
 
 | Step | Flag / state |
 |---|---|
-| 1 batched matvec | shared-tree fusion (default); `HALO_SUBGROUP_REDUCE=1` subgroupAdd + unrolled NV variants (q4_k/q5_k/q6_k/iq4_xs) |
+| 1 batched matvec | shared-tree fusion (default); `HALO_SUBGROUP_REDUCE=1` subgroupAdd + unrolled NV variants (q4_k/q5_k/q6_k/iq4_xs). **GPU-verified 2026-11-14 (RADV):** within the CPU bound for n_vec 1-17; it now also runs the n_vec = 1 chunks, because R=1 on the tree shader and R>1 on subgroupAdd broke the bitwise batch == single contract (MTP verify vs decode); `OpsOptions::subgroup_reduce` overrides the env (VkHead gemv test covers both). Qwen3.8-27B greedy 64 tokens identical with MTP on/off and vs the tree path. tok/s not measured (GPU busy) |
 | 2 draft head | `HALO_MTP_DRAFT_VOCAB=32768` (first-N-ids prefix; not a frequency list) |
 | 3 GDN decode | `HALO_GDN_DV_TILE=32`; `HALO_GDN_REG=1` register-resident state kernel (d_k <= 128) |
 | 4 host round-trips | mid-forward sync removed; `HALO_STREAM_REUSE=1`; `HALO_MTP_DEVICE_HIDDEN=1`; `HALO_MTP_CHAIN=1` (chained drafts, one submit for the draft phase; verify still its own forward) |

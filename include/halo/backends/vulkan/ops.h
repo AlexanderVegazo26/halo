@@ -92,6 +92,12 @@ struct OpsOptions {
     /// 248320-row embedding or LM head) is processed in row slabs that each fit. 0 = the
     /// device's maxStorageBufferRange. (A smaller value only splits more; for tests.)
     std::uint64_t max_binding_bytes = 0;
+    /// subgroupAdd reduction for the Q4_K / Q5_K / Q6_K / IQ4_XS matvecs (next.md step 1): every chunk of
+    /// those types, n_vec == 1 included, runs the matvec_<type>_sg shader, so a batch row stays bitwise
+    /// its own n_vec == 1 matvec (MTP verify == plain decode); results differ from the tree shaders in
+    /// reduction order only. nullopt = the HALO_SUBGROUP_REDUCE env var (default off). Needs arithmetic
+    /// subgroup ops in compute with subgroupSize >= 32; otherwise ignored (see Ops::subgroup_reduce()).
+    std::optional<bool> subgroup_reduce = std::nullopt;
 };
 
 /// Byte size of one row of `cols` elements of weight type `t` (F32, Q8_0, Q4_K, Q5_K,
@@ -499,6 +505,9 @@ public:
     explicit Ops(std::shared_ptr<Context> ctx, OpsOptions options = {});
 
     [[nodiscard]] const OpsOptions& options() const noexcept { return options_; }
+    /// Whether gemv uses the subgroupAdd matvec shaders: OpsOptions::subgroup_reduce (or its env
+    /// default) AND the device supports them.
+    [[nodiscard]] bool subgroup_reduce() const noexcept { return subgroup_reduce_; }
 
     /// [RMS_NORM] y[r,i] = (x[r,i] * rsqrt(mean_i(x[r,·]²) + eps)) * w[i], like cpu::rms_norm.
     /// x, y: `rows` rows of `cols` fp32 (row strides from the views); w: [cols]. Plain x̂·w
@@ -579,6 +588,7 @@ private:
 
     std::shared_ptr<Context> ctx_;
     OpsOptions options_;
+    bool subgroup_reduce_ = false;
     std::map<std::string, std::unique_ptr<Kernel>> kernels_;
 };
 
