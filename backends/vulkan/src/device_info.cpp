@@ -118,6 +118,13 @@ void policy_warnings(std::span<const DeviceInfo> devices, const DeviceInfo& chos
 
 }  // namespace
 
+void require_gpu_device(const DeviceInfo& info) {
+    HALO_CHECK(!info.correctness_only, ErrorCode::Device,
+               "halo runs the model on the GPU only, but the Vulkan device it found is '{}', a CPU "
+               "implementation (no usable GPU driver such as RADV, or HALO_VK_DEVICE selects it)",
+               info.name);
+}
+
 DeviceSelection select_device(std::span<const DeviceInfo> devices,
                               std::optional<std::string_view> override) {
     DeviceSelection sel;

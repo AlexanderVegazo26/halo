@@ -135,6 +135,11 @@ struct DeviceSelection {
 [[nodiscard]] DeviceSelection select_device(std::span<const DeviceInfo> devices,
                                             std::optional<std::string_view> override);
 
+/// halo runs the model on the GPU only: throws Error(Device) when `info` is a CPU Vulkan
+/// implementation (lavapipe / llvmpipe, `correctness_only`). Tests may still open such a device
+/// to check shader results; the engine calls this before it runs a model on the device.
+void require_gpu_device(const DeviceInfo& info);
+
 /// Intended use of a buffer's memory.
 enum class MemoryUsage {
     DeviceLocal,  ///< GPU-only working memory (weights, activations, state)

@@ -164,6 +164,26 @@ TEST(VkPolicy, LavapipeOnlyIsSelectedAndFlaggedCorrectnessOnly) {
     EXPECT_TRUE(any_contains(sel.warnings, "correctness-only"));
 }
 
+TEST(VkPolicy, RequireGpuDeviceRefusesCpuImplementationsAndAcceptsGpus) {
+    // halo runs the model on the GPU only: the engine refuses lavapipe even when select_device
+    // picks it (no GPU driver, or HALO_VK_DEVICE=llvmpipe), instead of serving on the CPU.
+    for (const auto& cpu : {fake(0, "llvmpipe (LLVM 20.1.2, 256 bits)", VK_DRIVER_ID_MESA_LLVMPIPE, VK_PHYSICAL_DEVICE_TYPE_CPU),
+                            fake(1, "SwiftShader", VK_DRIVER_ID_GOOGLE_SWIFTSHADER, VK_PHYSICAL_DEVICE_TYPE_CPU)}) {
+        try {
+            hv::require_gpu_device(cpu);
+            ADD_FAILURE() << "require_gpu_device accepted CPU device '" << cpu.name << "'";
+        } catch (const halo::Error& e) {
+            EXPECT_EQ(e.code(), halo::ErrorCode::Device) << cpu.name << ": " << e.what();
+            EXPECT_NE(std::string(e.what()).find("GPU only"), std::string::npos) << cpu.name << ": " << e.what();
+            EXPECT_NE(std::string(e.what()).find(cpu.name), std::string::npos) << "message should name the device: " << e.what();
+        }
+    }
+    for (const auto& gpu : {fake(0, "AMD Radeon 8060S (RADV GFX1151)", VK_DRIVER_ID_MESA_RADV, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU),
+                            fake(1, "AMD Radeon 8060S", VK_DRIVER_ID_AMD_PROPRIETARY, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)}) {
+        EXPECT_NO_THROW(hv::require_gpu_device(gpu)) << gpu.name;
+    }
+}
+
 TEST(VkPolicy, NonRadvGpuBeatsLavapipeAndDiscreteBeatsIntegrated) {
     const std::vector<hv::DeviceInfo> devs{
         fake(0, "llvmpipe", VK_DRIVER_ID_MESA_LLVMPIPE, VK_PHYSICAL_DEVICE_TYPE_CPU),

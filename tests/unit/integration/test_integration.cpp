@@ -138,6 +138,20 @@ TEST(RuntimeProfile, Sha256KnownAnswers) {
 
 // ---- (1) halo run -------------------------------------------------------------------------
 
+namespace {
+// The CLI runs the model on the GPU only (`auto` = vulkan, `cpu` refused), but these tests check
+// the CLI against the CPU golden data: the engine is pinned to the CPU reference backend here.
+halo::cli::EngineFactory cpu_reference_factory() {
+    auto real = halo::cli::default_engine_factory();
+    EXPECT_TRUE(real) << "this CLI build does not link halo_runtime";
+    return [real](const halo::runtime::EngineConfig& c) {
+        auto cpu = c;
+        cpu.backend = "cpu";
+        return real(cpu);
+    };
+}
+}  // namespace
+
 TEST_F(Fx, HaloRunGreedyOutputEqualsGolden) {
     const Toks p = prompt("p1");
     const Toks g = gold("p1");
@@ -148,8 +162,7 @@ TEST_F(Fx, HaloRunGreedyOutputEqualsGolden) {
     ctx.out = &out;
     ctx.err = &err;
     ctx.in = &in;
-    ctx.engine_factory = halo::cli::default_engine_factory();
-    ASSERT_TRUE(ctx.engine_factory) << "this CLI build does not link halo_runtime";
+    ctx.engine_factory = cpu_reference_factory();
     const int rc = halo::cli::run_cli({"run", tiny().string(), "--raw", "-p", text, "--temperature", "0", "-n",
                                        std::to_string(g.size()), "--ctx", "512"},
                                       ctx);
@@ -442,7 +455,7 @@ TEST_F(Fx, HaloBenchModelWritesAValidSchemaArtifact) {
     ctx.out = &out;
     ctx.err = &err;
     ctx.in = &in;
-    ctx.engine_factory = halo::cli::default_engine_factory();
+    ctx.engine_factory = cpu_reference_factory();
     const int rc = halo::cli::run_cli({"bench", "model", tiny().string(), "--host-label", "dev-host", "--power-mode", "dev-host",
                                        "--out", out_path.string(), "--modes", "prompt,decode,concurrency", "--contexts", "64",
                                        "--concurrency", "1,2", "--prompt-tokens", "16", "--decode-tokens", "4",

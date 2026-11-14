@@ -118,10 +118,15 @@ std::size_t ceil_div(std::size_t a, std::size_t b) { return (a + b - 1) / b; }
 
 #if defined(HALO_RUNTIME_VULKAN) || defined(HALO_RUNTIME_HIP)
 /// Constructs the GPU backend named by EngineConfig::backend ("auto" is resolved before this
-/// is called, see resolve_auto_backend). Throws Error(Device) when the device/driver is missing.
+/// is called, see resolve_auto_backend). Throws Error(Device) when the device/driver is missing or
+/// the only Vulkan device is a CPU implementation (halo runs the model on the GPU only).
 std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
 #if defined(HALO_RUNTIME_VULKAN)
-    if (name == "vulkan") return backend::make_vulkan_backend(vulkan::Context::create({}));
+    if (name == "vulkan") {
+        auto ctx = vulkan::Context::create({});
+        vulkan::require_gpu_device(ctx->info());
+        return backend::make_vulkan_backend(std::move(ctx));
+    }
 #endif
 #if defined(HALO_RUNTIME_HIP)
     if (name == "hip") {
@@ -137,23 +142,15 @@ std::unique_ptr<backend::Backend> make_gpu_backend(const std::string& name) {
 }
 #endif
 
-/// Resolves backend "auto" to Vulkan. halo is GPU-only: when the build has no Vulkan backend or
-/// no device opens, this throws instead of falling back to the CPU. The constructed backend is
-/// handed back through *out so the device context is opened once. A test-supplied
-/// backend_factory keeps "auto" on cpu: unit tests drive the CPU reference engine on tiny models.
-std::string resolve_auto_backend(const CpuEngineOptions& opts, std::unique_ptr<backend::Backend>* out) {
-    if (opts.backend_factory) return "cpu";
+/// The backend "auto" runs on, without opening a device: "vulkan" (halo runs the model on the GPU
+/// only). Throws Error(Unsupported) when this build has no Vulkan backend: never a CPU fallback.
+std::string resolve_auto_backend() {
 #if defined(HALO_RUNTIME_VULKAN)
-    try {
-        *out = make_gpu_backend("vulkan");
-    } catch (const Error& e) {
-        throw_error(ErrorCode::Device, "halo runs on the GPU only, and no Vulkan device could be opened: {}", e.what());
-    }
     return "vulkan";
 #else
-    (void)out;
     throw_error(ErrorCode::Unsupported,
-                "halo runs on the GPU only, and this build has no Vulkan backend (configure with HALO_BUILD_VULKAN=ON)");
+                "halo runs the model on the GPU only, and this build has no Vulkan backend (configure with "
+                "HALO_BUILD_VULKAN=ON)");
 #endif
 }
 
@@ -367,7 +364,10 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     HALO_CHECK(cfg_.backend == "cpu" || cfg_.backend == "auto" || cfg_.backend == "vulkan" || cfg_.backend == "hip",
                ErrorCode::Unsupported, "unknown backend '{}' (cpu | vulkan | hip | auto)", cfg_.backend);
     if (cfg_.backend == "auto") {
-        cfg_.backend = resolve_auto_backend(opts, &backend_);
+        // halo is GPU-only: auto = vulkan, and an error (never a CPU fallback) when the build has
+        // no Vulkan backend or no GPU device opens. A test-supplied backend_factory keeps "auto"
+        // on cpu: unit tests drive the CPU reference engine on tiny models.
+        cfg_.backend = opts.backend_factory ? "cpu" : resolve_auto_backend();
         HALO_INFO("runtime", "backend 'auto' resolved to '{}'", cfg_.backend);
     }
     const bool cpu_path = cfg_.backend == "cpu";
@@ -403,9 +403,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     if (cpu_path) {
         model_ = std::make_unique<models::Qwen35>(*nm_, pool_.get(), mo);
     } else {
-        if (backend_) {
-            // already opened by resolve_auto_backend
-        } else if (opts_.backend_factory) {
+        if (opts_.backend_factory) {
             backend_ = opts_.backend_factory();
         } else {
 #if defined(HALO_RUNTIME_VULKAN) || defined(HALO_RUNTIME_HIP)
