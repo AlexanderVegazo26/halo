@@ -186,6 +186,66 @@ TEST(PlannerPolicy, GttCountsAgainstTheOsPool) {
     EXPECT_TRUE(std::ranges::none_of(plan.overflows, [](const Overflow& o) { return o.constraint == "GTT"; }));
 }
 
+// Carveout-primary (96 GiB BIOS carve-out, small OS RAM): when another process holds most of
+// the VRAM, the weights spill into GTT, whose pages are OS RAM, and the plan is refused on the
+// HOST pool. The cause is the full VRAM, so the refusal must say that first (Q-0064).
+TEST(PlannerRefusal, CarveoutSpillToGttSaysNotEnoughFreeVramFirst) {
+    MemoryTiers t;
+    t.topology = MemoryTopology::CarveoutPrimary;
+    t.vram_total = 96 * GiB;
+    t.vram_used = 90 * GiB;  // e.g. another model resident: 6 GiB free, budget 5.4 GiB
+    t.gtt_total = 32 * GiB;  // budget 28.8 GiB: holds the spilled weights on its own
+    t.gtt_used = 0;
+    t.host_total = 32 * GiB;
+    t.host_available = 12 * GiB;  // budget 10.8 GiB: the OS pool cannot back them
+    PlanRequest r;
+    r.max_context = 4096;
+    const auto plan = plan_memory(qwen(), r, t);
+    std::cout << plan.table();
+    ASSERT_FALSE(plan.ok) << plan.table();
+    ASSERT_TRUE(std::ranges::any_of(plan.allocations,
+                                    [](const Allocation& a) { return a.tier == halo::hardware::MemoryTier::Gtt; }))
+        << "fixture should spill something into GTT\n" << plan.table();
+    EXPECT_EQ(plan.overflows.front().constraint, "HOST") << plan.table();
+    const std::string want = "memory plan refused: not enough free VRAM: 6.00 GiB available of 96.00 GiB";
+    EXPECT_TRUE(plan.message.starts_with(want))
+        << "refusal should lead with the VRAM shortfall\n  want prefix: " << want << "\n  actual: " << plan.message;
+    EXPECT_NE(plan.message.find("spilled to GTT"), std::string::npos) << plan.message;
+    // The HOST detail is still there, after the VRAM cause.
+    EXPECT_GT(plan.message.find("HOST (system RAM"), plan.message.find("not enough free VRAM")) << plan.message;
+
+    // Same request with the VRAM free: nothing spills and the plan fits, so VRAM was the cause.
+    MemoryTiers freed = t;
+    freed.vram_used = 0;
+    const auto fits = plan_memory(qwen(), r, freed);
+    EXPECT_TRUE(fits.ok) << fits.table();
+
+    // A GTT spill is not blamed when VRAM is not the binding limit: a user cap refusal keeps its own message.
+    PlanRequest capped = r;
+    capped.max_memory = 1 * GiB;
+    const auto cap = plan_memory(qwen(), capped, freed);
+    ASSERT_FALSE(cap.ok);
+    EXPECT_EQ(cap.message.find("not enough free VRAM"), std::string::npos) << cap.message;
+}
+
+// gtt-primary: GTT is the GPU's main pool there, so a HOST refusal is not a VRAM shortfall.
+TEST(PlannerRefusal, GttPrimaryHostRefusalDoesNotBlameVram) {
+    MemoryTiers t;
+    t.topology = MemoryTopology::GttPrimary;
+    t.vram_total = 1 * GiB;
+    t.vram_used = 0;
+    t.gtt_total = 60 * GiB;
+    t.gtt_used = 0;
+    t.host_total = 64 * GiB;
+    t.host_available = 16 * GiB;
+    PlanRequest r;
+    r.max_context = 1024;
+    const auto plan = plan_memory(qwen(), r, t);
+    ASSERT_FALSE(plan.ok) << plan.table();
+    EXPECT_EQ(plan.overflows.front().constraint, "HOST");
+    EXPECT_TRUE(plan.message.starts_with("memory plan refused: HOST (system RAM")) << plan.message;
+}
+
 TEST(PlannerPolicy, OverridePinsTierAndCannotTargetMissingTier) {
     MemoryTiers t;
     t.topology = MemoryTopology::CarveoutPrimary;

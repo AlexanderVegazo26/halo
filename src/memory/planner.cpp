@@ -451,10 +451,22 @@ MemoryPlan plan_once(const ModelShape& shape, const PlanRequest& req, const hard
         plan.message = std::format("fits: {} planned (safety factor {:.2f})", gib(plan.planned_total), req.safety_factor);
     } else {
         const auto& o = plan.overflows.front();
-        plan.message = std::format("memory plan refused: {} needs {} but its budget is {} (safety factor {:.2f}): "
-                                   "short by {} ({} bytes)",
-                                   constraint_label(o.constraint), gib(o.demand), gib(o.budget), req.safety_factor,
-                                   gib(o.excess), o.excess);
+        plan.message = "memory plan refused: ";
+        // Carveout-primary: GPU classes only reach GTT (OS RAM) because VRAM is full, so a
+        // refusal on the OS pool, GTT or VRAM is a VRAM shortfall first; say so before the pool
+        // that ran out (a 96 GiB carve-out with another model resident spills its weights to RAM).
+        const bool memory_pool_overflow = std::ranges::any_of(plan.overflows, [](const Overflow& ov) {
+            return ov.constraint == "HOST" || ov.constraint == "GTT" || ov.constraint == "VRAM";
+        });
+        if (hw.topology == hardware::MemoryTopology::CarveoutPrimary && L.vram && L.gtt && L.gtt->planned > 0 &&
+            memory_pool_overflow)
+            plan.message += std::format("not enough free VRAM: {} available of {} ({} in use at discovery), so {} "
+                                        "spilled to GTT, whose pages come out of system RAM; ",
+                                        gib(L.vram->available), gib(L.vram->total),
+                                        gib(sat_sub(L.vram->total, L.vram->available)), gib(L.gtt->planned));
+        plan.message += std::format("{} needs {} but its budget is {} (safety factor {:.2f}): short by {} ({} bytes)",
+                                    constraint_label(o.constraint), gib(o.demand), gib(o.budget), req.safety_factor,
+                                    gib(o.excess), o.excess);
         for (std::size_t i = 1; i < plan.overflows.size(); ++i)
             plan.message += std::format("; also {} short by {}", constraint_label(plan.overflows[i].constraint),
                                         gib(plan.overflows[i].excess));
