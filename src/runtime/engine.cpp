@@ -217,7 +217,9 @@ struct Active {
     std::optional<Clock::time_point> t_first;
     Clock::time_point t_last;
     std::size_t drafted = 0, accepted = 0;
-    Toks forced;                  ///< draft_hook output for the current tick
+    std::size_t ngram_lookups = 0, ngram_hits = 0, ngram_drafted = 0, ngram_accepted = 0, mtp_fallbacks = 0;
+    Toks forced;                  ///< draft_hook or n-gram drafts for the current tick
+    bool forced_ngram = false;    ///< `forced` came from the n-gram lookup (not draft_hook)
     std::size_t delivered = 0;    ///< generated tokens handed to the request's queue
     bool finished = false;
     FinishReason reason = FinishReason::Stop;
@@ -1168,12 +1170,18 @@ void CpuEngine::tick() {
             q.token = a.pending;
             q.max_draft = a.r->fast_greedy ? max_draft_ : 0;
             a.forced.clear();
+            a.forced_ngram = false;
             if (opts_.draft_hook && a.r->fast_greedy && max_draft_ > 0) {
                 a.forced = opts_.draft_hook(a.r->req.prompt, a.generated);
             } else if (ngram_draft_ && a.r->fast_greedy && max_draft_ > 0) {
                 a.forced = speculative::ngram_draft(a.r->req.prompt, a.generated, max_draft_);
                 ++ngram_lookups;
-                if (!a.forced.empty()) ++ngram_drafts;
+                ++a.ngram_lookups;
+                if (!a.forced.empty()) {
+                    ++ngram_drafts;
+                    ++a.ngram_hits;
+                    a.forced_ngram = true;
+                }
             }
             if (!a.forced.empty()) {
                 if (a.forced.size() > max_draft_) a.forced.resize(max_draft_);
@@ -1189,6 +1197,7 @@ void CpuEngine::tick() {
 
     speculative::Tick t;
     bool fallback = false;
+    std::vector<bool> lost_mtp;  // per request: its MTP was dropped by the fallback
     const std::uint64_t trunk0 = spec_->metrics().trunk_passes, passes0 = spec_->metrics().weight_passes;
     for (;;) {
         try {
@@ -1203,12 +1212,15 @@ void CpuEngine::tick() {
             if (evict_one_cache_entry()) continue;
             if (fallback) throw;
             bool had_mtp = false;
-            for (auto& q : reqs) {
+            lost_mtp.assign(n, false);
+            for (std::size_t i = 0; i < n; ++i) {
+                speculative::StepRequest& q = reqs[i];
                 if (q.seq->mtp_kv && (q.max_draft > 0 || q.seq->mtp_queue_size() > 0 || !q.prefill.empty())) {
                     q.seq->mtp_kv.reset();
                     q.seq->mtp_queue_tokens.clear();
                     q.seq->mtp_queue_hidden.clear();
                     q.max_draft = 0;
+                    lost_mtp[i] = true;
                     had_mtp = true;
                 }
             }
@@ -1219,6 +1231,10 @@ void CpuEngine::tick() {
     }
 
     // ---- outputs -------------------------------------------------------------------------
+    // Counted once the retried step has run, like EngineStats::mtp_fallbacks below.
+    for (std::size_t i = 0; i < lost_mtp.size(); ++i) {
+        if (lost_mtp[i]) ++who[i]->mtp_fallbacks;
+    }
     TickInfo info;
     info.sequences = n;
     info.prefill_rows = prefill_rows;
@@ -1269,6 +1285,10 @@ void CpuEngine::tick() {
             info.accepted += o.accepted;
             a.drafted += o.drafts.size();
             a.accepted += o.accepted;
+            if (a.forced_ngram) {
+                a.ngram_drafted += o.drafts.size();
+                a.ngram_accepted += o.accepted;
+            }
             if (a.r->fast_greedy) {
                 // H1: same check as the prefill branch above, before any of this sequence's
                 // poisoned tokens are pushed into a.fed (which would otherwise resurface as an
@@ -1388,6 +1408,11 @@ void CpuEngine::retire(Active& a, FinishReason why, std::string error) noexcept 
         res.error = std::move(error);
         res.draft_tokens = a.drafted;
         res.accepted_draft_tokens = a.accepted;
+        res.ngram_lookups = a.ngram_lookups;
+        res.ngram_hits = a.ngram_hits;
+        res.ngram_draft_tokens = a.ngram_drafted;
+        res.ngram_accepted_draft_tokens = a.ngram_accepted;
+        res.mtp_fallbacks = a.mtp_fallbacks;
         res.deadline_expired = r.deadline_hit;
         if (a.t_first) {
             res.ttft_ms = ms_between(r.t_submit, *a.t_first);

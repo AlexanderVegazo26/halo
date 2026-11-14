@@ -617,14 +617,35 @@ TEST(CliRun, StreamsContentAndHidesReasoning) {
     EXPECT_NE(r.err.find("device lost"), std::string::npos);
 }
 
+/// The request's draft counters, as CpuEngine fills GenerateResult.
 struct Drafts {
-    std::size_t proposed = 0, accepted = 0;
+    std::size_t proposed = 0, accepted = 0;            // every source
+    std::size_t ngram_proposed = 0, ngram_accepted = 0;  // the n-gram share of the above
+    std::size_t lookups = 0, hits = 0, fallbacks = 0;
 };
 
-/// `halo run --raw` over a FakeEngine whose request reports `d` draft tokens and whose stats
-/// move from `before` to `after` across it; `fail` ends the request with FinishReason::Error.
-CliResult run_with_stats(Drafts d, const runtime::EngineStats& before, const runtime::EngineStats& after,
-                         bool fail = false) {
+/// Engine-wide counters that moved across the request because other requests ran beside it:
+/// every number differs from the request's own, so a line built from stats deltas fails.
+std::pair<runtime::EngineStats, runtime::EngineStats> busy_engine_stats() {
+    runtime::EngineStats before;
+    before.speculative_attempts = 100;
+    before.speculative_accepts = 90;
+    before.ngram_lookups = 7;
+    before.ngram_drafts = 1;
+    before.mtp_fallbacks = 4;
+    runtime::EngineStats after = before;
+    after.speculative_attempts += 61;
+    after.speculative_accepts += 37;
+    after.ngram_lookups += 29;
+    after.ngram_drafts += 11;
+    after.mtp_fallbacks += 5;
+    after.ticks = 40;
+    return {before, after};
+}
+
+/// `halo run --raw` over a FakeEngine whose request reports `d` and whose engine-wide stats
+/// move as busy_engine_stats() across it; `fail` ends the request with FinishReason::Error.
+CliResult run_with_drafts(Drafts d, bool fail = false) {
     auto fake = std::shared_ptr<FakeEngine>(FakeEngine::synthetic(4096).release());
     fake->script = [fail](const auto&, int) {
         Script s = sc("abcdefgh");
@@ -638,8 +659,13 @@ CliResult run_with_stats(Drafts d, const runtime::EngineStats& before, const run
     h.on_result = [d](runtime::GenerateResult& r) {
         r.draft_tokens = d.proposed;
         r.accepted_draft_tokens = d.accepted;
+        r.ngram_draft_tokens = d.ngram_proposed;
+        r.ngram_accepted_draft_tokens = d.ngram_accepted;
+        r.ngram_lookups = d.lookups;
+        r.ngram_hits = d.hits;
+        r.mtp_fallbacks = d.fallbacks;
     };
-    h.stats = std::pair{before, after};
+    h.stats = busy_engine_stats();
     return cli_run({"run", "m.gguf", "-p", "x", "--raw", "--temperature", "0"},
                    CliOptions().with_factory([=](const runtime::EngineConfig&) -> std::unique_ptr<runtime::Engine> {
                        return std::make_unique<SharedEngine>(fake, h);
@@ -653,70 +679,66 @@ std::size_t count_lines_with(const std::string& text, const std::string& needle)
     return n;
 }
 
-TEST(CliRun, SummarizesThisRequestsSpeculativeDraftsOnStderr) {
-    // Engine counters already non-zero before the request (an engine that warmed up or served
-    // before): the n-gram / fallback clauses report only this request's share.
-    runtime::EngineStats before;
-    before.speculative_attempts = 100;
-    before.speculative_accepts = 90;
-    before.ngram_lookups = 7;
-    before.ngram_drafts = 1;
-    runtime::EngineStats after = before;
-    after.speculative_attempts += 20;  // engine-wide; the line must use the request's 12 / 9
-    after.speculative_accepts += 17;
-    after.ngram_lookups += 3;
-    after.ngram_drafts += 2;
-    after.mtp_fallbacks = 1;
-    const CliResult r = run_with_stats({.proposed = 12, .accepted = 9}, before, after);
+TEST(CliRun, SummarizesThisRequestsDraftsPerSourceOnStderr) {
+    // 12 drafts, 9 accepted: 8 from MTP (5 accepted) and 4 from 2 n-gram hits in 3 lookups (4
+    // accepted), 1 fallback; the engine-wide counters moved by other numbers (busy_engine_stats).
+    const CliResult r = run_with_drafts(
+        {.proposed = 12, .accepted = 9, .ngram_proposed = 4, .ngram_accepted = 4, .lookups = 3, .hits = 2, .fallbacks = 1});
     ASSERT_EQ(r.rc, 0) << r.err;
     EXPECT_EQ(r.out, "abcdefgh\n") << "the draft summary must not reach stdout";
-    EXPECT_NE(r.err.find("[halo] drafts (MTP + n-gram) 9 accepted of 12 proposed (75.0%), n-gram hits 2 of 3 "
-                         "lookups, 1 MTP fallback\n"),
+    EXPECT_NE(r.err.find("[halo] drafts 9 accepted of 12 proposed (75.0%): MTP 5 of 8 (62.5%), n-gram 4 of 4 "
+                         "(100.0%) from 2 hits in 3 lookups, 1 MTP fallback\n"),
               std::string::npos)
-        << "expected the request's 9/12 drafts (not the engine-wide 17/20), 2/3 n-gram hits (deltas), 1 fallback; "
-           "stderr:\n"
+        << "expected the request's own counters split by source (not the engine-wide stats); stderr:\n"
         << r.err;
     // It follows the tok/s line.
     EXPECT_LT(r.err.find("tok/s decode"), r.err.find("[halo] drafts")) << r.err;
 }
 
 TEST(CliRun, DraftSummaryOmitsUnusedPartsAndIsAbsentForPlainDecode) {
-    runtime::EngineStats before;
-    before.ticks = 3;
-    before.speculative_attempts = 40;  // earlier requests drafted; this one did not
-    runtime::EngineStats after = before;
-    after.ticks += 9;
-    CliResult r = run_with_stats({}, before, after);
+    // Plain decode, while other requests drafted on the engine: one summary line only.
+    CliResult r = run_with_drafts({});
     ASSERT_EQ(r.rc, 0) << r.err;
     EXPECT_EQ(count_lines_with(r.err, "[halo] "), 1u) << "plain decode keeps the single summary line; stderr:\n"
                                                         << r.err;
     EXPECT_EQ(r.err.find("drafts"), std::string::npos) << r.err;
 
-    // MTP only, nothing accepted: no n-gram or fallback clause, no "(MTP + n-gram)" label.
-    r = run_with_stats({.proposed = 6, .accepted = 0}, before, after);
+    // MTP only (n-gram off), nothing accepted: no source split, no fallback clause.
+    r = run_with_drafts({.proposed = 6, .accepted = 0});
     ASSERT_EQ(r.rc, 0) << r.err;
     EXPECT_NE(r.err.find("[halo] drafts 0 accepted of 6 proposed (0.0%)\n"), std::string::npos) << r.err;
 
     // Plural fallbacks.
-    runtime::EngineStats fb = after;
-    fb.mtp_fallbacks = 2;
-    r = run_with_stats({.proposed = 4, .accepted = 1}, before, fb);
+    r = run_with_drafts({.proposed = 4, .accepted = 1, .fallbacks = 2});
     EXPECT_NE(r.err.find("[halo] drafts 1 accepted of 4 proposed (25.0%), 2 MTP fallbacks\n"), std::string::npos)
         << r.err;
 
     // A failed request ends with its error, not with partial draft counts.
-    r = run_with_stats({.proposed = 8, .accepted = 3}, before, after, /*fail=*/true);
+    r = run_with_drafts({.proposed = 8, .accepted = 3}, /*fail=*/true);
     EXPECT_EQ(r.rc, 1) << r.err;
     EXPECT_EQ(r.err.find("drafts"), std::string::npos) << "no draft line for a failed request; stderr:\n" << r.err;
     EXPECT_NE(r.err.find("halo: generation failed: device lost"), std::string::npos) << r.err;
 
-    // n-gram lookups without a single draft: no percentage to divide by zero.
-    after.ngram_lookups = 5;
-    r = run_with_stats({}, before, after);
+    // n-gram lookups without a single draft: no percentage to divide by zero, singular units.
+    r = run_with_drafts({.lookups = 1});
     ASSERT_EQ(r.rc, 0) << r.err;
-    EXPECT_NE(r.err.find("[halo] drafts (MTP + n-gram) 0 accepted of 0 proposed, n-gram hits 0 of 5 lookups\n"),
+    EXPECT_NE(r.err.find("[halo] drafts 0 accepted of 0 proposed: MTP 0 of 0, n-gram 0 of 0 from 0 hits in 1 lookup\n"),
               std::string::npos)
         << r.err;
+
+    // Every draft from n-gram (one hit): MTP proposed nothing.
+    r = run_with_drafts({.proposed = 3, .accepted = 2, .ngram_proposed = 3, .ngram_accepted = 2, .lookups = 5, .hits = 1});
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.err.find("[halo] drafts 2 accepted of 3 proposed (66.7%): MTP 0 of 0, n-gram 2 of 3 (66.7%) from 1 "
+                         "hit in 5 lookups\n"),
+              std::string::npos)
+        << r.err;
+
+    // An inconsistent result (n-gram share above the total, from some other Engine): the MTP
+    // part clamps to 0 instead of wrapping to 2^64 - 1.
+    r = run_with_drafts({.proposed = 1, .accepted = 0, .ngram_proposed = 4, .ngram_accepted = 2, .lookups = 2, .hits = 1});
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.err.find(": MTP 0 of 0, n-gram 2 of 4 (50.0%) from 1 hit in 2 lookups\n"), std::string::npos) << r.err;
 }
 
 #if HALO_CLI_HAVE_API

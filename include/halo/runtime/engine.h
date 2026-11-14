@@ -111,8 +111,20 @@ struct GenerateResult {
     std::size_t cached_prompt_tokens = 0;    // prefix-cache hit length
     double ttft_ms = 0.0;
     double decode_tps = 0.0;
-    std::size_t draft_tokens = 0;
-    std::size_t accepted_draft_tokens = 0;
+    std::size_t draft_tokens = 0;           ///< every draft token verified (MTP and n-gram)
+    std::size_t accepted_draft_tokens = 0;  ///< ... and accepted
+    // Additive (next.md step 11): this request's share of EngineStats' n-gram and fallback
+    // counters, and the n-gram part of draft_tokens / accepted_draft_tokens (the rest is MTP, or
+    // CpuEngineOptions::draft_hook drafts on an engine with that test hook), so a caller can
+    // report each draft source per request even when the engine serves several at once.
+    std::size_t ngram_lookups = 0;                ///< greedy decode steps that searched the context
+    std::size_t ngram_hits = 0;                   ///< ... and found a match (drafted instead of MTP)
+    std::size_t ngram_draft_tokens = 0;           ///< draft tokens that came from those matches
+    std::size_t ngram_accepted_draft_tokens = 0;  ///< ... and were accepted
+    /// Ticks that dropped this request's MTP because the MTP KV ran out and retried without it
+    /// (its share of EngineStats::mtp_fallbacks). MTP stays off for the rest of the request, so
+    /// this is 0 or 1 on CpuEngine.
+    std::size_t mtp_fallbacks = 0;
     std::string error;
     /// Additive (WS-G M5): the request ended because GenerateRequest::deadline passed
     /// (finish == Length); distinguishes a wall-clock limit from max_tokens.

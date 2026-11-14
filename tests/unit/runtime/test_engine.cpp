@@ -13,7 +13,9 @@
 #include <filesystem>
 #include <future>
 #include <mutex>
+#include <span>
 #include <thread>
+#include <utility>
 
 #include "../models/tiny_golden.h"
 #include "halo/core/error.h"
@@ -581,10 +583,15 @@ TEST_F(EngineTest, MtpKvExhaustionFallsBackToPlainDecodeWithIdenticalOutput) {
     EXPECT_EQ(r.finish, FinishReason::Length);
     EXPECT_GE(e->stats().mtp_fallbacks, 1u);
     EXPECT_TRUE(std::any_of(ticks.begin(), ticks.end(), [](const TickInfo& t) { return t.mtp_fallback; }));
+    EXPECT_EQ(r.mtp_fallbacks, static_cast<std::size_t>(std::ranges::count_if(ticks, [](const TickInfo& t) { return t.mtp_fallback; })))
+        << "the request alone: its fallbacks are the ticks that fell back";
+    EXPECT_EQ(r.mtp_fallbacks, e->stats().mtp_fallbacks);
     EXPECT_GT(r.draft_tokens, 0u) << "MTP ran before the pool ran out";
-    // A new request re-attaches MTP for its sequence.
+    // A new request re-attaches MTP for its sequence and counts only its own fallbacks.
+    const std::uint64_t fb0 = e->stats().mtp_fallbacks;
     const GenerateResult r2 = run(*e, greedy(prompt("p1"), 6));
     EXPECT_GT(r2.draft_tokens, 0u);
+    EXPECT_EQ(r2.mtp_fallbacks, e->stats().mtp_fallbacks - fb0);
 }
 
 // ---- cost model: one weight pass per tick; rollback costs no extra pass (D-012 / D-014) ------------
@@ -874,4 +881,130 @@ TEST_F(VulkanEngine, NgramDraftingWithoutAMatchIsBitwiseMtpDrafting) {
         EXPECT_EQ(s1.ngram_drafts - s0.ngram_drafts, 0u);
     }
     EXPECT_EQ(off->engine->stats().ngram_lookups, 0u) << "ngram_draft = false must not search (env ignored)";
+}
+
+
+// ---- per-request draft accounting (GenerateResult n-gram / fallback counters) ----------------
+// GenerateResult splits the request's drafts by source: ngram_* is the prompt-lookup share of
+// draft_tokens / accepted_draft_tokens (the rest is MTP) plus this request's lookups, hits and
+// MTP fallbacks, so `halo run` / serve can report each source per request instead of reading
+// engine-wide EngineStats deltas that mix every concurrent request.
+
+namespace {
+
+/// p0, the first 12 tokens of its greedy continuation, p0 again, then that continuation's
+/// first 2 tokens: the tiny model never repeats a 3-gram on its own (no lookup hit in 300
+/// greedy tokens from p0-p2), but this context recurs, and its greedy decode hits the n-gram
+/// lookup (1 hit, 3 drafted, 1 accepted on tiny-f32 when written).
+Toks recurring_prompt(const Toks& p0, const Toks& ref) {
+    Toks q = p0;
+    q.insert(q.end(), ref.begin(), ref.begin() + 12);
+    q.insert(q.end(), p0.begin(), p0.end());
+    q.insert(q.end(), ref.begin(), ref.begin() + 2);
+    return q;
+}
+
+struct DraftSplit {
+    std::size_t lookups = 0, hits = 0, drafted = 0, accepted = 0;
+};
+
+/// Replays a request that ran alone (one sequence per tick) through its decode ticks: each one
+/// searched the context (prompt + tokens emitted so far, the last one pending) and, on a hit,
+/// verified exactly the n-gram draft.
+DraftSplit replay_ngram(const Toks& prompt, const Toks& out, const std::vector<TickInfo>& ticks, std::size_t k) {
+    DraftSplit d;
+    std::size_t j = 1;  // the prefill's last row emitted the first token
+    for (const TickInfo& t : ticks) {
+        if (t.prefill_rows != 0) continue;
+        EXPECT_EQ(t.sequences, 1u) << "replay needs the request alone";
+        const std::vector<std::int32_t> draft =
+            halo::speculative::ngram_draft(prompt, std::span(out.data(), std::min(j, out.size())), k);
+        ++d.lookups;
+        if (!draft.empty()) {
+            ++d.hits;
+            EXPECT_EQ(t.drafts, draft) << "decode tick after " << j << " tokens: a hit verifies the n-gram draft";
+            d.drafted += t.drafted;
+            d.accepted += t.accepted;
+        }
+        j += t.accepted + 1;
+    }
+    return d;
+}
+
+}  // namespace
+
+TEST_F(EngineTest, ResultSplitsTheRequestsNgramDraftsFromItsMtpDrafts) {
+    std::vector<TickInfo> ticks;
+    std::mutex mu;
+    CpuEngineOptions o;
+    o.gate_mode = GateMode::Always;
+    o.ngram_draft = true;
+    o.on_tick = [&](const TickInfo& t) {
+        const std::lock_guard lk(mu);
+        ticks.push_back(t);
+    };
+    EngineConfig c = base_cfg();
+    c.mtp_max_draft = 3;
+    auto e = make(o, c);
+    const Toks p0 = prompt("p0");
+    const Toks q = recurring_prompt(p0, run(*engine_, greedy(p0, 24)).tokens);
+
+    const halo::runtime::EngineStats s0 = e->stats();
+    const GenerateResult a = run(*e, greedy(q, 24));
+    const halo::runtime::EngineStats s1 = e->stats();
+    ASSERT_EQ(a.tokens.size(), 24u);
+    const DraftSplit want = replay_ngram(q, a.tokens, ticks, 3);
+    ASSERT_GE(want.hits, 1u) << "premise: recurring_prompt hits the n-gram lookup (pick another context if the tiny "
+                                "model changed)";
+    EXPECT_EQ(a.ngram_lookups, want.lookups) << "one lookup per greedy decode step";
+    EXPECT_EQ(a.ngram_hits, want.hits);
+    EXPECT_EQ(a.ngram_draft_tokens, want.drafted) << "n-gram drafts = the drafts of the ticks that hit";
+    EXPECT_EQ(a.ngram_accepted_draft_tokens, want.accepted);
+    EXPECT_GT(a.draft_tokens, a.ngram_draft_tokens) << "the steps without a hit drafted with MTP";
+    EXPECT_EQ(a.mtp_fallbacks, 0u);
+    // Alone on the engine, the request's counters are exactly the engine's.
+    EXPECT_EQ(a.ngram_lookups, s1.ngram_lookups - s0.ngram_lookups);
+    EXPECT_EQ(a.ngram_hits, s1.ngram_drafts - s0.ngram_drafts);
+    EXPECT_EQ(a.draft_tokens, s1.speculative_attempts - s0.speculative_attempts);
+
+    // Batched with a request whose context never recurs: each keeps its own counts.
+    const Toks p1 = prompt("p1");
+    const GenerateResult b_alone = run(*e, greedy(p1, 12));
+    ASSERT_GT(b_alone.ngram_lookups, 0u);
+    ASSERT_EQ(b_alone.ngram_hits, 0u);
+    {
+        const std::lock_guard lk(mu);
+        ticks.clear();
+    }
+    std::vector<GenerateResult> con(2);
+    std::barrier start(2);
+    std::thread tb([&] {
+        start.arrive_and_wait();
+        con[1] = run(*e, greedy(p1, 12));
+    });
+    start.arrive_and_wait();
+    con[0] = run(*e, greedy(q, 24));
+    tb.join();
+    EXPECT_TRUE(std::ranges::any_of(ticks, [](const TickInfo& t) { return t.prefill_rows == 0 && t.sequences == 2; }))
+        << "the two requests never shared a decode tick";
+    EXPECT_EQ(con[0].tokens, a.tokens);
+    EXPECT_EQ(con[1].tokens, b_alone.tokens);
+    for (const auto& [i, alone] : {std::pair<std::size_t, const GenerateResult*>{0, &a}, {1, &b_alone}}) {
+        SCOPED_TRACE(i == 0 ? "recurring request batched" : "plain request batched");
+        EXPECT_EQ(con[i].ngram_lookups, alone->ngram_lookups);
+        EXPECT_EQ(con[i].ngram_hits, alone->ngram_hits);
+        EXPECT_EQ(con[i].ngram_draft_tokens, alone->ngram_draft_tokens);
+        EXPECT_EQ(con[i].ngram_accepted_draft_tokens, alone->ngram_accepted_draft_tokens);
+    }
+
+    // Off: nothing searched, nothing attributed to n-gram.
+    EngineConfig c_off = base_cfg();
+    c_off.mtp_max_draft = 3;
+    CpuEngineOptions o_off;
+    o_off.gate_mode = GateMode::Always;
+    o_off.ngram_draft = false;
+    const GenerateResult off = run(*make(o_off, c_off), greedy(q, 24));
+    EXPECT_EQ(off.tokens, a.tokens);
+    EXPECT_EQ(off.ngram_lookups + off.ngram_hits + off.ngram_draft_tokens + off.ngram_accepted_draft_tokens, 0u);
+    EXPECT_GT(off.draft_tokens, 0u);
 }

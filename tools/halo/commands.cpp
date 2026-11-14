@@ -370,26 +370,37 @@ void apply_thinking(chat::RenderOptions& o, bool no_think, const std::optional<s
     }
 }
 
+/// "A of P (R%)" for one draft source; no percentage when nothing was proposed.
+std::string acceptance(std::size_t accepted, std::size_t proposed) {
+    std::string s = std::format("{} of {}", accepted, proposed);
+    if (proposed > 0) {
+        s += std::format(" ({:.1f}%)", 100.0 * static_cast<double>(accepted) / static_cast<double>(proposed));
+    }
+    return s;
+}
+
 /// `halo run`'s second summary line, so MTP / n-gram acceptance can be measured from the CLI:
-/// this request's draft tokens (GenerateResult; MTP and n-gram drafts together, which the
-/// label says when n-gram lookups ran) plus the engine's n-gram and MTP-fallback counters over
-/// the request (stats after minus before; `run` is the engine's only request). Empty when
-/// nothing was drafted, looked up or retried (plain or sampled decode keeps one summary line).
-std::string draft_summary(const runtime::GenerateResult& r, const runtime::EngineStats& before,
-                          const runtime::EngineStats& after) {
-    const auto delta = [](std::uint64_t a, std::uint64_t b) { return a >= b ? a - b : 0; };
-    const std::uint64_t lookups = delta(after.ngram_lookups, before.ngram_lookups);
-    const std::uint64_t hits = delta(after.ngram_drafts, before.ngram_drafts);
-    const std::uint64_t fallbacks = delta(after.mtp_fallbacks, before.mtp_fallbacks);
-    if (r.draft_tokens == 0 && lookups == 0 && fallbacks == 0) return {};
-    std::string s = std::format("[halo] drafts{} {} accepted of {} proposed", lookups > 0 ? " (MTP + n-gram)" : "",
-                                r.accepted_draft_tokens, r.draft_tokens);
+/// this request's draft tokens accepted of proposed, split into MTP and n-gram when n-gram
+/// lookups ran, plus its n-gram hits and MTP fallbacks. Every count is the request's own
+/// (GenerateResult), never an engine-wide counter. Empty when nothing was drafted, looked up
+/// or retried (plain or sampled decode keeps one summary line).
+std::string draft_summary(const runtime::GenerateResult& r) {
+    if (r.draft_tokens == 0 && r.ngram_lookups == 0 && r.mtp_fallbacks == 0) return {};
+    std::string s = std::format("[halo] drafts {} accepted of {} proposed", r.accepted_draft_tokens, r.draft_tokens);
     if (r.draft_tokens > 0) {
         s += std::format(" ({:.1f}%)", 100.0 * static_cast<double>(r.accepted_draft_tokens) /
                                            static_cast<double>(r.draft_tokens));
     }
-    if (lookups > 0) s += std::format(", n-gram hits {} of {} lookups", hits, lookups);
-    if (fallbacks > 0) s += std::format(", {} MTP fallback{}", fallbacks, fallbacks == 1 ? "" : "s");
+    if (r.ngram_lookups > 0) {
+        // MTP = all drafts minus the n-gram share (saturating: never wraps on an inconsistent result).
+        const auto minus = [](std::size_t a, std::size_t b) { return a >= b ? a - b : 0; };
+        s += std::format(": MTP {}, n-gram {} from {} hit{} in {} lookup{}",
+                         acceptance(minus(r.accepted_draft_tokens, r.ngram_accepted_draft_tokens),
+                                    minus(r.draft_tokens, r.ngram_draft_tokens)),
+                         acceptance(r.ngram_accepted_draft_tokens, r.ngram_draft_tokens), r.ngram_hits,
+                         r.ngram_hits == 1 ? "" : "s", r.ngram_lookups, r.ngram_lookups == 1 ? "" : "s");
+    }
+    if (r.mtp_fallbacks > 0) s += std::format(", {} MTP fallback{}", r.mtp_fallbacks, r.mtp_fallbacks == 1 ? "" : "s");
     return s + "\n";
 }
 
@@ -516,7 +527,6 @@ int cmd_run(const std::vector<std::string>& args, Context& ctx) {
             }
         }
     };
-    const runtime::EngineStats stats_before = engine->stats();
     const auto t0 = std::chrono::steady_clock::now();
     std::size_t generated = 0;
     const auto result = engine->generate(req, [&](const runtime::TokenEvent& ev) {
@@ -542,7 +552,7 @@ int cmd_run(const std::vector<std::string>& args, Context& ctx) {
         err << "halo: generation failed: " << result.error << "\n";
         return kExitFailure;
     }
-    err << draft_summary(result, stats_before, engine->stats());
+    err << draft_summary(result);
     return kExitOk;
 }
 
