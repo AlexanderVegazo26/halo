@@ -342,6 +342,8 @@ MemoryPlan plan_once(const ModelShape& shape, const PlanRequest& req, const hard
     if (gpu && hw.gtt_total && *hw.gtt_total > 0)
         L.gtt = make_budget(MemoryTier::Gtt, *hw.gtt_total, sat_sub(*hw.gtt_total, hw.gtt_used.value_or(0)),
                             req.safety_factor);
+    if (L.vram || L.gtt)
+        plan.notes.emplace_back("VRAM/GTT available = amdgpu sysfs mem_info_{vram,gtt}_total - _used at discovery time");
     const std::uint64_t host_total = hw.host_total.value_or(hw.host_available.value_or(0));
     L.host = make_budget(MemoryTier::Host, host_total, hw.host_available.value_or(host_total), req.safety_factor);
     if (!hw.host_available) plan.notes.emplace_back("MemAvailable unknown: HOST budget uses MemTotal");

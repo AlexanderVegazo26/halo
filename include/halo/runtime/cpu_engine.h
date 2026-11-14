@@ -19,7 +19,9 @@
 // the same tokens within fp32 tolerance (a different chunking), not bitwise.
 //
 // Memory: the model is planned with memory::plan_memory over the discovered tiers
-// (hardware::discover, root "/"); a plan that does not fit is Error(Memory) at creation.
+// (hardware::discover, root "/"); a plan that does not fit is Error(Memory) at creation. The
+// tiers are sampled before the backend opens and the weights load, so the engine's own weights
+// are never counted as VRAM that something else already uses.
 // D-013 puts checkpoints in the GPU pool; with no GPU tier (the CPU reference on the dev
 // host) the planner assigns them none, and the CPU backend then budgets the planner's
 // requested count on the host instead (logged at creation). The plan includes the prefix

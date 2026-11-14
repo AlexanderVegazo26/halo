@@ -67,6 +67,7 @@
 #include <unistd.h>
 
 #include "../model/gguf_builder.h"
+#include "halo/backend/backend.h"
 #include "halo/runtime/cpu_engine.h"
 
 #if defined(__has_feature)
@@ -1289,4 +1290,121 @@ TEST_F(SpeculativeCancel, ResubmitAfterACancelMidDraftReusesTheCachedPrefixWithC
     expect_echo_with_every_draft_accepted(p.next, kEchoFirst, "'A' re-submitted after its cancel mid-draft");
     EXPECT_GT(p.next.cached_prompt_tokens, 0u) << "the identical re-submit should hit the cancelled request's entry";
     EXPECT_EQ(p.fallbacks, 0u) << "the default MTP KV pool holds both requests";
+}
+
+// ---- memory snapshot (Q-0064) ----------------------------------------------------------
+// The memory plan reads free VRAM from sysfs (mem_info_vram_total - mem_info_vram_used). That
+// snapshot must be taken before the engine opens its backend and uploads the weights: sampled
+// after, `used` already contains the engine's own weights and the plan counts them twice
+// (2026-11-14: `halo serve --ctx 32768 --parallel 2` refused with 11.42 GiB VRAM available
+// while sysfs showed 29 GiB free before the run and after the refusal). A fake amdgpu sysfs
+// tree (hardware_root) plus a backend factory that marks the VRAM as taken stand in for the
+// real upload; the factory runs exactly where a GPU engine starts holding device memory.
+
+namespace {
+
+constexpr std::uint64_t kGiB = 1ull << 30;
+constexpr std::uint64_t kFakeVramTotal = 8 * kGiB;
+
+class FakeSysfs {
+public:
+    explicit FakeSysfs(const std::string& tag)
+        : root_(std::filesystem::temp_directory_path() /
+                ("halo_engine_" + std::to_string(::getpid()) + "_" + tag)) {
+        std::filesystem::remove_all(root_);
+        write("proc/meminfo", "MemTotal:       33554432 kB\nMemAvailable:   33554432 kB\n");
+        write(dev("vendor"), "0x1002\n");
+        write(dev("mem_info_vram_total"), std::to_string(kFakeVramTotal) + "\n");
+        set_vram_used(1 * kGiB);
+    }
+    ~FakeSysfs() {
+        std::error_code ec;
+        std::filesystem::remove_all(root_, ec);
+    }
+    FakeSysfs(const FakeSysfs&) = delete;
+    FakeSysfs& operator=(const FakeSysfs&) = delete;
+
+    void set_vram_used(std::uint64_t bytes) const { write(dev("mem_info_vram_used"), std::to_string(bytes) + "\n"); }
+    [[nodiscard]] std::string root() const { return root_.string(); }
+
+private:
+    static std::string dev(const std::string& f) { return "sys/class/drm/card1/device/" + f; }
+    void write(const std::string& rel, const std::string& text) const {
+        const auto p = root_ / rel;
+        std::filesystem::create_directories(p.parent_path());
+        std::ofstream f(p, std::ios::trunc);
+        f << text;
+        EXPECT_TRUE(f.good()) << "could not write the fake sysfs file " << p;
+    }
+    std::filesystem::path root_;
+};
+
+// A GPU-path engine (backend "vulkan" through a factory, so no device is needed) on the fake
+// sysfs. `claim_vram` is what the factory reports as used once the engine's backend is open.
+std::unique_ptr<halo::runtime::Engine> make_gpu_path_engine(const std::filesystem::path& model, const FakeSysfs& fs,
+                                                            std::optional<std::uint64_t> claim_vram) {
+    EngineConfig c;
+    c.model_path = model.string();
+    c.backend = "vulkan";
+    c.max_context = kMaxContext;
+    c.max_context_explicit = true;
+    c.max_sequences = 1;
+    c.threads = 1;
+    c.mtp_enabled = false;
+    c.prefix_cache = false;
+    halo::runtime::CpuEngineOptions o;
+    o.hardware_root = fs.root();
+    o.backend_factory = [&fs, claim_vram] {
+        if (claim_vram) fs.set_vram_used(*claim_vram);
+        return halo::backend::make_cpu_backend(nullptr);
+    };
+    return halo::runtime::create_cpu_engine(c, o);
+}
+
+class EngineMemorySnapshot : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() { path_ = write_synthetic_model("memory-snapshot"); }
+    static void TearDownTestSuite() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    static inline std::filesystem::path path_;
+};
+
+}  // namespace
+
+TEST_F(EngineMemorySnapshot, VramTheEngineItselfTakesAtStartupIsNotCountedAsUsedByOthers) {
+    const FakeSysfs fs("own_vram");
+    // 7 GiB free before the engine starts; its own backend + weights then fill the carveout to
+    // 64 KiB of the total. Planned against the later reading, nothing fits.
+    std::unique_ptr<halo::runtime::Engine> e;
+    try {
+        e = make_gpu_path_engine(path_, fs, kFakeVramTotal - 64 * 1024);
+    } catch (const halo::Error& x) {
+        FAIL() << "engine creation was refused although 7 GiB of the 8 GiB fake VRAM were free before it started "
+                  "(sysfs used 1 GiB); the VRAM it then took itself must not count against its own plan: "
+               << x.what();
+    }
+    ASSERT_NE(e, nullptr);
+    GenerateRequest req;
+    req.prompt = {kPromptToken};
+    req.sampling.temperature = 0.0f;
+    req.max_tokens = 2;
+    const GenerateResult r = e->generate(req, [](const TokenEvent&) { return true; });
+    EXPECT_EQ(r.finish, FinishReason::Length) << "error='" << r.error << "'";
+}
+
+TEST_F(EngineMemorySnapshot, VramAlreadyTakenBeforeTheEngineStartsIsRefused) {
+    // The control for the test above: the same fake sysfs reaches the planner, and VRAM another
+    // process holds when the engine starts is honoured (64 KiB free cannot hold the plan).
+    const FakeSysfs fs("other_vram");
+    fs.set_vram_used(kFakeVramTotal - 64 * 1024);
+    try {
+        (void)make_gpu_path_engine(path_, fs, std::nullopt);
+        FAIL() << "engine creation succeeded with 64 KiB of the 8 GiB fake VRAM free: the fake sysfs at " << fs.root()
+               << " did not reach the memory planner";
+    } catch (const halo::Error& x) {
+        EXPECT_NE(std::string(x.what()).find("VRAM"), std::string::npos)
+            << "the refusal should name the VRAM shortfall: " << x.what();
+    }
 }

@@ -393,6 +393,16 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     // Built before the model (M2): the model needs the tokenizer's real vocab size to clamp
     // the fused greedy argmax away from GGUF LM-head padding rows, and the tokenizer itself
     // only depends on GGUF metadata, not on the model.
+    // The memory tiers are sampled BEFORE the backend opens and the weights are uploaded: sysfs
+    // mem_info_vram_used read after that already holds this engine's own weights, and the plan
+    // (which places the weights itself) would count them twice and refuse plans that fit (Q-0064).
+    hardware::DiscoveryOptions dopts;
+    dopts.root = opts.hardware_root;
+    const hardware::HardwareInfo hw = hardware::discover(dopts);
+    if (hw.tiers.vram_total)
+        HALO_INFO("runtime", "memory tiers sampled before the model loads: VRAM {:.2f} GiB used of {:.2f} GiB (amdgpu sysfs)",
+                  static_cast<double>(hw.tiers.vram_used.value_or(0)) / (1ULL << 30),
+                  static_cast<double>(*hw.tiers.vram_total) / (1ULL << 30));
     const model::TokenizerMetadata meta = nm_->tokenizer();
     tok_ = std::make_unique<tokenizer::Tokenizer>(tokenizer::Tokenizer::from_spec(models::vocab_spec(meta)));
     HALO_CHECK(meta.chat_template.has_value() && !meta.chat_template->empty(), ErrorCode::Model,
@@ -436,9 +446,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     tree_extra_ = max_draft_ > 0 && speculative::tree_env_enabled() ? 1 : 0;
 
     // ---- memory plan (D-002: tier discovery, never assumption) --------------------------
-    hardware::DiscoveryOptions dopts;
-    dopts.root = opts.hardware_root;
-    const hardware::HardwareInfo hw = hardware::discover(dopts);
+    // `hw` was sampled above, before the backend opened and the weights were uploaded.
     memory::PlanRequest pr;
     pr.max_context = info_.context_length;
     pr.max_sequences = static_cast<std::uint32_t>(cfg.max_sequences);
