@@ -161,11 +161,22 @@ TEST(VulkanBackend, IdentityLimitsVariantsAndZeroFill) {
     EXPECT_EQ(l.max_conv_k, 8u);
     EXPECT_EQ(l.max_top_k, 1024u);
     EXPECT_EQ(l.max_gdn_dk, 256u);
+    // Every op has the default variant 0; Gemv also registers the opt-in repacked-weights
+    // variant kGemvRepacked (backend.h), and no other op has a second variant.
     for (std::size_t i = 0; i < hb::kOpCount; ++i) {
-        const auto v = be->variants(static_cast<hb::OpId>(i));
-        ASSERT_EQ(v.size(), 1u);
-        EXPECT_EQ(v[0].id, 0u);
-        EXPECT_EQ(v[0].op, static_cast<hb::OpId>(i));
+        const auto op = static_cast<hb::OpId>(i);
+        const auto v = be->variants(op);
+        const std::size_t want = op == hb::OpId::Gemv ? 2u : 1u;
+        ASSERT_EQ(v.size(), want) << "variants of op " << i << ": expected " << want << ", got " << v.size();
+        for (std::size_t j = 0; j < v.size(); ++j) {
+            EXPECT_EQ(v[j].op, op) << "op " << i << " variant " << j << " is registered under another op";
+        }
+        EXPECT_EQ(v[0].id, 0u) << "op " << i << ": the first variant must be the default id 0";
+        EXPECT_EQ(v[0].name, "vulkan") << "op " << i;
+        if (op == hb::OpId::Gemv) {
+            EXPECT_EQ(v[1].id, hb::kGemvRepacked) << "Gemv's second variant must be kGemvRepacked";
+            EXPECT_EQ(v[1].name, "vulkan_repacked") << "Gemv variant " << v[1].id;
+        }
     }
     Dev d(*be);
     for (const hb::Tier t : {hb::Tier::Vram, hb::Tier::Gtt, hb::Tier::Host}) {
