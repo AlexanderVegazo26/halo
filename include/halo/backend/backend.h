@@ -71,7 +71,8 @@ enum class Tier : std::uint8_t { Vram, Gtt, Host };
 ///   F32: kv_dim floats.
 ///   F16: kv_dim IEEE half values, two per 32-bit word (kv_dim even).
 ///   Q8:  kv_dim/32 groups of 9 words = [fp32 scale | 32 x int8, 4 per word], value =
-///        scale * q with scale = max|x| / 127 (kv_dim a multiple of 32; 1.125 B/element).
+///        scale * q with scale = max|x| / 127 (a group with max|x| < 2^-119 is all zeros;
+///        kv_dim a multiple of 32; 1.125 B/element).
 /// Only the Vulkan backend implements F16 and Q8 (kv_write quantizes, attention dequantizes).
 enum class KvType : std::uint8_t { F32, F16, Q8 };
 

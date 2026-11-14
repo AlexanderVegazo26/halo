@@ -34,6 +34,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -177,9 +178,10 @@ void encode_row(hv::KvType t, std::span<const float> x, std::uint32_t* out) {
             const float* s = x.data() + g * 32;
             float amax = 0.0f;
             for (std::size_t j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(s[j]));
-            const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+            const bool enc = amax >= 0x1p-119f;  // kv_write_q8: smaller groups store all zeros
+            const float inv = enc ? 127.0f / amax : 0.0f;
             std::uint32_t* w = out + g * 9;
-            w[0] = std::bit_cast<std::uint32_t>(amax / 127.0f);
+            w[0] = enc ? std::bit_cast<std::uint32_t>(amax / 127.0f) : 0u;
             for (std::size_t j = 0; j < 32; ++j) {
                 if (j % 4 == 0) w[1 + j / 4] = 0;
                 const int q = std::clamp(static_cast<int>(std::nearbyint(s[j] * inv)), -127, 127);
@@ -894,6 +896,77 @@ TEST(VkKv, KvWriteQ8StoresMaxScaleAndNearestInt8PerGroup) {
         std::cout << "[vk-kv] q8 kv_write kv_dim " << c.kv_dim << ": " << host_equal << "/" << groups
                   << " groups bitwise the host encoder\n";
     }
+}
+
+// A group whose max|x| is tiny made 127 / max|x| overflow to +inf (max|x| < ~3.7e-37): x * inf
+// is +-inf (every nonzero element became +-127, so x = max/2 decoded as max) and 0 * inf is NaN
+// (int(NaN) is undefined), while the scale max|x| / 127 was a subnormal that a flush-to-zero
+// FPU may read back as 0. The contract: a group with max|x| < 2^-119 (scale would be subnormal)
+// is stored as all zeros; from 2^-119 up, scale and 127 / max|x| are finite normals and the
+// group encodes like any other.
+TEST(VkKv, KvWriteQ8StoresGroupsBelowTheNormalScaleRangeAsZeroAndTinyNormalGroupsExactly) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    constexpr std::size_t kv_dim = 128, bt = 4, S = 9, start = 5;
+    constexpr float lo = 0x1p-119f;  // smallest max|x| that encodes; lo / 127 is a normal float
+    std::mt19937 rng(4119);
+    PoolFixture f(kv_dim, bt, S, start, rng);
+    std::vector<float> k(kv_dim, 0.0f), v(kv_dim, 0.0f);
+    // K: g0 max 3e-37 (127/max = inf before the fix), g1 max exactly 2^-119 (tie 63.5 -> 64,
+    // 31.75 -> 32), g2 max one float below 2^-119, g3 fp32 subnormals.
+    k[0] = 3e-37f, k[1] = 1.5e-37f, k[2] = -1e-37f;
+    k[32] = lo, k[33] = lo / 2, k[34] = -lo / 4;
+    k[64] = std::nextafter(lo, 0.0f), k[65] = -std::nextafter(lo, 0.0f) / 3;
+    k[96] = 1e-40f, k[97] = -1e-41f;
+    // V: g0 negative max -3.6e-37, g1 max 1e-30 (normal path), g2 uniform control, g3 a
+    // repeated -2^-118.
+    v[0] = -3.6e-37f, v[1] = 1e-37f;
+    v[32] = 1e-30f, v[33] = -5e-31f, v[34] = 2.5e-31f;
+    for (std::size_t j = 64; j < 96; ++j) v[j] = uniform(rng, 1, -1.0f, 1.0f)[0];
+    std::fill(v.begin() + 96, v.end(), -0x1p-118f);
+    const std::vector<std::uint32_t> before = encode_pool(hv::KvType::Q8, f.pool_bytes(), kv_dim);
+    const std::vector<std::uint32_t> got = device_kv_write(ctx, f, hv::KvType::Q8, before, k, v, start, 1);
+    const std::size_t rw = kv_dim / 32 * 9;
+    std::size_t bad = 0;
+    for (std::size_t kv = 0; kv < 2; ++kv) {
+        const float* x = (kv == 0 ? k : v).data();
+        const std::uint32_t* row = got.data() + image_row(f, start, kv) * rw;
+        std::vector<std::uint32_t> host(rw);
+        encode_row(hv::KvType::Q8, std::span(x, kv_dim), host.data());
+        for (std::size_t g = 0; g < kv_dim / 32; ++g) {
+            const std::uint32_t* gw = row + g * 9;
+            float amax = 0.0f;
+            for (std::size_t j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[g * 32 + j]));
+            char amax_s[32];
+            std::snprintf(amax_s, sizeof amax_s, "%.6g", double(amax));
+            const std::string where =
+                std::string(kv == 0 ? "K" : "V") + " group " + std::to_string(g) + " (max|x| " + amax_s + ")";
+            if (amax < lo) {
+                const bool zero = std::all_of(gw, gw + 9, [](std::uint32_t w) { return w == 0; });
+                const bool host_zero = std::all_of(host.begin() + g * 9, host.begin() + g * 9 + 9,
+                                                   [](std::uint32_t w) { return w == 0; });
+                if (!zero && bad++ < 8)
+                    ADD_FAILURE() << where << ": below 2^-119 must store 9 zero words, got scale bits 0x" << std::hex
+                                  << gw[0] << " q words 0x" << gw[1] << std::dec;
+                EXPECT_TRUE(host_zero) << where << ": host encoder must store zeros too";
+                continue;
+            }
+            const float want_scale = amax / 127.0f;
+            const float sg = std::bit_cast<float>(gw[0]);
+            const double ulp = double(std::nextafter(want_scale, INFINITY) - want_scale);
+            if (std::fpclassify(sg) != FP_NORMAL || !(std::fabs(double(sg) - double(want_scale)) <= 3.0 * ulp)) {
+                if (bad++ < 8) ADD_FAILURE() << where << ": scale " << sg << " vs max|x|/127 " << want_scale;
+                continue;
+            }
+            for (std::size_t j = 0; j < 32; ++j) {
+                const int q = static_cast<std::int8_t>((gw[1 + j / 4] >> (8 * (j % 4))) & 0xFFu);
+                const double r = double(x[g * 32 + j]) * 127.0 / double(amax);
+                if (std::fabs(q - r) > 0.5 + 1e-4 && bad++ < 8)
+                    ADD_FAILURE() << where << " element " << j << ": x " << x[g * 32 + j] << " -> q " << q
+                                  << ", want nearest of x*127/max|x| = " << r;
+            }
+        }
+    }
+    EXPECT_EQ(bad, 0u) << "q8 groups at the bottom of the float range";
 }
 
 TEST(VkKv, AttentionOverF16AndQ8PoolsMatchesCpuOnTheDecodedValues) {

@@ -12,7 +12,9 @@
 //     words. One invocation owns one word. Values beyond +-65504 become +-inf.
 //   KV_TYPE 2 (q8):  each 32-element group is 9 words [fp32 scale | 32 x int8, 4 per word];
 //     row = kv_dim/32*9 words. One invocation owns one group: scale = max|x| / 127,
-//     q = clamp(roundEven(x * 127 / max|x|), -127, 127) (all zero when max|x| = 0).
+//     q = clamp(roundEven(x * 127 / max|x|), -127, 127). A group with max|x| < 2^-119 (incl. 0)
+//     is all zero words: below that, max|x| / 127 is a subnormal (flushed to 0 by FTZ hardware)
+//     and 127 / max|x| overflows to inf (x * inf = +-127 for every nonzero x, 0 * inf = NaN).
 #include "halo_common.glsl"
 
 #ifndef KV_TYPE
@@ -71,6 +73,9 @@ void write_row(uint db, uint sb, bool is_k) {
     }
 }
 #else
+// 2^-119: the smallest max|x| whose scale max|x| / 127 is a normal float (127 * 2^-126 < 2^-119).
+#define KV_Q8_MIN_MAX uintBitsToFloat(0x04000000u)  // exactly 2^-119 (glslang folds no bit casts in a const)
+
 float src_at(uint i, bool is_k) { return is_k ? k[i] : v[i]; }
 
 void write_row(uint db, uint sb, bool is_k) {
@@ -78,9 +83,10 @@ void write_row(uint db, uint sb, bool is_k) {
         const uint s0 = sb + g * 32u;
         float amax = 0.0;
         for (uint j = 0u; j < 32u; ++j) amax = max(amax, abs(src_at(s0 + j, is_k)));
-        const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+        const bool enc = amax >= KV_Q8_MIN_MAX;  // false for 0, subnormals and tiny normals
+        const float inv = enc ? 127.0 / amax : 0.0;
         const uint w0 = db + g * 9u;
-        pool[w0] = floatBitsToUint(amax / 127.0);
+        pool[w0] = enc ? floatBitsToUint(amax / 127.0) : 0u;
         for (uint w = 0u; w < 8u; ++w) {
             uint word = 0u;
             for (uint b = 0u; b < 4u; ++b) {
