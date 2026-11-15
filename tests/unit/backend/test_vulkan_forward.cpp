@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -39,7 +40,6 @@
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -64,9 +64,10 @@ constexpr std::size_t k_blocks = 64;
 constexpr std::size_t k_slots = 4;
 
 /// Weight types the Vulkan backend implements (vulkan::matvec_row_bytes).
-const std::set<halo::DType> k_vk_types{halo::DType::F32,    halo::DType::Q8_0,   halo::DType::Q4_K,
-                                       halo::DType::Q5_K,   halo::DType::Q6_K,   halo::DType::IQ4_XS,
-                                       halo::DType::IQ4_NL, halo::DType::Q3_K,   halo::DType::IQ3_S};
+/// constexpr: a std::set here was built during static init, where a throw can't be caught.
+constexpr std::array k_vk_types{halo::DType::F32,    halo::DType::Q8_0, halo::DType::Q4_K,
+                                halo::DType::Q5_K,   halo::DType::Q6_K, halo::DType::IQ4_XS,
+                                halo::DType::IQ4_NL, halo::DType::Q3_K, halo::DType::IQ3_S};
 
 /// The first matrix / embedding type the Vulkan backend does not implement, or empty.
 std::string unsupported_type(const halo::model::NormalizedModel& m) {
@@ -85,7 +86,7 @@ std::string unsupported_type(const halo::model::NormalizedModel& m) {
         for (const auto* r : {&mtp->eh_proj, &mtp->embedding, &mtp->lm_head}) w.push_back(r);
     }
     for (const auto* r : w) {
-        if (r->present() && !k_vk_types.contains(r->type())) return std::string(halo::traits(r->type()).name) + " (" + std::string(r->name()) + ")";
+        if (r->present() && !std::ranges::contains(k_vk_types, r->type())) return std::string(halo::traits(r->type()).name) + " (" + std::string(r->name()) + ")";
     }
     return {};
 }
@@ -573,6 +574,7 @@ TEST(VulkanCoopmatGate, VerifyRowsOfABatchedForwardAreBitwiseTheSameVerifyAlone)
                            hm::GdnPath::Recurrent};
     };
     std::vector<hm::SeqStep> all;
+    all.reserve(n_seq);
     for (std::size_t i = 0; i < n_seq; ++i) all.push_back(verify_step(batched, i));
     hm::StepResult rb;
     batched.model->forward(all, rb);
