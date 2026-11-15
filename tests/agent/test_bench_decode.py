@@ -36,6 +36,11 @@ FAKE_HALO = textwrap.dedent(
         sys.stderr.write("halo: vulkan: device lost\\n"); sys.exit(4)
     for k in hit("busy_after"):
         open(spec["busy_after"][k], "w").write("100\\n")
+    calls = sum(1 for _ in open(spec["log"]))
+    if spec.get("busy_on_call") == calls:  # another process takes the GPU during this call
+        open(spec["busy_file"], "w").write("100\\n")
+    if spec.get("busy_gone_on_call") == calls:  # gpu_busy_percent disappears during this call
+        os.remove(spec["busy_file"])
     tps = spec.get("default_tps", 10.0)
     if "tps_seq" in spec:  # per-call values, in call order
         tps = spec["tps_seq"][sum(1 for _ in open(spec["log"])) - 1]
@@ -65,14 +70,15 @@ class BenchDecode(unittest.TestCase):
         self.busy = self.root / "gpu_busy_percent"
         self.busy.write_text("0\n")
         self.log = self.root / "calls.jsonl"
-        self.spec = {"log": str(self.log)}
+        self.spec = {"log": str(self.log), "busy_file": str(self.busy)}
         self.report = self.root / "report"
 
     def run_bench(self, *extra, env=None):
         spec_path = self.root / "spec.json"
         spec_path.write_text(json.dumps(self.spec))
         argv = ["--halo", str(self.halo), "--model", "/models/m.gguf", "--busy-file", str(self.busy),
-                "--busy-samples", "1", "--busy-interval", "0", "--report-dir", str(self.report), *extra]
+                "--busy-samples", "1", "--busy-interval", "0", "--busy-settle", "0", "--report-dir", str(self.report),
+                *extra]
         # Start from no HALO_* at all: scripts/test-agent exports HALO_*_REPORT_DIR, which would
         # otherwise reach the fake halo and the env assertions.
         outer = {k: v for k, v in os.environ.items() if not k.startswith("HALO_")}
@@ -120,6 +126,8 @@ class BenchDecode(unittest.TestCase):
         self.assertEqual(self.results["plain"]["drafts"], "", "plain decode prints no drafts line")
         self.assertEqual(self.results["baseline"]["drafts"], "drafts 90 accepted of 120 proposed (75.0%)")
         self.assertTrue(all(r["same_output"] for r in self.results.values()), self.results)
+        self.assertTrue(all(r["busy_after"] == 0 for r in self.results.values()),
+                        f"every run must be checked idle right after it finished: {self.results}")
         self.assertIn("| mtp-tree | 5 | 12.50 | +25.0% |", self.summary)
 
     def test_each_variant_runs_the_speed_command_with_only_its_own_flag(self):
@@ -162,13 +170,45 @@ class BenchDecode(unittest.TestCase):
         self.assertEqual(self.results["ngram"]["status"], "measured", "a failed variant does not stop the sweep")
 
     def test_gpu_turning_busy_mid_sweep_stops_measuring(self):
+        # Another process takes the GPU while gdn-reg runs: its tok/s was shared with that
+        # process, so it is discarded rather than reported as measured, and nothing more runs.
         self.spec["busy_after"] = {"HALO_GDN_REG": str(self.busy)}
         rc = self.run_bench("--variants", "gdn-reg,stream-reuse,ngram")
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 3, f"stderr: {self.stderr}\n{self.summary}")
         self.assertEqual(len(self.calls()), 2, "nothing runs after the GPU turned busy")
-        self.assertEqual(self.results["gdn-reg"]["status"], "measured")
-        self.assertEqual(self.results["stream-reuse"]["status"], "not measured")
+        self.assertEqual(self.results["baseline"]["status"], "measured", self.results["baseline"])
+        gdn = self.results["gdn-reg"]
+        self.assertEqual((gdn["status"], gdn["tps_median"], gdn["tps"]), ("not measured", None, []),
+                         f"a run that overlapped another GPU user must not count as measured: {gdn}")
+        self.assertEqual(gdn["busy_after"], 100)
+        self.assertIn("GPU busy 100% > 5% right after run 1", gdn["note"])
+        self.assertEqual(self.results["stream-reuse"]["note"], "skipped after GPU busy")
         self.assertEqual(self.results["ngram"]["note"], "skipped after GPU busy")
+        self.assertIn("| gdn-reg | 3 | - | - |", self.summary)
+
+    def test_overlap_in_any_repeat_discards_the_whole_variant(self):
+        # Repeats 1 and 2 are clean, repeat 3 overlaps: a median over the clean two would hide
+        # that the sweep's conditions changed, so the variant reports no tok/s at all.
+        self.spec["busy_on_call"] = 3
+        self.spec["tps_seq"] = [10.0, 10.2, 4.0]
+        rc = self.run_bench("--variants", "baseline", "--repeat", "3")
+        self.assertEqual(rc, 3, f"stderr: {self.stderr}")
+        b = self.results["baseline"]
+        self.assertEqual((b["status"], b["tps"], b["tps_median"]), ("not measured", [], None), b)
+        self.assertIn("right after run 3", b["note"])
+        self.assertIn("GPU BUSY: not measured", self.summary)
+
+    def test_busy_file_vanishing_during_a_run_is_not_an_idle_gpu(self):
+        self.spec["busy_gone_on_call"] = 1
+        rc = self.run_bench("--variants", "baseline")
+        self.assertEqual(rc, 3, f"stderr: {self.stderr}")
+        b = self.results["baseline"]
+        self.assertEqual((b["status"], b["tps_median"], b["busy_after"]), ("not measured", None, None), b)
+        self.assertIn("GPU busy unreadable right after run 1", b["note"])
+
+    def test_busy_settle_must_not_be_negative(self):
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            bd.main(["--halo", "h", "--model", "m", "--busy-settle", "-1"])
 
     def test_repeat_takes_the_median(self):
         self.spec["tps_seq"] = [9.0, 30.0, 11.0]

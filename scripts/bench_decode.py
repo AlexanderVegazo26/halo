@@ -7,14 +7,17 @@ tok/s, the change against the baseline, the request's draft acceptance, and whet
 greedy output is identical to the baseline's.
 
     scripts/bench_decode.py --halo build-dev/tools/halo/halo --model Qwen3.8-27B-UD-Q4_K_XL.gguf \
-        [--variants all|NAME,NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] \
+        [--variants all|NAME,NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] [--busy-settle 1] \
         [--report-dir .test-report/bench-decode]
 
 Numbers taken while another process keeps the GPU busy are not benchmarks (2026-11-14: a
 24-token prompt + 4 tokens took 62 s beside a busy model server). So before every run the
 script samples gpu_busy_percent; above --busy-max it runs nothing more, marks the remaining
-variants "not measured", and exits 3. Every inherited HALO_* speed flag is removed so the
-baseline really is the default build behaviour.
+variants "not measured", and exits 3. It samples again right after every run (after
+--busy-settle seconds): a GPU still busy once halo has exited means another process overlapped
+the run, so that run's tok/s is discarded the same way instead of being reported as measured.
+Every inherited HALO_* speed flag is removed so the baseline really is the default build
+behaviour.
 
 Exit: 0 every variant measured, no failure · 1 a run failed, printed no tok/s, or a variant
 that must be bitwise the baseline produced different output · 2 usage · 3 GPU busy (or
@@ -102,6 +105,7 @@ class Result:
     drafts: str = ""
     same_output: bool | None = None
     busy_before: int | None = None
+    busy_after: int | None = None  # highest sample right after the last run that finished
     command: str = ""
 
 
@@ -163,6 +167,17 @@ def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
             tail = " | ".join(p.stderr.strip().splitlines()[-3:])
             r.status, r.note = "failed", f"exit {p.returncode}{'' if 'tps' in info else ', no tok/s line'}: {tail}"
             return r, outputs
+        # halo has exited, so its own work is done: a GPU still busy now was shared with
+        # another process during the run, and the run's tok/s is not a benchmark.
+        if a.busy_settle > 0:
+            time.sleep(a.busy_settle)
+        after = gpu_busy(a.busy_file, a.busy_samples, a.busy_interval)
+        r.busy_after = after
+        if after is None or after > a.busy_max:
+            seen = "unreadable" if after is None else f"{after}% > {a.busy_max}%"
+            r.note = f"GPU busy {seen} right after run {i + 1}: another process overlapped it, tok/s discarded"
+            r.tps = []
+            return r, []
         r.tps.append(info["tps"])
         r.prompt_tokens, r.generated = info["prompt_tokens"], info["generated"]
         r.drafts = info.get("drafts", "")
@@ -191,7 +206,8 @@ def write_report(a, results: list[Result], stripped: list, rc: int) -> Path:
     d = Path(a.report_dir)
     d.mkdir(parents=True, exist_ok=True)
     meta = {"halo": a.halo, "model": a.model, "prompt": a.prompt, "max_tokens": a.max_tokens, "ctx": a.ctx,
-            "repeat": a.repeat, "busy_max": a.busy_max, "stripped_env": stripped, "exit": rc,
+            "repeat": a.repeat, "busy_max": a.busy_max, "busy_settle": a.busy_settle, "stripped_env": stripped,
+            "exit": rc,
             "date": time.strftime("%Y-%m-%d %H:%M:%S %z")}
     (d / "bench-decode.json").write_text(json.dumps({"meta": meta, "results": [asdict(r) for r in results]}, indent=2) + "\n")
     lines = [f"# Decode sweep: {'PASS' if rc == 0 else 'GPU BUSY: not measured' if rc == 3 else 'FAIL'}", "",
@@ -225,11 +241,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--busy-file", default=DEFAULT_BUSY_GLOB, help="glob of gpu_busy_percent files")
     ap.add_argument("--busy-samples", type=int, default=5)
     ap.add_argument("--busy-interval", type=float, default=0.2, help="seconds between busy samples")
+    ap.add_argument("--busy-settle", type=float, default=1.0,
+                    help="seconds to wait after a run before checking that no other process used the GPU")
     ap.add_argument("--timeout", type=int, default=900, help="seconds per run")
     ap.add_argument("--report-dir", default=".test-report/bench-decode")
     a = ap.parse_args(argv)
     if a.repeat < 1 or a.max_tokens < 1:
         ap.error("--repeat and -n must be >= 1")
+    if a.busy_settle < 0:
+        ap.error("--busy-settle must be >= 0")
     variants = select(a.variants)
     env, stripped = clean_env(dict(os.environ))
 
