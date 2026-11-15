@@ -79,7 +79,8 @@ Kernel::Kernel(std::shared_ptr<Context> ctx, KernelDesc desc) : ctx_(std::move(c
         spec.dataSize = values.size() * 4;
         spec.pData = values.data();
 
-        VkComputePipelineCreateInfo cpi{};
+        // Zeroed Vulkan create-info (the API's idiom); every enum field is set below.
+        VkComputePipelineCreateInfo cpi{};  // NOLINT(bugprone-invalid-enum-default-initialization)
         cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;

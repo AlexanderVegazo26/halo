@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -96,6 +97,11 @@ using GroupCount = std::array<std::uint32_t, 3>;
 /// `gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x` and must discard ids >= n.
 /// Throws Error(Kernel) if n == 0 or the grid cannot fit.
 [[nodiscard]] GroupCount grid_1d(std::uint64_t n, std::uint32_t max_x, std::uint32_t max_y);
+
+/// Value of HALO_VK_SYNC_EVERY (see Stream): empty or "0" = off (0), otherwise a decimal count N >= 1
+/// (sync every N dispatches). Anything else (signs, spaces, letters, more than uint32) throws
+/// Error(Config) instead of silently syncing every dispatch, as std::atoi made of "abc" and "0".
+[[nodiscard]] std::uint32_t parse_sync_every(std::string_view value);
 
 class Stream {
 public:

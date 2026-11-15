@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -22,6 +23,16 @@ constexpr std::size_t kMaxBindings = k_descriptors_per_pool / k_sets_per_pool;
 constexpr std::uint32_t kMaxDispatchesPerSubmit = 512;
 }  // namespace
 
+std::uint32_t parse_sync_every(std::string_view value) {
+    if (value.empty()) return 0;
+    std::uint32_t n = 0;
+    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), n);
+    HALO_CHECK(ec == std::errc{} && ptr == value.data() + value.size(), ErrorCode::Config,
+               "HALO_VK_SYNC_EVERY='{}' is not a dispatch count (0 = off, N >= 1 = sync every N dispatches)",
+               value);
+    return n;
+}
+
 Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx_(std::move(ctx)) {
     HALO_CHECK(ctx_ != nullptr, ErrorCode::Backend, "Stream: null context");
     if (const char* p = std::getenv("HALO_VK_OP_TIMINGS"); p != nullptr && *p != '\0') {
@@ -29,8 +40,7 @@ Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx
         op_timings_path_ = p;
         max_timestamps = std::max(max_timestamps, 8192u);
     }
-    if (const char* p = std::getenv("HALO_VK_SYNC_EVERY"); p != nullptr && *p != '\0')
-        sync_every_ = static_cast<std::uint32_t>(std::max(1, std::atoi(p)));
+    if (const auto p = detail::getenv_str("HALO_VK_SYNC_EVERY")) sync_every_ = parse_sync_every(*p);
     const VkDevice dev = ctx_->device();
     try {
         VkCommandPoolCreateInfo cpi{};

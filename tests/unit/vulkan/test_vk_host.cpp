@@ -226,6 +226,31 @@ TEST(VkPolicy, OverrideByIndexOrNameAndNeverSilentlyReplaced) {
     EXPECT_EQ(hv::select_device(devs, "").index, 1u);                      // empty = policy
 }
 
+// ---------------------------------------------------------------- HALO_VK_SYNC_EVERY
+
+// The diagnostics knob went through std::max(1, std::atoi(p)): "0" (documented as off) and any
+// non-number synced and logged every dispatch, a silent ~100x slowdown.
+TEST(VkSyncEvery, ZeroAndEmptyAreOffAndCountsParse) {
+    EXPECT_EQ(hv::parse_sync_every(""), 0u) << "empty HALO_VK_SYNC_EVERY must leave syncing off";
+    EXPECT_EQ(hv::parse_sync_every("0"), 0u) << "HALO_VK_SYNC_EVERY=0 is documented as off";
+    EXPECT_EQ(hv::parse_sync_every("1"), 1u);
+    EXPECT_EQ(hv::parse_sync_every("64"), 64u);
+    EXPECT_EQ(hv::parse_sync_every("4294967295"), 4294967295u);
+}
+
+TEST(VkSyncEvery, NonCountsAreConfigErrorsNamingTheValue) {
+    for (const char* bad : {"abc", "-3", "+3", " 8", "8 ", "8x", "1.5", "4294967296"}) {
+        try {
+            (void)hv::parse_sync_every(bad);
+            ADD_FAILURE() << "HALO_VK_SYNC_EVERY='" << bad << "' was accepted";
+        } catch (const halo::Error& e) {
+            EXPECT_EQ(e.code(), halo::ErrorCode::Config) << "value '" << bad << "': " << e.what();
+            EXPECT_NE(std::string(e.what()).find(std::string("'") + bad + "'"), std::string::npos)
+                << "the message should quote the bad value '" << bad << "': " << e.what();
+        }
+    }
+}
+
 // ---------------------------------------------------------------- memory types
 
 namespace {

@@ -76,7 +76,7 @@ std::uint64_t matvec_row_bytes(DType t, std::uint32_t cols) {
         case DType::Q6_K: return blocks(256, 210);
         case DType::IQ4_XS: return blocks(256, 136);
         case DType::IQ4_NL: return blocks(32, 18);
-        case DType::Q3_K: return blocks(256, 110);
+        case DType::Q3_K:  // same 110-byte super-block of 256 weights as IQ3_S
         case DType::IQ3_S: return blocks(256, 110);
         default:
             throw_error(ErrorCode::Unsupported,

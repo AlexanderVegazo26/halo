@@ -223,7 +223,8 @@ std::optional<std::uint32_t> choose_memory_type(std::span<const MemoryTypeInfo> 
 namespace detail {
 
 DeviceInfo query_device(VkPhysicalDevice pd, std::uint32_t index) {
-    VkPhysicalDeviceDriverProperties driver{};
+    // Zeroed Vulkan out-struct: the driver fills driverID (no VkDriverId has the value 0).
+    VkPhysicalDeviceDriverProperties driver{};  // NOLINT(bugprone-invalid-enum-default-initialization)
     driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
     VkPhysicalDeviceSubgroupProperties subgroup{};
     subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;

@@ -249,6 +249,9 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
               to_string(ctx->info_.driver), ctx->info_.driver_info,
               detail::version_string(ctx->info_.api_version), ctx->selection_.reason);
 
+    // select_device only returns suitable() devices, which have a compute queue.
+    HALO_CHECK(ctx->info_.compute_queue_family.has_value(), ErrorCode::Device,
+               "Vulkan device '{}' has no compute queue", ctx->info_.name);
     ctx->queue_family_ = *ctx->info_.compute_queue_family;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -505,8 +508,7 @@ std::optional<Context::RecycledBuffer> Context::recycle_take(std::uint32_t memor
             recycle_.erase(std::next(it).base());
             return rb;
         }
-    } catch (...) {
-        // Bookkeeping failure: fall through to the allocating path.
+    } catch (...) {  // NOLINT(bugprone-empty-catch): bookkeeping failure falls through to the allocating path
     }
     return std::nullopt;
 }
@@ -522,8 +524,7 @@ void Context::recycle_put(RecycledBuffer rb) noexcept {
             recycle_destroy(recycle_.front());
             recycle_.pop_front();
         }
-    } catch (...) {
-        // Never throw out of Buffer::release: destroy the allocation instead.
+    } catch (...) {  // NOLINT(bugprone-empty-catch): never throw out of Buffer::release; rb is destroyed below
     }
     recycle_destroy(rb);
 }
