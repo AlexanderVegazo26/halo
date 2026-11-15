@@ -376,6 +376,42 @@ TEST(ConnGuardUnit, ShutdownActsOnTheCheckedSocketEvenIfTheNumberIsReused) {
     for (int fd : {a.client, a.server, b.client, b.server, c.client, c.server, l}) ::close(fd);
 }
 
+TEST(ConnGuardUnit, CloseIsCountedBeforeTheShutdownFreesTheWorker) {
+    // The shutdown frees the worker blocked on the socket, which may answer /metrics before the
+    // guard thread runs again: by then the close must already be counted (it was bumped after
+    // the shutdown, so a /metrics read right after /health could show 0 of the 4 closes logged).
+    // A victim whose identity check fails is neither shut down nor counted.
+    int port = 0;
+    const int l = listen_loopback(port);
+    ASSERT_GE(l, 0);
+    const Pair a = connect_pair(l, port);
+    const Pair b = connect_pair(l, port);
+    ASSERT_GE(a.server, 0);
+    ASSERT_GE(b.server, 0);
+    ConnectionGuard::Victim va = victim_for(a.server);
+    va.reason = ConnectionGuard::Reason::Overload;
+    ConnectionGuard::Victim stale = victim_for(b.server);
+    stale.reason = ConnectionGuard::Reason::PeerLimit;
+    stale.ino += 1;
+    ConnectionGuard guard(GuardLimits{});
+    int calls = 0;
+    const auto n = guard.close_victims({stale, va}, port, [&](const ConnectionGuard::Victim& v) {
+        ++calls;
+        EXPECT_EQ(v.key, va.key) << "only the verified victim is reported as shut down";
+        EXPECT_EQ(client_state(a.client), 0) << "the victim is shut down when the hook runs";
+        EXPECT_EQ(guard.closes(ConnectionGuard::Reason::Overload), 1U)
+            << "the overload close is counted before its shutdown frees the worker";
+        EXPECT_EQ(guard.timeouts(), 1U) << "the total is counted before the shutdown too";
+    });
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(n[static_cast<int>(ConnectionGuard::Reason::Overload)], 1U);
+    EXPECT_EQ(n[static_cast<int>(ConnectionGuard::Reason::PeerLimit)], 0U) << "the stale victim is not counted";
+    EXPECT_EQ(guard.closes(ConnectionGuard::Reason::PeerLimit), 0U);
+    EXPECT_EQ(guard.timeouts(), 1U);
+    EXPECT_EQ(client_state(b.client), 1) << "the stale victim's connection stays open";
+    for (int fd : {a.client, a.server, b.client, b.server, l}) ::close(fd);
+}
+
 // ---- the server under slow clients (S-38) ----------------------------------------------------
 
 /// A raw connection from source address `from` that sends a partial request and then one

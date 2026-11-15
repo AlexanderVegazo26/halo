@@ -53,6 +53,7 @@
 // reverse proxy D-017 requires. Linux only (the scan uses /proc); elsewhere start() is a
 // no-op and the gap remains, which docs/api.md states.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -134,6 +135,13 @@ public:
     /// `port`. `between` runs after the check and before shutdown (tests use it to close
     /// and reuse the descriptor number). Returns true when the socket was shut down.
     static bool shutdown_verified(const Victim& v, int port, const std::function<void()>& between = {});
+
+    /// Shuts down each victim (shutdown_verified on `port`) and returns how many per reason.
+    /// A close is counted (timeouts(), closes()) before its shutdown: the shutdown frees the
+    /// worker, which may answer /metrics at once, and that answer must include it.
+    /// `after_shutdown` runs after each successful shutdown (tests check that ordering).
+    std::array<std::size_t, kReasons> close_victims(const std::vector<Victim>& victims, int port,
+                                                    const std::function<void(const Victim&)>& after_shutdown = {});
 
     /// Connections closed by the guard, total and per reason.
     [[nodiscard]] std::uint64_t timeouts() const noexcept { return timeouts_.load(); }

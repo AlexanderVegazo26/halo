@@ -304,6 +304,27 @@ bool ConnectionGuard::shutdown_verified(const Victim& v, int port, const std::fu
 #endif
 }
 
+std::array<std::size_t, ConnectionGuard::kReasons> ConnectionGuard::close_victims(
+    const std::vector<Victim>& victims, int port, const std::function<void(const Victim&)>& after_shutdown) {
+    std::array<std::size_t, kReasons> n{};
+    for (const Victim& v : victims) {
+        const auto r = static_cast<std::size_t>(v.reason);
+        // Counted once the identity check has passed and before the shutdown: the worker it
+        // frees may serve /metrics right away (the ApiGuard shedding tests read it next).
+        const auto count = [&] {
+            by_reason_[r].fetch_add(1);
+            timeouts_.fetch_add(1);
+        };
+        if (!shutdown_verified(v, port, count)) continue;
+        if (after_shutdown) after_shutdown(v);
+        ++n.at(r);
+        std::lock_guard lk(mu_);
+        const auto it = conns_.find(v.key);
+        if (it != conns_.end() && it->second.ino == v.ino) conns_.erase(it);
+    }
+    return n;
+}
+
 void ConnectionGuard::scan() {
 #if defined(__linux__)
     // 1. Snapshot the connected sockets on our port (no lock held during syscalls).
@@ -348,16 +369,7 @@ void ConnectionGuard::scan() {
     // 2. Merge and decide.
     const std::vector<Victim> victims = decide(live, t_snap, Clock::now());
     // 3. Shut them down.
-    std::size_t n[kReasons] = {};
-    for (const Victim& v : victims) {
-        if (!shutdown_verified(v, port_)) continue;
-        ++n[static_cast<int>(v.reason)];
-        by_reason_[static_cast<int>(v.reason)].fetch_add(1);
-        timeouts_.fetch_add(1);
-        std::lock_guard lk(mu_);
-        const auto it = conns_.find(v.key);
-        if (it != conns_.end() && it->second.ino == v.ino) conns_.erase(it);
-    }
+    const std::array<std::size_t, kReasons> n = close_victims(victims, port_);
     if (n[0] + n[1] + n[2] + n[3] > 0) {  // one line per scan, not one per connection
         HALO_WARN("api",
                   "closed {} connection(s) while reading a request: {} past the read deadline, {} over the per-peer "
