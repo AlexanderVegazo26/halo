@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <stdexcept>
 
 #include "../models/tiny_golden.h"
 #include "halo/backends/cpu/ops.h"
@@ -67,7 +68,13 @@ protected:
         c.tree = true;
         return Speculator(model(), c);
     }
-    static Toks prompt(const char* p) { return golden_->i32(std::string(p) + ".tokens"); }
+    /// The suite's golden data; SetUp() skips every test when it is missing, so this only throws
+    /// if a helper runs outside a test body.
+    static const Golden& golden() {
+        if (!golden_) throw std::logic_error("golden data not loaded (Spec::SetUpTestSuite)");
+        return *golden_;
+    }
+    static Toks prompt(const char* p) { return golden().i32(std::string(p) + ".tokens"); }
 
     static inline std::optional<Golden> golden_;
     static inline std::unique_ptr<TinyModel> tiny_;
@@ -128,6 +135,13 @@ std::vector<float> dump_kv(const halo::kv_cache::SequenceKv& kv) {
     return out;
 }
 
+/// The sequence's MTP KV rows. Throws (the test fails with this message) instead of dereferencing an
+/// empty optional when the sequence has none (no MTP pool, or MTP dropped after a failed flush).
+halo::kv_cache::SequenceKv& mtp_kv_of(SequenceState& s) {
+    if (!s.mtp_kv) throw std::logic_error("sequence has no MTP KV (no MTP pool, or MTP was dropped)");
+    return *s.mtp_kv;
+}
+
 /// Bitwise equality of two sequences' complete state (flushes both MTP queues first).
 void expect_same_state(Speculator& sp, SequenceState& a, SequenceState& b) {
     SequenceState* both[] = {&a, &b};
@@ -136,10 +150,10 @@ void expect_same_state(Speculator& sp, SequenceState& a, SequenceState& b) {
     EXPECT_TRUE(dump_kv(a.kv) == dump_kv(b.kv)) << "trunk KV rows differ";
     EXPECT_TRUE(a.gdn.snapshot().data == b.gdn.snapshot().data) << "GDN recurrent/conv state differs";
     EXPECT_TRUE(a.last_hidden == b.last_hidden) << "carried trunk hidden (pending_h) differs";
-    ASSERT_TRUE(a.mtp_kv && b.mtp_kv);
-    EXPECT_EQ(a.mtp_kv->length(), b.mtp_kv->length());
-    EXPECT_EQ(a.mtp_kv->length() + 1, a.length()) << "MTP KV must hold positions 1..L-1 after a flush";
-    EXPECT_TRUE(dump_kv(*a.mtp_kv) == dump_kv(*b.mtp_kv)) << "MTP KV rows differ";
+    ASSERT_TRUE(a.mtp_kv && b.mtp_kv) << "both sequences must keep their MTP KV";
+    EXPECT_EQ(mtp_kv_of(a).length(), mtp_kv_of(b).length());
+    EXPECT_EQ(mtp_kv_of(a).length() + 1, a.length()) << "MTP KV must hold positions 1..L-1 after a flush";
+    EXPECT_TRUE(dump_kv(mtp_kv_of(a)) == dump_kv(mtp_kv_of(b))) << "MTP KV rows differ";
 }
 
 /// Oracle drafts: the true continuation g[m+1 .. m+k] with a wrong token at depth `wrong`
@@ -195,7 +209,7 @@ TEST_P(SpecPrompt, GreedyWithRealMtpDraftsEqualsPlainGreedyAndGolden) {
         auto so = seq();
         const Toks plain = generate(off, *so, pr, kN, 3);
         EXPECT_EQ(off.metrics().spec_steps, 0u);
-        const Toks gold = golden_->i32(std::string(p) + ".decode_tokens");
+        const Toks gold = golden().i32(std::string(p) + ".decode_tokens");
         EXPECT_TRUE(std::equal(gold.begin(), gold.begin() + static_cast<std::ptrdiff_t>(std::min(gold.size(), kN)), plain.begin()))
             << "plain greedy must reproduce the transformers greedy decode";
         for (std::size_t k = 1; k <= 3; ++k) {
@@ -457,7 +471,7 @@ TEST_F(Spec, AbortAfterRealDraftRestoresTheExactPreTickState) {
     const std::size_t queued = s->mtp_queue_size();
     sp.draft(std::span(&q, 1), t);
     ASSERT_EQ(t.out[0].drafts.size(), 3u) << "real MTP chain of depth 3";
-    EXPECT_EQ(s->mtp_kv->length(), pr.size() + 2) << "catch-up + x row + 2 chain rows";
+    EXPECT_EQ(mtp_kv_of(*s).length(), pr.size() + 2) << "catch-up + x row + 2 chain rows";
     sp.abort_draft(std::span(&q, 1), t);
     EXPECT_EQ(s->mtp_queue_size(), queued) << "the catch-up queue is only consumed at commit";
     EXPECT_THROW(sp.verify(std::span(&q, 1), t), halo::Error) << "verify after abort";
@@ -558,10 +572,10 @@ TEST_F(Spec, DraftChainEqualsDirectMtpCallsFedTheirOwnHidden) {
     SequenceState* tw[] = {twin.get()};
     sp.flush_mtp(tw);
     const std::size_t L = twin->length();
-    ASSERT_EQ(twin->mtp_kv->length(), L - 1);
-    const Toks direct = direct_chain(model(), *twin->mtp_kv, first[0], twin->last_hidden, L, 3);
+    ASSERT_EQ(mtp_kv_of(*twin).length(), L - 1);
+    const Toks direct = direct_chain(model(), mtp_kv_of(*twin), first[0], twin->last_hidden, L, 3);
     EXPECT_EQ(t.out[0].drafts, direct);
-    EXPECT_EQ(dump_kv(*s->mtp_kv), dump_kv(*twin->mtp_kv)) << "chain rows written at the same MTP positions";
+    EXPECT_EQ(dump_kv(mtp_kv_of(*s)), dump_kv(mtp_kv_of(*twin))) << "chain rows written at the same MTP positions";
     sp.abort_draft(std::span(&q, 1), t);
 }
 
@@ -605,7 +619,7 @@ TEST_F(Spec, DraftChainMatchesLlamaCpp) {
         ASSERT_EQ(rec.at("server_prompt_tokens").get<std::size_t>(), pr.size()) << "llama.cpp must not add a BOS";
         const Toks gen = rec.at("tokens").get<Toks>();
         // The recorded run is the same model: llama.cpp's greedy decode is the golden one.
-        EXPECT_EQ(gen, golden_->i32(name + ".decode_tokens"));
+        EXPECT_EQ(gen, golden().i32(name + ".decode_tokens"));
         const auto& calls = rec.at("draft_calls");
         const auto accepted = rec.at("accepted").get<std::vector<std::size_t>>();
         ASSERT_FALSE(calls.empty());
@@ -640,12 +654,12 @@ TEST_F(Spec, DraftChainMatchesLlamaCpp) {
             halo::models::MtpStep cu;
             cu.tokens = ctx;
             cu.hidden = hid;
-            cu.kv = &*s->mtp_kv;
+            cu.kv = &mtp_kv_of(*s);
             cu.first_position = 0;
             cu.logits = halo::models::LogitsMode::None;
             halo::models::StepResult cr;
             model().mtp_forward(std::span(&cu, 1), cr);
-            const Toks d = direct_chain(model(), *s->mtp_kv, gen[emitted - 1],
+            const Toks d = direct_chain(model(), mtp_kv_of(*s), gen[emitted - 1],
                                         std::vector<float>(h.end() - static_cast<std::ptrdiff_t>(E), h.end()), L, call.size());
             for (std::size_t i = 0; i < call.size(); ++i) {
                 const auto& cand = call[i];
@@ -694,7 +708,7 @@ TEST_F(Spec, ChunkedPrefillMtpCatchUpEqualsDirectGoldenPairing) {
     const Toks first = step1(sp, c2).out[0].tokens;
     SequenceState* one[] = {s.get()};
     sp.flush_mtp(one);
-    ASSERT_EQ(s->mtp_kv->length(), 149u);
+    ASSERT_EQ(mtp_kv_of(*s).length(), 149u);
     // Direct reference: one-shot trunk forward (chunk boundaries 0/64/128 as above) + one
     // direct mtp_forward over the golden pairing.
     auto ref = seq();
@@ -712,14 +726,14 @@ TEST_F(Spec, ChunkedPrefillMtpCatchUpEqualsDirectGoldenPairing) {
     halo::models::MtpStep m;
     m.tokens = std::span(pr).subspan(1);
     m.hidden = std::span(h).first(149 * E);
-    m.kv = &*ref->mtp_kv;
+    m.kv = &mtp_kv_of(*ref);
     m.first_position = 1;
     m.logits = halo::models::LogitsMode::None;
     halo::models::StepResult mr;
     model().mtp_forward(std::span(&m, 1), mr);
-    EXPECT_TRUE(dump_kv(*s->mtp_kv) == dump_kv(*ref->mtp_kv)) << "MTP catch-up rows differ from the golden pairing";
+    EXPECT_TRUE(dump_kv(mtp_kv_of(*s)) == dump_kv(mtp_kv_of(*ref))) << "MTP catch-up rows differ from the golden pairing";
     // First draft = direct MTP((x, h_149)) at position 150.
-    const Toks gold = golden_->i32("p0.decode_tokens");
+    const Toks gold = golden().i32("p0.decode_tokens");
     ASSERT_EQ(first, Toks{gold[0]});
     StepRequest q;
     q.seq = s.get();
@@ -730,7 +744,7 @@ TEST_F(Spec, ChunkedPrefillMtpCatchUpEqualsDirectGoldenPairing) {
     halo::models::MtpStep d;
     d.tokens = std::span(&first[0], 1);
     d.hidden = std::span(h).subspan(149 * E, E);
-    d.kv = &*ref->mtp_kv;
+    d.kv = &mtp_kv_of(*ref);
     d.first_position = 150;
     const std::size_t row0 = 0;
     d.logit_rows = std::span(&row0, 1);
