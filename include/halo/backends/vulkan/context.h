@@ -145,9 +145,11 @@ public:
     void submit(VkCommandBuffer cmd, VkFence fence);
 
     /// A submission on this device did not complete within its wait budget (a hung GPU or a
-    /// lost device): set by Stream when a bounded fence wait times out, never cleared. While it
-    /// is set, streams refuse to record, submit or wait (Error(Backend)) instead of blocking on
-    /// a fence that will not signal, and teardown skips the waits and frees it cannot do safely.
+    /// lost device): set by Stream when a bounded fence wait times out and by a staged transfer
+    /// whose fence wait fails, never cleared. While it is set, streams refuse to record, submit
+    /// or wait and staged transfers / copy_buffer_sync refuse to run (Error(Backend)) instead of
+    /// blocking on a fence that will not signal or re-recording a command buffer the GPU may
+    /// still execute, and teardown skips the waits and frees it cannot do safely.
     void mark_hung() noexcept { hung_.store(true, std::memory_order_relaxed); }
     [[nodiscard]] bool hung() const noexcept { return hung_.load(std::memory_order_relaxed); }
 

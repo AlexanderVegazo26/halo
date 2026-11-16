@@ -407,6 +407,15 @@ void Context::copy_buffer_sync(VkBuffer src, VkBuffer dst, VkDeviceSize src_offs
 
 namespace {
 
+// A transfer whose fence wait failed may still be executing transfer_cmd_ and reading or writing
+// the staging buffer. Resetting or re-recording a pending command buffer is invalid (the driver
+// may reuse its command-stream memory under the GPU), and refilling the staging buffer races the
+// pending copy, so once the device is hung transfers refuse, as streams do.
+void require_not_hung(const Context& ctx) {
+    HALO_CHECK(!ctx.hung(), ErrorCode::Backend,
+               "the Vulkan device is hung (a submission did not complete); restart the process");
+}
+
 // [0, size) of a mapped allocation rounded out to nonCoherentAtomSize, clamped.
 VkMappedMemoryRange staging_range(VkDeviceMemory mem, VkDeviceSize size, VkDeviceSize atom, VkDeviceSize alloc) {
     VkMappedMemoryRange r{};
@@ -481,6 +490,7 @@ void Context::invalidate_staging_locked(VkDeviceSize size) const {
 
 void Context::staged_upload(VkBuffer dst, VkDeviceSize dst_offset, std::span<const std::byte> data) {
     const std::scoped_lock lock(transfer_mutex_);
+    require_not_hung(*this);
     ensure_staging_locked();
     for (std::size_t done = 0; done < data.size();) {
         const std::size_t n = static_cast<std::size_t>(std::min<VkDeviceSize>(data.size() - done, staging_capacity_));
@@ -494,6 +504,7 @@ void Context::staged_upload(VkBuffer dst, VkDeviceSize dst_offset, std::span<con
 
 void Context::staged_download(VkBuffer src, VkDeviceSize src_offset, std::span<std::byte> out) {
     const std::scoped_lock lock(transfer_mutex_);
+    require_not_hung(*this);
     ensure_staging_locked();
     for (std::size_t done = 0; done < out.size();) {
         const std::size_t n = static_cast<std::size_t>(std::min<VkDeviceSize>(out.size() - done, staging_capacity_));
@@ -569,6 +580,7 @@ void Context::recycle_put(RecycledBuffer rb) noexcept {
 
 void Context::copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, VkDeviceSize dst_offset,
                           VkDeviceSize size) {
+    require_not_hung(*this);
     detail::vk_check(vkResetCommandBuffer(transfer_cmd_, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -589,6 +601,7 @@ void Context::copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, V
     detail::vk_check(vkResetFences(device_, 1, &transfer_fence_), "vkResetFences");
     submit(transfer_cmd_, transfer_fence_);
     const VkResult r = vkWaitForFences(device_, 1, &transfer_fence_, VK_TRUE, 60'000'000'000ull);
+    if (r != VK_SUCCESS) mark_hung();  // transfer_cmd_ may still be pending: never reset or reuse it
     detail::vk_check(r, "vkWaitForFences(transfer)");
 }
 

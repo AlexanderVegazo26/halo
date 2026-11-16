@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iostream>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -147,6 +148,38 @@ TEST(VkBuffer, RejectsZeroSizeAndOutOfRangeTransfers) {
         EXPECT_THROW((void)hv::Buffer::create(ctx, d.max_memory_allocation_size + 1, hv::MemoryUsage::DeviceLocal),
                      halo::Error);
     }
+}
+
+TEST(VkBuffer, StagedTransfersRefuseOnAHungDeviceWithoutTouchingTheTransferCommandBuffer) {
+    // After a fence wait fails, the transfer command buffer may still be pending on the GPU:
+    // re-recording it (or refilling the staging buffer it reads) is invalid and can corrupt the
+    // command stream the GPU is executing. Staged transfers must refuse instead, like streams.
+    hv::ContextOptions opts;
+    opts.force_staging = true;
+    opts.staging_bytes = 4096;
+    HALO_VK_CONTEXT_OR_SKIP(ctx, opts);
+    hv::Buffer b = hv::Buffer::create(ctx, 64, hv::MemoryUsage::DeviceLocal);
+    const std::vector<std::uint32_t> before{1, 2, 3, 4};
+    b.upload(std::span<const std::uint32_t>(before));
+    const std::uint64_t chunks0 = ctx->staging_stats().chunks;
+
+    ctx->mark_hung();
+    const auto expect_hung_refusal = [](const auto& transfer, const char* what) {
+        try {
+            transfer();
+            ADD_FAILURE() << what << " on a hung device: expected Error(Backend) 'device is hung', got no throw";
+        } catch (const halo::Error& e) {
+            EXPECT_EQ(e.code(), halo::ErrorCode::Backend) << what << ": " << e.what();
+            EXPECT_NE(std::string(e.what()).find("hung"), std::string::npos)
+                << what << ": message should say the device is hung, got: " << e.what();
+        }
+    };
+    const std::vector<std::uint32_t> after{9, 9, 9, 9};
+    expect_hung_refusal([&] { b.upload(std::span<const std::uint32_t>(after)); }, "staged upload");
+    std::vector<std::uint32_t> got(4);
+    expect_hung_refusal([&] { b.download(std::span<std::uint32_t>(got)); }, "staged download");
+    expect_hung_refusal([&] { ctx->copy_buffer_sync(b.handle(), b.handle(), 0, 32, 16); }, "copy_buffer_sync");
+    EXPECT_EQ(ctx->staging_stats().chunks, chunks0) << "no GPU copy may be issued once the device is hung";
 }
 
 TEST(VkBuffer, MoveTransfersOwnership) {
