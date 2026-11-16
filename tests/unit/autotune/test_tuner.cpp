@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -28,9 +29,14 @@ std::vector<Candidate> grid(std::initializer_list<std::int64_t> a, std::initiali
 
 std::vector<std::string> texts(const std::vector<Candidate>& cs) {
     std::vector<std::string> out;
+    out.reserve(cs.size());
     for (const auto& c : cs) out.push_back(c.to_string());
     return out;
 }
+
+// Canonical text of an optional candidate, "<none>" when empty, so a missing winner fails the
+// comparison with a readable value instead of dereferencing an empty optional.
+std::string text(const std::optional<Candidate>& c) { return c ? c->to_string() : "<none>"; }
 
 OpTuneResult only(const TuneReport& r) {
     EXPECT_EQ(r.ops.size(), 1u);
@@ -119,7 +125,7 @@ TEST(Tuner, PicksSmallestMedianAndPersists) {
     TunableOp* ops[] = {&op};
     const auto r = only(tune(db, test::sample_key(), ops, test::fast_options(Strategy::Exhaustive), clock));
     ASSERT_TRUE(r.winner);
-    EXPECT_EQ(r.winner->to_string(), "v=2");
+    EXPECT_EQ(text(r.winner), "v=2");
     EXPECT_DOUBLE_EQ(r.winner_median_ns, 1000.0);
     EXPECT_TRUE(r.persisted);
     EXPECT_EQ(op.total_runs, 3 * (5 + 20));  // TRD §50 warm-up + measured per candidate
@@ -141,7 +147,7 @@ TEST(Tuner, TiesGoToTheSmallestCanonicalString) {
     ProfileDb db = ProfileDb::open(t.path());
     TunableOp* ops[] = {&op};
     const auto r = only(tune(db, test::sample_key(), ops, test::fast_options(Strategy::Exhaustive), clock));
-    EXPECT_EQ(r.winner->to_string(), "v=3");
+    EXPECT_EQ(text(r.winner), "v=3");
 }
 
 TEST(Tuner, UnstableCandidateWithBestMedianIsRejected) {
@@ -153,7 +159,7 @@ TEST(Tuner, UnstableCandidateWithBestMedianIsRejected) {
     TunableOp* ops[] = {&op};
     const auto r = only(tune(db, test::sample_key(), ops, test::fast_options(Strategy::Exhaustive), clock));
     ASSERT_TRUE(r.winner);
-    EXPECT_EQ(r.winner->to_string(), "v=2");
+    EXPECT_EQ(text(r.winner), "v=2");
     const auto& unstable = r.candidates.at(0);
     EXPECT_EQ(unstable.candidate.to_string(), "v=1");
     EXPECT_DOUBLE_EQ(unstable.stats.median, 500.0);
@@ -168,7 +174,7 @@ TEST(Tuner, InvalidCandidateCannotWin) {
     ProfileDb db = ProfileDb::open(t.path());
     TunableOp* ops[] = {&op};
     const auto r = only(tune(db, test::sample_key(), ops, test::fast_options(Strategy::Exhaustive), clock));
-    EXPECT_EQ(r.winner->to_string(), "v=2");
+    EXPECT_EQ(text(r.winner), "v=2");
     EXPECT_FALSE(r.candidates.at(0).measured);
     EXPECT_EQ(r.candidates.at(0).rejected, "invalid: fake mismatch");
     EXPECT_EQ(op.total_runs, 25);  // the invalid candidate is never timed
@@ -194,7 +200,7 @@ TEST(Tuner, AllUnstableKeepsTheExistingWinner) {
     const auto lk = ProfileLookup::open(t.path());
     const auto found = lk.find(key, {"FAKE", "S"}, "cpu");
     ASSERT_TRUE(found.candidate);
-    EXPECT_EQ(found.candidate->to_string(), "v=1");
+    EXPECT_EQ(text(found.candidate), "v=1");
 }
 
 TEST(Tuner, HeuristicMeasuresOnlyThePrefilter) {
@@ -211,9 +217,11 @@ TEST(Tuner, HeuristicMeasuresOnlyThePrefilter) {
     TunableOp* ops[] = {&op};
     const auto r = only(tune(db, test::sample_key(), ops, o, clock));
     EXPECT_EQ(r.candidates.size(), 2u);
-    EXPECT_EQ(r.winner->to_string(), "v=2");
-    ASSERT_TRUE(r.candidates[0].predicted);
-    EXPECT_DOUBLE_EQ(r.candidates[0].predicted->total_ns, 10.0);
+    EXPECT_EQ(text(r.winner), "v=2");
+    const auto& predicted = r.candidates[0].predicted;
+    if (!predicted) GTEST_FAIL() << "HEURISTIC candidate " << r.candidates[0].candidate.to_string()
+                                 << " should carry its cost-model prediction";
+    EXPECT_DOUBLE_EQ(predicted->total_ns, 10.0);
 }
 
 TEST(Tuner, WinnersAreKeptPerBackend) {
@@ -239,9 +247,9 @@ TEST(Tuner, WinnersAreKeptPerBackend) {
     EXPECT_EQ(c.source, SelectionSource::Exact);
     EXPECT_EQ(v.source, SelectionSource::Exact);
     ASSERT_TRUE(c.candidate && v.candidate);
-    EXPECT_EQ(c.candidate->to_string(), "v=2");
+    EXPECT_EQ(text(c.candidate), "v=2");
     EXPECT_DOUBLE_EQ(c.value, 50.0);
-    EXPECT_EQ(v.candidate->to_string(), "v=2");
+    EXPECT_EQ(text(v.candidate), "v=2");
     EXPECT_DOUBLE_EQ(v.value, 100.0);
     EXPECT_EQ(lk.find(key, {"FAKE", "S"}, "hip").source, SelectionSource::None);
 }
@@ -282,7 +290,7 @@ TEST_F(LookupFixture, ExactCompatibleAndRejected) {
     ProfileKey k = test::sample_key();
     auto r = lk.find(k, op_, "cpu");
     EXPECT_EQ(r.source, SelectionSource::Exact);
-    EXPECT_EQ(r.candidate->to_string(), "v=2");
+    EXPECT_EQ(text(r.candidate), "v=2");
     EXPECT_TRUE(r.differing.empty());
 
     k.driver_version = "radv 25.3";
@@ -290,7 +298,7 @@ TEST_F(LookupFixture, ExactCompatibleAndRejected) {
     r = lk.find(k, op_, "cpu");
     EXPECT_EQ(r.source, SelectionSource::Compatible);
     EXPECT_EQ(r.differing, (std::vector<std::string>{"DRIVER_VERSION", "KERNEL_VERSION"}));
-    EXPECT_EQ(r.candidate->to_string(), "v=2");
+    EXPECT_EQ(text(r.candidate), "v=2");
 
     k = test::sample_key();
     k.power_mode = "quiet|manual/COMPUTE";  // a different power mode is rejected
@@ -322,14 +330,14 @@ TEST_F(LookupFixture, PrefersExactThenFewestDifferences) {
         (void)tune(db, far, ob, test::fast_options(Strategy::Exhaustive), clock);
     }
     const auto lk = ProfileLookup::open(t_.path());
-    EXPECT_EQ(lk.find(test::sample_key(), op_, "cpu").candidate->to_string(), "v=2");  // exact beats compatible
+    EXPECT_EQ(text(lk.find(test::sample_key(), op_, "cpu").candidate), "v=2");  // exact beats compatible
     ProfileKey cur = test::sample_key();
     cur.os = "Ubuntu 28.04";  // differs from all three in OS; `far` also differs in HALO_VERSION
     const auto r = lk.find(cur, op_, "cpu");
     EXPECT_EQ(r.source, SelectionSource::Compatible);
     EXPECT_EQ(r.differing, std::vector<std::string>{"OS"});
     // Two entries (original and `near`) differ only in OS; the more recent (higher id) wins.
-    EXPECT_EQ(r.candidate->to_string(), "v=5");
+    EXPECT_EQ(text(r.candidate), "v=5");
 }
 
 TEST_F(LookupFixture, SelectKernelWalksSteps1To3) {
@@ -341,13 +349,13 @@ TEST_F(LookupFixture, SelectKernelWalksSteps1To3) {
 
     auto r = select_kernel(lk, test::sample_key(), op_, "cpu", op.candidates(), &model, cost);
     EXPECT_EQ(r.source, SelectionSource::Exact);
-    EXPECT_EQ(r.candidate->to_string(), "v=2");
+    EXPECT_EQ(text(r.candidate), "v=2");
 
     // Stored winner no longer offered (e.g. fewer threads now): falls to the heuristic.
     const std::vector<Candidate> fewer{Candidate{{{"v", 1}}}, Candidate{{{"v", 3}}}};
     r = select_kernel(lk, test::sample_key(), op_, "cpu", fewer, &model, cost);
     EXPECT_EQ(r.source, SelectionSource::Heuristic);
-    EXPECT_EQ(r.candidate->to_string(), "v=3");
+    EXPECT_EQ(text(r.candidate), "v=3");
     EXPECT_DOUBLE_EQ(r.value, 20.0);
     EXPECT_FALSE(r.rejections.empty());
 
@@ -355,7 +363,7 @@ TEST_F(LookupFixture, SelectKernelWalksSteps1To3) {
     other.model_hash = "different-model";
     r = select_kernel(lk, other, op_, "cpu", op.candidates(), &model, cost);
     EXPECT_EQ(r.source, SelectionSource::Heuristic);
-    EXPECT_EQ(r.candidate->to_string(), "v=3");
+    EXPECT_EQ(text(r.candidate), "v=3");
     r = select_kernel(lk, other, op_, "cpu", op.candidates(), nullptr, cost);
     EXPECT_EQ(r.source, SelectionSource::None);  // no silent default
     EXPECT_FALSE(r.candidate);
@@ -366,6 +374,7 @@ TEST_F(LookupFixture, SnapshotIsConcurrentReadSafe) {
     std::atomic<int> exact{0};
     {
         std::vector<std::jthread> ts;
+        ts.reserve(8);
         for (int i = 0; i < 8; ++i) {
             ts.emplace_back([&] {
                 for (int n = 0; n < 200; ++n) {
