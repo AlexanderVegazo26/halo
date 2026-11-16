@@ -210,7 +210,7 @@ TEST(Cli, UsageAndExitCodes) {
 TEST(CliConfig, PrecedenceCliOverEnvOverFile) {
     const auto file = temp_file("cfg.json", R"({"server":{"port":1111,"host":"127.0.0.2"},"runtime":{"ctx":2048}})");
     const std::vector<std::string> keys = {"server.port", "server.host", "runtime.ctx", "runtime.parallel"};
-    const auto resolve = [&](std::vector<std::string> args, std::map<std::string, std::string> env) {
+    const auto resolve = [&](const std::vector<std::string>& args, const std::map<std::string, std::string>& env) {
         std::vector<cli::OptionSpec> opts = cli::config_options(keys);
         return cli::resolve_config(cli::parse_args(args, opts), env, keys);
     };
@@ -223,7 +223,7 @@ TEST(CliConfig, PrecedenceCliOverEnvOverFile) {
     c = resolve({}, {{"HALO_CONFIG", file.string()}});
     EXPECT_EQ(c.u64("server.port"), 1111u);
     EXPECT_EQ(c.source("server.port"), "file:" + file.string());
-    EXPECT_EQ(c.str("server.host").value(), "127.0.0.2");
+    EXPECT_EQ(c.str("server.host"), "127.0.0.2");
     EXPECT_EQ(c.u64("runtime.ctx"), 2048u);
     EXPECT_EQ(c.u64("runtime.parallel"), 4u);
     EXPECT_EQ(c.source("runtime.parallel"), "default");
@@ -237,7 +237,7 @@ TEST(CliConfig, LoadSheddingSettingsReachTheServerConfig) {
     // api::ServerConfig; defaults are the ServerConfig defaults; out-of-range is refused.
     std::vector<std::string> keys = cli::runtime_keys();
     keys.insert(keys.end(), cli::server_keys().begin(), cli::server_keys().end());
-    const auto resolve = [&](std::vector<std::string> args, std::map<std::string, std::string> env) {
+    const auto resolve = [&](const std::vector<std::string>& args, const std::map<std::string, std::string>& env) {
         return cli::resolve_config(cli::parse_args(args, cli::config_options(keys)), env, keys);
     };
     const api::ServerConfig d;
@@ -262,9 +262,9 @@ TEST(CliConfig, LoadSheddingSettingsReachTheServerConfig) {
     EXPECT_EQ(s.http_queue, 40u);
     EXPECT_EQ(s.max_header_connections_per_peer, 5u);
     EXPECT_EQ(s.header_shed_grace, std::chrono::milliseconds(1500));
-    const auto refused = [&](std::vector<std::string> args) {
+    const auto refused = [&](const std::vector<std::string>& args) {
         try {
-            (void)resolve(std::move(args), {});
+            (void)resolve(args, {});
         } catch (const cli::UsageError&) {
             return true;  // a CLI value outside [lo, hi]
         }
@@ -276,7 +276,7 @@ TEST(CliConfig, LoadSheddingSettingsReachTheServerConfig) {
 
 TEST(CliConfig, StrictValidation) {
     const std::vector<std::string> keys = {"server.port", "server.api_key", "runtime.prefix_cache"};
-    const auto resolve = [&](std::vector<std::string> args, std::map<std::string, std::string> env) {
+    const auto resolve = [&](const std::vector<std::string>& args, const std::map<std::string, std::string>& env) {
         return cli::resolve_config(cli::parse_args(args, cli::config_options(keys)), env, keys);
     };
     const auto bad_key = temp_file("bad_key.json", R"({"server":{"prot":1}})");
@@ -304,7 +304,7 @@ TEST(CliConfig, StrictValidation) {
     EXPECT_FALSE(c.boolean("runtime.prefix_cache"));
     // The API key never appears in the dump.
     c = resolve({}, {{"HALO_API_KEY", "sk-very-secret"}});
-    EXPECT_EQ(c.str("server.api_key").value(), "sk-very-secret");
+    EXPECT_EQ(c.str("server.api_key"), "sk-very-secret");
     const std::string dump = c.to_json().dump();
     EXPECT_EQ(dump.find("sk-very-secret"), std::string::npos) << dump;
     EXPECT_NE(dump.find("<redacted>"), std::string::npos);
@@ -345,7 +345,7 @@ TEST(CliConfig, EngineAndServerConfigMapping) {
     const auto file = temp_file("serve.json", R"({"runtime":{"backend":"vulkan","parallel":2},"server":{"max_queue":3}})");
     const auto r = cli_run({"serve", "--model", "m.gguf", "--config", file.string(), "--mtp", "mtp.gguf", "--ctx", "8192",
                             "--mtp-draft", "0", "--no-prefix-cache"},
-                           CliOptions().with_factory(ff.factory()).with_serving([](api::ApiServer& s, std::function<void()> stop) {
+                           CliOptions().with_factory(ff.factory()).with_serving([](api::ApiServer& s, const std::function<void()>& stop) {
                                EXPECT_EQ(s.config().max_queue, 3u);
                                EXPECT_EQ(s.config().max_concurrent, 2u) << "defaults to --parallel";
                                EXPECT_EQ(s.config().host, "127.0.0.1");
@@ -367,7 +367,7 @@ TEST(CliConfig, EngineAndServerConfigMapping) {
     // or cancellation reaches them; serve caps --max-concurrent at --parallel and says so.
     std::size_t seen_concurrent = 0;
     auto r2 = cli_run({"serve", "m.gguf", "--port", "0", "--parallel", "2", "--max-concurrent", "8"},
-                      CliOptions().with_factory(ff.factory()).with_serving([&](api::ApiServer& s, std::function<void()> stop) {
+                      CliOptions().with_factory(ff.factory()).with_serving([&](api::ApiServer& s, const std::function<void()>& stop) {
                           seen_concurrent = s.config().max_concurrent;
                           stop();
                       }));
@@ -378,7 +378,7 @@ TEST(CliConfig, EngineAndServerConfigMapping) {
     ff.configs->clear();
     auto r3 = cli_run({"serve", "m.gguf", "--port", "0", "--power-mode", "performance"},
                       CliOptions().with_env({{"HALO_PROFILE_DB", "/tmp/halo-profiles.db"}}).with_factory(ff.factory())
-                          .with_serving([](api::ApiServer&, std::function<void()> stop) { stop(); }));
+                          .with_serving([](api::ApiServer&, const std::function<void()>& stop) { stop(); }));
     ASSERT_EQ(r3.rc, 0) << r3.err;
     EXPECT_EQ(ff.configs->at(0).platform_power_mode, "performance");
     EXPECT_EQ(ff.configs->at(0).profile_db.value_or(""), "/tmp/halo-profiles.db");
@@ -517,7 +517,7 @@ TEST(CliTokenize, MatchesTheHfTokenizer) {
     ASSERT_EQ(r.rc, 0) << r.err;
     const auto ids = json::parse(r.out).at("tokens").get<std::vector<std::int32_t>>();
     EXPECT_EQ(ids, hf->tokenizer().encode(text, true));
-    EXPECT_EQ(ids.back(), hf->tokenizer().piece_to_id("<|im_end|>").value());
+    EXPECT_EQ(std::optional(ids.back()), hf->tokenizer().piece_to_id("<|im_end|>")) << "last id is <|im_end|>";
     r = cli_run({"tokenize", tiny_model().string(), "-t", "hi", "--pieces"});
     EXPECT_EQ(r.out, std::to_string(hf->tokenizer().encode("hi", false).at(0)) + "\t\"hi\"\n");
     r = cli_run({"tokenize", tiny_model().string(), "--text", "a", "--file", "b"});
@@ -541,7 +541,9 @@ TEST(CliTemplate, RendersAndProtectsSpecialTokens) {
     std::string why;
     auto hf = FakeEngine::real(why);
     if (!hf) GTEST_SKIP() << why;
-    const auto im_start = hf->tokenizer().piece_to_id("<|im_start|>").value();
+    const auto im_start_id = hf->tokenizer().piece_to_id("<|im_start|>");
+    if (!im_start_id) GTEST_FAIL() << "the real tokenizer has no <|im_start|> piece";
+    const auto im_start = *im_start_id;
     const auto toks = j.at("tokens").get<std::vector<std::int32_t>>();
 #if HALO_CLI_HAVE_API
     EXPECT_EQ(count_id(toks, im_start), 3u) << "client text never becomes a control token (S-1)";
@@ -610,7 +612,8 @@ TEST(CliRun, StreamsContentAndHidesReasoning) {
     ASSERT_EQ(r.rc, 0) << r.err;
     EXPECT_EQ(r.out, "raw</think>text\n");
     calls = ff.engine->calls();
-    EXPECT_EQ(calls.back().request.prompt.front(), ff.engine->tokenizer().piece_to_id("<|im_start|>").value());
+    EXPECT_EQ(std::optional(calls.back().request.prompt.front()), ff.engine->tokenizer().piece_to_id("<|im_start|>"))
+        << "--raw passes <|im_start|> through as the special token";
     // Engine failure -> exit 1.
     ff.engine->script = [](const auto&, int) {
         Script s = sc("partial");
@@ -757,7 +760,7 @@ TEST(CliServe, ServesTheApiUntilStopped) {
     std::string chat_body;
     auto r = cli_run({"serve", "m.gguf", "--port", "0", "--served-model-name", "halo-test"},
                      CliOptions().with_env({{"HALO_API_KEY", "k1"}}).with_factory(ff.factory()).with_serving(
-                         [&](api::ApiServer& s, std::function<void()> stop) {
+                         [&](api::ApiServer& s, const std::function<void()>& stop) {
                           httplib::Client c("127.0.0.1", s.port());
                           c.set_read_timeout(std::chrono::seconds(10));
                           if (auto h = c.Get("/health")) status_health = h->status;
@@ -797,7 +800,7 @@ TEST(CliServe, UnsafeBindRefusedBeforeLoadingTheModel) {
     EXPECT_TRUE(ff.configs->empty());
     r = cli_run({"serve", "m.gguf", "--host", "0.0.0.0", "--port", "0", "--allow-remote"},
                 CliOptions().with_env({{"HALO_API_KEY", "k"}}).with_factory(ff.factory()).with_serving(
-                    [&](api::ApiServer&, std::function<void()> stop) {
+                    [&](api::ApiServer&, const std::function<void()>& stop) {
                         served = true;
                         stop();
                     }));
@@ -819,7 +822,7 @@ TEST(CliServe, EmptyApiKeyNeverDisablesAuthentication) {
     std::optional<std::string> key;
     r = cli_run({"serve", "m.gguf", "--port", "0", "--config", cfgfile.string()},
                 CliOptions().with_env({{"HALO_API_KEY", ""}}).with_factory(ff.factory()).with_serving(
-                    [&](api::ApiServer& s, std::function<void()> stop) {
+                    [&](api::ApiServer& s, const std::function<void()>& stop) {
                         key = s.config().api_key;
                         stop();
                     }));
@@ -857,7 +860,7 @@ TEST(CliServe, UnsafeBrowserAndRemoteConfigurationsAreRefused) {
     bool parse_special = true;
     r = cli_run({"serve", "m.gguf", "--port", "0", "--no-completions-parse-special", "--header-timeout", "3",
                  "--utility-concurrency", "3"},
-                CliOptions().with_factory(ff.factory()).with_serving([&](api::ApiServer& s, std::function<void()> stop) {
+                CliOptions().with_factory(ff.factory()).with_serving([&](api::ApiServer& s, const std::function<void()>& stop) {
                     parse_special = s.config().completions_parse_special;
                     EXPECT_EQ(s.config().header_timeout, std::chrono::milliseconds(3000));
                     EXPECT_EQ(s.config().utility_concurrency, 3u);
@@ -1239,11 +1242,13 @@ TEST(CliTune, TunesTinyModelThenListShowsTheLookup) {
         const auto mm = autotune::select_kernel(lookup, key, runtime::matmul_op_key(nm.hparams()), "cpu",
                                                 runtime::matmul_candidates(), nullptr, {});
         EXPECT_EQ(mm.source, autotune::SelectionSource::Exact);
-        EXPECT_EQ(mm.candidate.value().to_string(), winners.at("MATMUL"));
+        ASSERT_TRUE(mm.candidate.has_value()) << "MATMUL selection found no candidate";
+        EXPECT_EQ(mm.candidate->to_string(), winners.at("MATMUL"));
         const auto gd = autotune::select_kernel(lookup, key, runtime::gdn_op_key(nm.hparams()), "cpu",
                                                 runtime::gdn_candidates(), nullptr, {});
         EXPECT_EQ(gd.source, autotune::SelectionSource::Exact);
-        EXPECT_EQ(gd.candidate.value().to_string(), winners.at("GATED_DELTANET"));
+        ASSERT_TRUE(gd.candidate.has_value()) << "GATED_DELTANET selection found no candidate";
+        EXPECT_EQ(gd.candidate->to_string(), winners.at("GATED_DELTANET"));
     }
 
     // --list: the same key finds both winners at §56 step 1 (exact).
