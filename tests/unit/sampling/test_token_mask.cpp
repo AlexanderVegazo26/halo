@@ -212,7 +212,7 @@ TEST(TokenMask, SyntheticVocabMatchesReferenceScanOnRandomWalks) {
         // An unsatisfiable optional property: its key must never be offered, because no
         // value could follow it (exercises the productive-rule pruning).
         Grammar::from_json_schema(R"({"type":"object","properties":{"a":{"type":"array","minItems":3,"maxItems":1},"b":{"type":"integer"}},"additionalProperties":false})")};
-    std::mt19937_64 rng(31);
+    std::mt19937_64 rng(31);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     WalkStats st;
     for (const auto& g : grammars) {
         for (int run = 0; run < 40; ++run) (void)checked_walk(g, sv.vocab, sv.eos, rng, 40, 8, st);
@@ -316,7 +316,7 @@ TEST(StructuredSampler, SyntheticIntegrationAndErrors) {
     const std::vector<float> lg{3.0f, 2.0f};
     EXPECT_FALSE(s.try_sample(CandidateSet{ids, lg}, {}).has_value());
     EXPECT_EQ(code_of([&] { (void)s.sample(CandidateSet{ids, lg}, {}); }), ErrorCode::Api);
-    std::mt19937 g(3);
+    std::mt19937 g(3);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<float> row(n + 7);
     for (auto& x : row) x = nd(g);
@@ -356,6 +356,8 @@ struct Real {
     std::string why;
 };
 
+// Tests guard it with `const auto& r = real(); if (!r.tok) GTEST_SKIP()`: the check on the local
+// reference is what lets bugprone-unchecked-optional-access see r.tok as engaged afterwards.
 const Real& real() {
     static const Real r = [] {
         Real x;
@@ -372,14 +374,9 @@ const Real& real() {
     return r;
 }
 
-#define REQUIRE_REAL_VOCAB()                                       \
-    do {                                                           \
-        if (!real().tok) GTEST_SKIP() << "real vocab: " << real().why; \
-    } while (0)
-
 TEST(TokenMaskReal, VocabularyFacts) {
-    REQUIRE_REAL_VOCAB();
     const auto& r = real();
+    if (!r.tok) GTEST_SKIP() << "real vocab: " << r.why;
     EXPECT_EQ(r.tok->vocab_size(), 248077U);
     EXPECT_EQ(r.vocab->vocab_size(), 248077U);
     EXPECT_EQ(r.tok->token_to_piece(r.eos), "<|im_end|>");
@@ -394,18 +391,18 @@ TEST(TokenMaskReal, VocabularyFacts) {
     }
     EXPECT_EQ(included, 248044U);
     const auto think = r.tok->piece_to_id("<think>");
-    ASSERT_TRUE(think.has_value());
+    if (!think) GTEST_FAIL() << "<think> should be a token of the real vocabulary";
     EXPECT_FALSE(r.vocab->included(*think));
 }
 
 TEST(TokenMaskReal, MaskEqualsReferenceScanAndNeverAllowsDeadEnds) {
-    REQUIRE_REAL_VOCAB();
     const auto& r = real();
+    if (!r.tok) GTEST_SKIP() << "real vocab: " << r.why;
     const std::vector<std::string> schemas{
         R"({"type":"object","properties":{"name":{"type":"string","maxLength":10},"age":{"type":"integer"},"tags":{"type":"array","items":{"enum":["a","bé","日本"]},"maxItems":3}},"required":["name"],"additionalProperties":false})",
         R"({"type":"object","properties":{"id":{"type":"string","pattern":"^[A-Z]{2}-\\d{3}$"},"ok":{"type":"boolean"}},"required":["id","ok"]})",
         R"({"anyOf":[{"type":"null"},{"type":"array","items":{"type":"number"},"minItems":1,"maxItems":4}]})"};
-    std::mt19937_64 rng(99);
+    std::mt19937_64 rng(99);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     WalkStats st;
     for (const auto& text : schemas) {
         const auto g = Grammar::from_json_schema(text);
@@ -420,8 +417,8 @@ TEST(TokenMaskReal, MaskEqualsReferenceScanAndNeverAllowsDeadEnds) {
 }
 
 TEST(TokenMaskReal, EosAllowedExactlyWhenCompleteAlongTokenizedDocuments) {
-    REQUIRE_REAL_VOCAB();
     const auto& r = real();
+    if (!r.tok) GTEST_SKIP() << "real vocab: " << r.why;
     struct Case {
         Grammar g;
         std::string doc;
@@ -455,8 +452,8 @@ TEST(TokenMaskReal, EosAllowedExactlyWhenCompleteAlongTokenizedDocuments) {
 }
 
 TEST(StructuredSamplerReal, RandomSchemaRunsAlwaysProduceValidJson) {
-    REQUIRE_REAL_VOCAB();
     const auto& r = real();
+    if (!r.tok) GTEST_SKIP() << "real vocab: " << r.why;
     // Bounded schemas (every string has a length bound, enum or pattern), so random logits
     // terminate; EOS gets a boost so it wins once it becomes allowed.
     const std::vector<std::string> schemas{
@@ -468,7 +465,7 @@ TEST(StructuredSamplerReal, RandomSchemaRunsAlwaysProduceValidJson) {
         R"({"enum":["日本語","é","naïve","😀x",1.5,null,{"k":[true]}]})",
         R"({"type":"string","minLength":1,"maxLength":6})"};
     constexpr int kRunsPerSchema = 30;
-    std::mt19937 g(2026);
+    std::mt19937 g(2026);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<float> nd(0.0f, 2.0f);
     std::vector<std::vector<float>> base(4, std::vector<float>(kPaddedVocab));
     for (auto& b : base) {
