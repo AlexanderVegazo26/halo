@@ -52,12 +52,14 @@ Sampler make(const SamplingParams& p, std::size_t vocab) {
 
 std::vector<chain::Cand> cands_of(const std::vector<double>& logits) {
     std::vector<chain::Cand> c;
+    c.reserve(logits.size());
     for (std::size_t i = 0; i < logits.size(); ++i) c.push_back({static_cast<std::int32_t>(i), logits[i]});
     return c;
 }
 
-std::vector<std::int32_t> ids_of(std::vector<chain::Cand> c) {
+std::vector<std::int32_t> ids_of(const std::vector<chain::Cand>& c) {
     std::vector<std::int32_t> ids;
+    ids.reserve(c.size());
     for (const auto& x : c) ids.push_back(x.id);
     std::sort(ids.begin(), ids.end());
     return ids;
@@ -376,12 +378,13 @@ TEST(SamplerPenalties, AppliedThroughSamplerOverHistoryWindow) {
 }
 
 TEST(SamplerFilters, TopKMatchesReference) {
-    std::mt19937_64 rng(11);
+    std::mt19937_64 rng(11);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<double> nd(0.0, 2.0);
     for (int trial = 0; trial < 200; ++trial) {
         std::vector<double> lg(50);
         for (auto& x : lg) x = std::round(nd(rng) * 4) / 4;  // many ties
         std::vector<Ref> r;
+        r.reserve(lg.size());
         for (std::size_t i = 0; i < lg.size(); ++i) r.push_back({static_cast<std::int32_t>(i), lg[i]});
         for (const int k : {0, 1, 3, 17, 49, 50, 51, 1000}) {
             auto c = cands_of(lg);
@@ -395,12 +398,13 @@ TEST(SamplerFilters, TopKMatchesReference) {
 }
 
 TEST(SamplerFilters, TopPMatchesReferenceIncludingEdges) {
-    std::mt19937_64 rng(12);
+    std::mt19937_64 rng(12);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<double> nd(0.0, 1.5);
     for (int trial = 0; trial < 200; ++trial) {
         std::vector<double> lg(40);
         for (auto& x : lg) x = std::round(nd(rng) * 8) / 8;
         std::vector<Ref> r;
+        r.reserve(lg.size());
         for (std::size_t i = 0; i < lg.size(); ++i) r.push_back({static_cast<std::int32_t>(i), lg[i]});
         for (const float p : {0.0f, 0.05f, 0.5f, 0.9f, 0.999f, 1.0f}) {
             auto c = cands_of(lg);
@@ -442,12 +446,13 @@ TEST(SamplerDraw, InverseCdfInIdOrderIndependentOfInputOrder) {
 }
 
 TEST(SamplerFilters, MinPMatchesReferenceIncludingEdges) {
-    std::mt19937_64 rng(13);
+    std::mt19937_64 rng(13);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<double> nd(0.0, 1.5);
     for (int trial = 0; trial < 200; ++trial) {
         std::vector<double> lg(40);
         for (auto& x : lg) x = nd(rng);
         std::vector<Ref> r;
+        r.reserve(lg.size());
         for (std::size_t i = 0; i < lg.size(); ++i) r.push_back({static_cast<std::int32_t>(i), lg[i]});
         for (const float p : {0.0f, 0.01f, 0.2f, 0.7f, 1.0f}) {
             auto c = cands_of(lg);
@@ -463,12 +468,13 @@ TEST(SamplerFilters, MinPMatchesReferenceIncludingEdges) {
 }
 
 TEST(SamplerFilters, TypicalMatchesReference) {
-    std::mt19937_64 rng(14);
+    std::mt19937_64 rng(14);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<double> nd(0.0, 1.5);
     for (int trial = 0; trial < 200; ++trial) {
         std::vector<double> lg(30);
         for (auto& x : lg) x = nd(rng);
         std::vector<Ref> r;
+        r.reserve(lg.size());
         for (std::size_t i = 0; i < lg.size(); ++i) r.push_back({static_cast<std::int32_t>(i), lg[i]});
         for (const float p : {0.0f, 0.2f, 0.5f, 0.95f, 1.0f}) {
             auto c = cands_of(lg);
@@ -530,7 +536,7 @@ TEST(SamplerDeterminism, SeedResetAndOrderIndependence) {
     SamplingParams p;
     p.seed = 42;
     p.top_p = 0.95f;
-    std::mt19937 g(5);
+    std::mt19937 g(5);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<float> nd(0.0f, 2.0f);
     std::vector<std::vector<float>> rows(300, std::vector<float>(64));
     for (auto& r : rows) {
@@ -548,6 +554,7 @@ TEST(SamplerDeterminism, SeedResetAndOrderIndependence) {
     p.seed = 43;
     auto c = make(p, 64);
     std::vector<std::int32_t> td;
+    td.reserve(rows.size());
     for (const auto& r : rows) td.push_back(c.sample(r, {}));
     EXPECT_NE(ta, td);
     EXPECT_EQ(a.seed(), 42U);
@@ -561,6 +568,7 @@ TEST(SamplerDeterminism, SeedResetAndOrderIndependence) {
         std::vector<std::int32_t> perm = ids;
         std::shuffle(perm.begin(), perm.end(), g);
         std::vector<float> lg;
+        lg.reserve(perm.size());
         for (const auto id : perm) lg.push_back(r[static_cast<std::size_t>(id)]);
         ASSERT_EQ(e.sample(r, {}), f.sample(CandidateSet{perm, lg}, {}));
     }
@@ -596,7 +604,7 @@ TEST(SamplerPrefilter, ExactPrefilterOkTruthTable) {
 
 TEST(SamplerPrefilter, PrefilteredEqualsFullRowWheneverExact) {
     constexpr std::size_t kVocab = 5000;
-    std::mt19937 g(77);
+    std::mt19937 g(77);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<float> nd(0.0f, 3.0f);
     const std::vector<SamplingParams> configs = [] {
         std::vector<SamplingParams> v;
