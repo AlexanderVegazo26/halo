@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -617,7 +618,8 @@ TEST(TemplateLimitsUnit, DefaultsLeaveHeadroomOverRealTemplates) {
 namespace {
 
 // Runs fn on a thread whose stack we own and pre-paint, and returns the peak number of
-// stack bytes it touched ("stack painting").
+// stack bytes it touched ("stack painting"). An exception escaping fn is rethrown here after
+// the join (it can't leave the pthread), so the test fails with it instead of passing over it.
 std::size_t peak_stack_bytes(std::size_t stack_bytes, const std::function<void()>& fn) {
     std::vector<unsigned char> stack(stack_bytes, 0xA5);
     pthread_attr_t attr;
@@ -625,14 +627,17 @@ std::size_t peak_stack_bytes(std::size_t stack_bytes, const std::function<void()
     pthread_attr_setstack(&attr, stack.data(), stack.size());
     struct Job {
         const std::function<void()>* fn;
-    } job{&fn};
+        std::exception_ptr error;
+    } job{&fn, nullptr};
     pthread_t th{};
     const int rc = pthread_create(
         &th, &attr,
         [](void* p) -> void* {
+            auto* j = static_cast<Job*>(p);
             try {
-                (*static_cast<Job*>(p)->fn)();
+                (*j->fn)();
             } catch (...) {
+                j->error = std::current_exception();
             }
             return nullptr;
         },
@@ -640,6 +645,7 @@ std::size_t peak_stack_bytes(std::size_t stack_bytes, const std::function<void()
     pthread_attr_destroy(&attr);
     if (rc != 0) return SIZE_MAX;
     pthread_join(th, nullptr);
+    if (job.error) std::rethrow_exception(job.error);
     std::size_t untouched = 0;  // the stack grows down from the end of the buffer
     while (untouched < stack.size() && stack[untouched] == 0xA5) ++untouched;
     return stack.size() - untouched;

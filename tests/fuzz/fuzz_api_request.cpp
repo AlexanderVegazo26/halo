@@ -43,7 +43,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         const auto p = halo::api::build_chat_prompt(env.eng->tokenizer(), env.sp, env.eng->chat_template(),
                                                     job.messages, job.tools, job.render);
         if (p.tokens.empty()) HALO_FUZZ_FAIL("accepted request rendered an empty prompt");
-    } catch (const halo::api::RequestError&) {
+    } catch (const halo::api::RequestError&) {  // NOLINT(bugprone-empty-catch): the fuzz oracle's pass case
         // client error (400-class): expected
     } catch (const halo::Error& e) {
         if (e.code() != halo::ErrorCode::Api) HALO_FUZZ_FAIL("halo::Error with a non-Api code: %s", e.what());

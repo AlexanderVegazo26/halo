@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,20 @@ namespace {
 std::string env(const char* k, const char* def = "") {
     const char* v = std::getenv(k);
     return v != nullptr ? v : def;
+}
+
+// Strict integer from the environment: a typo in a test's HALO_FAKE_* value must not turn
+// into 0 silently (atoi), so anything but a whole decimal int exits 98 with a message.
+int env_int(const char* k, const char* def) {
+    const std::string s = env(k, def);
+    errno = 0;
+    char* end = nullptr;
+    const long v = std::strtol(s.c_str(), &end, 10);
+    if (s.empty() || end != s.c_str() + s.size() || errno == ERANGE || v < INT32_MIN || v > INT32_MAX) {
+        std::cerr << "child_helper: " << k << "='" << s << "' is not an integer\n";
+        std::exit(98);
+    }
+    return static_cast<int>(v);
 }
 
 void write_all(int fd, const char* p, std::size_t n) {
@@ -58,7 +73,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    if (mode == "exit") return std::atoi(env("HALO_FAKE_CODE", "0").c_str());
+    if (mode == "exit") return env_int("HALO_FAKE_CODE", "0");
     if (mode == "ignore_term") {
         ::signal(SIGTERM, SIG_IGN);
         ::sleep(60);
@@ -94,7 +109,7 @@ int main(int argc, char** argv) {
         std::stringstream ss;
         ss << in.rdbuf();
         const std::string body = ss.str();
-        const int port = std::atoi(env("HALO_FAKE_PORT", "0").c_str());
+        const int port = env_int("HALO_FAKE_PORT", "0");
         const pid_t g = ::fork();
         if (g == 0) {
             ::alarm(30);  // never outlive a test, even if a mutation breaks the group kill
@@ -150,7 +165,7 @@ int main(int argc, char** argv) {
         ss << in.rdbuf();
         std::cout << ss.str();
         std::cout.flush();
-        return std::atoi(env("HALO_FAKE_CODE", "0").c_str());
+        return env_int("HALO_FAKE_CODE", "0");
     }
     std::cerr << "child_helper: unknown HALO_FAKE_MODE '" << mode << "'\n";
     return 99;

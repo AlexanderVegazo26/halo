@@ -12,8 +12,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <stdexcept>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -34,15 +38,21 @@ std::filesystem::path bin_dir() {
 
 std::filesystem::path tiny_model() { return std::filesystem::path(HALO_REF_DIR) / "tiny" / "tiny-q8_0.gguf"; }
 
+// An ephemeral loopback port. Throws (gtest reports it as the test's failure) instead of
+// handing back port 0 or a garbage port when the socket calls fail.
 std::uint16_t free_port() {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) throw std::runtime_error(std::string("free_port: socket: ") + std::strerror(errno));
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
     socklen_t len = sizeof(a);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0 &&
+                    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len) == 0;
+    const int err = errno;
     ::close(fd);
+    if (!ok) throw std::runtime_error(std::string("free_port: bind/getsockname: ") + std::strerror(err));
+    if (a.sin_port == 0) throw std::runtime_error("free_port: the kernel assigned port 0");
     return ntohs(a.sin_port);
 }
 

@@ -283,16 +283,14 @@ runtime::GenerateResult FakeEngine::generate(const runtime::GenerateRequest& req
         r.finish = runtime::FinishReason::Cancelled;
         return r;
     }
-    if (hit_length) {
-        r.finish = runtime::FinishReason::Length;
-    } else if (s.eos && r.tokens.size() < req.max_tokens) {
+    if (s.eos && !hit_length && r.tokens.size() < req.max_tokens) {
         const std::int32_t eos = tok_->eos().value_or(0);
         r.tokens.push_back(eos);
         if (!emit(runtime::TokenEvent{.token = eos, .piece = "", .is_eos = true})) {
             r.finish = runtime::FinishReason::Cancelled;
             return r;
         }
-    } else if (!s.eos) {
+    } else if (hit_length || !s.eos) {
         r.finish = runtime::FinishReason::Length;
     }
     if (s.finish) {

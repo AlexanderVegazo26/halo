@@ -454,6 +454,7 @@ TEST(OutputParser, InvalidUtf8InToolArgumentsBecomesOneReplacementPerMaximalSubp
 TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
     const std::string outputs[] = {
         "Reason A\nmore\n</think>\n\nAnswer with <b>markup</b> and a < sign.",
+        // NOLINTNEXTLINE(bugprone-suspicious-missing-comma): one output with two tool calls, split over lines
         "  plan \n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n"
         "</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBergen\n</parameter>\n</function>\n"
         "</tool_call>",

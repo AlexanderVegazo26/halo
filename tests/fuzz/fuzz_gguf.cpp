@@ -22,7 +22,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             GgufFile f = GgufFile::parse(std::vector<std::byte>(first, first + size), mode, "fuzz");
             halo::model::NormalizedModel m = halo::model::NormalizedModel::from_gguf(std::move(f));
             (void)m.tokenizer();
-        } catch (const halo::Error&) {
+        } catch (const halo::Error&) {  // NOLINT(bugprone-empty-catch): the fuzz oracle's pass case
             // typed rejection: the expected outcome for most inputs
         } catch (const std::exception& e) {
             HALO_FUZZ_FAIL("non-halo exception (mode %s): %s", mode == GgufMode::Full ? "Full" : "HeaderOnly",
