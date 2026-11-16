@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -48,6 +51,16 @@ halo::profiling::SuiteArtifact artifact(const std::string& backend, double tg_sc
     return a;
 }
 
+/// A missing metric reads as NaN, so EXPECT_DOUBLE_EQ fails readably instead of dereferencing
+/// an empty optional.
+double value(const std::optional<double>& v) { return v.value_or(std::numeric_limits<double>::quiet_NaN()); }
+
+/// decode_tps of the latest tiny-q8_0 tg8 baseline for `backend`; NaN when none is stored.
+double latest_tg8_decode_tps(const ProfileDb& db, const std::string& backend) {
+    const auto r = db.latest_run("baseline", backend, "tiny-q8_0", 8, "tg8");
+    return r ? value(r->decode_tps) : std::numeric_limits<double>::quiet_NaN();
+}
+
 }  // namespace
 
 TEST(BaselineStore, StoresMedianAggregatesQueryableAsLatest) {
@@ -55,23 +68,22 @@ TEST(BaselineStore, StoresMedianAggregatesQueryableAsLatest) {
     ProfileDb db = ProfileDb::open(t.path());
     EXPECT_EQ(store_baseline(db, artifact("vulkan")), 2u);  // pp16 + tg8 aggregates
     EXPECT_EQ(db.count("benchmark_run"), 2);
-    auto tg = db.latest_run("baseline", "vulkan", "tiny-q8_0", 8, "tg8");
-    ASSERT_TRUE(tg);
+    const auto tg = db.latest_run("baseline", "vulkan", "tiny-q8_0", 8, "tg8");
+    if (!tg) GTEST_FAIL() << "no vulkan tiny-q8_0 tg8 baseline stored";
     // Samples 167.092, 144.574, 167.092 -> median 167.092 (the last sample would be too).
-    EXPECT_DOUBLE_EQ(*tg->decode_tps, 167.092);
+    EXPECT_DOUBLE_EQ(value(tg->decode_tps), 167.092);
     EXPECT_EQ(tg->extra.at("aggregate").at("n"), 3);
     EXPECT_EQ(tg->engine, "llama-bench");
     const auto pp = db.latest_run("baseline", "vulkan", "tiny-q8_0", 16, "pp16");
-    ASSERT_TRUE(pp);
-    EXPECT_DOUBLE_EQ(*pp->prompt_tps, 1578.73);
+    if (!pp) GTEST_FAIL() << "no vulkan tiny-q8_0 pp16 baseline stored";
+    EXPECT_DOUBLE_EQ(value(pp->prompt_tps), 1578.73);
 
     // A newer run of the same configuration becomes the latest; other backends are separate.
     EXPECT_EQ(store_baseline(db, artifact("vulkan", 2.0)), 2u);
-    tg = db.latest_run("baseline", "vulkan", "tiny-q8_0", 8, "tg8");
-    EXPECT_DOUBLE_EQ(*tg->decode_tps, 2 * 167.092);
+    EXPECT_DOUBLE_EQ(latest_tg8_decode_tps(db, "vulkan"), 2 * 167.092) << "the newer vulkan run should be the latest";
     EXPECT_EQ(store_baseline(db, artifact("hip")), 2u);
-    EXPECT_DOUBLE_EQ(*db.latest_run("baseline", "hip", "tiny-q8_0", 8, "tg8")->decode_tps, 167.092);
-    EXPECT_DOUBLE_EQ(*db.latest_run("baseline", "vulkan", "tiny-q8_0", 8, "tg8")->decode_tps, 2 * 167.092);
+    EXPECT_DOUBLE_EQ(latest_tg8_decode_tps(db, "hip"), 167.092) << "hip is a separate configuration";
+    EXPECT_DOUBLE_EQ(latest_tg8_decode_tps(db, "vulkan"), 2 * 167.092) << "storing hip must not replace vulkan";
     EXPECT_FALSE(db.latest_run("baseline", "vulkan", "tiny-q8_0", 4096, "tg8"));
 }
 
@@ -91,7 +103,7 @@ TEST(BaselineStore, RefusesInvalidArtifactsUnlessAllowed) {
     EXPECT_EQ(db.count("benchmark_run"), 0);
     EXPECT_EQ(store_baseline(db, a, /*allow_invalid=*/true), 2u);
     const auto r = db.latest_run("baseline", "vulkan", "tiny-q8_0", 8, "tg8");
-    ASSERT_TRUE(r);
+    if (!r) GTEST_FAIL() << "the invalid artifact stored with allow_invalid has no tg8 row";
     EXPECT_FALSE(r->extra.at("aggregate").at("artifact_valid").get<bool>());  // marked, not hidden
     a.suite = "micro";
     test::expect_error(ErrorCode::Config, [&] { (void)store_baseline(db, a, true); });
