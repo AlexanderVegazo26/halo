@@ -59,6 +59,7 @@ EngineConfig base_cfg() {
     c.max_sequences = 4;
     c.mtp_max_draft = 2;
     c.prefix_cache = false;
+    c.backend = "cpu";  // the CPU reference engine (EngineConfig defaults to the GPU)
     return c;
 }
 

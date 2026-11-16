@@ -47,6 +47,7 @@ EngineConfig cfg(std::size_t seqs = 4) {
     c.max_sequences = seqs;
     c.mtp_max_draft = 2;
     c.prefix_cache = false;
+    c.backend = "cpu";  // the CPU reference engine (EngineConfig defaults to the GPU)
     return c;
 }
 

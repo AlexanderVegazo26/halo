@@ -198,6 +198,7 @@ std::unique_ptr<halo::runtime::Engine> make_engine(const std::filesystem::path& 
                                                    const halo::runtime::CpuEngineOptions& opts = {},
                                                    std::size_t max_sequences = 1) {
     EngineConfig c;
+    c.backend = "cpu";  // CPU reference budgets (EngineConfig defaults to the GPU)
     c.model_path = path.string();
     c.max_context = kMaxContext;
     c.max_context_explicit = true;
@@ -836,6 +837,7 @@ protected:
     // One greedy request on a fresh MTP engine (gate Always: no profit measurement in the way).
     static Run run(std::size_t max_tokens, std::optional<std::size_t> mtp_kv_blocks = std::nullopt) {
         EngineConfig c;
+        c.backend = "cpu";  // CPU reference budgets (EngineConfig defaults to the GPU)
         c.model_path = path_.string();
         c.max_context = kMaxContext;
         c.max_context_explicit = true;
@@ -969,6 +971,7 @@ protected:
         const std::int32_t cancel_token =
             plan.cancel.empty() ? std::int32_t{-1} : kEchoFirst + static_cast<std::int32_t>(plan.cancel.front());
         EngineConfig c;
+        c.backend = "cpu";  // CPU reference budgets (EngineConfig defaults to the GPU)
         c.model_path = path_.string();
         c.max_context = kMaxContext;
         c.max_context_explicit = true;
@@ -1220,6 +1223,7 @@ protected:
     // little more, so blocks the cancelled request kept would starve the next one.
     static Pair run(bool prefix_cache, std::int32_t next_token, std::optional<std::size_t> mtp_kv_blocks) {
         EngineConfig c;
+        c.backend = "cpu";  // CPU reference budgets (EngineConfig defaults to the GPU)
         c.model_path = path_.string();
         c.max_context = kMaxContext;
         c.max_context_explicit = true;
@@ -1452,4 +1456,12 @@ TEST_F(EngineBackendName, AutoIsReportedAsTheBackendItResolvedTo) {
     o.backend_factory = [] { return halo::backend::make_cpu_backend(nullptr); };
     const auto e = halo::runtime::create_cpu_engine(c, o);
     EXPECT_EQ(e->model().backend, "cpu") << "backend 'auto' with a test backend_factory resolves to 'cpu'";
+}
+
+TEST(EngineConfigDefaults, BackendDefaultsToAutoSoLibraryCallersNeverGetTheCpuEngineSilently) {
+    // halo runs the model on the GPU only: a library caller that only sets model_path must get
+    // "auto" (= vulkan, or an error when there is no GPU), never the CPU reference engine.
+    const EngineConfig c;
+    EXPECT_EQ(c.backend, "auto") << "EngineConfig{}.backend should be 'auto' (GPU only); 'cpu' must be asked for "
+                                    "explicitly";
 }

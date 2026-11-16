@@ -89,6 +89,7 @@ EngineConfig cfg(const fs::path& model) {
     c.max_sequences = 1;
     c.mtp_max_draft = 3;
     c.prefix_cache = false;  // every request computes from scratch (no cross-request state)
+    c.backend = "cpu";       // the CPU reference engine (EngineConfig defaults to the GPU)
     return c;
 }
 

@@ -24,7 +24,10 @@ namespace halo::runtime {
 struct EngineConfig {
     std::string model_path;                 // GGUF (trunk; may embed MTP)
     std::optional<std::string> mtp_path;    // separate MTP GGUF (D-006)
-    std::string backend = "cpu";            // cpu | vulkan | hip | auto
+    /// auto | vulkan | hip | cpu. Default "auto" = vulkan: halo runs the model on the GPU only, and
+    /// "auto" is an error (never a CPU fallback) when no Vulkan backend/device is there. "cpu" is the
+    /// differential-test reference engine and must be asked for explicitly.
+    std::string backend = "auto";
     std::size_t max_context = 32768;
     /// True when the caller asked for max_context (--ctx / HALO_CTX / config file), false for
     /// the built-in default. An explicit value that cannot be honoured (larger than the model's
