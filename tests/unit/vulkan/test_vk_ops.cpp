@@ -25,6 +25,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -121,9 +122,10 @@ hv::test::ErrorStats run_matvec(const std::shared_ptr<hv::Context>& ctx, hv::Ops
     ops.matvec(s, dtype_of(t), bw, bx, by, rows, cols);
     const auto t1 = s.timestamp();
     s.submit_and_wait();
-    if (print_timing && t0 && t1) {
+    const std::optional<double> ns = (print_timing && t0 && t1) ? s.elapsed_ns(*t0, *t1) : std::nullopt;
+    if (ns) {
         std::cout << "[vk-timing] matvec_" << name_of(t) << " " << rows << "x" << cols << ": "
-                  << *s.elapsed_ns(*t0, *t1) / 1e6 << " ms — " << timing_label(*ctx) << "\n";
+                  << *ns / 1e6 << " ms — " << timing_label(*ctx) << "\n";
     }
     const std::vector<float> y = download<float>(by, rows);
     const double f = sum_bound_factor(cols, ops.options().reduce_workgroup) + sum_bound_factor(cols, k_cpu_lanes);
@@ -299,7 +301,7 @@ TEST(VkRef, TensorDequantMatchesHandBuiltGgmlBlocks) {
     const auto dir = std::getenv("HALO_VK_DUMP_DIR");  // NOLINT(concurrency-mt-unsafe)
     if (dir == nullptr) return;
     for (const ref::WType t : {ref::WType::Q8_0, ref::WType::Q4_K, ref::WType::Q6_K}) {
-        std::mt19937 rng(2024);
+        std::mt19937 rng(2024);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
         const ref::Weights w = ref::random_weights(t, 16, 1024, rng);
         const std::size_t raw = 16 * 1024 / ref::block_elems(t) * ref::block_bytes(t);
         std::ofstream(std::string(dir) + "/" + name_of(t) + ".blocks", std::ios::binary)
@@ -526,9 +528,10 @@ namespace {
 void gdn_multi_row(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, std::uint32_t T, std::uint32_t K,
                    const std::string& label, const hv::OpsOptions& opt = {}) {
     hv::Ops ops(ctx, opt);
-    std::mt19937 rng(9000 + T * 10 + K);
+    std::mt19937 rng(9000 + T * 10 + K);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const auto s0 = random_state(d, rng);
     std::vector<GdnRow> rows;
+    rows.reserve(T);
     for (std::uint32_t t = 0; t < T; ++t) rows.push_back(gdn_row(d, rng));
     const GdnRow all = concat(rows);
 
@@ -620,7 +623,7 @@ TEST(VkGdn, SameBufferDisjointRegionsAndInPlaceAgree) {
     const GdnDims d{6, 2, 16, 8};
     const std::size_t S = d.state_elems();
     hv::Ops ops(ctx);
-    std::mt19937 rng(5);
+    std::mt19937 rng(5);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const auto s0 = random_state(d, rng);
     const GdnRow r = gdn_row(d, rng);
     std::vector<double> s_ref(s0.begin(), s0.end());
@@ -669,7 +672,7 @@ TEST(VkGdn, StateRegionsBeyondMaxStorageBufferRange) {
     std::cout << "[vk-gdn] arena " << total * 4 << " B, maxStorageBufferRange "
               << ctx->info().max_storage_buffer_range << " B, input region at byte " << base * 4 << "\n";
     hv::Ops ops(ctx);
-    std::mt19937 rng(8);
+    std::mt19937 rng(8);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const auto s0 = random_state(d, rng);
     const std::vector<GdnRow> rows{gdn_row(d, rng), gdn_row(d, rng)};
     std::vector<double> s_ref(s0.begin(), s0.end());
@@ -713,7 +716,7 @@ TEST(VkGdn, ValidatesRegionsAndSizes) {
     const GdnDims d{6, 2, 16, 8};
     const std::size_t S = d.state_elems();
     hv::Ops ops(ctx);
-    std::mt19937 rng(1);
+    std::mt19937 rng(1);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const GdnRow r = concat({gdn_row(d, rng), gdn_row(d, rng)});
     GdnBuffers b = gdn_upload(ctx, r, 2 * std::size_t{d.n_v} * d.d_v);
     hv::Buffer state = hv::Buffer::create(ctx, 3 * S * 4, hv::MemoryUsage::DeviceLocal);
@@ -771,9 +774,11 @@ void gdn_ring_case(const std::shared_ptr<hv::Context>& ctx, const GdnDims& d, st
                    std::uint32_t P, std::uint32_t live, bool chunked, const std::string& label,
                    const hv::OpsOptions& opt = {}) {
     hv::Ops ops(ctx, opt);
+    // NOLINTNEXTLINE(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::mt19937 rng(31000 + T * 100 + K * 10 + P + live + chunked);
     const auto s0 = random_state(d, rng);
     std::vector<GdnRow> rows;
+    rows.reserve(T);
     for (std::uint32_t t = 0; t < T; ++t) rows.push_back(gdn_row(d, rng));
     const GdnRow all = concat(rows);
     const std::size_t S = d.state_elems();
@@ -877,7 +882,7 @@ TEST(VkGdn, RingValidation) {
     const GdnDims d{6, 2, 16, 8};
     const std::size_t S = d.state_elems();
     hv::Ops ops(ctx);
-    std::mt19937 rng(3);
+    std::mt19937 rng(3);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const GdnRow r = concat({gdn_row(d, rng), gdn_row(d, rng)});
     GdnBuffers b = gdn_upload(ctx, r, 2 * std::size_t{d.n_v} * d.d_v);
     hv::Buffer slab = hv::Buffer::create(ctx, 3 * S * 4, hv::MemoryUsage::DeviceLocal);
@@ -923,8 +928,9 @@ std::array<std::uint32_t, 3> gpu_argmax_words(const std::shared_ptr<hv::Context>
     ops.argmax(s, bx, static_cast<std::uint32_t>(x.size()), scratch, result);
     const auto t1 = s.timestamp();
     s.submit_and_wait();
-    if (print_timing && t0 && t1) {
-        std::cout << "[vk-timing] argmax n=" << x.size() << ": " << *s.elapsed_ns(*t0, *t1) / 1e6 << " ms — "
+    const std::optional<double> ns = (print_timing && t0 && t1) ? s.elapsed_ns(*t0, *t1) : std::nullopt;
+    if (ns) {
+        std::cout << "[vk-timing] argmax n=" << x.size() << ": " << *ns / 1e6 << " ms — "
                   << timing_label(*ctx) << "\n";
     }
     std::array<std::uint32_t, 3> w{};
@@ -961,7 +967,7 @@ TEST(VkArgmax, VocabSizedRowMatchesCpuExactly) {
         EXPECT_EQ(v, hc::argmax(x).value);
 
         const float big = 1000.0f;
-        auto check_at = [&](std::vector<std::uint32_t> at, std::uint32_t expect, const char* what) {
+        auto check_at = [&](const std::vector<std::uint32_t>& at, std::uint32_t expect, const char* what) {
             auto y = x;
             for (auto i : at) y[i] = big;
             EXPECT_EQ(cpu_argmax(y), expect) << what << " (halo::cpu)";
@@ -1098,7 +1104,7 @@ TEST(VkOps, ChainedNormMatvecArgmaxInOneSubmission) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t cols = 1024, rows = 3000;
-    std::mt19937 rng(31);
+    std::mt19937 rng(31);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const auto x = ref::random_vec(cols, rng);
     const auto nw = ref::random_vec(cols, rng);
     const ref::Weights w = ref::random_weights(ref::WType::Q8_0, rows, cols, rng, 14);
@@ -1182,6 +1188,7 @@ GdnDecodeResult gdn_decode_once(const std::shared_ptr<hv::Context>& ctx, const G
     std::mt19937 rng(seed);
     const auto s0 = random_state(d, rng);
     std::vector<GdnRow> rows;
+    rows.reserve(T);
     for (std::uint32_t t = 0; t < T; ++t) rows.push_back(gdn_row(d, rng, k_slow_decay));
     const GdnRow all = concat(rows);
     const std::size_t S = d.state_elems();
