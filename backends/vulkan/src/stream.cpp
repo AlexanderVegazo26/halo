@@ -16,9 +16,8 @@ namespace halo::vulkan {
 
 namespace {
 constexpr std::uint32_t k_sets_per_pool = 256;
-constexpr std::uint32_t k_descriptors_per_pool = 256 * 16;
-// Most buffer bindings one dispatch may have (descriptors per pool / sets per pool).
-constexpr std::size_t kMaxBindings = k_descriptors_per_pool / k_sets_per_pool;
+// The pools hold Context::kMaxBindings (the most buffers one dispatch may bind) descriptors per set.
+constexpr std::uint32_t k_descriptors_per_pool = k_sets_per_pool * Context::kMaxBindings;
 // See Stream::dispatch: command buffers are capped at this many dispatches.
 constexpr std::uint32_t kMaxDispatchesPerSubmit = 512;
 }  // namespace
@@ -164,10 +163,8 @@ void Stream::barrier_for(std::span<const BufferBinding> buffers, std::uint64_t w
     for (std::size_t i = 0; i < buffers.size(); ++i) mark_touched(buffers[i].buffer, (write_mask >> i) & 1);
 }
 
-VkDescriptorSet Stream::allocate_set(VkDescriptorSetLayout layout, std::uint32_t num_buffers) {
-    HALO_CHECK(num_buffers <= k_descriptors_per_pool / k_sets_per_pool, ErrorCode::Kernel,
-               "kernel uses {} buffers; stream pools support at most {}", num_buffers,
-               k_descriptors_per_pool / k_sets_per_pool);
+VkDescriptorSet Stream::allocate_set(VkDescriptorSetLayout layout) {
+    // dispatch() has checked the kernel's binding count against Context::kMaxBindings (the pools' sizing).
     const VkDevice dev = ctx_->device();
     while (true) {
         if (current_pool_ == desc_pools_.size()) {
@@ -224,9 +221,9 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
     }
     // Fixed-size scratch instead of per-dispatch heap vectors (the bound is also what the
     // descriptor pools are sized for, see allocate_set).
-    HALO_CHECK(buffers.size() <= kMaxBindings, ErrorCode::Kernel, "kernel {}: {} buffers bound, stream supports at most {}",
-               name, buffers.size(), kMaxBindings);
-    std::array<VkDescriptorBufferInfo, kMaxBindings> infos;
+    HALO_CHECK(buffers.size() <= Context::kMaxBindings, ErrorCode::Kernel,
+               "kernel {}: {} buffers bound, stream supports at most {}", name, buffers.size(), Context::kMaxBindings);
+    std::array<VkDescriptorBufferInfo, Context::kMaxBindings> infos;
     for (std::size_t i = 0; i < buffers.size(); ++i) {
         const BufferBinding& b = buffers[i];
         HALO_CHECK(b.buffer != nullptr && b.buffer->valid(), ErrorCode::Kernel,
@@ -247,8 +244,12 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
     }
 
     ensure_recording();
-    const VkDescriptorSet set = allocate_set(kernel.set_layout(), d.num_buffers);
-    std::array<VkWriteDescriptorSet, kMaxBindings> writes{};  // zero-init: pNext/pImageInfo/... stay null
+    // Push descriptors (ContextOptions::push_descriptors): the writes go into the command buffer at
+    // bind time (dstSet is ignored), so no set is allocated from the pools or written here.
+    const PFN_vkCmdPushDescriptorSetKHR push_set = ctx_->push_descriptor_fn();
+    const VkDescriptorSet set =
+        push_set != nullptr ? VK_NULL_HANDLE : allocate_set(kernel.set_layout());
+    std::array<VkWriteDescriptorSet, Context::kMaxBindings> writes{};  // zero-init: pNext/pImageInfo/... stay null
     for (std::size_t i = 0; i < buffers.size(); ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = set;
@@ -257,13 +258,22 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(ctx_->device(), static_cast<std::uint32_t>(buffers.size()), writes.data(), 0,
-                           nullptr);
+    if (push_set == nullptr)
+        vkUpdateDescriptorSets(ctx_->device(), static_cast<std::uint32_t>(buffers.size()), writes.data(), 0,
+                               nullptr);
 
     barrier_for(buffers, write_mask);
     const std::optional<std::uint32_t> t0 = op_timings_ ? timestamp() : std::nullopt;
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline());
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.layout(), 0, 1, &set, 0, nullptr);
+    if (push_set != nullptr) {
+        // A buffer-less kernel has nothing to push (descriptorWriteCount must be > 0); its empty set needs no binding.
+        if (!buffers.empty()) {
+            push_set(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.layout(), 0,
+                     static_cast<std::uint32_t>(buffers.size()), writes.data());
+        }
+    } else {
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.layout(), 0, 1, &set, 0, nullptr);
+    }
     if (!push.empty()) {
         vkCmdPushConstants(cmd_, kernel.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            static_cast<std::uint32_t>(push.size()), push.data());

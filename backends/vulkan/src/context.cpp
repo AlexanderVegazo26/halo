@@ -114,6 +114,19 @@ bool coopmat_supported(VkInstance instance, VkPhysicalDevice pd, const DeviceInf
     return false;
 }
 
+// Can Stream::dispatch push its bindings on `pd`? VK_KHR_push_descriptor, with room for the most
+// storage buffers one dispatch may bind (Context::kMaxBindings). Never throws.
+bool push_descriptors_supported(VkPhysicalDevice pd) {
+    if (!device_extension_available(pd, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) return false;
+    VkPhysicalDevicePushDescriptorPropertiesKHR pdp{};
+    pdp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR;
+    VkPhysicalDeviceProperties2 p2{};
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &pdp;
+    vkGetPhysicalDeviceProperties2(pd, &p2);
+    return pdp.maxPushDescriptors >= Context::kMaxBindings;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- Instance
@@ -274,7 +287,7 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
     cm_v12.pNext = &cm_features;
     cm_v12.shaderFloat16 = VK_TRUE;
     cm_v12.vulkanMemoryModel = VK_TRUE;
-    const char* cm_extensions[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+    std::vector<const char*> device_extensions;
     const bool want_coopmat = options.coopmat.has_value() ? *options.coopmat : [] {
         const auto cm_env = detail::getenv_str("HALO_COOPMAT");
         return cm_env && *cm_env == "1";
@@ -282,8 +295,7 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
     if (want_coopmat) {
         if (coopmat_supported(ctx->instance_->handle(), ctx->physical_, ctx->info_)) {
             dci.pNext = &cm_v12;
-            dci.enabledExtensionCount = 1;
-            dci.ppEnabledExtensionNames = cm_extensions;
+            device_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
             ctx->coopmat_enabled_ = true;
             HALO_INFO("vulkan", "cooperative matrices (HALO_COOPMAT / ContextOptions::coopmat): "
                                 "VK_KHR_cooperative_matrix enabled (fp16 tiles, fp32 accumulate)");
@@ -293,8 +305,34 @@ std::shared_ptr<Context> Context::create(const ContextOptions& options) {
                                 "subgroup matrices (or shaderFloat16 / vulkanMemoryModel / subgroupSize >= 32)");
         }
     }
+    // Opt-in push descriptors (HALO_VK_PUSH_DESCRIPTORS=1; next.md step 4): no feature struct, only the
+    // extension; without it device creation is unchanged.
+    const bool want_push = options.push_descriptors.has_value() ? *options.push_descriptors : [] {
+        const auto env = detail::getenv_str("HALO_VK_PUSH_DESCRIPTORS");
+        return env && *env == "1";
+    }();
+    const bool push_ok = want_push && push_descriptors_supported(ctx->physical_);
+    if (push_ok) {
+        device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    } else if (want_push) {
+        HALO_WARN("vulkan", "push descriptors (HALO_VK_PUSH_DESCRIPTORS / ContextOptions::push_descriptors) ignored: "
+                            "device lacks VK_KHR_push_descriptor with maxPushDescriptors >= {}",
+                  Context::kMaxBindings);
+    }
+    dci.enabledExtensionCount = static_cast<std::uint32_t>(device_extensions.size());
+    dci.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     detail::vk_check(vkCreateDevice(ctx->physical_, &dci, nullptr, &ctx->device_), "vkCreateDevice");
     vkGetDeviceQueue(ctx->device_, ctx->queue_family_, 0, &ctx->queue_);
+    if (push_ok) {
+        ctx->push_descriptor_fn_ = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+            vkGetDeviceProcAddr(ctx->device_, "vkCmdPushDescriptorSetKHR"));
+        if (ctx->push_descriptor_fn_ == nullptr) {
+            HALO_WARN("vulkan", "push descriptors ignored: vkCmdPushDescriptorSetKHR not found on the device");
+        } else {
+            HALO_INFO("vulkan", "push descriptors (HALO_VK_PUSH_DESCRIPTORS / ContextOptions::push_descriptors): "
+                                "VK_KHR_push_descriptor enabled, no descriptor sets allocated per dispatch");
+        }
+    }
 
     VkPipelineCacheCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;

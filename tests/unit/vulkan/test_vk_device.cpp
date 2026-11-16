@@ -4,9 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 #include "halo/backends/vulkan/buffer.h"
@@ -245,6 +247,63 @@ TEST(VkKernel, DispatchValidatesBindingsPushAndGroups) {
     hv::KernelDesc bad_push = d;
     bad_push.push_constant_bytes = 6;
     EXPECT_THROW(hv::Kernel(ctx, bad_push), halo::Error);
+}
+
+namespace {
+
+/// 600 dependent rms_norm dispatches (past the stream's 512-dispatch submit split, so pools are reset
+/// mid-chain on the descriptor-set path) ping-ponging between two offset views of one buffer; returns
+/// the final rows and the stream's descriptor pool count.
+std::pair<std::vector<float>, std::size_t> rms_norm_chain(const std::shared_ptr<hv::Context>& ctx) {
+    constexpr std::uint32_t rows = 4, cols = 256;
+    constexpr std::uint64_t region = 4096;  // bytes; rows * cols * 4, aligned for any device's offset rule
+    std::vector<float> x0(2 * rows * cols), w(cols);
+    for (std::size_t i = 0; i < x0.size(); ++i) x0[i] = static_cast<float>((i * 2654435761u) % 1000u) / 250.0f - 2.0f;
+    for (std::size_t i = 0; i < w.size(); ++i) w[i] = 0.75f + static_cast<float>(i % 7u) / 16.0f;
+    hv::Buffer xb = upload(ctx, std::span<const float>(x0));
+    hv::Buffer wb = upload(ctx, std::span<const float>(w));
+    hv::Ops ops(ctx);
+    hv::Stream s(ctx);
+    for (int i = 0; i < 600; ++i) {
+        const std::uint64_t src = (i % 2) * region, dst = region - src;
+        ops.rms_norm(s, hv::BufferView(xb, src, region), wb, hv::BufferView(xb, dst, region), rows, cols, 1e-6f);
+    }
+    s.submit_and_wait();
+    return {download<float>(xb, x0.size()), s.descriptor_pool_count()};
+}
+
+hv::ContextOptions push_options(bool on) {
+    hv::ContextOptions o;
+    o.push_descriptors = on;
+    return o;
+}
+
+}  // namespace
+
+// next.md step 4 (per-dispatch CPU cost): with ContextOptions::push_descriptors the stream pushes each
+// dispatch's bindings instead of allocating and writing a descriptor set. Same buffers and offsets bound,
+// so every output is bit for bit the descriptor-set path's, and the stream never creates a pool.
+TEST(VkStream, PushDescriptorsBindTheSameBuffersWithoutDescriptorSets) {
+    HALO_VK_CONTEXT_OR_SKIP(off, push_options(false));
+    EXPECT_FALSE(off->push_descriptors_enabled()) << "ContextOptions::push_descriptors = false enabled them";
+    const auto on = hv::Context::create(push_options(true));
+    if (!on->push_descriptors_enabled())
+        GTEST_SKIP() << "device '" << on->info().name << "' lacks VK_KHR_push_descriptor (maxPushDescriptors >= "
+                     << hv::Context::kMaxBindings << ")";
+    const auto [want, pools_off] = rms_norm_chain(off);
+    const auto [got, pools_on] = rms_norm_chain(on);
+    EXPECT_GE(pools_off, 1u) << "the descriptor-set path allocated no pool: the comparison is vacuous";
+    EXPECT_EQ(pools_on, 0u) << "push descriptors on, yet the stream created " << pools_on << " descriptor pool(s)";
+    ASSERT_EQ(got.size(), want.size());
+    std::size_t diff = 0, first = got.size();
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (std::bit_cast<std::uint32_t>(got[i]) != std::bit_cast<std::uint32_t>(want[i])) {
+            if (diff++ == 0) first = i;
+        }
+    }
+    EXPECT_EQ(diff, 0u) << diff << " of " << got.size() << " floats differ after 600 rms_norm dispatches; first at "
+                        << first << ": push " << (first < got.size() ? got[first] : 0.0f) << " vs set "
+                        << (first < got.size() ? want[first] : 0.0f);
 }
 
 TEST(VkKernel, PipelineCacheRoundTripsIntoANewContext) {

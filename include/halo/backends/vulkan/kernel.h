@@ -163,6 +163,9 @@ public:
     [[nodiscard]] std::optional<double> elapsed_ns(std::uint32_t begin, std::uint32_t end) const;
 
     [[nodiscard]] std::uint32_t dispatch_count() const noexcept { return dispatches_; }
+    /// Descriptor pools this stream has created (they are reused across recordings). Stays 0 when the
+    /// context pushes descriptors (Context::push_descriptors_enabled()): no set is ever allocated.
+    [[nodiscard]] std::size_t descriptor_pool_count() const noexcept { return desc_pools_.size(); }
 
 private:
     enum class State { Idle, Recording, Submitted, Hung };
@@ -172,7 +175,7 @@ private:
     /// the buffers touched since the last barrier; then records this op's touches.
     void barrier_for(std::span<const BufferBinding> buffers, std::uint64_t write_mask);
     void mark_touched(const Buffer* buf, bool write);
-    VkDescriptorSet allocate_set(VkDescriptorSetLayout layout, std::uint32_t num_buffers);
+    VkDescriptorSet allocate_set(VkDescriptorSetLayout layout);
     void release() noexcept;
 
     std::shared_ptr<Context> ctx_;

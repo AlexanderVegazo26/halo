@@ -22,6 +22,11 @@ Kernel::Kernel(std::shared_ptr<Context> ctx, KernelDesc desc) : ctx_(std::move(c
     HALO_CHECK(desc_.num_buffers <= info.max_storage_buffers_per_stage, ErrorCode::Kernel,
                "kernel {}: {} storage buffers > device limit {}", name, desc_.num_buffers,
                info.max_storage_buffers_per_stage);
+    // Streams bind at most kMaxBindings buffers per dispatch (descriptor pools, and maxPushDescriptors for a
+    // push-descriptor layout): fail at construction in both modes, not at the first dispatch.
+    HALO_CHECK(desc_.num_buffers <= Context::kMaxBindings, ErrorCode::Kernel,
+               "kernel {}: {} storage buffers > {} (Stream's per-dispatch limit)", name, desc_.num_buffers,
+               Context::kMaxBindings);
     std::uint64_t invocations = 1;
     for (std::size_t i = 0; i < 3; ++i) {
         const std::uint32_t s = desc_.local_size[i];
@@ -50,6 +55,9 @@ Kernel::Kernel(std::shared_ptr<Context> ctx, KernelDesc desc) : ctx_(std::move(c
         }
         VkDescriptorSetLayoutCreateInfo dli{};
         dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        // Push descriptors (ContextOptions::push_descriptors): Stream::dispatch pushes the bindings
+        // instead of allocating a set, which needs a layout created with this flag.
+        if (ctx_->push_descriptors_enabled()) dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         dli.bindingCount = desc_.num_buffers;
         dli.pBindings = bindings.data();
         detail::vk_check(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &set_layout_),

@@ -49,6 +49,7 @@ SPEED_FLAGS = (
     "HALO_STREAM_REUSE", "HALO_MTP_DEVICE_HIDDEN", "HALO_MTP_CHAIN", "HALO_MTP_TREE",
     "HALO_FUSE_GEMV", "HALO_FUSE_NORM", "HALO_COOPMAT", "HALO_REPACK", "HALO_KV_FP16",
     "HALO_KV_TYPE", "HALO_NGRAM_DRAFT", "HALO_VK_GEMV_WG", "HALO_VK_SYNC_EVERY", "HALO_VK_OP_TIMINGS",
+    "HALO_VK_PUSH_DESCRIPTORS",
 )
 
 
@@ -72,6 +73,7 @@ VARIANTS = (
     Variant("gdn-reg", "3", {"HALO_GDN_REG": "1"}),
     Variant("gdn-dv-tile-32", "3", {"HALO_GDN_DV_TILE": "32"}),
     Variant("stream-reuse", "4", {"HALO_STREAM_REUSE": "1"}),
+    Variant("push-descriptors", "4", {"HALO_VK_PUSH_DESCRIPTORS": "1"}),
     Variant("mtp-device-hidden", "4", {"HALO_MTP_DEVICE_HIDDEN": "1"}),
     Variant("mtp-chain", "4", {"HALO_MTP_CHAIN": "1"}),
     Variant("mtp-tree", "5", {"HALO_MTP_TREE": "1"}),

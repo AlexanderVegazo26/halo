@@ -326,10 +326,12 @@ void PrintTo(const KvCase& c, std::ostream* os) {
 class VulkanKvQuantForward : public ::testing::TestWithParam<KvCase> {};
 class VulkanCoopmatForward : public ::testing::TestWithParam<Case> {};
 
-/// A Vulkan context with the cooperative-matrix prefill GEMM explicitly on or off (never the env).
-std::shared_ptr<halo::vulkan::Context> vk_context(bool coopmat) {
+/// A Vulkan context with the cooperative-matrix prefill GEMM explicitly on or off (never the env), and push
+/// descriptors as `push_descriptors` says (nullopt: HALO_VK_PUSH_DESCRIPTORS).
+std::shared_ptr<halo::vulkan::Context> vk_context(bool coopmat, std::optional<bool> push_descriptors = std::nullopt) {
     halo::vulkan::ContextOptions o;
     o.coopmat = coopmat;
+    o.push_descriptors = push_descriptors;
     return halo::vulkan::Context::create(o);
 }
 
@@ -531,6 +533,35 @@ TEST(VulkanCoopmatGate, ModelsWithoutKQuantGemvsAreBitwiseUnchanged) {
     EXPECT_TRUE(a.seqs[0].hidden == b.seqs[0].hidden) << c.file << ": coopmat on changed the prefill hidden";
     EXPECT_TRUE(a.seqs[0].logits == b.seqs[0].logits) << c.file << ": coopmat on changed the prefill logits";
     EXPECT_TRUE(cm.kv_pool->read_all() == mv.kv_pool->read_all()) << c.file << ": coopmat on changed the trunk KV";
+}
+
+// next.md step 4 (per-dispatch CPU cost) at model level: ContextOptions::push_descriptors only changes how a
+// dispatch's buffers are bound (vkCmdPushDescriptorSetKHR instead of a pool-allocated set), so the scenario's
+// 70-row prefill (every kernel qwen35 records for it, on both GDN paths) must leave hidden, full logits and the
+// trunk KV bit for bit equal to the descriptor-set path's on the same device (VkStream.PushDescriptors* gates
+// the stream itself).
+TEST(VulkanPushDescriptors, PrefillIsBitwiseTheDescriptorSetPrefill) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const auto on = vk_context(false, true);
+    if (!on->push_descriptors_enabled()) GTEST_SKIP() << "device '" << on->info().name << "' lacks VK_KHR_push_descriptor";
+    const auto off = vk_context(false, false);
+    const Case model{"tiny-q6_k.gguf", hm::GdnPath::Auto};
+    const auto nm = load_case(model);
+    if (!nm) GTEST_SKIP() << model.file << " missing or not loadable over Vulkan (see output)";
+    for (const hm::GdnPath path : {hm::GdnPath::Recurrent, hm::GdnPath::Chunked}) {
+        const Case c{model.file, path};
+        SCOPED_TRACE(path == hm::GdnPath::Recurrent ? "recurrent GDN" : "chunked GDN");
+        Side pd(hb::make_vulkan_backend(on), *nm);
+        Side ds(hb::make_vulkan_backend(off), *nm);
+        const hm::StepResult a = prefill70(pd, c.path), b = prefill70(ds, c.path);
+        ASSERT_EQ(a.seqs.size(), 1u);
+        ASSERT_EQ(b.seqs.size(), 1u);
+        EXPECT_TRUE(a.seqs[0].hidden == b.seqs[0].hidden)
+            << c.file << ": push descriptors changed the prefill hidden (rel L2 " << rel_l2(a.seqs[0].hidden, b.seqs[0].hidden) << ")";
+        EXPECT_TRUE(a.seqs[0].logits == b.seqs[0].logits)
+            << c.file << ": push descriptors changed the prefill logits (rel L2 " << rel_l2(a.seqs[0].logits, b.seqs[0].logits) << ")";
+        EXPECT_TRUE(pd.kv_pool->read_all() == ds.kv_pool->read_all()) << c.file << ": push descriptors changed the trunk KV";
+    }
 }
 
 // The GEMM is gated on the batch size (n_vec > 8), but a forward's gemvs carry the rows of every step in it:

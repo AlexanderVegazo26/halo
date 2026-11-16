@@ -97,6 +97,14 @@ struct ContextOptions {
     /// HALO_COOPMAT == "1". true on a device without f16 x f16 -> f32 16x16x16 subgroup matrices only
     /// logs a warning (coopmat_enabled() stays false); false never enables it, whatever the env says.
     std::optional<bool> coopmat;
+    /// Enable VK_KHR_push_descriptor (next.md step 4, per-dispatch CPU cost): every Kernel's set layout
+    /// becomes a push-descriptor layout and Stream::dispatch records its bindings with
+    /// vkCmdPushDescriptorSetKHR instead of allocating + writing a descriptor set from a pool per dispatch.
+    /// The bound buffers are the same, so results are bitwise unchanged. nullopt: HALO_VK_PUSH_DESCRIPTORS
+    /// == "1". true on a device without the extension (or with maxPushDescriptors below the most bindings
+    /// a dispatch may have) only logs a warning (push_descriptors_enabled() stays false); false never
+    /// enables it, whatever the env says.
+    std::optional<bool> push_descriptors;
 };
 
 class Context : public std::enable_shared_from_this<Context> {
@@ -123,6 +131,15 @@ public:
     /// HALO_COOPMAT=1 was set AND the device offers f16 x f16 -> f32 16x16x16 subgroup matrices.
     /// False by default (device creation is then unchanged); gates the matmul_cm_* prefill GEMMs.
     [[nodiscard]] bool coopmat_enabled() const noexcept { return coopmat_enabled_; }
+    /// VK_KHR_push_descriptor was enabled on this device (ContextOptions::push_descriptors). Kernels
+    /// created on this context then have push-descriptor set layouts and streams never allocate
+    /// descriptor sets. False by default.
+    [[nodiscard]] bool push_descriptors_enabled() const noexcept { return push_descriptor_fn_ != nullptr; }
+    /// vkCmdPushDescriptorSetKHR of this device; null unless push_descriptors_enabled().
+    [[nodiscard]] PFN_vkCmdPushDescriptorSetKHR push_descriptor_fn() const noexcept { return push_descriptor_fn_; }
+    /// Most storage-buffer bindings one dispatch may have (Stream's descriptor pools are sized for it,
+    /// and push descriptors need maxPushDescriptors >= it).
+    static constexpr std::uint32_t kMaxBindings = 16;
 
     /// Thread-safe vkQueueSubmit of one command buffer signalling `fence`.
     void submit(VkCommandBuffer cmd, VkFence fence);
@@ -200,6 +217,7 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     bool force_staging_ = false;
     bool coopmat_enabled_ = false;
+    PFN_vkCmdPushDescriptorSetKHR push_descriptor_fn_ = nullptr;
     std::atomic<bool> hung_{false};
 
     std::mutex queue_mutex_;
