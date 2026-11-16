@@ -20,7 +20,10 @@ python3 load/run.py --server build/tests/unit/api/halo_load_server --server-arg=
 
 `halo_load_server` takes `--concurrent=N`, `--queue=N` and `--token-delay-ms=N`. `run.py` exits 0
 pass, 1 fail, 77 when `k6` is not on PATH (ctest reports SKIPPED); on failure it prints each
-crossed threshold and failed check with the rerun command. The k6 summary JSON goes to
+crossed threshold and failed check with the rerun command, plus one `server closed N connection(s)
+mid-request: ...` line summing the reasons the server's connection guard logged (read deadline,
+per-peer limit, overload shedding, global stalled limit), so a run failed by resets says which cap
+fired. The server's stderr is still passed through. The k6 summary JSON goes to
 `$HALO_LOAD_REPORT_DIR` (`.test-report/load/` under `scripts/test-agent`) or `./load-report/`.
 The server must also exit 0 on SIGTERM, so under ASan a leak or memory error at shutdown fails
 the run.

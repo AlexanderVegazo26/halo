@@ -9,7 +9,10 @@ Starts the server (the real ApiServer over the FakeEngine, 127.0.0.1, ephemeral 
 `k6 run` with BASE_URL pointing at it, stops the server and checks it exited cleanly (under
 ASan a leak or memory error at shutdown fails the run). k6's end-of-test summary is written to
 $HALO_LOAD_REPORT_DIR (scripts/test-agent sets it to .test-report/load) or ./load-report as
-k6-<script>.json; the failed thresholds and checks are printed with the rerun command.
+k6-<script>.json; the failed thresholds and checks are printed with the rerun command. The
+server's stderr is passed through, and the connections its ConnectionGuard closed mid-request are
+summed per reason ('[WARN] api: closed N connection(s) ...', src/api/conn_guard.cpp) and printed
+with the result, so a run failed by resets says why without reading the whole log.
 --budget-scale multiplies the script's latency budgets (HALO_LOAD_BUDGET_SCALE): 1 for an optimized
 build, larger for sanitizer/Debug builds (CMake picks it per build, tests/unit/api/CMakeLists.txt).
 
@@ -22,12 +25,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,9 +40,58 @@ SKIP = 77
 PORT_TIMEOUT_S = 30
 STOP_TIMEOUT_S = 30
 
+# ConnectionGuard::scan's warning (src/api/conn_guard.cpp), text or JSON log format alike.
+CLOSE_LINE = re.compile(
+    r"closed (\d+) connection\(s\) while reading a request: (\d+) past the read deadline, (\d+) over the "
+    r"per-peer limit, (\d+) shed under overload, (\d+) over the global stalled-connection limit"
+)
+CLOSE_REASONS = ("past the read deadline", "over the per-peer limit", "shed under overload",
+                 "over the global stalled-connection limit")
 
-def start_server(server: str, server_args: list[str]) -> tuple[subprocess.Popen[str], int]:
-    proc = subprocess.Popen([server, *server_args], stdout=subprocess.PIPE, text=True)
+
+class CloseTally:
+    """Connections the server closed mid-request, summed per reason over its log lines."""
+
+    def __init__(self) -> None:
+        self.counts = [0] * len(CLOSE_REASONS)
+        self.lines = 0
+
+    def feed(self, line: str) -> None:
+        m = CLOSE_LINE.search(line)
+        if m is None:
+            return
+        self.lines += 1
+        for i, n in enumerate(m.groups()[1:]):
+            self.counts[i] += int(n)
+
+    def total(self) -> int:
+        return sum(self.counts)
+
+    def describe(self) -> str | None:
+        """One line naming each reason that closed a connection, or None when none were closed."""
+        if self.total() == 0:
+            return None
+        parts = ", ".join(f"{n} {why}" for n, why in zip(self.counts, CLOSE_REASONS) if n)
+        return (f"server closed {self.total()} connection(s) mid-request: {parts} "
+                f"({self.lines} '[WARN] api: closed ...' line(s) in its stderr above)")
+
+
+def pump_stderr(stream, tally: CloseTally) -> None:
+    """Forward the server's stderr line by line (it stays visible as before) and tally close lines."""
+    for line in stream:
+        sys.stderr.write(line)
+        tally.feed(line)
+
+
+def start_server(server: str, server_args: list[str],
+                 tally: CloseTally) -> tuple[subprocess.Popen[str], int, threading.Thread]:
+    # errors="replace": an undecodable stderr byte must not kill the pump (the server would then
+    # block on a full stderr pipe).
+    proc = subprocess.Popen([server, *server_args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            errors="replace")
+    assert proc.stderr is not None
+    pump = threading.Thread(target=pump_stderr, args=(proc.stderr, tally), daemon=True)
+    pump.start()
     assert proc.stdout is not None
     deadline = time.monotonic() + PORT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -48,9 +102,10 @@ def start_server(server: str, server_args: list[str]) -> tuple[subprocess.Popen[
         if not line:  # EOF: the server exited before printing its port
             break
         if line.startswith("PORT "):
-            return proc, int(line.split()[1])
+            return proc, int(line.split()[1]), pump
     proc.kill()
     proc.wait()
+    pump.join(timeout=STOP_TIMEOUT_S)
     raise RuntimeError(
         f"{server} did not print 'PORT <n>' within {PORT_TIMEOUT_S}s (exit code {proc.returncode}); "
         "its stderr is above"
@@ -127,8 +182,9 @@ def main(argv: list[str]) -> int:
                         *(f"--server-arg={a}" for a in args.server_arg), f"--budget-scale={args.budget_scale:g}",
                         str(script)])
 
+    tally = CloseTally()
     try:
-        proc, port = start_server(args.server, args.server_arg)
+        proc, port, pump = start_server(args.server, args.server_arg, tally)
     except (OSError, RuntimeError) as e:
         print(f"load: FAIL, could not start the server: {e}\nrerun: {rerun}")
         return 1
@@ -142,6 +198,7 @@ def main(argv: list[str]) -> int:
         ).returncode
     finally:
         server_rc = stop_server(proc)
+        pump.join(timeout=STOP_TIMEOUT_S)  # EOF once the server exited: every line is tallied
 
     problems: list[str] = []
     if summary_path.exists():
@@ -151,13 +208,18 @@ def main(argv: list[str]) -> int:
     if server_rc != 0:
         problems.append(f"halo_load_server exited {server_rc} after SIGTERM, expected 0 (its stderr is above)")
 
+    closed = tally.describe()
     if problems:
         print(f"load: FAIL {script.name} against halo_load_server")
         for p in problems:
             print(f"  - {p}")
+        if closed is not None:
+            print(closed)
         print(f"summary: {summary_path}\nrerun: {rerun}")
         return 1
     print(f"load: PASS {script.name}, summary {summary_path}")
+    if closed is not None:
+        print(closed)
     return 0
 
 
