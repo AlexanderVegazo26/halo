@@ -16,6 +16,7 @@
 #include <future>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -63,7 +64,7 @@ EngineConfig base_cfg() {
     return c;
 }
 
-std::unique_ptr<Engine> make(CpuEngineOptions o = {}, EngineConfig c = base_cfg()) {
+std::unique_ptr<Engine> make(const CpuEngineOptions& o = {}, const EngineConfig& c = base_cfg()) {
     return halo::runtime::create_cpu_engine(c, o);
 }
 
@@ -104,8 +105,13 @@ protected:
         if (!golden_) GTEST_SKIP() << "golden data missing under " << halo::test::tiny_dir();
         if (!engine_) GTEST_SKIP() << "tiny-f32.gguf missing under " << halo::test::tiny_dir();
     }
-    static Toks prompt(const char* p) { return golden_->i32(std::string(p) + ".tokens"); }
-    static Toks gold(const char* p) { return golden_->i32(std::string(p) + ".decode_tokens"); }
+    // SetUp skips when the golden data is missing; the guard names the cause if a test reaches it anyway.
+    static const Golden& golden() {
+        if (!golden_) throw std::logic_error("EngineTest: golden data missing under " + halo::test::tiny_dir().string());
+        return *golden_;
+    }
+    static Toks prompt(const char* p) { return golden().i32(std::string(p) + ".tokens"); }
+    static Toks gold(const char* p) { return golden().i32(std::string(p) + ".decode_tokens"); }
 
     static inline std::optional<Golden> golden_;
     static inline std::unique_ptr<Engine> engine_;
@@ -309,12 +315,14 @@ TEST_F(EngineTest, FourConcurrentRequestsEqualFourSequential) {
     reqs[3].sampling.top_k = 40;
     reqs[3].sampling.seed = 11;
     std::vector<GenerateResult> seq;
+    seq.reserve(reqs.size());
     const auto t0 = engine_->stats().ticks;
     for (const auto& r : reqs) seq.push_back(run(*engine_, r));
     const auto seq_ticks = engine_->stats().ticks - t0;
     std::vector<GenerateResult> con(4);
     std::barrier start(4);
     std::vector<std::thread> th;
+    th.reserve(4);
     const auto t1 = engine_->stats().ticks;
     for (std::size_t i = 0; i < 4; ++i) {
         th.emplace_back([&, i] {
@@ -409,7 +417,7 @@ TEST_F(EngineTest, CancellationDeliversExactlyTheAcceptedTokensAndLeavesTheEngin
 // ---- KV pool limits: fail loudly, split per layer ----------------------------------------------
 
 TEST_F(EngineTest, ExplicitContextThatCannotBeHonouredIsATypedConfigError) {
-    const auto expect_config = [](EngineConfig c, CpuEngineOptions o, const char* contains) {
+    const auto expect_config = [](const EngineConfig& c, const CpuEngineOptions& o, const char* contains) {
         try {
             (void)make(o, c);
             ADD_FAILURE() << "expected Error(Config) (" << contains << ")";
@@ -836,12 +844,14 @@ TEST_F(VulkanEngine, ForcedDraftsAreVerifiedAndAcceptedBitwise) {
     reqs[2].sampling.top_k = 40;
     reqs[2].sampling.seed = 7;
     std::vector<GenerateResult> alone;
+    alone.reserve(reqs.size());
     for (const auto& r : reqs) alone.push_back(run(*plain->engine, r));
     step = 0;
     hooked->ticks.clear();
     std::vector<GenerateResult> con(reqs.size());
     std::barrier start(static_cast<std::ptrdiff_t>(reqs.size()));
     std::vector<std::thread> th;
+    th.reserve(reqs.size());
     for (std::size_t i = 0; i < reqs.size(); ++i) {
         th.emplace_back([&, i] {
             start.arrive_and_wait();
