@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 
 #include <nlohmann/json.hpp>
@@ -33,6 +35,10 @@ nlohmann::json load(const char* name) { return nlohmann::json::parse(slurp(fixtu
 BaselineParseContext ctx(std::string engine, std::string backend) {
     return {std::move(engine), std::move(backend), "tiny", "tiny-q8_0", "abc", "unit-test", std::nullopt};
 }
+
+// An optional metric's value, NaN when it is empty, so a missing metric fails EXPECT_DOUBLE_EQ /
+// EXPECT_EQ with a readable "nan" instead of dereferencing an empty optional.
+double value(const std::optional<double>& v) { return v.value_or(std::numeric_limits<double>::quiet_NaN()); }
 
 BaselineCommon common() {
     BaselineCommon c;
@@ -101,7 +107,7 @@ TEST(LlamaBench, ParsesCapturedFixture) {
     const auto& pp = p.records[0];
     EXPECT_EQ(pp.mode, "pp16");
     EXPECT_EQ(pp.context, 16u);
-    EXPECT_DOUBLE_EQ(*pp.prompt_tps, 1578.73);
+    EXPECT_DOUBLE_EQ(value(pp.prompt_tps), 1578.73);
     EXPECT_FALSE(pp.decode_tps);
     EXPECT_EQ(pp.quantization, "Q8_0");
     EXPECT_EQ(pp.engine, "llama-bench");
@@ -113,7 +119,7 @@ TEST(LlamaBench, ParsesCapturedFixture) {
     const auto& tg = p.records[3];
     EXPECT_EQ(tg.mode, "tg8");
     EXPECT_EQ(tg.context, 8u);
-    EXPECT_DOUBLE_EQ(*tg.decode_tps, 144.574);
+    EXPECT_DOUBLE_EQ(value(tg.decode_tps), 144.574);
     EXPECT_FALSE(tg.prompt_tps);
 }
 
@@ -182,7 +188,7 @@ TEST(LlamaBench, RunsFakeBinaryEndToEnd) {
     SuiteArtifact a = run_llama_bench(c);
     ASSERT_EQ(a.records.size(), 4u) << nlohmann::json(a.notes).dump();
     const auto& r = a.records[0];
-    ASSERT_TRUE(r.invocation);
+    if (!r.invocation) GTEST_FAIL() << "first llama-bench record has no invocation";
     EXPECT_EQ(r.invocation->version, "0.5.0-dev (build 1, commit bd4f514)");
     EXPECT_EQ(r.invocation->commit, "bd4f514");
     EXPECT_EQ(r.invocation->argv, llama_bench_argv(c));
@@ -267,8 +273,8 @@ TEST(LlamaServer, ParsesCapturedCompletions) {
     EXPECT_TRUE(p.failures.empty());
     const auto& r = p.records[0];
     EXPECT_EQ(r.mode, "completion");
-    EXPECT_DOUBLE_EQ(*r.prompt_tps, 136.5161089008503);
-    EXPECT_DOUBLE_EQ(*r.decode_tps, 48.21169064624327);
+    EXPECT_DOUBLE_EQ(value(r.prompt_tps), 136.5161089008503);
+    EXPECT_DOUBLE_EQ(value(r.decode_tps), 48.21169064624327);
     EXPECT_FALSE(r.decode_effective_tps);
     EXPECT_FALSE(r.mtp_acceptance);
     EXPECT_FALSE(r.ttft_ms);  // not exposed by non-streaming /completion; never substituted
@@ -279,9 +285,9 @@ TEST(LlamaServer, ParsesCapturedCompletions) {
     const auto& m = p.records[0];
     EXPECT_EQ(m.mode, "mtp_completion");
     EXPECT_FALSE(m.decode_tps);
-    EXPECT_DOUBLE_EQ(*m.decode_effective_tps, 32.02630427124144);
+    EXPECT_DOUBLE_EQ(value(m.decode_effective_tps), 32.02630427124144);
     ASSERT_TRUE(m.mtp_acceptance);
-    EXPECT_EQ(*m.mtp_acceptance, 0.0);  // 0 of 27 accepted: a MEASURED zero, not null
+    EXPECT_EQ(value(m.mtp_acceptance), 0.0);  // 0 of 27 accepted: a MEASURED zero, not null
     EXPECT_EQ(m.extra.at("draft_n"), 27);
 
     // MTP requested but the server did not speculate.
@@ -309,8 +315,8 @@ TEST(Ollama, ParsesDocumentedResponseInNanoseconds) {
     const auto p = parse_ollama_generate(load("ollama_generate.json"), ctx("ollama", "ollama"));
     ASSERT_EQ(p.records.size(), 1u);
     const auto& r = p.records[0];
-    EXPECT_DOUBLE_EQ(*r.decode_tps, 50.0);   // 100 tokens / 2e9 ns
-    EXPECT_DOUBLE_EQ(*r.prompt_tps, 200.0);  // 26 tokens / 1.3e8 ns
+    EXPECT_DOUBLE_EQ(value(r.decode_tps), 50.0);   // 100 tokens / 2e9 ns
+    EXPECT_DOUBLE_EQ(value(r.prompt_tps), 200.0);  // 26 tokens / 1.3e8 ns
     EXPECT_DOUBLE_EQ(r.extra.at("load_duration_s").get<double>(), 0.012);
     EXPECT_EQ(r.context, 126u);
     EXPECT_EQ(r.mode, "generate");
@@ -338,11 +344,13 @@ TEST(Ollama, RunsAgainstAFakeServer) {
     c.common = common();
     c.common.model_hash.reset();
     const SuiteArtifact a = run_ollama(c);
-    EXPECT_EQ(a.records.size(), 4u) << nlohmann::json(a.notes).dump();  // 1 warm-up + 3
+    ASSERT_EQ(a.records.size(), 4u) << nlohmann::json(a.notes).dump();  // 1 warm-up + 3
     EXPECT_EQ(a.records[0].phase, Phase::Cold);
     EXPECT_EQ(a.records[0].model_hash,
               "ollama-digest:0000000000000000000000000000000000000000000000000000000000000000");
-    EXPECT_EQ(a.records[0].invocation->version, "0.17.6");
+    const auto& invocation = a.records[0].invocation;
+    if (!invocation) GTEST_FAIL() << "first ollama record has no invocation";
+    EXPECT_EQ(invocation->version, "0.17.6");
     const auto reqs = srv.requests();
     ASSERT_EQ(reqs.size(), 6u);
     const auto body = nlohmann::json::parse(reqs[2].substr(std::string("POST /api/generate ").size()));
@@ -382,7 +390,7 @@ TEST(Baseline, AggregateIsTheMedianPerConfiguration) {
     const auto agg = aggregate_records(a);
     ASSERT_EQ(agg.size(), 2u);
     const auto& tg = agg[0].mode == "tg128" ? agg[0] : agg[1];
-    EXPECT_DOUBLE_EQ(*tg.decode_tps, 20.0);  // the median: neither the first nor the last sample
+    EXPECT_DOUBLE_EQ(value(tg.decode_tps), 20.0);  // the median: neither the first nor the last sample
     EXPECT_EQ(tg.repetition, 0u);
     EXPECT_EQ(tg.extra.at("aggregate").at("method"), "median");
     EXPECT_EQ(tg.extra.at("aggregate").at("n"), 3);
