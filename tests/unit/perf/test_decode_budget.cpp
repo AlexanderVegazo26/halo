@@ -1408,3 +1408,48 @@ TEST_F(EngineMemorySnapshot, VramAlreadyTakenBeforeTheEngineStartsIsRefused) {
             << "the refusal should name the VRAM shortfall: " << x.what();
     }
 }
+
+// ---- backend name (Q-0063 review follow-up) ---------------------------------------------
+// ModelInfo::backend names the backend the engine actually runs on, with "auto" already
+// resolved, so callers that record where a number was measured (halo bench identity.backend)
+// never store the unresolved config value.
+
+namespace {
+
+class EngineBackendName : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() { path_ = write_synthetic_model("backend-name"); }
+    static void TearDownTestSuite() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    static inline std::filesystem::path path_;
+};
+
+}  // namespace
+
+TEST_F(EngineBackendName, ModelInfoNamesTheBackendTheEngineRunsOn) {
+    const auto cpu = make_engine(path_, /*prefix_cache=*/false);
+    EXPECT_EQ(cpu->model().backend, "cpu") << "an engine created with backend 'cpu' should report 'cpu'";
+
+    const FakeSysfs fs("backend_name");
+    const auto gpu = make_gpu_path_engine(path_, fs, std::nullopt);
+    EXPECT_EQ(gpu->model().backend, "vulkan") << "an engine created with backend 'vulkan' should report 'vulkan'";
+}
+
+TEST_F(EngineBackendName, AutoIsReportedAsTheBackendItResolvedTo) {
+    // With a test-supplied backend_factory, "auto" resolves to the CPU reference path (engine.cpp);
+    // the engine must report that resolution, never the literal "auto".
+    EngineConfig c;
+    c.model_path = path_.string();
+    c.backend = "auto";
+    c.max_context = kMaxContext;
+    c.max_context_explicit = true;
+    c.max_sequences = 1;
+    c.threads = 1;
+    c.mtp_enabled = false;
+    halo::runtime::CpuEngineOptions o;
+    o.backend_factory = [] { return halo::backend::make_cpu_backend(nullptr); };
+    const auto e = halo::runtime::create_cpu_engine(c, o);
+    EXPECT_EQ(e->model().backend, "cpu") << "backend 'auto' with a test backend_factory resolves to 'cpu'";
+}

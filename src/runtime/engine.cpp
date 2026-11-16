@@ -414,6 +414,7 @@ CpuEngine::CpuEngine(const EngineConfig& cfg, const CpuEngineOptions& opts) : cf
     const std::string* gname = nm_->gguf().get_string("general.name");
     info_.id = gname != nullptr && !gname->empty() ? *gname : std::filesystem::path(cfg.model_path).stem().string();
     info_.architecture = "qwen35";
+    info_.backend = cfg_.backend;  // "auto" was resolved in the constructor's first lines
     // An explicit --ctx above the model's trained context is refused, not silently reduced (the
     // /v1/models context_length would otherwise disagree with what the user asked for).
     HALO_CHECK(!cfg.max_context_explicit || hp.context_length == 0 || cfg.max_context <= hp.context_length, ErrorCode::Config,

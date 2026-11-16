@@ -113,14 +113,19 @@ fs::path temp_file(const std::string& name, const std::string& content) {
 struct EngineHooks {
     std::function<void(runtime::GenerateResult&)> on_result;
     std::optional<std::pair<runtime::EngineStats, runtime::EngineStats>> stats;
+    /// Reported as ModelInfo::backend (the backend a real engine resolved "auto" to).
+    std::optional<std::string> backend;
 };
 
 /// An Engine that forwards to a shared FakeEngine, so tests can inspect it after the CLI has
 /// destroyed the engine it was given.
 class SharedEngine final : public runtime::Engine {
 public:
-    explicit SharedEngine(std::shared_ptr<FakeEngine> e, EngineHooks h = {}) : e_(std::move(e)), h_(std::move(h)) {}
-    const runtime::ModelInfo& model() const override { return e_->model(); }
+    explicit SharedEngine(std::shared_ptr<FakeEngine> e, EngineHooks h = {})
+        : e_(std::move(e)), h_(std::move(h)), info_(e_->model()) {
+        if (h_.backend) info_.backend = *h_.backend;
+    }
+    const runtime::ModelInfo& model() const override { return info_; }
     const tokenizer::Tokenizer& tokenizer() const override { return e_->tokenizer(); }
     const chat::ChatTemplate& chat_template() const override { return e_->chat_template(); }
     runtime::GenerateResult generate(const runtime::GenerateRequest& r, const runtime::TokenCallback& cb) override {
@@ -137,6 +142,7 @@ public:
 private:
     std::shared_ptr<FakeEngine> e_;
     EngineHooks h_;
+    runtime::ModelInfo info_;
     bool ran_ = false;
 };
 
@@ -1058,6 +1064,38 @@ TEST(CliBench, ModelSuiteOverFakeEngine) {
         EXPECT_EQ(rec.at("context"), 96) << rec.dump();
     }
     EXPECT_TRUE(saw) << jc.dump().substr(0, 400);
+}
+
+TEST(CliBench, RecordsTheBackendTheEngineRanOnNotTheConfigValue) {
+    // The CLI default backend is "auto"; the engine resolves it (to vulkan). Every record's
+    // identity.backend must name the resolved backend, or bench records say "auto".
+    FakeFactory ff;
+    auto configs = ff.configs;
+    const cli::EngineFactory factory = [e = ff.engine, configs](const runtime::EngineConfig& cfg) -> std::unique_ptr<runtime::Engine> {
+        configs->push_back(cfg);
+        EngineHooks h;
+        h.backend = "vulkan";
+        return std::make_unique<SharedEngine>(e, std::move(h));
+    };
+    const std::string root = fixture_root("evo_x2").string();
+    auto r = cli_run({"bench", "model", "m.gguf", "--host-label", "fake", "--modes", "decode", "--contexts", "128",
+                      "--prompt-tokens", "16", "--decode-tokens", "4", "--warmup", "0", "--repetitions", "3", "--root", root},
+                     CliOptions().with_factory(factory));
+    ASSERT_EQ(r.rc, 0) << r.err;
+    ASSERT_FALSE(configs->empty());
+    EXPECT_EQ(configs->at(0).backend, "auto") << "precondition: the CLI passes the unresolved default";
+    json j = json::parse(r.out);
+    ASSERT_FALSE(j.at("records").empty()) << r.out.substr(0, 400);
+    for (const auto& rec : j.at("records")) EXPECT_EQ(rec.at("backend"), "vulkan") << "bench model record: " << rec.dump();
+
+    const fs::path wl = source_dir() / "bench/workloads/agent_replay.json";
+    r = cli_run({"bench", "system", "m.gguf", "--workload", wl.string(), "--agents", "1", "--warmup", "0",
+                 "--repetitions", "3", "--host-label", "fake", "--root", root},
+                CliOptions().with_factory(factory));
+    ASSERT_EQ(r.rc, 0) << r.err;
+    j = json::parse(r.out);
+    ASSERT_FALSE(j.at("records").empty()) << r.out.substr(0, 400);
+    for (const auto& rec : j.at("records")) EXPECT_EQ(rec.at("backend"), "vulkan") << "bench system record: " << rec.dump();
 }
 
 TEST(CliBench, SystemSuiteOverFakeEngine) {

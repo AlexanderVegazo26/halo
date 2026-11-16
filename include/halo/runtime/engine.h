@@ -54,6 +54,9 @@ struct ModelInfo {
     bool has_mtp = false;
     std::uint64_t kv_pool_bytes = 0;  // trunk + MTP KV pools actually allocated (0 = not reported)
     std::size_t kv_segments = 0;      // backend buffers of the trunk KV pool (1 = contiguous)
+    /// The backend this engine runs on, with "auto" already resolved ("vulkan" | "hip" | "cpu");
+    /// empty = not reported. Record this, not EngineConfig::backend, as where a number was measured.
+    std::string backend{};
 };
 
 // Per-token callback during generation. Return false to cancel.

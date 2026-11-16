@@ -83,6 +83,13 @@ profiling::EnvironmentOptions environment(const ParsedArgs& a, const Context& ct
     return e;
 }
 
+/// The backend a bench record names: the one the engine reports it runs on ("auto" resolved), or
+/// the configured name when the engine does not report one.
+std::string ran_backend(const runtime::Engine& engine, const runtime::EngineConfig& config) {
+    const std::string& b = engine.model().backend;
+    return b.empty() ? config.backend : b;
+}
+
 profiling::RecordIdentity identity(const ParsedArgs& a, const std::optional<std::string>& model,
                                    const std::string& backend) {
     profiling::RecordIdentity id;
@@ -405,7 +412,7 @@ int bench_model(const std::vector<std::string>& args, Context& ctx) {
     if (auto v = a.u64("concurrency-context", 1, 1u << 22)) mc.concurrency_context = *v;  // F-2
     auto setup = make_engine(a, ctx, !mc.modes.contains(profiling::ModelMode::MtpDecode));
     if (!setup) return kExitUsage;
-    mc.identity = identity(a, setup->config.model_path, setup->config.backend);
+    mc.identity = identity(a, setup->config.model_path, ran_backend(*setup->engine, setup->config));
     mc.environment = environment(a, ctx);
     const auto factory = ctx.engine_factory;
     const auto ec = setup->config;
@@ -435,7 +442,7 @@ int bench_system(const std::vector<std::string>& args, Context& ctx) {
     sc.allow_nonconformant = a.flag("allow-nonconformant");
     auto setup = make_engine(a, ctx);
     if (!setup) return kExitUsage;
-    sc.identity = identity(a, setup->config.model_path, setup->config.backend);
+    sc.identity = identity(a, setup->config.model_path, ran_backend(*setup->engine, setup->config));
     sc.environment = environment(a, ctx);
     sc.encoder = engine_encoder(*setup->engine);
     profiling::SuiteRequest req;
