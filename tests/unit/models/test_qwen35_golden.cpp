@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <map>
 #include <numeric>
+#include <stdexcept>
 #include <tuple>
 
 #include "halo/backends/cpu/ops.h"
@@ -119,6 +120,12 @@ protected:
         if (!golden_) GTEST_SKIP() << "golden data missing under " << halo::test::tiny_dir();
         if (!tiny_) GTEST_SKIP() << "tiny-f32.gguf missing under " << halo::test::tiny_dir();
     }
+    /// The loaded golden data. Throws (the test fails with this message) instead of
+    /// dereferencing an empty optional; SetUp skips every test before that can happen.
+    static const Golden& golden() {
+        if (!golden_) throw std::logic_error("golden data not loaded (Qwen35F32::SetUpTestSuite)");
+        return *golden_;
+    }
     static inline std::optional<Golden> golden_;
     static inline std::unique_ptr<TinyModel> tiny_;
     static inline std::map<std::string, PromptRun> runs_;
@@ -133,7 +140,7 @@ TEST_F(Qwen35F32, EmbeddingAndLayerInputsMatchTransformers) {
         const PromptRun& r = runs_.at(p);
         ASSERT_EQ(r.prefill.layer_inputs.size(), kLayers);
         for (std::size_t li = 0; li < kLayers; ++li) {
-            const auto ref = golden_->f32(std::string(p) + ".layer_in." + std::to_string(li));
+            const auto ref = golden().f32(std::string(p) + ".layer_in." + std::to_string(li));
             ASSERT_EQ(ref.size(), r.tokens.size() * E);
             double worst = 0;
             for (std::size_t t = 0; t < r.tokens.size(); ++t) {
@@ -156,7 +163,7 @@ TEST_F(Qwen35F32, FinalHiddenMatchesTransformers) {
     for (const char* p : kPrompts) {
         SCOPED_TRACE(p);
         const PromptRun& r = runs_.at(p);
-        const auto ref = golden_->f32(std::string(p) + ".final_hidden");
+        const auto ref = golden().f32(std::string(p) + ".final_hidden");
         ASSERT_EQ(r.prefill.seqs[0].hidden.size(), ref.size());
         double worst = 0;
         for (std::size_t t = 0; t < r.tokens.size(); ++t) {
@@ -174,8 +181,8 @@ TEST_F(Qwen35F32, LogitsRowsAndArgmaxMatchTransformers) {
     for (const char* p : kPrompts) {
         SCOPED_TRACE(p);
         const PromptRun& r = runs_.at(p);
-        const auto rows = golden_->i32(std::string(p) + ".logits_rows");
-        const auto ref = golden_->f32(std::string(p) + ".logits");
+        const auto rows = golden().i32(std::string(p) + ".logits_rows");
+        const auto ref = golden().f32(std::string(p) + ".logits");
         ASSERT_EQ(ref.size(), rows.size() * V);
         double worst = 0, max_ref = 0;
         for (std::size_t j = 0; j < rows.size(); ++j) {
@@ -190,8 +197,8 @@ TEST_F(Qwen35F32, LogitsRowsAndArgmaxMatchTransformers) {
         // Argmax of every row where the golden top-1 margin exceeds twice that row's logits
         // tolerance (tolerance from HALO's own row max |logit|; the golden stores full
         // logits only for logits_rows).
-        const auto am = golden_->i32(std::string(p) + ".argmax");
-        const auto margin = golden_->f32(std::string(p) + ".top1_margin");
+        const auto am = golden().i32(std::string(p) + ".argmax");
+        const auto margin = golden().f32(std::string(p) + ".top1_margin");
         const std::size_t n_rows = r.tokens.size();
         std::size_t compared = 0;
         for (std::size_t t = 0; t < n_rows; ++t) {
@@ -221,9 +228,9 @@ TEST_F(Qwen35F32, GreedyDecodeWithCacheMatchesTransformers) {
     for (const char* p : kPrompts) {
         SCOPED_TRACE(p);
         const PromptRun& r = runs_.at(p);
-        const auto dec = golden_->i32(std::string(p) + ".decode_tokens");
-        const auto top_ids = golden_->i32(std::string(p) + ".decode_top16_ids");
-        const auto top_lg = golden_->f32(std::string(p) + ".decode_top16_logits");
+        const auto dec = golden().i32(std::string(p) + ".decode_tokens");
+        const auto top_ids = golden().i32(std::string(p) + ".decode_top16_ids");
+        const auto top_lg = golden().f32(std::string(p) + ".decode_top16_logits");
         // decode_tokens[0] is the argmax of the prefill's last row.
         EXPECT_EQ(r.prefill.seqs[0].argmax.back().index, dec[0]);
         double worst = 0;
@@ -422,15 +429,15 @@ TEST_F(Qwen35F32, MtpMatchesGoldenGivenGoldenHidden) {
     const std::size_t E = tiny_->model->n_embd();
     for (const char* p : {"p0", "p1"}) {
         SCOPED_TRACE(p);
-        const auto toks = golden_->i32(std::string(p) + ".tokens");
-        const auto fh = golden_->f32(std::string(p) + ".final_hidden");
+        const auto toks = golden().i32(std::string(p) + ".tokens");
+        const auto fh = golden().f32(std::string(p) + ".final_hidden");
         auto seq = tiny_->seq();
         const std::size_t n = toks.size() - 1;
         const StepResult r = run_mtp(*tiny_, std::span(toks).subspan(1), std::span(fh).first(n * E), *seq);
-        check_mtp(*tiny_, *golden_, p, r, kMtpRel, kMtpLogitRel);
+        check_mtp(*tiny_, golden(), p, r, kMtpRel, kMtpLogitRel);
         EXPECT_EQ(seq->mtp_kv.length(), n);
     }
-    EXPECT_FALSE(golden_->has("p2.mtp_hidden")) << "p2 has one token: no MTP row exists (checked, not skipped silently)";
+    EXPECT_FALSE(golden().has("p2.mtp_hidden")) << "p2 has one token: no MTP row exists (checked, not skipped silently)";
 }
 
 TEST_F(Qwen35F32, MtpEndToEndOnOwnHidden) {
@@ -442,7 +449,7 @@ TEST_F(Qwen35F32, MtpEndToEndOnOwnHidden) {
         auto seq = tiny_->seq();
         const StepResult r = run_mtp(*tiny_, std::span(run.tokens).subspan(1),
                                      std::span(run.prefill.seqs[0].hidden).first(n * E), *seq);
-        check_mtp(*tiny_, *golden_, p, r, kFinalRel + kMtpRel, kLogitRel + kMtpLogitRel);
+        check_mtp(*tiny_, golden(), p, r, kFinalRel + kMtpRel, kLogitRel + kMtpLogitRel);
     }
 }
 
@@ -474,7 +481,7 @@ TEST_F(Qwen35F32, MtpInPiecesEqualsOneShotAndDraftChainIsSelfConsistent) {
     }
     EXPECT_EQ(hid, all.seqs[0].hidden);
     // Chain: draft d1 from (x_n = decode_tokens[0], h_{n-1}), then d2 from (d1, mtp_hidden(d1-row)).
-    const std::int32_t x_n = golden_->i32("p1.decode_tokens")[0];
+    const std::int32_t x_n = golden().i32("p1.decode_tokens")[0];
     const std::span<const float> h_last = std::span(run.prefill.seqs[0].hidden).subspan(n * E, E);
     auto c = tiny_->seq();
     auto run1 = [&](halo::test::TestSeq& s, std::int32_t tok, std::span<const float> hin, std::int32_t pos) {
