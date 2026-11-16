@@ -176,8 +176,9 @@ TEST(ChatTemplateGolden, MessageOffsetsLandOnImStartTokens) {
     REQUIRE_GOLDEN();
     if (!fs::exists(ref_dir() / "tiny" / "hf" / "tokenizer.json")) GTEST_SKIP() << "reference tokenizer missing";
     const auto tok = halo::tokenizer::Tokenizer::from_hf_dir(ref_dir() / "tiny" / "hf");
-    const auto im_start = tok.piece_to_id("<|im_start|>");
-    ASSERT_TRUE(im_start.has_value());
+    const auto im_start_id = tok.piece_to_id("<|im_start|>");
+    if (!im_start_id) GTEST_FAIL() << "reference tokenizer has no <|im_start|> piece";
+    const std::int32_t im_start = *im_start_id;
     int checked_users = 0;
     for (const char* name : {"tool_calls_round_trip", "reasoning_history_preserve_unset", "system_multi_turn",
                              "tools_basic", "multi_step_tool_last_query"}) {
@@ -190,7 +191,7 @@ TEST(ChatTemplateGolden, MessageOffsetsLandOnImStartTokens) {
                 const std::size_t k = enc.token_index_at(m.offset);
                 ASSERT_LT(k, enc.ids.size()) << name;
                 EXPECT_EQ(enc.offsets[k], m.offset) << name << " message " << m.message_index;
-                EXPECT_EQ(enc.ids[k], *im_start) << name << " message " << m.message_index;
+                EXPECT_EQ(enc.ids[k], im_start) << name << " message " << m.message_index;
                 const std::string& role = c["messages"][m.message_index]["role"].get_ref<const std::string&>();
                 if (role == "user") ++checked_users;
                 EXPECT_EQ(r.prompt.compare(m.offset + 12, m.role.size(), m.role), 0) << name;
@@ -200,15 +201,16 @@ TEST(ChatTemplateGolden, MessageOffsetsLandOnImStartTokens) {
                 EXPECT_EQ(prefix_ids, std::vector<std::int32_t>(enc.ids.begin(), enc.ids.begin() + static_cast<std::ptrdiff_t>(k)))
                     << name << " message " << m.message_index;
             }
-            ASSERT_TRUE(r.preamble_end.has_value());
-            if (*r.preamble_end < r.prompt.size()) {
-                const std::size_t k = enc.token_index_at(*r.preamble_end);
-                EXPECT_EQ(enc.ids[k], *im_start) << name;
-                EXPECT_EQ(tok.encode(std::string_view(r.prompt).substr(0, *r.preamble_end), true),
+            if (!r.preamble_end) GTEST_FAIL() << name << ": render() reported no preamble_end";
+            const std::size_t preamble_end = *r.preamble_end;
+            if (preamble_end < r.prompt.size()) {
+                const std::size_t k = enc.token_index_at(preamble_end);
+                EXPECT_EQ(enc.ids[k], im_start) << name;
+                EXPECT_EQ(tok.encode(std::string_view(r.prompt).substr(0, preamble_end), true),
                           std::vector<std::int32_t>(enc.ids.begin(), enc.ids.begin() + static_cast<std::ptrdiff_t>(k)))
                     << name;
             }
-            ASSERT_TRUE(r.generation_prompt_start.has_value()) << name;
+            if (!r.generation_prompt_start) GTEST_FAIL() << name << ": render() reported no generation_prompt_start";
             EXPECT_EQ(r.prompt.substr(*r.generation_prompt_start), "<|im_start|>assistant\n<think>\n") << name;
         }
     }
@@ -231,14 +233,17 @@ TEST(ChatTemplateGolden, OffsetsForSystemToolsAndToolRuns) {
     ASSERT_TRUE(r.offsets_valid);
     // system(0) user(1) assistant(2) tool(3, run head) [tool 4: no header] assistant(5) user(6)
     std::vector<std::size_t> idx;
+    idx.reserve(r.message_starts.size());
     for (const auto& m : r.message_starts) idx.push_back(m.message_index);
-    EXPECT_EQ(idx, (std::vector<std::size_t>{0, 1, 2, 3, 5, 6}));
+    ASSERT_EQ(idx, (std::vector<std::size_t>{0, 1, 2, 3, 5, 6}));
     EXPECT_EQ(r.message_starts[0].offset, 0u);
     EXPECT_EQ(r.message_starts[3].role, "user");  // tool responses render inside a user turn
+    if (!r.preamble_end) GTEST_FAIL() << "render() reported no preamble_end";
     EXPECT_EQ(*r.preamble_end, r.message_starts[1].offset);
     // The preamble (system + tools) is identical for a different conversation.
     OrderedJson other = OrderedJson::array({c["messages"][0], {{"role", "user"}, {"content", "Different question"}}});
     const auto r2 = G.ggml->render(other, c["tools"], options_of(c));
+    if (!r2.preamble_end) GTEST_FAIL() << "render() of the other conversation reported no preamble_end";
     EXPECT_EQ(r2.prompt.substr(0, *r2.preamble_end), r.prompt.substr(0, *r.preamble_end));
 }
 
@@ -476,7 +481,7 @@ TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
         "</think>\n\nunterminated <tool_call>\n<function=x>\n<parameter=a>\n1",
         "</think> 　unicode ws ✓　",
     };
-    std::mt19937 rng(20260924);
+    std::mt19937 rng(20260924);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible splits
     for (const auto& text : outputs) {
         ParserOptions o;
         o.tools = tools();
@@ -645,7 +650,7 @@ TEST(OutputParserGolden, RoundTripsRenderedAssistantTurn) {
     const std::string body = full.substr(prompt.size(), full.find("<|im_end|>", prompt.size()) - prompt.size());
     ParserOptions o;
     o.tools = c["tools"];
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible splits
     std::string rs, cs;
     std::size_t calls = 0;
     const ParsedMessage m = parse_in_pieces(body, o, rng, 1, &rs, &cs, &calls);
