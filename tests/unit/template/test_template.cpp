@@ -31,8 +31,16 @@ using halo::chat::RenderOptions;
 
 namespace {
 
-const fs::path kRef = HALO_REF_DIR;
-const fs::path kGolden = kRef / "template_golden";
+// Function-local statics: a throwing initializer at namespace scope would end the binary before
+// gtest prints which test it was (bugprone-throwing-static-initialization).
+const fs::path& ref_dir() {
+    static const fs::path dir = HALO_REF_DIR;
+    return dir;
+}
+const fs::path& golden_dir() {
+    static const fs::path dir = ref_dir() / "template_golden";
+    return dir;
+}
 
 std::string read_file(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
@@ -51,15 +59,15 @@ Golden& golden() {
     static Golden g = [] {
         Golden r;
         for (const char* f : {"cases.json", "ggml.jinja", "unsloth.jinja"}) {
-            if (!fs::exists(kGolden / f)) {
-                r.skip = "template golden missing (" + (kGolden / f).string() +
+            if (!fs::exists(golden_dir() / f)) {
+                r.skip = "template golden missing (" + (golden_dir() / f).string() +
                          "): run python/tools/make_template_golden.py";
                 return r;
             }
         }
-        r.ggml = std::make_unique<ChatTemplate>(read_file(kGolden / "ggml.jinja"));
-        r.unsloth = std::make_unique<ChatTemplate>(read_file(kGolden / "unsloth.jinja"));
-        r.cases = OrderedJson::parse(read_file(kGolden / "cases.json"))["cases"];
+        r.ggml = std::make_unique<ChatTemplate>(read_file(golden_dir() / "ggml.jinja"));
+        r.unsloth = std::make_unique<ChatTemplate>(read_file(golden_dir() / "unsloth.jinja"));
+        r.cases = OrderedJson::parse(read_file(golden_dir() / "cases.json"))["cases"];
         return r;
     }();
     return g;
@@ -98,11 +106,14 @@ ErrorCode error_code_of(const std::function<void()>& f) {
     return ErrorCode::Cancelled;  // "did not throw"
 }
 
-const OrderedJson kTools = OrderedJson::parse(R"([
+const OrderedJson& tools() {
+    static const OrderedJson parsed = OrderedJson::parse(R"([
   {"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{
     "city":{"type":"string"},"days":{"type":"integer"},"note":{"type":"string"}}}}},
   {"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{
     "query":{"type":"string"},"cursor":{"type":["string","null"]}}}}}])");
+    return parsed;
+}
 
 }  // namespace
 
@@ -156,15 +167,15 @@ TEST(ChatTemplateGolden, HistoryRerenderIsPrefixStable) {
 
 TEST(ChatTemplateGolden, GgmlTemplateIsTheShippedFile) {
     REQUIRE_GOLDEN();
-    const fs::path shipped = kRef / "chat_template.jinja";
+    const fs::path shipped = ref_dir() / "chat_template.jinja";
     if (!fs::exists(shipped)) GTEST_SKIP() << "missing " << shipped;
     EXPECT_EQ(G.ggml->source(), read_file(shipped));
 }
 
 TEST(ChatTemplateGolden, MessageOffsetsLandOnImStartTokens) {
     REQUIRE_GOLDEN();
-    if (!fs::exists(kRef / "tiny" / "hf" / "tokenizer.json")) GTEST_SKIP() << "reference tokenizer missing";
-    const auto tok = halo::tokenizer::Tokenizer::from_hf_dir(kRef / "tiny" / "hf");
+    if (!fs::exists(ref_dir() / "tiny" / "hf" / "tokenizer.json")) GTEST_SKIP() << "reference tokenizer missing";
+    const auto tok = halo::tokenizer::Tokenizer::from_hf_dir(ref_dir() / "tiny" / "hf");
     const auto im_start = tok.piece_to_id("<|im_start|>");
     ASSERT_TRUE(im_start.has_value());
     int checked_users = 0;
@@ -357,7 +368,7 @@ TEST(OutputParser, SplitsReasoningContentAndToolCalls) {
         "<tool_call>\n<function=search>\n<parameter=query>\n42\n</parameter>\n<parameter=cursor>\nnull\n"
         "</parameter>\n</function>\n</tool_call>";
     ParserOptions o;
-    o.tools = kTools;
+    o.tools = tools();
     const ParsedMessage m = OutputParser::parse(out, o);
     EXPECT_EQ(m.reasoning_content, "The user wants weather.");
     EXPECT_EQ(m.content, "Let me check.");
@@ -468,7 +479,7 @@ TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
     std::mt19937 rng(20260924);
     for (const auto& text : outputs) {
         ParserOptions o;
-        o.tools = kTools;
+        o.tools = tools();
         const ParsedMessage ref = OutputParser::parse(text, o);
         for (int mode = 0; mode < 2; ++mode) {
             for (int rep = 0; rep < (mode == 0 ? 1 : 20); ++rep) {
@@ -489,7 +500,7 @@ TEST(OutputParser, IncrementalFeedingEqualsOneShot) {
     }
     // Spot-check the one-shot results themselves.
     ParserOptions o;
-    o.tools = kTools;
+    o.tools = tools();
     const auto m2 = OutputParser::parse(outputs[2], o);
     EXPECT_EQ(m2.content, "c1\n\nc2 after");
     EXPECT_EQ(m2.tool_calls.at(0).arguments["note"], " x ");
@@ -567,7 +578,7 @@ TEST(OutputParser, DeltasNeverSplitAMultibyteCharacter) {
     };
     for (const auto& text : outputs) {
         ParserOptions o;
-        o.tools = kTools;
+        o.tools = tools();
         const ParsedMessage ref = OutputParser::parse(text, o);
         ASSERT_EQ(first_invalid_utf8(ref.reasoning_content), std::string_view::npos) << text;
         ASSERT_EQ(first_invalid_utf8(ref.content), std::string_view::npos) << text;

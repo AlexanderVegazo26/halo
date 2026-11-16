@@ -9,8 +9,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -34,20 +36,25 @@ using namespace halo::cpu;
 using namespace halo::cpu::test;
 namespace fs = std::filesystem;
 
-const fs::path kDir = fs::path(HALO_REF_DIR) / "kernel_golden";
+// Function-local static: a throwing initializer at namespace scope would end the binary before
+// gtest prints which test it was (bugprone-throwing-static-initialization).
+const fs::path& golden_dir() {
+    static const fs::path dir = fs::path(HALO_REF_DIR) / "kernel_golden";
+    return dir;
+}
 
-const std::vector<std::string> kRequiredCases{
+constexpr std::array kRequiredCases{
     "rms_norm.a", "rms_norm.b", "gated_norm", "l2norm", "rope", "conv", "gdn.r3", "gdn.r3_rect",
     "gdn.r1", "gdn.real", "attn.small", "attn.real", "elem", "matmul", "topk"};
 
 class CpuGolden : public ::testing::Test {
 protected:
     void SetUp() override {
-        if (!fs::exists(kDir / "manifest.json")) {
-            GTEST_SKIP() << "golden data not found at " << kDir
+        if (!fs::exists(golden_dir() / "manifest.json")) {
+            GTEST_SKIP() << "golden data not found at " << golden_dir()
                          << " (generate with python/tools/make_kernel_golden.py)";
         }
-        std::ifstream f(kDir / "manifest.json");
+        std::ifstream f(golden_dir() / "manifest.json");
         manifest_ = nlohmann::json::parse(f);
     }
 
@@ -66,7 +73,7 @@ protected:
         std::size_t n = 1;
         for (const auto& d : e["shape"]) n *= d.get<std::size_t>();
         std::vector<T> v(n);
-        std::ifstream f(kDir / e["file"].get<std::string>(), std::ios::binary);
+        std::ifstream f(golden_dir() / e["file"].get<std::string>(), std::ios::binary);
         f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(n * sizeof(T)));
         if (!f || f.gcount() != static_cast<std::streamsize>(n * sizeof(T))) throw std::runtime_error(name + ": short read");
         return v;
@@ -191,7 +198,7 @@ TEST_F(CpuGolden, GatedDeltaRuleGroupedAndTiledBothForms) {
         const std::size_t T = m["tokens"], nk = m["n_k_heads"], nv = m["n_v_heads"], dk = m["d_k"], dv = m["d_v"];
         const auto q = f32(c + ".q"), k = f32(c + ".k");
         for (const std::string layout : {"grouped", "tiled"}) {
-            const std::string p = c + "." + layout + ".";
+            const std::string p = std::format("{}.{}.", c, layout);
             const auto v = f32(p + "v"), g = f32(p + "g"), beta = f32(p + "beta"), s0 = f32(p + "state_in");
             const GdnDims dims{nk, nv, dk, dv, layout == "tiled" ? GdnHeadMapping::Tiled : GdnHeadMapping::Grouped};
             const GdnInputs in{cv(q, T, nk * dk), cv(k, T, nk * dk), cv(v, T, nv * dv), cv(g, T, nv), cv(beta, T, nv)};
@@ -207,7 +214,7 @@ TEST_F(CpuGolden, GatedDeltaRuleGroupedAndTiledBothForms) {
                     gated_delta_rule_recurrent(dims, in, st, mv(out, T, nv * dv), true);
                 double worst = 0;
                 for (const std::string hf : {"chunk", "recur"}) {
-                    const auto ho = f32(p + "out_" + hf), hs = f32(p + "state_" + hf);
+                    const auto ho = f32(std::format("{}out_{}", p, hf)), hs = f32(std::format("{}state_{}", p, hf));
                     for (std::size_t j = 0; j < nv; ++j) {
                         double so = 0, eo = 0, ss = 0, es = 0;
                         for (std::size_t t = 0; t < T; ++t)

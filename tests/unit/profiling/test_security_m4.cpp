@@ -27,7 +27,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-const std::string kHelper = HALO_CHILD_HELPER;
+constexpr const char* kHelper = HALO_CHILD_HELPER;
 
 std::filesystem::path tmp(const std::string& name) {
     return std::filesystem::temp_directory_path() / ("halo_wsj_m4_" + std::to_string(::getpid()) + "_" + name);

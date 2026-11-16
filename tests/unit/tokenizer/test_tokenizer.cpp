@@ -41,8 +41,16 @@ using Json = nlohmann::json;
 
 namespace {
 
-const fs::path kRef = HALO_REF_DIR;
-const fs::path kGolden = kRef / "tokenizer_golden";
+// Function-local statics: a throwing initializer at namespace scope would end the binary before
+// gtest prints which test it was (bugprone-throwing-static-initialization).
+const fs::path& ref_dir() {
+    static const fs::path dir = HALO_REF_DIR;
+    return dir;
+}
+const fs::path& golden_dir() {
+    static const fs::path dir = ref_dir() / "tokenizer_golden";
+    return dir;
+}
 
 std::string read_file(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
@@ -115,26 +123,26 @@ struct Golden {
 Golden& golden() {
     static Golden g = [] {
         Golden r;
-        if (!fs::exists(kRef / "tiny" / "hf" / "tokenizer.json")) {
-            r.skip = "reference tokenizer missing: " + (kRef / "tiny/hf/tokenizer.json").string();
+        if (!fs::exists(ref_dir() / "tiny" / "hf" / "tokenizer.json")) {
+            r.skip = "reference tokenizer missing: " + (ref_dir() / "tiny/hf/tokenizer.json").string();
             return r;
         }
         for (const char* f : {"cases.json", "fuzz.json", "sweep.json", "nfc.json", "decode.json", "long.json"}) {
-            if (!fs::exists(kGolden / f)) {
-                r.skip = "golden data missing (" + (kGolden / f).string() +
+            if (!fs::exists(golden_dir() / f)) {
+                r.skip = "golden data missing (" + (golden_dir() / f).string() +
                          "): run python/tools/make_tokenizer_golden.py golden";
                 return r;
             }
         }
         // A present-but-corrupt file is a failure, not a skip: the parse below throws inside
         // the test body and gtest reports it.
-        r.tok = std::make_unique<Tokenizer>(Tokenizer::from_hf_dir(kRef / "tiny" / "hf"));
-        r.cases = Json::parse(read_file(kGolden / "cases.json"))["cases"];
-        r.fuzz = Json::parse(read_file(kGolden / "fuzz.json"))["cases"];
-        r.sweep = Json::parse(read_file(kGolden / "sweep.json"))["chunks"];
-        r.nfc = Json::parse(read_file(kGolden / "nfc.json"))["chunks"];
-        r.decode = Json::parse(read_file(kGolden / "decode.json"))["cases"];
-        r.long_text = Json::parse(read_file(kGolden / "long.json"));
+        r.tok = std::make_unique<Tokenizer>(Tokenizer::from_hf_dir(ref_dir() / "tiny" / "hf"));
+        r.cases = Json::parse(read_file(golden_dir() / "cases.json"))["cases"];
+        r.fuzz = Json::parse(read_file(golden_dir() / "fuzz.json"))["cases"];
+        r.sweep = Json::parse(read_file(golden_dir() / "sweep.json"))["chunks"];
+        r.nfc = Json::parse(read_file(golden_dir() / "nfc.json"))["chunks"];
+        r.decode = Json::parse(read_file(golden_dir() / "decode.json"))["cases"];
+        r.long_text = Json::parse(read_file(golden_dir() / "long.json"));
         return r;
     }();
     return g;
@@ -531,7 +539,7 @@ TEST(TokenizerGolden, LongPromptMatchesAndReportsThroughput) {
 // compare with the HF-json tokenizer.
 TEST(TokenizerGolden, GgufVocabularyMatchesHfJson) {
     REQUIRE_GOLDEN();
-    const fs::path p = kGolden / "gguf_unsloth_vocab.json";
+    const fs::path p = golden_dir() / "gguf_unsloth_vocab.json";
     if (!fs::exists(p)) GTEST_SKIP() << "missing " << p;
     const Json g = Json::parse(read_file(p));
     ASSERT_EQ(g["pre"], "qwen35");

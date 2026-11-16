@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -36,7 +37,7 @@ struct Worst {
     void add(double err, double tol) { ratio = std::max(ratio, err / tol); }
 };
 
-const std::vector<std::size_t> kThreadCounts{1, 2, 3, 7, 16, 64};
+constexpr std::array<std::size_t, 6> kThreadCounts{1, 2, 3, 7, 16, 64};
 
 double silu64(double x) { return x / (1.0 + std::exp(-x)); }
 

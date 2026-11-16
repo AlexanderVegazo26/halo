@@ -15,7 +15,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-const std::string kHelper = HALO_CHILD_HELPER;
+constexpr const char* kHelper = HALO_CHILD_HELPER;
 
 ProcessOptions mode(const std::string& m, std::map<std::string, std::string> extra = {}) {
     ProcessOptions o;

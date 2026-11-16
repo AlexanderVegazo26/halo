@@ -190,7 +190,7 @@ TEST(JsonSchema, AdversarialNestingAndSize) {
     // 20 nested arrays fit the default max_nesting (32); 40 cannot and must be rejected.
     const auto nested = [](int depth) {
         std::string s = R"({"type":"integer"})";
-        for (int i = 0; i < depth; ++i) s = R"({"type":"array","minItems":1,"maxItems":1,"items":)" + s + "}";
+        for (int i = 0; i < depth; ++i) s.insert(0, R"({"type":"array","minItems":1,"maxItems":1,"items":)").append("}");
         return s;
     };
     const auto g = Grammar::from_json_schema(nested(20));
@@ -199,7 +199,7 @@ TEST(JsonSchema, AdversarialNestingAndSize) {
     EXPECT_EQ(compile_error(nested(40)), ErrorCode::Api);
     // Schema-document nesting limit (anyOf chains do not consume container levels).
     std::string deep = R"({"type":"null"})";
-    for (int i = 0; i < 200; ++i) deep = R"({"anyOf":[)" + deep + "]}";
+    for (int i = 0; i < 200; ++i) deep.insert(0, R"({"anyOf":[)").append("]}");
     EXPECT_EQ(compile_error(deep), ErrorCode::Unsupported);
     // Large enum: 5000 literals compile to a trie.
     std::string e = R"({"enum":[)";
