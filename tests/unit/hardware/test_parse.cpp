@@ -77,7 +77,9 @@ TEST(Parse, KernelVersionComparesNumerically) {
     const auto v68 = parse_kernel_version("6.8.0-45-generic");
     const auto v619 = parse_kernel_version("6.19-rc1");
     const auto v7 = parse_kernel_version("7.0.0-31-generic\n");
-    ASSERT_TRUE(v68 && v619 && v7);
+    if (!v68) GTEST_FAIL() << "\"6.8.0-45-generic\" should parse as a kernel version";
+    if (!v619) GTEST_FAIL() << "\"6.19-rc1\" should parse as a kernel version";
+    if (!v7) GTEST_FAIL() << "\"7.0.0-31-generic\\n\" should parse as a kernel version";
     EXPECT_EQ(*v68, (KernelVersion{6, 8, 0}));
     EXPECT_EQ(*v619, (KernelVersion{6, 19, 0}));
     EXPECT_EQ(*v7, (KernelVersion{7, 0, 0}));
@@ -144,11 +146,11 @@ TEST(Parse, ActivePowerProfileAcrossLayouts) {
 
 TEST(Parse, PciSlotToKfdLocationId) {
     const auto a = parse_pci_slot_name("0000:c5:00.0\n");
-    ASSERT_TRUE(a);
+    if (!a) GTEST_FAIL() << "\"0000:c5:00.0\\n\" should parse as a PCI slot name";
     EXPECT_EQ(a->domain, 0u);
     EXPECT_EQ(a->location_id, 0xc500u);  // 50432, as KFD reports it
     const auto b = parse_pci_slot_name("0001:03:1f.7");
-    ASSERT_TRUE(b);
+    if (!b) GTEST_FAIL() << "\"0001:03:1f.7\" should parse as a PCI slot name";
     EXPECT_EQ(b->domain, 1u);
     EXPECT_EQ(b->location_id, (0x03u << 8) | (0x1fu << 3) | 7u);
     EXPECT_FALSE(parse_pci_slot_name("0000:c5:20.0"));  // device > 0x1f
