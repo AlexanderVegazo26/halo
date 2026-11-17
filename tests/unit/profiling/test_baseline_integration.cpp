@@ -95,13 +95,14 @@ TEST(BaselineIntegration, LlamaBenchOnTinyModel) {
     EXPECT_TRUE(a.thermal.valid || !a.thermal.drift_c) << a.thermal.reason;
     // TRD §51 fields.
     const auto& r = a.records.front();
-    ASSERT_TRUE(r.invocation);
+    if (!r.invocation) GTEST_FAIL() << "first llama-bench record has no invocation (TRD §51)";
     EXPECT_EQ(r.invocation->commit, "bd4f514");
     EXPECT_EQ(r.invocation->binary, bench.string());
     EXPECT_EQ(r.invocation->argv, llama_bench_argv(c));
     EXPECT_EQ(r.backend, "cpu");
     EXPECT_EQ(r.driver, "cpu");
     EXPECT_EQ(r.extra.at("backends"), "CPU");
+    if (!a.hardware_before) GTEST_FAIL() << "llama-bench artifact has no hardware_before snapshot";
     EXPECT_EQ(r.power_mode, a.hardware_before->power_mode);
     ASSERT_TRUE(r.hardware_before && r.hardware_after);
     // Model hash: independent oracle = coreutils sha256sum, run through the same runner.
@@ -144,10 +145,11 @@ TEST(BaselineIntegration, LlamaServerMtpOnTinyModel) {
     ASSERT_EQ(a.records.size(), 4u);  // 1 warm-up + 3
     for (const auto& r : a.records) {
         EXPECT_EQ(r.mode, "mtp_completion");
-        ASSERT_TRUE(r.decode_effective_tps);
+        if (!r.decode_effective_tps) GTEST_FAIL() << "mtp_completion record has no decode_effective_tps";
         EXPECT_GT(*r.decode_effective_tps, 0);
         EXPECT_TRUE(r.extra.contains("draft_n"));  // speculation was active
         EXPECT_FALSE(r.ttft_ms);
+        if (!r.invocation) GTEST_FAIL() << "mtp_completion record has no invocation (TRD §51)";
         EXPECT_EQ(r.invocation->commit, "bd4f514");
     }
     // The server is gone: nothing listens on its port any more.
