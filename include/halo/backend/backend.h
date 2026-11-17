@@ -524,6 +524,15 @@ public:
     }
     /// Read-only import (the mmapped GGUF weights): writable() is false.
     [[nodiscard]] virtual std::unique_ptr<Buffer> import_host_readonly(std::span<const std::byte> bytes) = 0;
+    /// Read-only import of a small per-step input that lives for one forward (token ids,
+    /// positions, KV block tables, tree parents): the same contract as import_host_readonly (the
+    /// bytes stay unchanged while the Buffer lives, ops may also read them on the host), but a
+    /// device backend may place it where the device reads it in place, so the import needs no
+    /// transfer (Vulkan: host-visible memory and a memcpy instead of a staged copy behind the
+    /// context's transfer fence). Not for weights. The default is import_host_readonly.
+    [[nodiscard]] virtual std::unique_ptr<Buffer> import_step_readonly(std::span<const std::byte> bytes) {
+        return import_host_readonly(bytes);
+    }
     [[nodiscard]] virtual std::unique_ptr<Stream> create_stream() = 0;
     /// Ordered in the stream; `src` must stay valid until wait() returns.
     virtual void upload(Stream& s, TensorRef dst, std::span<const std::byte> src) = 0;

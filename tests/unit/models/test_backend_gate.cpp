@@ -460,7 +460,8 @@ INSTANTIATE_TEST_SUITE_P(
 // ---------------------------------------------------------------------------------------
 
 /// The CPU backend with other Limits (every call forwards to it); records the host spans of its
-/// read-only imports.
+/// read-only weight imports (import_host_readonly; a forward's import_step_readonly inputs are
+/// forwarded unrecorded).
 class LimitedBackend final : public hb::Backend {
 public:
     LimitedBackend(hb::Backend& inner, hb::Limits limits) : in_(inner), lim_(limits) {}
@@ -472,6 +473,9 @@ public:
     std::unique_ptr<hb::Buffer> import_host_readonly(std::span<const std::byte> b) override {
         readonly_imports.push_back(b);
         return in_.import_host_readonly(b);
+    }
+    std::unique_ptr<hb::Buffer> import_step_readonly(std::span<const std::byte> b) override {
+        return in_.import_step_readonly(b);
     }
     std::unique_ptr<hb::Stream> create_stream() override { return in_.create_stream(); }
     void upload(hb::Stream& s, hb::TensorRef d, std::span<const std::byte> b) override { in_.upload(s, d, b); }

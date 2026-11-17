@@ -421,6 +421,19 @@ public:
         return std::make_unique<VkBuf>(this, std::move(d), bytes.size(), Tier::Vram, false, bytes.data(),
                                        std::span<std::byte>());
     }
+    std::unique_ptr<Buffer> import_step_readonly(std::span<const std::byte> bytes) override {
+        // Host-visible (Gtt), not device-local: a forward imports its ids, positions, tree
+        // parents and block tables (a few KiB). As a device-local copy each import was a staged
+        // upload behind the context's transfer fence (a blocking GPU round trip per import,
+        // several per forward); mapped, the upload is a memcpy (Buffer::upload). On the UMA
+        // target (Strix Halo) host-visible memory is the same RAM the device-local heap is, so
+        // the kernels lose nothing reading it in place. On a discrete card the block tables would
+        // be read over PCIe in every attention layer: a stream-recorded staged copy is the
+        // alternative there (state.md halo backlog).
+        hv::Buffer d = device_copy(bytes, hv::MemoryUsage::HostVisible);
+        return std::make_unique<VkBuf>(this, std::move(d), bytes.size(), Tier::Gtt, false, bytes.data(),
+                                       std::span<std::byte>());
+    }
     std::unique_ptr<Stream> create_stream() override { return std::make_unique<VkStream>(this, ctx_); }
 
     void upload(Stream& s, TensorRef dst, std::span<const std::byte> src) override {
@@ -746,7 +759,7 @@ public:
         // That needs the positions on the host: they must be a read-only host import.
         HALO_CHECK(pos.buf->ro_host() != nullptr, ErrorCode::Unsupported,
                    "PARTIAL_ROPE: the vulkan backend builds the cos/sin table on the host; positions must be a "
-                   "read-only host import (import_host_readonly)");
+                   "read-only host import (import_host_readonly or import_step_readonly)");
         std::vector<std::int32_t> p(a.n_tokens);
         std::memcpy(p.data(), pos.buf->ro_host() + pos.begin, p.size() * 4);
         const std::vector<float> table = hv::rope_cos_sin_table(p, a.rot_dims, a.theta);
@@ -958,8 +971,9 @@ private:
         return *vs;
     }
 
-    hv::Buffer device_copy(std::span<const std::byte> bytes) {
-        hv::Buffer d = hv::Buffer::create(ctx_, std::max<std::uint64_t>(round_up4(bytes.size()), 4), hv::MemoryUsage::DeviceLocal);
+    /// A `usage` buffer holding a copy of `bytes` (at least 4 bytes, rounded up to 4).
+    hv::Buffer device_copy(std::span<const std::byte> bytes, hv::MemoryUsage usage = hv::MemoryUsage::DeviceLocal) {
+        hv::Buffer d = hv::Buffer::create(ctx_, std::max<std::uint64_t>(round_up4(bytes.size()), 4), usage);
         if (!bytes.empty()) d.upload(bytes);
         return d;
     }

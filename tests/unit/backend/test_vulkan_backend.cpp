@@ -32,6 +32,7 @@
 #include "backend/vulkan_adapter.h"
 #include "halo/backend/backend.h"
 #include "halo/backends/cpu/ops.h"
+#include "halo/backends/vulkan/buffer.h"
 #include "halo/backends/vulkan/context.h"
 #include "halo/core/error.h"
 #include "halo/kv_cache/paged_kv.h"
@@ -78,6 +79,10 @@ struct Dev {
     }
     hb::TensorRef import_ro(std::span<const std::byte> bytes) {
         bufs.push_back(be.import_host_readonly(bytes));
+        return hb::TensorRef::of(*bufs.back());
+    }
+    hb::TensorRef import_step(std::span<const std::byte> bytes) {
+        bufs.push_back(be.import_step_readonly(bytes));
         return hb::TensorRef::of(*bufs.back());
     }
     hb::TensorRef import_rw(std::span<std::byte> bytes) {
@@ -268,6 +273,59 @@ TEST(VulkanBackend, DownloadsSnapshotAtTheirStreamPosition) {
     EXPECT_TRUE(bitwise(second, b, "download after the copy"));
 }
 
+/// Runs `body` with HALO_VK_OP_TIMINGS pointed at a fresh file named after the current test and
+/// `tag`, restores the variable, and returns the profile's marker lines ("# wait", "# transfer
+/// <bytes>") plus the whole profile for failure messages.
+struct Profile {
+    std::vector<std::string> marks;
+    std::string shown;
+    [[nodiscard]] std::size_t transfers() const {
+        return static_cast<std::size_t>(
+            std::count_if(marks.begin(), marks.end(), [](const std::string& m) { return m.starts_with("# transfer"); }));
+    }
+};
+template <class F>
+Profile op_timings_profile(const std::string& tag, F&& body) {
+    const std::filesystem::path path =
+        std::filesystem::path(::testing::TempDir()) /
+        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "_" + tag +
+         ".txt");
+    std::filesystem::remove(path);
+    // Restores the variable and removes the file even when `body` throws, so a failing op
+    // cannot leave later tests of this binary profiling into a stale file.
+    struct Restore {
+        std::filesystem::path path;
+        std::optional<std::string> old;
+        Restore(std::filesystem::path p, std::optional<std::string> o) : path(std::move(p)), old(std::move(o)) {}
+        Restore(const Restore&) = delete;
+        Restore& operator=(const Restore&) = delete;
+        ~Restore() {
+            if (old) {
+                ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
+            } else {
+                ::unsetenv("HALO_VK_OP_TIMINGS");
+            }
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    };
+    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
+    const Restore restore{path, old_env ? std::optional<std::string>(old_env) : std::nullopt};
+    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+    body();
+    ::unsetenv("HALO_VK_OP_TIMINGS");  // stop profiling before reading the file (Restore puts the old value back)
+    Profile r;
+    r.shown = "profile " + path.string() + ":";
+    {
+        std::ifstream in(path);
+        for (std::string l; std::getline(in, l);) {
+            r.shown += "\n  " + l;
+            if (l.starts_with('#')) r.marks.push_back(l);
+        }
+    }
+    return r;
+}
+
 // next.md step 4 ("keep the MTP hidden state on the device"): forward() hands the trunk hidden to
 // mtp_forward() as a Stream download and a Stream upload of a Vram buffer. Both are recorded into
 // the stream (host-mapped staging + a recorded copy), so they ride the stream's own fence: with
@@ -278,43 +336,75 @@ TEST(VulkanBackend, StreamUploadAndDownloadRideTheStreamFenceNotATransferFence) 
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     if (ctx->force_staging()) GTEST_SKIP() << "context forces staged host copies (ContextOptions::force_staging)";
     auto be = hb::make_vulkan_backend(ctx);
-    const std::filesystem::path path =
-        std::filesystem::path(::testing::TempDir()) /
-        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".txt");
-    std::filesystem::remove(path);
-    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
-    const std::optional<std::string> old = old_env ? std::optional<std::string>(old_env) : std::nullopt;
     constexpr std::size_t kRow = 5120;  // one 27B hidden row (n_embd floats)
     const std::vector<float> h = randn(2 * kRow, 11);
     std::vector<float> back(kRow);
-    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
-    {
+    const Profile prof = op_timings_profile("stream", [&] {
         Dev d(*be);
         const hb::TensorRef dev = d.zeros(2 * kRow * sizeof(float));
         be->upload(*d.s, dev, std::as_bytes(std::span(h)));
         be->download(*d.s, dev.shifted(kRow * sizeof(float)), std::as_writable_bytes(std::span(back)));
         d.sync();
-    }
-    if (old) {
-        ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
-    } else {
-        ::unsetenv("HALO_VK_OP_TIMINGS");
-    }
-    std::vector<std::string> marks;
-    std::string shown;
-    {
-        std::ifstream in(path);
-        for (std::string l; std::getline(in, l);) {
-            shown += "\n  " + l;
-            if (l.starts_with('#')) marks.push_back(l);
-        }
-    }
-    std::filesystem::remove(path);
+    });
     EXPECT_TRUE(bitwise(back, std::span(h).subspan(kRow), "second row after a stream upload + download"));
-    EXPECT_EQ(marks, std::vector<std::string>{"# wait"})
-        << "profile " << path << ": a stream upload of " << h.size() * sizeof(float) << " B and download of "
-        << back.size() * sizeof(float) << " B into/from a Vram buffer should add no '# transfer' line (no "
-        << "context transfer fence) and exactly one '# wait' for the stream's submission; got:" << shown;
+    EXPECT_EQ(prof.marks, std::vector<std::string>{"# wait"})
+        << "a stream upload of " << h.size() * sizeof(float) << " B and download of " << back.size() * sizeof(float)
+        << " B into/from a Vram buffer should add no '# transfer' line (no context transfer fence) and exactly one "
+        << "'# wait' for the stream's submission; " << prof.shown;
+}
+
+// next.md step 4 (per-forward transfer fences): every forward imports its token ids, positions,
+// KV block tables and tree parents through Step::import_ro. As import_host_readonly each was a
+// device-local copy staged behind the context's blocking transfer fence (one "# transfer" line
+// per import). import_step_readonly keeps them host-visible, so the import is a memcpy: a step
+// that gathers rows by imported ids and ropes by imported positions submits and waits once with
+// no "# transfer" line, and the ops still read the right values (bitwise the CPU backend; RoPE
+// still finds the positions on the host). The same step over import_host_readonly shows the
+// profile does see those transfers when device-local memory is not host-visible.
+TEST(VulkanBackend, StepReadonlyImportsNeedNoTransferFence) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    if (ctx->force_staging()) GTEST_SKIP() << "context forces staged host copies (ContextOptions::force_staging)";
+    Pair p = make_pair(ctx);
+    constexpr std::uint32_t kRows = 6, kHeads = 2, kHd = 16, kRot = 8;
+    constexpr std::uint32_t kCols = kHeads * kHd;
+    const std::vector<float> table = randn(std::size_t{kRows} * kCols, 41);
+    const std::vector<std::int32_t> ids{4, 0, 5};
+    const std::vector<std::int32_t> pos{9, 10, 11};
+    const auto n = static_cast<std::uint32_t>(ids.size());
+    // Gathers rows of `table` by `ids`, ropes them in place by `pos`, returns them.
+    const auto run = [&](hb::Backend& be, bool step_import) {
+        Dev d(be);
+        const hb::TensorRef tb = d.put(table);
+        const auto imp = [&](std::span<const std::byte> b) { return step_import ? d.import_step(b) : d.import_ro(b); };
+        const hb::TensorRef rid = imp(std::as_bytes(std::span(ids)));
+        const hb::TensorRef rpos = imp(std::as_bytes(std::span(pos)));
+        for (std::size_t i = d.bufs.size() - 2; i < d.bufs.size(); ++i) {
+            EXPECT_FALSE(d.bufs[i]->writable())
+                << be.describe() << ": " << (step_import ? "import_step_readonly" : "import_host_readonly") << " of the "
+                << (i + 2 == d.bufs.size() ? "ids" : "positions") << " must be read-only (writable() false)";
+        }
+        const hb::TensorRef x = d.zeros(std::size_t{n} * kCols * sizeof(float));
+        be.get_rows(*d.s, hb::GetRowsArgs{halo::DType::F32, tb, rid, x, kRows, kCols, n, {}, {}});
+        be.partial_rope(*d.s, hb::RopeArgs{x, rpos, n, kHeads, kHd, kRot, 1e7f, 0, {}});
+        return d.get<float>(x, std::size_t{n} * kCols);
+    };
+    const std::vector<float> want = run(*p.cpu, true);
+    std::vector<float> got;
+    const Profile step = op_timings_profile("step", [&] { got = run(*p.vk, true); });
+    EXPECT_TRUE(bitwise(got, want, "rows gathered by step-imported ids, roped by step-imported positions"));
+    EXPECT_EQ(step.marks, std::vector<std::string>{"# wait"})
+        << "importing " << ids.size() * 4 << " B of ids and " << pos.size() * 4 << " B of positions with "
+        << "import_step_readonly should add no '# transfer' line (no context transfer fence) and exactly one '# wait' "
+        << "for the step's submission; " << step.shown;
+    if (hv::Buffer::create(ctx, 4, hv::MemoryUsage::DeviceLocal).host_visible()) {
+        std::cout << "[vk-backend] device-local memory is host-visible here: no staged import to contrast\n";
+        return;
+    }
+    std::vector<float> got_ro;
+    const Profile ro = op_timings_profile("readonly", [&] { got_ro = run(*p.vk, false); });
+    EXPECT_TRUE(bitwise(got_ro, want, "same step over import_host_readonly"));
+    EXPECT_EQ(ro.transfers(), 2U) << "the same two imports through import_host_readonly are device-local copies, one "
+                                     "staged transfer each; " << ro.shown;
 }
 
 TEST(VulkanBackend, InterfaceRules) {

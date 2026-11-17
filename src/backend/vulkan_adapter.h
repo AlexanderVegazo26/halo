@@ -14,6 +14,8 @@
 ///    Host; zero-filled (as the CPU backend). host_data() / host_ptr() are always null (A-4).
 ///  - import_host_readonly: a device COPY made at import time; the caller's bytes must stay
 ///    unchanged while the Buffer lives (they are also read on the host, e.g. RoPE positions).
+///  - import_step_readonly: the same contract, but host-visible memory filled by a memcpy (no
+///    staged copy behind the context's transfer fence): a forward's ids, positions, block tables.
 ///  - import_host (writable): a device mirror of the caller's memory. The bytes are copied in
 ///    at import time; after every successful Stream::wait() of this backend the device copy
 ///    is written back to the caller's memory (for every live writable import). The caller

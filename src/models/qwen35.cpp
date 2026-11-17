@@ -464,7 +464,7 @@ bool fuse_norm = false;
             return TensorRef::of(*arena.back());
         }
         TensorRef import_ro(std::span<const std::byte> v) {
-            arena.push_back(I.be->import_host_readonly(v));
+            arena.push_back(I.be->import_step_readonly(v));
             return TensorRef::of(*arena.back());
         }
         void sync() {
