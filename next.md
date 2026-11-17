@@ -162,3 +162,29 @@ All new paths are opt-in (env flag, default off) except the `stream.cpp` per-dis
 | 12 mixed-bitrate | not implemented: owner decision (conflicts with D-014) |
 
 Verify on the EVO-X2 in this order: full test suite (differential + VkHead/VkViews bitwise gates), baseline tok/s, then each flag alone.
+
+## First idle-GPU sweep (2026-11-17, `scripts/bench_decode.py`)
+Qwen3.8-27B UD-Q4_K_XL, Vulkan/RADV, `-n 128 --ctx 4096`, default prompt, **one run per variant** (so differences within about ±2% are noise), GPU idle (gpu_busy_percent 0, no other model loaded) before each run. Every measured variant's greedy output equals the baseline's.
+
+| variant | step | tok/s | vs baseline | drafts accepted |
+|---|---|---|---|---|
+| baseline (MTP k=2) | - | 15.91 | - | 70 / 114 (61.4%) |
+| plain (`--mtp-draft 0`) | - | 11.12 | -30.1% | - |
+| `--mtp-draft 3` | 5 | 13.99 | -12.1% | 75 / 156 (48.1%) |
+| `HALO_SUBGROUP_REDUCE=1` | 1 | 16.75 | +5.3% | same |
+| `HALO_MTP_DRAFT_VOCAB=32768` | 2 | 16.87 | +6.0% | same |
+| `HALO_GDN_REG=1` | 3 | 16.33 | +2.6% | same |
+| `HALO_GDN_DV_TILE=32` | 3 | 15.79 | -0.8% | same |
+| `HALO_STREAM_REUSE=1` | 4 | 15.59 | -2.0% | same |
+| `HALO_VK_PUSH_DESCRIPTORS=1` | 4 | 15.84 | -0.4% | same |
+| `HALO_MTP_DEVICE_HIDDEN=1` | 4 | 15.71 | -1.3% | same |
+| `HALO_MTP_CHAIN=1` | 4 | 15.74 | -1.1% | same |
+| `HALO_MTP_TREE=1` | 5 | 13.92 | -12.5% | 73 / 108 (67.6%) |
+| `HALO_FUSE_GEMV=all` | 6 | 15.86 | -0.3% | same |
+| `HALO_COOPMAT=1` | 7 | 15.71 | -1.3% | same |
+| `HALO_REPACK=1` | 8 | 16.11 | +1.3% | same |
+| `HALO_KV_FP16=1`, `HALO_KV_TYPE=q8`, `HALO_FUSE_NORM=1`, `HALO_NGRAM_DRAFT=1` | 9-11 | not measured | | another model server took the GPU mid-sweep (the sweep stopped, as designed) |
+
+Reading: only subgroup-reduce (step 1) and the reduced draft head (step 2) clearly beat the baseline; gdn-reg and repack are within noise. Deeper drafts and tree verification cost more than their extra accepted tokens on this prompt. Next: `--repeat 3` on the four positive flags and their combination, then the four unmeasured variants.
+
+The sweep's first attempt discarded every run: amdgpu smooths gpu_busy_percent, so halo's own load reads 72% at exit and 28% a second later, fading to <= 5% only after ~2.75 s. The post-run check now polls for up to `--busy-settle` (default 10 s) before it calls the GPU shared.

@@ -206,6 +206,29 @@ class BenchDecode(unittest.TestCase):
         self.assertEqual((b["status"], b["tps_median"], b["busy_after"]), ("not measured", None, None), b)
         self.assertIn("GPU busy unreadable right after run 1", b["note"])
 
+    def busy_readings(self, seq):
+        """Patch gpu_busy to return `seq` in call order (then its last value): amdgpu smooths
+        gpu_busy_percent, so a run's own load fades over a few seconds after halo exits."""
+        it = iter(seq)
+        return mock.patch.object(bd, "gpu_busy", side_effect=lambda *_: next(it, seq[-1]))
+
+    def test_own_load_fading_after_exit_is_still_an_idle_gpu(self):
+        # Idle EVO-X2, 2026-11-17: 0 before the run, then 72 -> 43 -> 20 -> 3 after halo exited.
+        # Reading once 1 s after exit (28%) discarded every run of a sweep on an idle machine.
+        with self.busy_readings([0, 72, 43, 20, 3]):
+            rc = self.run_bench("--variants", "baseline", "--busy-settle", "30")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 0, f"a fading reading on an idle GPU must not discard the run: {b}\n{self.stderr}")
+        self.assertEqual((b["status"], b["tps_median"], b["busy_after"]), ("measured", 10.0, 3), b)
+
+    def test_gpu_still_busy_after_the_settle_window_discards_the_run(self):
+        with self.busy_readings([0, 100]):
+            rc = self.run_bench("--variants", "baseline", "--busy-settle", "0.2")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 3, f"a GPU that stays busy after halo exited was shared: {b}")
+        self.assertEqual((b["status"], b["tps"], b["busy_after"]), ("not measured", [], 100), b)
+        self.assertIn("GPU busy 100% > 5% right after run 1 (still after 0.2 s settle)", b["note"])
+
     def test_busy_settle_must_not_be_negative(self):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
             bd.main(["--halo", "h", "--model", "m", "--busy-settle", "-1"])

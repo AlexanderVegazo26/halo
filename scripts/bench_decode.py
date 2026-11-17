@@ -7,15 +7,18 @@ tok/s, the change against the baseline, the request's draft acceptance, and whet
 greedy output is identical to the baseline's.
 
     scripts/bench_decode.py --halo build-dev/tools/halo/halo --model Qwen3.8-27B-UD-Q4_K_XL.gguf \
-        [--variants all|NAME,NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] [--busy-settle 1] \
+        [--variants all|NAME,NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] [--busy-settle 10] \
         [--report-dir .test-report/bench-decode]
 
 Numbers taken while another process keeps the GPU busy are not benchmarks (2026-11-14: a
 24-token prompt + 4 tokens took 62 s beside a busy model server). So before every run the
 script samples gpu_busy_percent; above --busy-max it runs nothing more, marks the remaining
-variants "not measured", and exits 3. It samples again right after every run (after
---busy-settle seconds): a GPU still busy once halo has exited means another process overlapped
-the run, so that run's tok/s is discarded the same way instead of being reported as measured.
+variants "not measured", and exits 3. It samples again after every run: gpu_busy_percent is
+smoothed by amdgpu, so halo's own load takes a few seconds to fade once it has exited (measured
+2026-11-17 on the idle EVO-X2: 72 -> 28 after 1 s, <= 5 only after ~2.75 s). The script polls
+until the reading is back under --busy-max, for up to --busy-settle seconds; a GPU still busy
+after that means another process overlapped the run, so that run's tok/s is discarded the same
+way instead of being reported as measured.
 Every inherited HALO_* speed flag is removed so the baseline really is the default build
 behaviour.
 
@@ -142,6 +145,17 @@ def parse_run(stderr: str) -> dict:
     return out
 
 
+def wait_settled(a) -> int | None:
+    """Busy reading once halo's own load has faded: polls until <= --busy-max or --busy-settle
+    seconds have passed, and returns the last reading (None if unreadable)."""
+    deadline = time.monotonic() + a.busy_settle
+    while True:
+        busy = gpu_busy(a.busy_file, a.busy_samples, a.busy_interval)
+        if busy is None or busy <= a.busy_max or time.monotonic() >= deadline:
+            return busy
+        time.sleep(max(a.busy_interval, 0.05))
+
+
 def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
     cmd = [a.halo, "run", a.model, "-p", a.prompt, "--raw", "--temperature", "0", "-n", str(a.max_tokens),
            "--ctx", str(a.ctx), "--parallel", "1", *v.args]
@@ -169,15 +183,15 @@ def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
             tail = " | ".join(p.stderr.strip().splitlines()[-3:])
             r.status, r.note = "failed", f"exit {p.returncode}{'' if 'tps' in info else ', no tok/s line'}: {tail}"
             return r, outputs
-        # halo has exited, so its own work is done: a GPU still busy now was shared with
-        # another process during the run, and the run's tok/s is not a benchmark.
-        if a.busy_settle > 0:
-            time.sleep(a.busy_settle)
-        after = gpu_busy(a.busy_file, a.busy_samples, a.busy_interval)
+        # halo has exited, so its own work is done once its smoothed load has faded: a GPU
+        # still busy after the settle window was shared with another process during the run,
+        # and the run's tok/s is not a benchmark.
+        after = wait_settled(a)
         r.busy_after = after
         if after is None or after > a.busy_max:
             seen = "unreadable" if after is None else f"{after}% > {a.busy_max}%"
-            r.note = f"GPU busy {seen} right after run {i + 1}: another process overlapped it, tok/s discarded"
+            r.note = (f"GPU busy {seen} right after run {i + 1} (still after {a.busy_settle:g} s settle): "
+                      "another process overlapped it, tok/s discarded")
             r.tps = []
             return r, []
         r.tps.append(info["tps"])
@@ -243,8 +257,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--busy-file", default=DEFAULT_BUSY_GLOB, help="glob of gpu_busy_percent files")
     ap.add_argument("--busy-samples", type=int, default=5)
     ap.add_argument("--busy-interval", type=float, default=0.2, help="seconds between busy samples")
-    ap.add_argument("--busy-settle", type=float, default=1.0,
-                    help="seconds to wait after a run before checking that no other process used the GPU")
+    ap.add_argument("--busy-settle", type=float, default=10.0,
+                    help="seconds a run's own smoothed GPU load may take to fade before the GPU counts as "
+                         "shared with another process")
     ap.add_argument("--timeout", type=int, default=900, help="seconds per run")
     ap.add_argument("--report-dir", default=".test-report/bench-decode")
     a = ap.parse_args(argv)
