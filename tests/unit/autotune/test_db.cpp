@@ -26,7 +26,7 @@ void raw_exec(const std::filesystem::path& p, const std::string& sql) {
     sqlite3_close(db);
 }
 
-OpTuneResult result_with(const std::string& winner, double median, std::vector<std::string> measured) {
+OpTuneResult result_with(const std::string& winner, double median, const std::vector<std::string>& measured) {
     OpTuneResult r;
     r.key = {"MATMUL", "T=1,K=4,N=4,w=f32"};
     r.backend = "cpu";
@@ -81,7 +81,7 @@ TEST(ProfileDb, PersistTuneRoundTripAndWinnerReplacement) {
         const auto lk = ProfileLookup::open(t.path());
         const auto r = lk.find(key, {"MATMUL", "T=1,K=4,N=4,w=f32"}, "cpu");
         EXPECT_EQ(r.source, SelectionSource::Exact);
-        ASSERT_TRUE(r.candidate);
+        if (!r.candidate) GTEST_FAIL() << "lookup after the first tune returned no candidate (expected threads=4)";
         EXPECT_EQ(r.candidate->to_string(), "threads=4");
         EXPECT_DOUBLE_EQ(r.value, 100.0);
         EXPECT_EQ(r.strategy, "exhaustive");
@@ -100,7 +100,7 @@ TEST(ProfileDb, PersistTuneRoundTripAndWinnerReplacement) {
         EXPECT_EQ(db.count("benchmark_run"), 5);
     }
     const auto r = ProfileLookup::open(t.path()).find(key, {"MATMUL", "T=1,K=4,N=4,w=f32"}, "cpu");
-    ASSERT_TRUE(r.candidate);
+    if (!r.candidate) GTEST_FAIL() << "lookup after the re-tune returned no candidate (expected threads=1)";
     EXPECT_EQ(r.candidate->to_string(), "threads=1");
     EXPECT_DOUBLE_EQ(r.value, 50.0);
 }
@@ -162,7 +162,8 @@ TEST(ProfileDb, TierBandwidthAndBenchmarkRecords) {
     rec.decode_tps = 9.0;
     (void)db.add_benchmark_record(rec, "baseline");
     const auto latest = db.latest_run("baseline", "vulkan", "UD-Q4_K_XL", 4096, "tg128");
-    ASSERT_TRUE(latest);
+    if (!latest) GTEST_FAIL() << "latest_run(baseline, vulkan, UD-Q4_K_XL, 4096, tg128) found no run";
+    if (!latest->decode_tps) GTEST_FAIL() << "latest baseline run has no decode_tps (expected 12.0)";
     EXPECT_DOUBLE_EQ(*latest->decode_tps, 12.0);
     EXPECT_FALSE(db.latest_run("baseline", "hip", "UD-Q4_K_XL", 4096, "tg128"));
     EXPECT_FALSE(db.latest_run("bench", "vulkan", "UD-Q4_K_XL", 4096, "tg128"));
