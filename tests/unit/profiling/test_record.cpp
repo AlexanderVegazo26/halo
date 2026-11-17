@@ -78,14 +78,18 @@ TEST(ByteModel, ApplyEfficiencyPrefersEffectiveTps) {
     m.w_trunk_gb = 16.48;
     BenchmarkRecord r;
     apply_efficiency(r, m, 256.0);
+    if (!r.measured_bandwidth_gbps) GTEST_FAIL() << "apply_efficiency should set measured_bandwidth_gbps";
     EXPECT_DOUBLE_EQ(*r.measured_bandwidth_gbps, 256.0);
+    if (!r.predicted_bytes_per_token) GTEST_FAIL() << "apply_efficiency should set predicted_bytes_per_token";
     EXPECT_NEAR(*r.predicted_bytes_per_token, 16.794e9, 1.0);
     EXPECT_FALSE(r.efficiency);  // no decode measured
     r.decode_tps = 12.0;
     apply_efficiency(r, m, 256.0);
+    if (!r.efficiency) GTEST_FAIL() << "efficiency should be set once decode_tps = 12 is measured";
     EXPECT_NEAR(*r.efficiency, 0.78722, 1e-4);
     r.decode_effective_tps = 24.0;
     apply_efficiency(r, m, 256.0);
+    if (!r.efficiency) GTEST_FAIL() << "efficiency should be set from decode_effective_tps = 24";
     EXPECT_NEAR(*r.efficiency, 2 * 0.78722, 2e-4);
 }
 
@@ -125,8 +129,9 @@ TEST(Record, RoundTrip) {
     const BenchmarkRecord back = j.get<BenchmarkRecord>();
     EXPECT_EQ(nlohmann::json(back), j);
     EXPECT_EQ(back.phase, Phase::Cold);
-    ASSERT_TRUE(back.ttft_ms);
+    if (!back.ttft_ms) GTEST_FAIL() << "a measured ttft_ms of 0 should round-trip as 0, not null";
     EXPECT_EQ(*back.ttft_ms, 0.0);
+    if (!back.invocation) GTEST_FAIL() << "invocation should round-trip";
     EXPECT_EQ(back.invocation->argv.size(), 5u);
 }
 
@@ -186,6 +191,7 @@ TEST(Summary, ConformanceMinimums) {
     EXPECT_EQ(s[0].metrics.at("decode_tps").stability, Stability::TooFewSamples);
 
     std::vector<BenchmarkRecord> micro;
+    micro.reserve(25);  // 4 cold + 20 steady + 1 more cold below
     for (int i = 0; i < 4; ++i) micro.push_back(rec("micro", "MATMUL", Phase::Cold, std::nullopt));
     for (int i = 0; i < 20; ++i) {
         auto r = rec("micro", "MATMUL", Phase::Steady, std::nullopt);
