@@ -101,7 +101,7 @@ TEST(VkViews, ArenaWeightsAtOddByteOffsetsAndStridesMatchCpu) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t wg = ops.options().reduce_workgroup;
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::vector<ArenaWeight> ws{{ref::WType::Q8_0, 5, 64},    {ref::WType::Q4_K, 3, 512},
                                 {ref::WType::Q5_K, 3, 256},   {ref::WType::Q6_K, 4, 256},
                                 {ref::WType::IQ4_XS, 2, 512}, {ref::WType::F32, 3, 40},
@@ -195,7 +195,7 @@ TEST(VkViews, MatvecWeightBeyondMaxStorageBufferRange) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint64_t base = ctx->info().max_storage_buffer_range + 3;
     const std::uint32_t rows = 4, cols = 256;
-    std::mt19937 rng(77);
+    std::mt19937 rng(77);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const ref::Weights w = ref::random_weights(ref::WType::Q6_K, rows, cols, rng, 14);
     const std::uint64_t total = base + w.bytes.size() + 8;
     if (total > ctx->info().max_memory_allocation_size) {
@@ -229,7 +229,7 @@ TEST(VkViews, RmsNormStridedViewsMatchCpuAndDense) {
     const std::uint32_t rows = 7, cols = 300;
     const std::size_t xs = cols + 3, ys = cols + 1;  // row strides (elements)
     const std::size_t x_off = 5, w_off = 7, y_off = 2;
-    std::mt19937 rng(9);
+    std::mt19937 rng(9);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const std::vector<float> xd = ref::random_vec(std::size_t{rows} * cols, rng, 3.0f);
     const std::vector<float> w = ref::random_vec(cols, rng);
     std::vector<float> xbuf(x_off + rows * xs, k_nan), wbuf(w_off + cols + 4, k_nan);
@@ -286,7 +286,7 @@ TEST(VkViews, ArgmaxOnSubViewsIgnoresBytesOutsideTheView) {
     hv::Ops ops(ctx, hv::OpsOptions{.reduce_workgroup = 64});
     const std::uint32_t n = 5000;
     const std::size_t off = 13;
-    std::mt19937 rng(31);
+    std::mt19937 rng(31);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const std::vector<float> x = ref::random_vec(n, rng, 2.0f);
     std::vector<float> buf(off + n + 9, 1e30f);
     buf[off - 1] = k_nan;
@@ -312,7 +312,7 @@ TEST(VkViews, ByteRangeOverlapChecksAcceptDisjointAndRejectOverlap) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t cols = 64, rows = 4;
-    std::mt19937 rng(5);
+    std::mt19937 rng(5);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const ref::Weights w = ref::random_weights(ref::WType::Q8_0, rows, cols, rng, 14);
     hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
     // x = elements [0, 64), y = elements [64, 68) of ONE buffer: disjoint -> accepted.

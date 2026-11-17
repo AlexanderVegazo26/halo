@@ -162,6 +162,12 @@ Placed place_status(const std::shared_ptr<hv::Context>& ctx) {
 
 const char* kv_name(hv::KvType t) { return t == hv::KvType::F16 ? "f16" : t == hv::KvType::Q8 ? "q8" : "f32"; }
 
+// Signed q8 element j of a q8_0 group (gw[0] = scale, gw[1..8] = 32 two's-complement bytes, little-endian).
+int q8_at(const std::uint32_t* gw, std::size_t j) {
+    const auto byte = static_cast<int>((gw[1 + j / 4] >> (8 * (j % 4))) & 0xFFu);
+    return byte >= 128 ? byte - 256 : byte;
+}
+
 std::size_t row_words(hv::KvType t, std::size_t kv_dim) {
     return t == hv::KvType::F16 ? kv_dim / 2 : t == hv::KvType::Q8 ? kv_dim / 32 * 9 : kv_dim;
 }
@@ -434,7 +440,7 @@ TEST(VkKv, KvWriteMatchesSequenceKvWriteBytewise) {
 TEST(VkKv, KvWriteBadBlockSetsStatusAndSkipsOnlyThoseRows) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::size_t kv_dim = 64, bt = 4, S = 13, start = 2, T = 9;  // rows 2..10 span blocks 0..2
-    std::mt19937 rng(5);
+    std::mt19937 rng(5);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     PoolFixture f(kv_dim, bt, S, start, rng);
     const std::vector<float> before = f.pool_bytes();
     const std::vector<float> k = uniform(rng, T * kv_dim, -3.0f, 3.0f), v = uniform(rng, T * kv_dim, -1.0f, 1.0f);
@@ -515,7 +521,7 @@ TEST(VkKv, KvWriteThenAttentionMatchesSequenceKvWriteThenCpuAttention) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t n_head = 24, n_kv = 4, hd = 256, bt = 16, q_offset = 45, T = 4;
     const std::size_t kv_dim = std::size_t{n_kv} * hd, S = q_offset + T, qcols = std::size_t{n_head} * hd;
-    std::mt19937 rng(900);
+    std::mt19937 rng(900);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     PoolFixture f(kv_dim, bt, S, q_offset, rng);
     const std::vector<float> before = f.pool_bytes();
     const std::vector<float> k = uniform(rng, T * kv_dim, -2.0f, 2.0f), v = uniform(rng, T * kv_dim, -1.0f, 1.0f);
@@ -880,7 +886,7 @@ TEST(VkKv, KvWriteQ8StoresMaxScaleAndNearestInt8PerGroup) {
                     if (!(std::fabs(double(sg) - double(want_scale)) <= 3.0 * ulp))
                         why = "scale " + std::to_string(sg) + " vs max|x|/127 " + std::to_string(want_scale);
                     for (std::size_t j = 0; j < 32 && why.empty(); ++j) {
-                        const int q = static_cast<std::int8_t>((gw[1 + j / 4] >> (8 * (j % 4))) & 0xFFu);
+                        const int q = q8_at(gw, j);
                         const double r = amax > 0.0 ? double(x[g * 32 + j]) * 127.0 / amax : 0.0;
                         const bool at_max = amax > 0.0 && std::fabs(double(x[g * 32 + j])) == amax;
                         if (q < -127 || q > 127 || std::fabs(q - r) > 0.5 + 1e-4 || (at_max && std::abs(q) != 127))
@@ -908,7 +914,7 @@ TEST(VkKv, KvWriteQ8StoresGroupsBelowTheNormalScaleRangeAsZeroAndTinyNormalGroup
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     constexpr std::size_t kv_dim = 128, bt = 4, S = 9, start = 5;
     constexpr float lo = 0x1p-119f;  // smallest max|x| that encodes; lo / 127 is a normal float
-    std::mt19937 rng(4119);
+    std::mt19937 rng(4119);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     PoolFixture f(kv_dim, bt, S, start, rng);
     std::vector<float> k(kv_dim, 0.0f), v(kv_dim, 0.0f);
     // K: g0 max 3e-37 (127/max = inf before the fix), g1 max exactly 2^-119 (tie 63.5 -> 64,
@@ -958,7 +964,7 @@ TEST(VkKv, KvWriteQ8StoresGroupsBelowTheNormalScaleRangeAsZeroAndTinyNormalGroup
                 continue;
             }
             for (std::size_t j = 0; j < 32; ++j) {
-                const int q = static_cast<std::int8_t>((gw[1 + j / 4] >> (8 * (j % 4))) & 0xFFu);
+                const int q = q8_at(gw, j);
                 const double r = double(x[g * 32 + j]) * 127.0 / double(amax);
                 if (std::fabs(q - r) > 0.5 + 1e-4 && bad++ < 8)
                     ADD_FAILURE() << where << " element " << j << ": x " << x[g * 32 + j] << " -> q " << q
