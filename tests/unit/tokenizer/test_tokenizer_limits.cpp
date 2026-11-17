@@ -228,7 +228,7 @@ TEST(TokenizerLimits, TrieMatchingEqualsLeftmostLongestReference) {
     // Random vocabularies over a small alphabet so added tokens overlap, nest and share
     // prefixes, with Control and UserDefined mixed (parse_special=false must fall back to
     // a shorter UserDefined token under a longer Control one).
-    std::mt19937 rng(20260925);
+    std::mt19937 rng(20260925);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible vocabularies
     const std::string alphabet = "<>|ab";
     std::size_t matched = 0;
     for (int round = 0; round < 60; ++round) {

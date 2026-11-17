@@ -97,7 +97,8 @@ TEST(GgufFuzz, MutatedQwen35FilesNeverCrash) {
         exercise(base, sanity, 0);
         ASSERT_EQ(sanity.ok, 2) << "unmutated file must load in both modes";
     }
-    std::mt19937_64 rng(0x4841'4C4F);  // fixed seed: deterministic, reproducible
+    // NOLINTNEXTLINE(bugprone-random-generator-seed): fixed seed = deterministic, reproducible mutations
+    std::mt19937_64 rng(0x4841'4C4F);
     constexpr std::size_t kIters = 6000;
     Outcome out;
     for (std::size_t i = 0; i < kIters; ++i) {

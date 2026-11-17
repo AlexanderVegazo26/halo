@@ -352,7 +352,7 @@ TEST(VulkanBackend, GemvGetRowsLmHeadArgmaxTopKCopyMatchCpu) {
     Pair p = make_pair(ctx);
     const std::uint32_t rows = 300, cols = 256, n_vec = 3;
     // A Q8_0 table with normal fp16 scales (bytes shared by both backends).
-    std::mt19937 rng(12);
+    std::mt19937 rng(12);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const std::size_t rb = halo::tensor::row_bytes(halo::DType::Q8_0, cols);
     std::vector<std::uint8_t> q8(rb * rows);
     for (auto& b : q8) b = static_cast<std::uint8_t>(rng());

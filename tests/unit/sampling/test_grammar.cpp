@@ -354,7 +354,7 @@ TEST(JsonSchemaWalk, ValidatorAcceptsOverflowingNumbersWithoutMaskingTypeErrors)
 }
 
 TEST(JsonSchemaWalk, RandomByteWalksAlwaysValidate) {
-    std::mt19937_64 rng(2024);
+    std::mt19937_64 rng(2024);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible walks
     std::size_t docs = 0;
     for (const auto& schema_text : walk_schemas()) {
         const auto g = Grammar::from_json_schema(schema_text);

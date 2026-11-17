@@ -267,7 +267,7 @@ TEST_F(CpuBackendTest, GemvF32AndQuantizedEqualCpuMatmul) {
     // Q8_0 weights (2-byte f16 scale + 32 int8 per block): dequantized with tensor::dequantize_row.
     const std::size_t rb = halo::tensor::row_bytes(DType::Q8_0, K);
     std::vector<std::byte> wq(N * rb);
-    std::mt19937 g(10);
+    std::mt19937 g(10);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     for (std::size_t i = 0; i < wq.size(); ++i) wq[i] = static_cast<std::byte>(g() & 0xFFu);
     for (std::size_t blk = 0; blk < wq.size(); blk += 34) {
         wq[blk] = std::byte{0x00};
