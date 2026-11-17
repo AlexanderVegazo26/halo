@@ -26,6 +26,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -95,8 +96,13 @@ protected:
         if (!golden_) GTEST_SKIP() << "golden data missing under " << halo::test::tiny_dir();
         if (!tok_) GTEST_SKIP() << "tiny-f32.gguf missing under " << halo::test::tiny_dir();
     }
-    static Toks prompt(const char* p) { return golden_->i32(std::string(p) + ".tokens"); }
-    static Toks gold(const char* p) { return golden_->i32(std::string(p) + ".decode_tokens"); }
+    /// Golden ids under `key`; throws naming the key if the suite ran without golden data.
+    static Toks golden(const std::string& key) {
+        if (!golden_) throw std::logic_error("Fx::golden(\"" + key + "\"): golden data not loaded");
+        return golden_->i32(key);
+    }
+    static Toks prompt(const char* p) { return golden(std::string(p) + ".tokens"); }
+    static Toks gold(const char* p) { return golden(std::string(p) + ".decode_tokens"); }
     /// The prompt as text, checked to tokenize back to exactly the golden ids.
     static std::string prompt_text(const Toks& t) {
         std::string s = tok_->decode(t, false);
@@ -364,11 +370,13 @@ TEST_F(Api, FourConcurrentHttpClientsGetTheSequentialGreedyTokens) {
         prompt_text(Toks(p0.begin(), p0.begin() + 40)), prompt_text(prompt("p1")), prompt_text(prompt("p2")),
         prompt_text(Toks(p0.end() - 30, p0.end()))};
     std::vector<std::string> seq;
+    seq.reserve(prompts.size());
     for (const auto& p : prompts) seq.push_back(complete(p, 8));
     max_tick_seqs_ = 0;
     std::vector<std::string> con(4);
     std::barrier start(4);
     std::vector<std::thread> th;
+    th.reserve(4);
     for (std::size_t i = 0; i < 4; ++i) {
         th.emplace_back([&, i] {
             start.arrive_and_wait();

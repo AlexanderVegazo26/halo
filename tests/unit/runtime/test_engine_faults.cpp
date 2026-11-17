@@ -17,6 +17,7 @@
 #include <future>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <stop_token>
 #include <thread>
 
@@ -68,8 +69,13 @@ protected:
         if (!golden_) GTEST_SKIP() << "golden data missing under " << halo::test::tiny_dir();
         if (!std::filesystem::exists(tiny())) GTEST_SKIP() << "tiny-f32.gguf missing under " << halo::test::tiny_dir();
     }
-    static Toks prompt(const char* p) { return golden_->i32(std::string(p) + ".tokens"); }
-    static Toks gold(const char* p) { return golden_->i32(std::string(p) + ".decode_tokens"); }
+    /// Golden ids under `key`; throws naming the key if the suite ran without golden data.
+    static Toks golden(const std::string& key) {
+        if (!golden_) throw std::logic_error("Faults::golden(\"" + key + "\"): golden data not loaded");
+        return golden_->i32(key);
+    }
+    static Toks prompt(const char* p) { return golden(std::string(p) + ".tokens"); }
+    static Toks gold(const char* p) { return golden(std::string(p) + ".decode_tokens"); }
     static inline std::optional<Golden> golden_;
 };
 
@@ -78,6 +84,7 @@ std::vector<GenerateResult> concurrently(Engine& e, const std::vector<GenerateRe
     std::vector<GenerateResult> out(reqs.size());
     std::barrier start(static_cast<std::ptrdiff_t>(reqs.size()));
     std::vector<std::thread> th;
+    th.reserve(reqs.size());
     for (std::size_t i = 0; i < reqs.size(); ++i) {
         th.emplace_back([&, i] {
             start.arrive_and_wait();
