@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -11,6 +13,14 @@
 
 using namespace halo::profiling;
 using halo::hardware::MemoryTier;
+
+namespace {
+
+// A derived counter's value, NaN when it is empty, so a missing value fails EXPECT_DOUBLE_EQ with a
+// readable "nan" instead of dereferencing an empty optional.
+double value(const std::optional<double>& v) { return v.value_or(std::numeric_limits<double>::quiet_NaN()); }
+
+}  // namespace
 
 TEST(Timer, ManualClockNeverDecreases) {
     ManualClock c(100);
@@ -72,8 +82,10 @@ TEST(Timer, ScopedOpTimerRecordsScopeDuration) {
 
 TEST(Timer, RecorderIsThreadSafe) {
     OpTimingRecorder rec;
+    constexpr int kThreads = 8;
     std::vector<std::jthread> ts;
-    for (int t = 0; t < 8; ++t) {
+    ts.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
         ts.emplace_back([&] {
             for (int i = 0; i < 1000; ++i) rec.record("OP", 1, 2);
         });
@@ -91,12 +103,12 @@ TEST(Counters, DerivedValuesComeFromTotals) {
     EXPECT_FALSE(c.effective_bandwidth_gbps(MemoryTier::Vram));
     c.speculative_attempts = 8;
     c.speculative_accepts = 6;
-    EXPECT_DOUBLE_EQ(*c.mtp_acceptance_rate(), 0.75);
+    EXPECT_DOUBLE_EQ(value(c.mtp_acceptance_rate()), 0.75);
     c.tier_bytes_read[MemoryTier::Vram] = 3'000'000'000;
     c.tier_bytes_written[MemoryTier::Vram] = 1'000'000'000;
     EXPECT_FALSE(c.effective_bandwidth_gbps(MemoryTier::Vram));  // window 0
     c.window_ns = 2'000'000'000;                                  // 2 s
-    EXPECT_DOUBLE_EQ(*c.effective_bandwidth_gbps(MemoryTier::Vram), 2.0);
+    EXPECT_DOUBLE_EQ(value(c.effective_bandwidth_gbps(MemoryTier::Vram)), 2.0);
     EXPECT_FALSE(c.effective_bandwidth_gbps(MemoryTier::Gtt));
 
     PerfCounters d = c;
@@ -104,7 +116,7 @@ TEST(Counters, DerivedValuesComeFromTotals) {
     EXPECT_EQ(d.speculative_attempts, 16u);
     EXPECT_EQ(d.tier_bytes_read.at(MemoryTier::Vram), 6'000'000'000u);
     EXPECT_EQ(d.window_ns, 4'000'000'000u);
-    EXPECT_DOUBLE_EQ(*d.effective_bandwidth_gbps(MemoryTier::Vram), 2.0);
+    EXPECT_DOUBLE_EQ(value(d.effective_bandwidth_gbps(MemoryTier::Vram)), 2.0);
 }
 
 TEST(Counters, FromEngineStats) {
@@ -118,7 +130,7 @@ TEST(Counters, FromEngineStats) {
     EXPECT_EQ(c.tokens_generated, 10u);
     EXPECT_EQ(c.prefix_cache_hits, 3u);
     EXPECT_EQ(c.prefix_cache_misses, 1u);
-    EXPECT_DOUBLE_EQ(*c.mtp_acceptance_rate(), 0.5);
+    EXPECT_DOUBLE_EQ(value(c.mtp_acceptance_rate()), 0.5);
 }
 
 TEST(Counters, PrometheusText) {
