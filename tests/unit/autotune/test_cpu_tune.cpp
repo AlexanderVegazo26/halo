@@ -52,7 +52,7 @@ TEST(CpuTune, MatmulTunePersistReopenLookup) {
         TunableOp* ops[] = {&op};
         result = tune(db, key, ops, o).ops.at(0);
     }
-    ASSERT_TRUE(result.winner) << nlohmann::json(result).dump();
+    if (!result.winner) GTEST_FAIL() << "tune() picked no winner: " << nlohmann::json(result).dump();
     EXPECT_TRUE(result.persisted);
     EXPECT_EQ(result.candidates.size(), thread_counts().size());
     for (const auto& c : result.candidates) {
@@ -65,7 +65,7 @@ TEST(CpuTune, MatmulTunePersistReopenLookup) {
     const auto lookup = ProfileLookup::open(t.path());
     const auto r = select_kernel(lookup, dev_host_key(), op.key(), "cpu", op.candidates(), nullptr, {});
     EXPECT_EQ(r.source, SelectionSource::Exact);
-    ASSERT_TRUE(r.candidate);
+    if (!r.candidate) GTEST_FAIL() << "select_kernel returned no candidate for " << op.key().shape;
     EXPECT_EQ(*r.candidate, *result.winner);
     EXPECT_DOUBLE_EQ(r.value, result.winner_median_ns);
     EXPECT_EQ(op.key().shape, "T=1,K=256,N=512,w=f32");
@@ -83,13 +83,15 @@ TEST(CpuTune, GdnChunkedCandidatesValidateAgainstRecurrent) {
         std::string why;
         EXPECT_TRUE(op.validate(c, why)) << c.to_string() << ": " << why;
         const auto in = op.cost(c);
-        ASSERT_TRUE(in);
+        if (!in) GTEST_FAIL() << c.to_string() << " should have a cost estimate";
         EXPECT_GT(in->flops, 0);
         EXPECT_LE(in->parallelism, 4u);
     }
     // Chunk size changes the predicted intra-chunk work.
-    EXPECT_LT(op.cost(Candidate{{{"chunk", 8}, {"threads", 1}}})->flops,
-              op.cost(Candidate{{{"chunk", 64}, {"threads", 1}}})->flops);
+    const auto chunk8 = op.cost(Candidate{{{"chunk", 8}, {"threads", 1}}});
+    const auto chunk64 = op.cost(Candidate{{{"chunk", 64}, {"threads", 1}}});
+    if (!chunk8 || !chunk64) GTEST_FAIL() << "chunk=8 and chunk=64 should both have a cost estimate";
+    EXPECT_LT(chunk8->flops, chunk64->flops) << "chunk=8 vs chunk=64 predicted flops";
     // A tolerance of 0 must reject: the forms differ by fp32 rounding (proves the gate works).
     CpuGdnChunkedTunable strict(dims, 48, {16}, {1}, 2, 0.0f);
     std::string why;
