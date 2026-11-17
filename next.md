@@ -62,13 +62,13 @@ The run was 44 forwards: 1 prefill, 15 verify (R=3) and 28 MTP drafts. That come
   - `Step` creates a new `Stream` for every forward (`qwen35.cpp:237`), with its own command pool, fence and descriptor pools. Keep a small per-model pool of streams.
   - The 512-dispatch cap (`stream.cpp:179`) currently forces a submit and wait mid-forward. Rotate 2-3 command buffers with their own descriptor pools so a split doesn't need a CPU wait.
 - **Cut per-dispatch CPU cost.**
-  - Use `VK_KHR_push_descriptor`, or cache descriptor sets per (kernel, bindings) because decode shapes don't change. **Push descriptors implemented (opt-in, 2026-11-16):** `HALO_VK_PUSH_DESCRIPTORS=1` / `ContextOptions::push_descriptors` enables `VK_KHR_push_descriptor` (needs `maxPushDescriptors` >= 16), kernels get push-descriptor set layouts and `Stream::dispatch` records `vkCmdPushDescriptorSetKHR`, so no descriptor set is allocated or written per dispatch and no pool exists. tok/s not measured yet (GPU busy).
+  - Use `VK_KHR_push_descriptor`, or cache descriptor sets per (kernel, bindings) because decode shapes don't change. **Push descriptors implemented (opt-in, 2026-11-16):** `HALO_VK_PUSH_DESCRIPTORS=1` / `ContextOptions::push_descriptors` enables `VK_KHR_push_descriptor` (needs `maxPushDescriptors` >= 16), kernels get push-descriptor set layouts and `Stream::dispatch` records `vkCmdPushDescriptorSetKHR`, so no descriptor set is allocated or written per dispatch and no pool exists. First idle-GPU sweep (2026-11-17, below): 15.84 vs 15.91 tok/s baseline (-0.4%, within one-run noise).
   - Swap the `std::unordered_map touched_` and the per-dispatch `std::vector` allocations in `Stream::dispatch` for small fixed arrays.
   - Longer term: record the fixed-shape decode command buffer once and replay it, with positions and lengths read from a device buffer.
 
 ### 5. More tokens per tick
 - Once step 1 makes R=4-8 nearly free, try `--mtp-draft 3` and measure. The profit gate already exists in `speculative.cpp`.
-- **Tree verification** (implemented, `HALO_MTP_TREE=1`): the top-2 at draft depth 1 verified as a small tree in one forward, through `attention_tree.comp` and a GDN leaf slot. Correctness is GPU-verified (status table); its tokens/tick gain is not measured yet (needs an idle GPU and the 27B).
+- **Tree verification** (implemented, `HALO_MTP_TREE=1`): the top-2 at draft depth 1 verified as a small tree in one forward, through `attention_tree.comp` and a GDN leaf slot. Correctness is GPU-verified (status table); First idle-GPU sweep (2026-11-17, below): 67.6% of drafts accepted vs 61.4%, but 13.92 vs 15.91 tok/s (-12.5%) on the story prompt.
 - Target: 2.1 → ~2.6-3 tokens per tick.
 
 ### 6. Kernel fusion (small ops, ~−2-3 ms/tick)
@@ -95,7 +95,7 @@ What exllamav2 does, and whether each idea transfers to HALO:
   - This removes the funnel-shift path Q6_K currently needs for its 210 B blocks.
 - **Target:** take the matvecs from ~200 GB/s toward llama.cpp's ~244 GB/s ceiling on this machine.
 - **Pairs with step 1:** repack while rewriting the batched path.
-- **Implemented (opt-in, unmeasured):** `HALO_REPACK=1` repacks the `make_mat` Mats (Q5_K/Q6_K/IQ4_XS, Vulkan only) with `tensor::gemv_repack` (`include/halo/tensor/repack.h` documents the plane layouts) and gemv runs them as Vulkan gemv variant `backend::kGemvRepacked` (shaders `matvec_{q5_k,q6_k,iq4_xs}_rp`; same apply/reduction expression as the raw kernels). Fused-projection buffers (`HALO_FUSE_GEMV`) and tables stay raw. Kernel bitwise gate vs the raw kernels: done on RADV 2026-11-14 (VkHead.GemvRepacked*). Model-level check: done on RADV 2026-11-14 (VulkanRepack.*: `Qwen35Options::repack` overrides the env, `Qwen35::repacked_mats()` reports what loaded). Still to do: a decode measurement on an idle GPU.
+- **Implemented (opt-in; first idle-GPU sweep 2026-11-17: 16.11 vs 15.91 tok/s, +1.3%, within one-run noise):** `HALO_REPACK=1` repacks the `make_mat` Mats (Q5_K/Q6_K/IQ4_XS, Vulkan only) with `tensor::gemv_repack` (`include/halo/tensor/repack.h` documents the plane layouts) and gemv runs them as Vulkan gemv variant `backend::kGemvRepacked` (shaders `matvec_{q5_k,q6_k,iq4_xs}_rp`; same apply/reduction expression as the raw kernels). Fused-projection buffers (`HALO_FUSE_GEMV`) and tables stay raw. Kernel bitwise gate vs the raw kernels: done on RADV 2026-11-14 (VkHead.GemvRepacked*). Model-level check: done on RADV 2026-11-14 (VulkanRepack.*: `Qwen35Options::repack` overrides the env, `Qwen35::repacked_mats()` reports what loaded). Still to do: a decode measurement on an idle GPU.
 
 ### 9. Quantized KV cache: fp16, then Q8 or Q4 with group scales
 - HALO stores KV in **fp32**, 64 KiB per token.
@@ -143,7 +143,7 @@ What exllamav2 does, and whether each idea transfers to HALO:
 3. **Attribution:** re-profile with `HALO_VK_OP_TIMINGS` and aggregate by kernel, as in the table above. Also confirm the per-tick wall time and fence count drop. `scripts/op_profile.py summary <file> [--per N]` prints that per-kernel table (dispatches, total ms, avg/max µs, % GPU, matvec share), and `scripts/op_profile.py compare <before> <after> [--per-before N --per-after M]` the per-kernel change between two profiles, largest first, with kernels only one side ran marked new/gone (`--per` = the run's generated tokens, so runs of different lengths compare per token; `--json` for the rows). The profile file is appended to: delete it before each run.
 4. Commit each step separately, with the before and after tok/s in the message, matching the repo's existing convention.
 
-## Implementation status (2026-09-29, compile-checked only; nothing benchmarked or tested)
+## Implementation status (written 2026-09-29 compile-checked only; since GPU-verified per row, tok/s in the idle-GPU sweep below)
 All new paths are opt-in (env flag, default off) except the `stream.cpp` per-dispatch allocation removal and the fused batched reduction (bitwise-neutral by construction).
 
 | Step | Flag / state |
