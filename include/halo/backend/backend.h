@@ -289,7 +289,7 @@ struct GemvArgs {
     /// n_vec == 1, a non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS weight and not the LM head; the CPU and
     /// HIP backends and every other case throw (never silently ignore it). norm_w: [cols] fp32.
     /// The numerics differ from the separate rms_norm + gemv only in the reduction order's
-    /// dependence on the reduce workgroup (see shaders matmul/matvec_*_normed.comp).
+    /// dependence on the reduce workgroup (see shaders common/matvec_normed.glsl).
     TensorRef norm_w{};
     float norm_eps = 1e-6f;
     /// The caller accepts the cooperative-matrix GEMM's fp16 numerics for these rows (Vulkan with

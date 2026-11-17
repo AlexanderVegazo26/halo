@@ -4,7 +4,7 @@
 // tree reduction (deterministic). Operands are views (element offset remainder + row
 // stride from the host, code review S-1).
 // The sum of squares, inv and the scaled product are `precise`: left free, the compiler contracted and
-// rewrote them differently here and in matmul/matvec_*_normed.comp (1 ulp apart), and HALO_FUSE_NORM
+// rewrote them differently here and in common/matvec_normed.glsl (1 ulp apart), and HALO_FUSE_NORM
 // relies on the two being bit for bit equal (VkHead.GemvFusedNorm*).
 #include "halo_common.glsl"
 
