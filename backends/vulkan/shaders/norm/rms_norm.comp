@@ -36,9 +36,7 @@ void main() {
     const uint xb = pc.x_off + row * pc.x_stride;
     const uint yb = pc.y_off + row * pc.y_stride;
 
-    float acc = 0.0;
-    for (uint i = tid; i < pc.cols; i += WG) acc = halo_rms_sq_add(acc, x[xb + i]);
-    red[tid] = acc;
+    HALO_RMS_LANE_SUM(red, tid, WG, pc.cols, i, x[xb + i])
     HALO_RMS_TREE_REDUCE_WG(red, tid, WG)
     const float inv = halo_rms_inv(red[0], pc.cols, pc.eps);
     for (uint i = tid; i < pc.cols; i += WG) {

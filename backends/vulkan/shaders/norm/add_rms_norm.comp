@@ -35,13 +35,9 @@ void main() {
     const uint bb = pc.b_off + row * pc.b_stride;
     const uint hb = pc.h_off + row * pc.h_stride;
     const uint yb = pc.y_off + row * pc.y_stride;
-    float acc = 0.0;
-    for (uint i = tid; i < pc.cols; i += WG) {
-        precise float v = a[ab + i] + b[bb + i];
-        h[hb + i] = v;
-        acc = halo_rms_sq_add(acc, v);
-    }
-    red[tid] = acc;
+    // h[hb + i] = a + b is stored here, inside the sum's LOAD: a[i] and b[i] are read before h[i]
+    // is written (the aliasing contract above), and the sum of squares takes the stored value.
+    HALO_RMS_LANE_SUM(red, tid, WG, pc.cols, i, h[hb + i] = a[ab + i] + b[bb + i])
     HALO_RMS_TREE_REDUCE_WG(red, tid, WG)
     const float inv = halo_rms_inv(red[0], pc.cols, pc.eps);
     for (uint i = tid; i < pc.cols; i += WG) {

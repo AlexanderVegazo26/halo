@@ -27,11 +27,8 @@ float normed_x(const uint c) {
 // the same x*inv then *w.
 void norm_prologue() {
     const uint tid = gl_LocalInvocationID.x;
-    for (uint l = tid; l < HALO_NORM_LANES; l += WG) {
-        float a = 0.0;
-        for (uint i = l; i < pc.cols; i += HALO_NORM_LANES) a = halo_rms_sq_add(a, xr[pc.xr_off + i]);
-        rn[l] = a;
-    }
+    for (uint l = tid; l < HALO_NORM_LANES; l += WG)
+        HALO_RMS_LANE_SUM(rn, l, HALO_NORM_LANES, pc.cols, i, xr[pc.xr_off + i])
     HALO_RMS_TREE_REDUCE(rn, HALO_NORM_LANES, tid, WG)
     g_inv_rms = halo_rms_inv(rn[0], pc.cols, pc.eps);
 }

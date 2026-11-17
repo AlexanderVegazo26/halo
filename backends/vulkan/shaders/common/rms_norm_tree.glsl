@@ -2,7 +2,7 @@
 // norm/gated_rms_norm.comp (its reduction and inv only) and common/matvec_normed.glsl
 // (HALO_FUSE_NORM). The fused gemv must produce bit for bit the row the separate norm produces
 // (VkHead.GemvFusedNorm*), so they take each step from here instead of keeping hand copies in step:
-//   lane l of LANES sums x[i]^2 for i = l, l + LANES, ...      (halo_rms_sq_add, in that order)
+//   lane l of LANES sums x[i]^2 for i = l, l + LANES, ...      (HALO_RMS_LANE_SUM)
 //   red[0..LANES) is folded by the fixed halving tree           (HALO_RMS_TREE_REDUCE)
 //   inv = 1 / sqrt(red[0] / cols + eps)                         (halo_rms_inv)
 //   y[i] = (x[i] * inv) * w[i]                                  (halo_rms_scale, = cpu::rms_norm)
@@ -16,11 +16,32 @@ float halo_rms_sq_add(const float acc, const float v) {
     return r;
 }
 
+// The macros below are blocks with halo_rms_-prefixed locals, so they are safe as an unbraced
+// if/for body and don't capture a caller's names (except HALO_RMS_LANE_SUM's loop index, which the
+// caller names as IDX so LOAD can use it).
+
+// red[lane] = 0 + x(lane)^2 + x(lane + LANES)^2 + ... for indices below cols, accumulated by
+// halo_rms_sq_add in that order, where x(IDX) is the expression LOAD with the loop index named IDX
+// (it may be an assignment: add_rms_norm.comp's `h[..] = a[..] + b[..]` stores h and sums it).
+// The value goes through a `precise` local so float math in LOAD (that a + b) is NoContraction by
+// contract here; glslang 2026-11 also gets there by tracing back from halo_rms_sq_add's argument.
+// Keep LOAD an expression, not a helper call: glslang then marks the helper's integer index math
+// NoContraction too. Every caller sums through this one loop, so the per-lane order the bitwise
+// contract depends on is not hand-copied.
+#define HALO_RMS_LANE_SUM(red, lane, LANES, cols, IDX, LOAD)                                 \
+    {                                                                                        \
+        const uint halo_rms_lane_ = (lane);                                                  \
+        float halo_rms_a_ = 0.0;                                                             \
+        for (uint IDX = halo_rms_lane_; IDX < (cols); IDX += (LANES)) {                      \
+            precise float halo_rms_v_ = (LOAD);                                              \
+            halo_rms_a_ = halo_rms_sq_add(halo_rms_a_, halo_rms_v_);                         \
+        }                                                                                    \
+        red[halo_rms_lane_] = halo_rms_a_;                                                   \
+    }
+
 // One step of the fixed halving tree: red[l] += red[l + s]. The add is `precise` itself: glslang
 // marks it only by tracing back from a precise use of red[0] in the same function, and red[0]
 // reaches halo_rms_inv() as an argument, which that trace does not follow.
-// The macros below are blocks with halo_rms_-prefixed locals, so they are safe as an unbraced
-// if/for body and don't capture a caller's names.
 #define HALO_RMS_TREE_ADD(red, l, s)                                     \
     {                                                                    \
         precise float halo_rms_t_ = red[l] + red[(l) + (s)];             \
