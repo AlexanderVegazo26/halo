@@ -8,7 +8,8 @@ greedy output is identical to the baseline's. `--variants subgroup-reduce+draft-
 measures several flags together (env and args merged; bitwise only if every part is).
 
     scripts/bench_decode.py --halo build-dev/tools/halo/halo --model Qwen3.8-27B-UD-Q4_K_XL.gguf \
-        [--variants all|NAME,NAME+NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] [--busy-settle 10] \
+        [--variants all|NAME,NAME+NAME] [--workload story|long-context|code-edit | --prompt TEXT] [-n 128] \
+        [--ctx N (default: the workload's)] [--repeat 1] [--busy-max 5] [--busy-settle 10] \
         [--report-dir .test-report/bench-decode]
 
 Numbers taken while another process keeps the GPU busy are not benchmarks (2026-11-14: a
@@ -44,6 +45,114 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog. Write a short story about it."
+
+
+def _long_context_prompt() -> str:
+    """A field log of 12 stations over 15 days (6047 Qwen3.8 tokens), then a question about
+    it: long enough that attention over the KV cache is a real share of a decode tick, which the
+    story prompt (145 rows) is not. Built from fixed tables, so it is the same text on every call."""
+    stations = ("Alder", "Birch", "Cedar", "Dunmore", "Elm", "Fennel", "Granite", "Harbor", "Ivy", "Juniper",
+                "Kestrel", "Linden")
+    weather = ("clear skies", "overcast", "light rain", "morning fog", "wind from the north", "a late frost",
+               "heavy rain")
+    items = ("water pumps", "seed trays", "fence posts", "solar panels", "rain gauges", "beehives", "tool sheds",
+             "irrigation valves")
+    notes = ("The access road was passable.", "A school group visited in the afternoon.",
+             "Supplies arrived a day late.", "The radio link dropped twice.", "Two volunteers joined the crew.",
+             "The north trail was closed for repairs.", "Nothing unusual was reported.")
+    lines = ["Field log of the Northern Valley stations. Each entry gives the day, the station, the number of "
+             "visitors, the weather, the repairs and a note.", ""]
+    for day in range(1, 16):
+        for s, name in enumerate(stations):
+            visitors = (37 * day + 101 * s) % 900 + 50
+            lines.append(f"Day {day}, {name} station: {visitors} visitors, {weather[(5 * day + 3 * s) % len(weather)]}. "
+                         f"The crew repaired {(day * (s + 1)) % 9 + 2} {items[(day + 2 * s) % len(items)]}. "
+                         f"{notes[(3 * day + s) % len(notes)]}")
+    lines += ["", "Question: On which day did Cedar station report the most visitors, what was the weather that "
+              "day, and what did the crew repair? Answer:"]
+    return "\n".join(lines)
+
+
+_CODE_EDIT_SOURCE = '''\
+"""Stock levels for a small parts store."""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Item:
+    sku: str
+    name: str
+    quantity: int
+    reorder_level: int
+    unit_cost_cents: int
+
+
+@dataclass
+class Inventory:
+    items: dict[str, Item] = field(default_factory=dict)
+
+    def add(self, item: Item) -> None:
+        if item.sku in self.items:
+            raise ValueError(f"duplicate sku {item.sku}")
+        self.items[item.sku] = item
+
+    def remove(self, sku: str, quantity: int) -> int:
+        item = self.items[sku]
+        if quantity > item.quantity:
+            raise ValueError(f"only {item.quantity} of {sku} in stock")
+        item.quantity -= quantity
+        return item.quantity
+
+    def restock(self, sku: str, quantity: int) -> int:
+        if quantity <= 0:
+            raise ValueError("restock quantity must be positive")
+        item = self.items[sku]
+        item.quantity += quantity
+        return item.quantity
+
+    def below_reorder_level(self) -> list[Item]:
+        return sorted((i for i in self.items.values() if i.quantity <= i.reorder_level), key=lambda i: i.sku)
+
+    def value_cents(self) -> int:
+        return sum(i.quantity * i.unit_cost_cents for i in self.items.values())
+
+
+def restock_all(inventory: Inventory, batch: int) -> list[str]:
+    restocked = []
+    for item in inventory.below_reorder_level():
+        inventory.restock(item.sku, batch)
+        restocked.append(item.sku)
+    return restocked
+'''
+
+
+def _code_edit_prompt() -> str:
+    """A source file, then the opening of the same file after a one-word rename: a faithful reply
+    copies long spans of the prompt, which is the case n-gram (prompt-lookup) drafts are for. The
+    story prompt never repeats a 3-gram, so n-gram drafting could only show its overhead there."""
+    return ("Here is inventory.py:\n\n```python\n" + _CODE_EDIT_SOURCE + "```\n\n"
+            "Here is the same file with the method `restock` renamed to `replenish` everywhere and nothing else "
+            "changed:\n\n```python\n" + _CODE_EDIT_SOURCE.split("\n", 1)[0])
+
+
+@dataclass(frozen=True)
+class Workload:
+    name: str
+    prompt: str
+    ctx: int  # default --ctx: room for the prompt plus generation
+    use: str  # what it measures
+
+
+WORKLOADS = {w.name: w for w in (
+    Workload("story", DEFAULT_PROMPT, 4096, "the default: short prompt, every step"),
+    Workload("long-context", _long_context_prompt(), 8192, "step 9 (KV formats) and attention at ~6k rows"),
+    Workload("code-edit", _code_edit_prompt(), 4096, "step 11 (n-gram drafts): the reply copies the prompt"),
+)}
+# Prompts longer than this are also saved as <report-dir>/prompt.txt and the rerun lines read them
+# from there ("$(cat f)" drops trailing newlines, so a prompt ending in one stays inline).
+PROMPT_INLINE_MAX = 200
+
 DEFAULT_BUSY_GLOB = "/sys/class/drm/card*/device/gpu_busy_percent"
 
 # Every env var that changes decode speed or numerics. They are stripped from the inherited
@@ -157,11 +266,20 @@ def wait_settled(a) -> int | None:
         time.sleep(max(a.busy_interval, 0.05))
 
 
+# bash $'...' escapes: a prompt with a newline still reruns from a single summary.md line.
+_ANSI_C = {"\\": "\\\\", "'": "\\'", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
 def speed_command(v: Variant, a) -> tuple[list, str]:
     """The variant's speed command as argv, and as the shell line that reruns it alone."""
     cmd = [a.halo, "run", a.model, "-p", a.prompt, "--raw", "--temperature", "0", "-n", str(a.max_tokens),
            "--ctx", str(a.ctx), "--parallel", "1", *v.args]
-    return cmd, " ".join([*(f"{k}={shlex.quote(x)}" for k, x in v.env.items()), *map(shlex.quote, cmd)])
+    words = list(map(shlex.quote, cmd))
+    if a.prompt_file:  # a long prompt would bury the command: read it back from the report's copy
+        words[4] = f'"$(cat {shlex.quote(str(a.prompt_file))})"'
+    elif any(c in a.prompt for c in "\n\r\t"):  # keep the rerun command on one line
+        words[4] = "$'" + "".join(_ANSI_C.get(c, c) for c in a.prompt) + "'"
+    return cmd, " ".join([*(f"{k}={shlex.quote(x)}" for k, x in v.env.items()), *words])
 
 
 def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
@@ -254,13 +372,14 @@ def select(names: str) -> list[Variant]:
 def write_report(a, results: list[Result], stripped: list, rc: int) -> Path:
     d = Path(a.report_dir)
     d.mkdir(parents=True, exist_ok=True)
-    meta = {"halo": a.halo, "model": a.model, "prompt": a.prompt, "max_tokens": a.max_tokens, "ctx": a.ctx,
+    meta = {"halo": a.halo, "model": a.model, "workload": a.workload, "prompt": a.prompt,
+            "prompt_file": str(a.prompt_file) if a.prompt_file else None, "max_tokens": a.max_tokens, "ctx": a.ctx,
             "repeat": a.repeat, "busy_max": a.busy_max, "busy_settle": a.busy_settle, "stripped_env": stripped,
             "exit": rc,
             "date": time.strftime("%Y-%m-%d %H:%M:%S %z")}
     (d / "bench-decode.json").write_text(json.dumps({"meta": meta, "results": [asdict(r) for r in results]}, indent=2) + "\n")
     lines = [f"# Decode sweep: {'PASS' if rc == 0 else 'GPU BUSY: not measured' if rc == 3 else 'FAIL'}", "",
-             f"- model `{a.model}`, `-n {a.max_tokens} --ctx {a.ctx}`, {a.repeat} run(s) per variant (median), "
+             f"- model `{a.model}`, workload `{a.workload}`, `-n {a.max_tokens} --ctx {a.ctx}`, {a.repeat} run(s) per variant (median), "
              f"busy limit {a.busy_max}%, {meta['date']}"]
     if stripped:
         lines.append(f"- removed from the inherited environment: {', '.join(stripped)}")
@@ -281,9 +400,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--halo", required=True, help="halo CLI binary (Vulkan build)")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--prompt", default=DEFAULT_PROMPT)
+    which = ap.add_mutually_exclusive_group()
+    which.add_argument("--prompt", help="custom prompt text (default: the story workload's prompt)")
+    which.add_argument("--workload", choices=list(WORKLOADS), default="story",
+                       help="built-in prompt: " + "; ".join(f"{w.name} = {w.use}" for w in WORKLOADS.values()))
     ap.add_argument("-n", "--max-tokens", type=int, default=128)
-    ap.add_argument("--ctx", type=int, default=4096)
+    ap.add_argument("--ctx", type=int, help="context size (default: the workload's, 4096 for story and --prompt)")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--variants", default="all",
                     help="all, or a comma list; a+b runs those variants' flags together (baseline always runs first)")
@@ -301,7 +423,19 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--repeat and -n must be >= 1")
     if a.busy_settle < 0:
         ap.error("--busy-settle must be >= 0")
+    w = WORKLOADS[a.workload]
+    if a.prompt is not None:
+        a.workload = "custom"
+    else:
+        a.prompt = w.prompt
+    if a.ctx is None:
+        a.ctx = w.ctx
     variants = select(a.variants)
+    a.prompt_file = None
+    if len(a.prompt) > PROMPT_INLINE_MAX and not a.prompt.endswith("\n"):
+        Path(a.report_dir).mkdir(parents=True, exist_ok=True)
+        a.prompt_file = Path(a.report_dir).resolve() / "prompt.txt"
+        a.prompt_file.write_text(a.prompt, encoding="utf-8")
     env, stripped = clean_env(dict(os.environ))
 
     results: list[Result] = []

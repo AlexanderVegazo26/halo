@@ -308,6 +308,83 @@ class BenchDecode(unittest.TestCase):
         missing = sorted(found - set(bd.SPEED_FLAGS))
         self.assertEqual(missing, [], f"HALO_* env knobs read by the sources but not stripped by bench_decode: {missing}")
 
+    @staticmethod
+    def sent(call, flag):
+        return call["argv"][call["argv"].index(flag) + 1]
+
+    def test_long_context_workload_sends_its_fixed_prompt_with_room_in_the_context(self):
+        rc = self.run_bench("--workload", "long-context", "--variants", "kv-fp16")
+        self.assertEqual(rc, 0, f"stderr: {self.stderr}\n{self.summary}")
+        calls = self.calls()
+        prompt = bd.WORKLOADS["long-context"].prompt
+        self.assertEqual([self.sent(c, "-p") for c in calls], [prompt, prompt],
+                         "baseline and kv-fp16 must both get the long-context prompt, unchanged")
+        self.assertEqual(bd._long_context_prompt(), prompt, "the long-context prompt must be the same text every time")
+        self.assertGreater(len(prompt), 20000, "long-context must be thousands of tokens, not the 17-token story")
+        self.assertEqual([self.sent(c, "--ctx") for c in calls], ["8192", "8192"],
+                         "a ~6k-token prompt needs the workload's 8192 context, not the 4096 default")
+        self.assertEqual(self.meta["workload"], "long-context")
+        self.assertIn("workload `long-context`", self.summary)
+
+    def test_explicit_ctx_overrides_the_workloads(self):
+        self.run_bench("--workload", "long-context", "--ctx", "16384", "--variants", "baseline")
+        self.assertEqual(self.sent(self.calls()[0], "--ctx"), "16384")
+
+    def test_story_stays_the_default_workload(self):
+        self.run_bench("--variants", "baseline")
+        call = self.calls()[0]
+        self.assertEqual((self.sent(call, "-p"), self.sent(call, "--ctx")), (bd.DEFAULT_PROMPT, "4096"))
+        self.assertEqual(self.meta["workload"], "story")
+
+    def test_custom_prompt_is_reported_as_custom(self):
+        self.run_bench("--prompt", "Count to five.", "--variants", "baseline")
+        self.assertEqual(self.sent(self.calls()[0], "-p"), "Count to five.")
+        self.assertEqual(self.meta["workload"], "custom", "a --prompt run must not be labelled as a built-in workload")
+
+    def test_prompt_and_workload_cannot_both_be_given(self):
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(io.StringIO()):
+            bd.main(["--halo", "h", "--model", "m", "--prompt", "x", "--workload", "code-edit"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_code_edit_reply_can_start_copying_the_prompt_at_once(self):
+        # n-gram drafts look up the context's recurring suffix: the prompt must already end inside a
+        # copy of a span it contains earlier, or step 11 measures only lookup overhead again.
+        prompt = bd.WORKLOADS["code-edit"].prompt
+        last_line = prompt.rsplit("\n", 1)[1]
+        self.assertGreater(len(last_line.split()), 3, f"the prompt must end with a copied line, got {last_line!r}")
+        self.assertEqual(prompt.count(last_line), 2, "its last line must appear once in the source and once at the end")
+        self.assertEqual(prompt.count(bd._CODE_EDIT_SOURCE), 1, "the source to copy must be in the prompt verbatim")
+
+    def test_long_prompt_rerun_line_reads_the_saved_prompt_back_exactly(self):
+        import subprocess
+
+        # "$(cat f)" drops trailing newlines, so a long prompt ending in one must stay inline.
+        newline_end = "Repeat after me:\n" + "one two three four. " * 20 + "\n"
+        cases = [(name, ("--workload", name), bd.WORKLOADS[name].prompt, True) for name in ("long-context", "code-edit")]
+        cases.append(("custom ending in a newline", ("--prompt", newline_end), newline_end, False))
+        tricky = "It's a\tshort one:\n'quoted' \\n back\\slash $HOME `x`\r\n"
+        cases.append(("short multi-line with quotes", ("--prompt", tricky), tricky, False))
+        for name, args, prompt, from_file in cases:
+            with self.subTest(workload=name):
+                self.log.unlink(missing_ok=True)
+                (self.report / "prompt.txt").unlink(missing_ok=True)
+                self.run_bench(*args, "--variants", "ngram")
+                line = next(x for x in self.summary.splitlines() if x.startswith("- ngram: "))
+                if from_file:
+                    self.assertNotIn(prompt[:200], line, "the rerun line must not inline a long prompt")
+                    self.assertIn("prompt.txt", line)
+                    self.assertEqual((self.report / "prompt.txt").read_text(), prompt)
+                else:
+                    self.assertNotIn("prompt.txt", line, "a prompt ending in a newline can't round-trip through $(cat)")
+                bench_call = self.calls()[-1]
+                env = {k: v for k, v in os.environ.items() if not k.startswith("HALO_")}
+                env["FAKE_HALO_SPEC"] = str(self.root / "spec.json")
+                p = subprocess.run(["bash", "-c", line.removeprefix("- ngram: `").removesuffix("`")], env=env,
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.calls()[-1], bench_call,
+                                 "rerunning the summary's line must give halo exactly the argv and HALO_* env the sweep did")
+
 
 if __name__ == "__main__":
     unittest.main()
