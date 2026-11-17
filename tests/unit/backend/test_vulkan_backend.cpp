@@ -16,10 +16,15 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -261,6 +266,55 @@ TEST(VulkanBackend, DownloadsSnapshotAtTheirStreamPosition) {
     d.sync();
     EXPECT_TRUE(bitwise(first, a, "download before the copy"));
     EXPECT_TRUE(bitwise(second, b, "download after the copy"));
+}
+
+// next.md step 4 ("keep the MTP hidden state on the device"): forward() hands the trunk hidden to
+// mtp_forward() as a Stream download and a Stream upload of a Vram buffer. Both are recorded into
+// the stream (host-mapped staging + a recorded copy), so they ride the stream's own fence: with
+// HALO_VK_OP_TIMINGS set, the round trip adds no "# transfer" line (the context's blocking
+// transfer fence, VkContext.OpTimingsProfileMarksEachTransferFenceWithItsBytes) and the one
+// submission waits once.
+TEST(VulkanBackend, StreamUploadAndDownloadRideTheStreamFenceNotATransferFence) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    if (ctx->force_staging()) GTEST_SKIP() << "context forces staged host copies (ContextOptions::force_staging)";
+    auto be = hb::make_vulkan_backend(ctx);
+    const std::filesystem::path path =
+        std::filesystem::path(::testing::TempDir()) /
+        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".txt");
+    std::filesystem::remove(path);
+    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
+    const std::optional<std::string> old = old_env ? std::optional<std::string>(old_env) : std::nullopt;
+    constexpr std::size_t kRow = 5120;  // one 27B hidden row (n_embd floats)
+    const std::vector<float> h = randn(2 * kRow, 11);
+    std::vector<float> back(kRow);
+    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+    {
+        Dev d(*be);
+        const hb::TensorRef dev = d.zeros(2 * kRow * sizeof(float));
+        be->upload(*d.s, dev, std::as_bytes(std::span(h)));
+        be->download(*d.s, dev.shifted(kRow * sizeof(float)), std::as_writable_bytes(std::span(back)));
+        d.sync();
+    }
+    if (old) {
+        ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
+    } else {
+        ::unsetenv("HALO_VK_OP_TIMINGS");
+    }
+    std::vector<std::string> marks;
+    std::string shown;
+    {
+        std::ifstream in(path);
+        for (std::string l; std::getline(in, l);) {
+            shown += "\n  " + l;
+            if (l.starts_with('#')) marks.push_back(l);
+        }
+    }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(bitwise(back, std::span(h).subspan(kRow), "second row after a stream upload + download"));
+    EXPECT_EQ(marks, std::vector<std::string>{"# wait"})
+        << "profile " << path << ": a stream upload of " << h.size() * sizeof(float) << " B and download of "
+        << back.size() * sizeof(float) << " B into/from a Vram buffer should add no '# transfer' line (no "
+        << "context transfer fence) and exactly one '# wait' for the stream's submission; got:" << shown;
 }
 
 TEST(VulkanBackend, InterfaceRules) {
