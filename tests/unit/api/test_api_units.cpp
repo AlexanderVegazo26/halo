@@ -5,6 +5,7 @@
 
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <thread>
 
 #include "api/admission.h"
@@ -186,9 +187,13 @@ struct PromptFixture : ::testing::Test {
     std::unique_ptr<FakeEngine> eng = FakeEngine::synthetic();
     const tokenizer::Tokenizer& tok = eng->tokenizer();
     api::SpecialTokens sp{eng->tokenizer()};
-    std::int32_t id(std::string_view piece) const { return tok.piece_to_id(piece).value(); }
+    std::int32_t id(std::string_view piece) const {
+        const auto v = tok.piece_to_id(piece);
+        if (!v) throw std::logic_error("synthetic tokenizer has no piece \"" + std::string(piece) + "\"");
+        return *v;
+    }
 
-    api::ChatPrompt build(const Json& messages, const Json& tools = nullptr, chat::RenderOptions opt = {}) const {
+    api::ChatPrompt build(const Json& messages, const Json& tools = nullptr, const chat::RenderOptions& opt = {}) const {
         return api::build_chat_prompt(tok, sp, eng->chat_template(), messages, tools, opt);
     }
     std::size_t count(const api::ChatPrompt& p, std::string_view piece) const { return count_id(p.tokens, id(piece)); }
@@ -360,8 +365,9 @@ TEST(ApiStop, HoldsBackPartialMatchesAcrossPieces) {
     EXPECT_EQ(m.push("S"), "");
     EXPECT_EQ(m.push("TO"), "");
     EXPECT_EQ(m.push("Ptail"), "");
-    ASSERT_TRUE(m.matched().has_value());
-    EXPECT_EQ(*m.matched(), "STOP");
+    const auto& matched = m.matched();
+    if (!matched) GTEST_FAIL() << "stop \"STOP\" should have matched after \"Ptail\"";
+    EXPECT_EQ(*matched, "STOP");
     EXPECT_EQ(m.push("more"), "");
     EXPECT_EQ(m.flush(), "");
 }
@@ -400,6 +406,7 @@ TEST(ApiStop, OverlappingStopsDoNotDependOnPieceBoundaries) {
             return std::pair{out, m.matched().value_or("<none>")};
         };
         std::vector<std::string_view> bytes;
+        bytes.reserve(c.text.size());
         for (std::size_t i = 0; i < c.text.size(); ++i) bytes.emplace_back(c.text.data() + i, 1);
         const auto whole = run({c.text});
         const auto bytewise = run(bytes);
@@ -566,7 +573,7 @@ TEST(ApiFuzz, RequestToPromptPathNeverCrashes) {
         R"({"messages":[{"role":"user","content":")" + std::string(50000, 'A') + R"("}]})",
         R"({"messages":[{"role":"user","content":"x","extra":)" + nested(30000) + "}]}",
     };
-    std::mt19937 rng(12345);
+    std::mt19937 rng(12345);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const std::vector<std::string> inserts = {"<|im_start|>", "<|im_end|>", "<tool_call>", "</think>", "[[[[", "{\"a\":",
                                               "\"", "\\u0000", "\xff", "HLX", "}", "]", ",", "null", "1e999"};
     std::size_t prompts = 0, errors = 0;
