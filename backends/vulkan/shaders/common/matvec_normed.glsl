@@ -11,35 +11,29 @@
 #ifndef HALO_MATVEC_NORMED_GLSL
 #define HALO_MATVEC_NORMED_GLSL
 
-shared float rn[256];
+#include "rms_norm_tree.glsl"
+
+const uint HALO_NORM_LANES = 256u;  // = rms_norm.comp's default WG (the host fuses only at 256)
+shared float rn[HALO_NORM_LANES];
 float g_inv_rms;  // set by norm_prologue() before the main runs; the same value in every invocation
 float normed_x(const uint c) {
-    precise float r = (xr[pc.xr_off + c] * g_inv_rms) * nw[pc.nw_off + c];
-    return r;
+    return halo_rms_scale(xr[pc.xr_off + c], g_inv_rms, nw[pc.nw_off + c]);
 }
 #define HALO_X(c) normed_x(c)
 
-// Same arithmetic as rms_norm.comp with its default WG = 256: 256 virtual lanes (lane l sums
-// elements l, l+256, ...) reduced by the same fixed tree, so inv_rms is bitwise equal to the
-// separate norm's when the host's reduce_workgroup is 256; x*inv then *w is the same op order. All of it
-// is `precise`, as in rms_norm.comp: otherwise the compiler builds the two differently (1 ulp apart).
+// The same steps as rms_norm.comp with its default WG = 256, taken from common/rms_norm_tree.glsl:
+// 256 virtual lanes (lane l sums elements l, l+256, ...) folded by the same fixed tree, so inv_rms is
+// bitwise equal to the separate norm's when the host's reduce_workgroup is 256, and halo_rms_scale is
+// the same x*inv then *w.
 void norm_prologue() {
     const uint tid = gl_LocalInvocationID.x;
-    for (uint l = tid; l < 256u; l += WG) {
-        precise float a = 0.0;
-        for (uint i = l; i < pc.cols; i += 256u) {
-            const float v = xr[pc.xr_off + i];
-            a += v * v;
-        }
+    for (uint l = tid; l < HALO_NORM_LANES; l += WG) {
+        float a = 0.0;
+        for (uint i = l; i < pc.cols; i += HALO_NORM_LANES) a = halo_rms_sq_add(a, xr[pc.xr_off + i]);
         rn[l] = a;
     }
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1) {
-        for (uint l = tid; l < s; l += WG) rn[l] += rn[l + s];
-        barrier();
-    }
-    precise float inv = 1.0 / sqrt(rn[0] / float(pc.cols) + pc.eps);
-    g_inv_rms = inv;
+    HALO_RMS_TREE_REDUCE(rn, HALO_NORM_LANES, tid, WG)
+    g_inv_rms = halo_rms_inv(rn[0], pc.cols, pc.eps);
 }
 
 #endif  // HALO_MATVEC_NORMED_GLSL

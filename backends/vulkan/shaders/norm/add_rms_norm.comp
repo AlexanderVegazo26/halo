@@ -3,10 +3,11 @@
 // the rms_norm kernel's reduction over h (same order, so y == Ops::rms_norm(h) bitwise).
 // h may alias a or b exactly: each invocation reads a[i], b[i] and then writes h[i]; the
 // normalisation re-reads only h values this invocation wrote.
-// The sum of squares, inv and the scaled product are `precise`: left free, the compiler contracted and
-// rewrote them differently here and in common/matvec_normed.glsl (1 ulp apart), and HALO_FUSE_NORM
-// relies on the two being bit for bit equal (VkHead.GemvFusedNorm*).
+// The sum of squares, the tree, inv and the scaled product come from common/rms_norm_tree.glsl, which
+// common/matvec_normed.glsl uses too: HALO_FUSE_NORM relies on the two being bit for bit equal
+// (VkHead.GemvFusedNorm*), and hand copies drifted apart once (1 ulp, 2026-11-14).
 #include "halo_common.glsl"
+#include "rms_norm_tree.glsl"
 
 layout(constant_id = 0) const uint WG = 256;  // power of two (host-validated)
 layout(local_size_x_id = 0) in;
@@ -34,21 +35,16 @@ void main() {
     const uint bb = pc.b_off + row * pc.b_stride;
     const uint hb = pc.h_off + row * pc.h_stride;
     const uint yb = pc.y_off + row * pc.y_stride;
-    precise float acc = 0.0;
+    float acc = 0.0;
     for (uint i = tid; i < pc.cols; i += WG) {
         precise float v = a[ab + i] + b[bb + i];
         h[hb + i] = v;
-        acc += v * v;
+        acc = halo_rms_sq_add(acc, v);
     }
     red[tid] = acc;
-    barrier();
-    for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s) red[tid] += red[tid + s];
-        barrier();
-    }
-    precise float inv = 1.0 / sqrt(red[0] / float(pc.cols) + pc.eps);
+    HALO_RMS_TREE_REDUCE_WG(red, tid, WG)
+    const float inv = halo_rms_inv(red[0], pc.cols, pc.eps);
     for (uint i = tid; i < pc.cols; i += WG) {
-        precise float r = (h[hb + i] * inv) * w[pc.w_off + i];
-        y[yb + i] = r;
+        y[yb + i] = halo_rms_scale(h[hb + i], inv, w[pc.w_off + i]);
     }
 }
