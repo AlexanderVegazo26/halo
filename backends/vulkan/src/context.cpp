@@ -1,6 +1,8 @@
 #include "halo/backends/vulkan/context.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <string>
@@ -603,6 +605,16 @@ void Context::copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, V
     const VkResult r = vkWaitForFences(device_, 1, &transfer_fence_, VK_TRUE, 60'000'000'000ull);
     if (r != VK_SUCCESS) mark_hung();  // transfer_cmd_ may still be pending: never reset or reuse it
     detail::vk_check(r, "vkWaitForFences(transfer)");
+    // HALO_VK_OP_TIMINGS profiles count Stream fence waits ("# wait"); staged uploads/downloads
+    // and copy_buffer_sync wait on this separate fence, so mark each completed one too
+    // (next.md step 4: host round-trips per tick). Read per copy so it follows the env like a
+    // new Stream does; the getenv is noise next to the fence wait above.
+    if (const char* p = std::getenv("HALO_VK_OP_TIMINGS"); p != nullptr && *p != '\0') {
+        if (std::FILE* f = std::fopen(p, "a")) {
+            std::fprintf(f, "# transfer %llu\n", static_cast<unsigned long long>(size));
+            std::fclose(f);
+        }
+    }
 }
 
 std::vector<std::byte> Context::pipeline_cache_data() const {

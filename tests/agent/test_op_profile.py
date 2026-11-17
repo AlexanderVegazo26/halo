@@ -167,6 +167,53 @@ class OpProfileTest(unittest.TestCase):
                     f"an unrecorded side is null in the JSON, not 0: {data}",
                 )
 
+    def test_summary_counts_transfer_fences_and_their_bytes_apart_from_fence_waits(self) -> None:
+        p = self.write(
+            "p.txt",
+            "# transfer 4096\nrms_norm 10\n# wait\n# transfer 1024\n# transfer 1024\n# wait\n",
+        )
+        rc, out, err = self.run_cli("summary", str(p), "--json", str(self.dir / "s.json"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("2 fence waits, 0.5 dispatches per wait.", out,
+                      f"'# transfer' lines are not Stream fence waits; got:\n{out}")
+        self.assertIn("3 transfer fences (6.0 KiB staged).", out, f"3 transfers of 4096+1024+1024 B; got:\n{out}")
+        self.assertNotIn("| transfer", out, f"a transfer marker is not a kernel row; got:\n{out}")
+        data = json.loads((self.dir / "s.json").read_text())
+        self.assertEqual((data["transfer_fences"], data["transfer_bytes"]), (3, 6144), f"JSON: {data}")
+        rc, out, _ = self.run_cli("summary", str(p), "--per", "3")
+        self.assertEqual(rc, 0)
+        self.assertIn("1 transfer fences per 3 (2.0 KiB staged per 3).", out,
+                      f"--per divides the transfer count and bytes; got:\n{out}")
+        old = self.write("old.txt", "eltwise 1\n# wait\n")
+        rc, out, _ = self.run_cli("summary", str(old), "--json", str(self.dir / "o.json"))
+        self.assertEqual(rc, 0)
+        self.assertIn("transfer fences: not recorded (no '# transfer' lines;", out, out)
+        self.assertIsNone(json.loads((self.dir / "o.json").read_text())["transfer_fences"],
+                          "an unrecorded count is null in the JSON, not 0")
+
+    def test_compare_reports_the_transfer_fence_change_per_token(self) -> None:
+        before = self.write("b.txt", "eltwise 1000\n" + "# transfer 20480\n" * 6)  # 6 over 2 tokens
+        after = self.write("a.txt", "eltwise 1000\n# transfer 4\n")  # 1 over 1 token
+        rc, out, err = self.run_cli("compare", str(before), str(after), "--per-before", "2",
+                                    "--json", str(self.dir / "c.json"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("transfer fences 3 -> 1 (-66.7%).", out, f"3 transfers/token before, 1 after; got:\n{out}")
+        data = json.loads((self.dir / "c.json").read_text())
+        self.assertEqual((data["transfer_fences_before"], data["transfer_fences_after"]), (3, 1), f"JSON: {data}")
+        rc, out, _ = self.run_cli("compare", str(after), str(self.write("o.txt", "eltwise 1\n")),
+                                  "--json", str(self.dir / "c.json"))
+        self.assertEqual(rc, 0)
+        self.assertIn("transfer fences: not recorded in after (no '# transfer' lines).", out, out)
+        self.assertIsNone(json.loads((self.dir / "c.json").read_text())["transfer_fences_after"])
+
+    def test_malformed_transfer_marker_is_named_with_file_and_line(self) -> None:
+        for marker in ("# transfer", "# transfer x", "# transfer -4", "# transfer 4 5", "# transfer ²"):
+            with self.subTest(marker=marker):
+                p = self.write("bad.txt", f"eltwise 1\n{marker}\n")
+                rc, out, err = self.run_cli("summary", str(p))
+                self.assertEqual(rc, 2, f"{marker!r} should exit 2; stdout: {out}")
+                self.assertIn(f"{p}:2: expected '# transfer <bytes>'", err, f"{marker!r}: got {err!r}")
+
     def test_malformed_line_is_named_with_file_and_line(self) -> None:
         for body, needle in [
             ("eltwise 100\nmatvec 1 2\n", ":2: expected '<kernel> <ns>'"),

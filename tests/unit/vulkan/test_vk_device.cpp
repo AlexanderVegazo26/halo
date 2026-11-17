@@ -288,15 +288,74 @@ TEST(VkStream, OpTimingsProfileMarksEachFenceWaitAfterItsDispatches) {
     std::filesystem::remove(path);
     std::string got;
     for (const std::string& l : lines) got += "\n  " + l;
-    std::vector<std::string> shape;  // kernel lines reduced to their name
+    // Kernel lines reduced to their name. The input uploads may be staged ("# transfer <bytes>",
+    // depending on the device's memory types); VkContext.OpTimingsProfileMarksEachTransferFence*
+    // pins those, so this Stream test ignores them.
+    std::vector<std::string> shape;
     shape.reserve(lines.size());
-    for (const std::string& l : lines) shape.push_back(l.starts_with('#') ? l : l.substr(0, l.find(' ')));
+    for (const std::string& l : lines) {
+        if (l.starts_with("# transfer ")) continue;
+        shape.push_back(l.starts_with('#') ? l : l.substr(0, l.find(' ')));
+    }
     const std::vector<std::string> want =
         ctx->info().timestamps_supported()
             ? std::vector<std::string>{"rms_norm", "rms_norm", "# wait", "# wait"}
             : std::vector<std::string>{"# wait", "# wait"};
     EXPECT_EQ(shape, want) << "profile " << path << " should hold each submission's dispatch lines followed by one "
                            << "'# wait' per completed fence wait (2 here; the idle wait() adds none); got:" << got;
+}
+
+// HALO_VK_OP_TIMINGS (next.md step 4): staged uploads/downloads wait on the context's transfer
+// fence, not a Stream's, so each completed staged copy appends "# transfer <bytes>" (one per
+// staging chunk, in order) and a Stream fence wait still appends only "# wait". Nothing is
+// written while the variable is unset.
+TEST(VkContext, OpTimingsProfileMarksEachTransferFenceWithItsBytes) {
+    hv::ContextOptions opts;
+    opts.force_staging = true;
+    opts.staging_bytes = 4096;
+    HALO_VK_CONTEXT_OR_SKIP(ctx, opts);
+    const std::filesystem::path path =
+        std::filesystem::path(::testing::TempDir()) /
+        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".txt");
+    std::filesystem::remove(path);
+    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
+    const std::optional<std::string> old = old_env ? std::optional<std::string>(old_env) : std::nullopt;
+    std::vector<std::uint8_t> src(10000);
+    for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::uint8_t>(i * 37u + 11u);
+    hv::Buffer a = hv::Buffer::create(ctx, src.size(), hv::MemoryUsage::DeviceLocal);
+    hv::Buffer b = hv::Buffer::create(ctx, src.size(), hv::MemoryUsage::DeviceLocal);
+    ::unsetenv("HALO_VK_OP_TIMINGS");
+    a.upload(std::span<const std::uint8_t>(src));  // unset: no profile written
+    const bool written_while_unset = std::filesystem::exists(path);
+    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+    std::vector<std::uint8_t> got(5000);
+    {
+        b.upload(std::span<const std::uint8_t>(src));          // 4096 + 4096 + 1808
+        b.download(std::span<std::uint8_t>(got), 3000);        // 4096 + 904
+        hv::Stream s(ctx);
+        s.copy(a, 0, b, 0, a.size());
+        s.submit_and_wait();  // a Stream fence: "# wait", not a transfer
+    }
+    if (old) {
+        ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
+    } else {
+        ::unsetenv("HALO_VK_OP_TIMINGS");
+    }
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(path);
+        for (std::string l; std::getline(in, l);) lines.push_back(l);
+    }
+    std::filesystem::remove(path);
+    EXPECT_FALSE(written_while_unset) << "a staged upload with HALO_VK_OP_TIMINGS unset created " << path;
+    EXPECT_EQ(got, std::vector<std::uint8_t>(src.begin() + 3000, src.begin() + 8000)) << "staged round trip";
+    const std::vector<std::string> want{"# transfer 4096", "# transfer 4096", "# transfer 1808",
+                                        "# transfer 4096", "# transfer 904",  "# wait"};
+    std::string shown;
+    for (const std::string& l : lines) shown += "\n  " + l;
+    EXPECT_EQ(lines, want) << "profile " << path << " should hold one '# transfer <bytes>' per staged chunk "
+                           << "(upload 10000 B, download 5000 B at 4 KiB staging) and one '# wait' for the "
+                           << "Stream fence; got:" << shown;
 }
 
 TEST(VkKernel, DispatchValidatesBindingsPushAndGroups) {

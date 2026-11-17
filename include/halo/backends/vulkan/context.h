@@ -230,6 +230,9 @@ private:
 
     // Reusable staging buffer (guarded by transfer_mutex_). Raw handles rather than a
     // Buffer: a Buffer holds a shared_ptr to its Context, which would be a cycle here.
+    // copy_locked submits one copy and waits on transfer_fence_; with HALO_VK_OP_TIMINGS=<path>
+    // set it appends "# transfer <bytes>" to <path> per completed copy (a host round-trip that
+    // is not a Stream fence: scripts/op_profile.py counts both).
     void copy_locked(VkBuffer src, VkBuffer dst, VkDeviceSize src_offset, VkDeviceSize dst_offset,
                      VkDeviceSize size);
     void ensure_staging_locked();
