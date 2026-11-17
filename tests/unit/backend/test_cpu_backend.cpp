@@ -24,6 +24,8 @@
 #include "halo/core/error.h"
 #include "halo/tensor/quant.h"
 
+#include "../bitwise.h"
+
 using namespace halo::backend;  // NOLINT(google-build-using-namespace)
 namespace cpu = halo::cpu;
 using halo::DType;
@@ -39,9 +41,7 @@ std::vector<float> rnd(std::size_t n, std::uint32_t seed, float lo = -1.0f, floa
     return v;
 }
 
-bool bits_equal(std::span<const float> a, std::span<const float> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
-}
+using halo::test::bitwise;
 
 void expect_code(ErrorCode code, const std::function<void()>& fn, const char* what, const char* contains = nullptr) {
     try {
@@ -225,7 +225,7 @@ TEST_F(CpuBackendTest, NormsAndEltwiseEqualCpuOps) {
     // RMS_NORM over a strided x (per-head norm reading every other head block).
     be->rms_norm(*st, {at(imp(x), 0, 2 * D), imp(w), imp(out), R, D, 1e-6f, {}});
     cpu::rms_norm(cpu::ConstRows(x.data(), R, D, 2 * D), w, 1e-6f, cpu::Rows(std::span(ref), R, D));
-    EXPECT_TRUE(bits_equal(out, ref));
+    EXPECT_TRUE(bitwise(out, ref));
 
     // ADD_RMS_NORM == cpu::add then cpu::rms_norm, with h identical to a.
     auto a1 = rnd(R * D, 6), a2 = a1;
@@ -235,23 +235,23 @@ TEST_F(CpuBackendTest, NormsAndEltwiseEqualCpuOps) {
     cpu::add(cpu::ConstRows(std::span<const float>(a2), R, D), cpu::ConstRows(std::span<const float>(b), R, D),
              cpu::Rows(std::span(a2), R, D));
     cpu::rms_norm(cpu::ConstRows(std::span<const float>(a2), R, D), w, 1e-6f, cpu::Rows(std::span(o2), R, D));
-    EXPECT_TRUE(bits_equal(a1, a2));
-    EXPECT_TRUE(bits_equal(o1, o2));
+    EXPECT_TRUE(bitwise(a1, a2));
+    EXPECT_TRUE(bitwise(o1, o2));
 
     // GATED_NORM, SWIGLU, MUL_SIGMOID (gate read with a head stride from an interleaved row).
     auto z = rnd(R * D, 7);
     be->gated_rms_norm(*st, {imp(b), imp(z), imp(w), imp(out), R, D, 1e-6f, {}});
     cpu::gated_rms_norm(cpu::ConstRows(std::span<const float>(b), R, D), w, cpu::ConstRows(std::span<const float>(z), R, D), 1e-6f,
                         cpu::Rows(std::span(ref), R, D));
-    EXPECT_TRUE(bits_equal(out, ref));
+    EXPECT_TRUE(bitwise(out, ref));
     be->swiglu(*st, {imp(b), imp(z), imp(out), R, D, {}});
     cpu::swiglu(cpu::ConstRows(std::span<const float>(b), R, D), cpu::ConstRows(std::span<const float>(z), R, D),
                 cpu::Rows(std::span(ref), R, D));
-    EXPECT_TRUE(bits_equal(out, ref));
+    EXPECT_TRUE(bitwise(out, ref));
     be->mul_sigmoid(*st, {imp(b), at(imp(x), D, 2 * D), imp(out), R, D, {}});
     cpu::mul_sigmoid(cpu::ConstRows(std::span<const float>(b), R, D), cpu::ConstRows(x.data() + D, R, D, 2 * D),
                      cpu::Rows(std::span(ref), R, D));
-    EXPECT_TRUE(bits_equal(out, ref));
+    EXPECT_TRUE(bitwise(out, ref));
 }
 
 TEST_F(CpuBackendTest, GemvF32AndQuantizedEqualCpuMatmul) {
@@ -263,7 +263,7 @@ TEST_F(CpuBackendTest, GemvF32AndQuantizedEqualCpuMatmul) {
     be->gemv(*st, {DType::F32, imp(wf), imp(x), imp(y), N, K, T, {}});
     cpu::matmul(cpu::ConstRows(std::span<const float>(x), T, K), cpu::WeightMatrix::dense(cpu::ConstRows(std::span<const float>(wf), N, K)),
                 cpu::Rows(std::span(ref), T, N));
-    EXPECT_TRUE(bits_equal(y, ref));
+    EXPECT_TRUE(bitwise(y, ref));
     // Q8_0 weights (2-byte f16 scale + 32 int8 per block): dequantized with tensor::dequantize_row.
     const std::size_t rb = halo::tensor::row_bytes(DType::Q8_0, K);
     std::vector<std::byte> wq(N * rb);
@@ -279,7 +279,7 @@ TEST_F(CpuBackendTest, GemvF32AndQuantizedEqualCpuMatmul) {
         halo::tensor::dequantize_row(DType::Q8_0, base + first * rb, out.data(), static_cast<std::int64_t>(n * 64));
     });
     cpu::matmul(cpu::ConstRows(std::span<const float>(x), T, K), wm, cpu::Rows(std::span(ref), T, N));
-    EXPECT_TRUE(bits_equal(y, ref));
+    EXPECT_TRUE(bitwise(y, ref));
     expect_code(ErrorCode::Kernel, [&] { be->gemv(*st, {DType::Q8_0, imp_bytes(wq), imp(x), imp(x), N, K, T, {}}); }, "y overlaps x");
 }
 
@@ -297,8 +297,8 @@ TEST_F(CpuBackendTest, GdnGatesEqualTheQwen35Sequence) {
     cpu::softplus(cpu::ConstRows(std::span<const float>(ra), T, nv), cpu::Rows(std::span(ra), T, nv));
     for (std::size_t r = 0; r < T; ++r)
         for (std::size_t j = 0; j < nv; ++j) ra[r * nv + j] = a[j] * ra[r * nv + j];
-    EXPECT_TRUE(bits_equal(g, ra));
-    EXPECT_TRUE(bits_equal(bo, rbt));
+    EXPECT_TRUE(bitwise(g, ra));
+    EXPECT_TRUE(bitwise(bo, rbt));
 }
 
 TEST_F(CpuBackendTest, ConvAndGatedDeltaRuleWithSlotsEqualCpuOps) {
@@ -310,9 +310,9 @@ TEST_F(CpuBackendTest, ConvAndGatedDeltaRuleWithSlotsEqualCpuOps) {
     be->conv1d_silu(*st, {imp(x), imp(w), imp(st1), imp(out1), imp(sl1), T, C, K, 3, {}});
     cpu::causal_conv1d_silu(cpu::ConstRows(std::span<const float>(x), T, C), cpu::ConstRows(std::span<const float>(w), C, K),
                             cpu::Rows(std::span(st2), K - 1, C), cpu::Rows(std::span(out2), T, C), nullptr, sl2);
-    EXPECT_TRUE(bits_equal(out1, out2));
-    EXPECT_TRUE(bits_equal(st1, st2));
-    EXPECT_TRUE(bits_equal(sl1, sl2));
+    EXPECT_TRUE(bitwise(out1, out2));
+    EXPECT_TRUE(bitwise(st1, st2));
+    EXPECT_TRUE(bitwise(sl1, sl2));
     expect_code(ErrorCode::Kernel, [&] { be->conv1d_silu(*st, {imp(x), imp(w), imp(st1), imp(x), {}, T, C, K, 0, {}}); },
                 "conv in place (neutral rule: distinct output)");
 
@@ -352,9 +352,9 @@ TEST_F(CpuBackendTest, ConvAndGatedDeltaRuleWithSlotsEqualCpuOps) {
         } else {
             cpu::gated_delta_rule_recurrent(dims, in, s2, cpu::Rows(std::span(o2), T, vd), qk, nullptr, q2);
         }
-        EXPECT_TRUE(bits_equal(o1, o2));
-        EXPECT_TRUE(bits_equal(s1, s2));
-        EXPECT_TRUE(bits_equal(q1, q2));
+        EXPECT_TRUE(bitwise(o1, o2));
+        EXPECT_TRUE(bitwise(s1, s2));
+        EXPECT_TRUE(bitwise(q1, q2));
     }
 }
 
@@ -375,9 +375,9 @@ TEST_F(CpuBackendTest, HeadStridedRopeEqualsDenseRopeOnDeinterleavedCopy) {
     cpu::partial_rope_neox(cpu::Rows(std::span(dense), T, nh * hd), nh, hd, pos, rot, 1e6f);
     for (std::size_t t = 0; t < T; ++t) {
         for (std::size_t h = 0; h < nh; ++h) {
-            EXPECT_TRUE(bits_equal(std::span(&qg[t * 2 * nh * hd + h * 2 * hd], hd), std::span(&dense[t * nh * hd + h * hd], hd)))
+            EXPECT_TRUE(bitwise(std::span(&qg[t * 2 * nh * hd + h * 2 * hd], hd), std::span(&dense[t * nh * hd + h * hd], hd)))
                 << "t " << t << " h " << h;
-            EXPECT_TRUE(bits_equal(std::span(&qg[t * 2 * nh * hd + h * 2 * hd + hd], hd),
+            EXPECT_TRUE(bitwise(std::span(&qg[t * 2 * nh * hd + h * 2 * hd + hd], hd),
                                    std::span(&before[t * 2 * nh * hd + h * 2 * hd + hd], hd)))
                 << "gate half touched at t " << t << " h " << h;
         }
@@ -386,7 +386,7 @@ TEST_F(CpuBackendTest, HeadStridedRopeEqualsDenseRopeOnDeinterleavedCopy) {
     auto d2 = rnd(T * nh * hd, 22), d3 = d2;
     be->partial_rope(*st, {imp(d2), imp(pos), T, nh, hd, rot, 1e6f, 0, {}});
     cpu::partial_rope_neox(cpu::Rows(std::span(d3), T, nh * hd), nh, hd, pos, rot, 1e6f);
-    EXPECT_TRUE(bits_equal(d2, d3));
+    EXPECT_TRUE(bitwise(d2, d3));
 }
 
 namespace {
@@ -420,8 +420,8 @@ TEST_F(CpuBackendTest, KvWriteAndAttentionOverThePoolImageEqualCpuOps) {
     be->kv_write(*st, w);
     for (std::size_t i = 0; i < T; ++i) {
         const std::size_t r = start + i;
-        EXPECT_TRUE(bits_equal(std::span(pool.k_rows(table[r / bt], layer) + (r % bt) * kvd, kvd), std::span(&k[i * kvd], kvd)));
-        EXPECT_TRUE(bits_equal(std::span(pool.v_rows(table[r / bt], layer) + (r % bt) * kvd, kvd), std::span(&v[i * kvd], kvd)));
+        EXPECT_TRUE(bitwise(std::span(pool.k_rows(table[r / bt], layer) + (r % bt) * kvd, kvd), std::span(&k[i * kvd], kvd)));
+        EXPECT_TRUE(bitwise(std::span(pool.v_rows(table[r / bt], layer) + (r % bt) * kvd, kvd), std::span(&v[i * kvd], kvd)));
     }
     EXPECT_TRUE(std::all_of(pool.k_rows(table[0], 0), pool.k_rows(table[0], 0) + bt * kvd, [](float f) { return f == 0.0f; }))
         << "layer 0 touched";
@@ -467,13 +467,13 @@ TEST_F(CpuBackendTest, KvWriteAndAttentionOverThePoolImageEqualCpuOps) {
     a.q_offset = start;
     a.scale = scale;
     be->attention(*st, a);
-    EXPECT_TRUE(bits_equal(o1, ref));
+    EXPECT_TRUE(bitwise(o1, ref));
     AttentionArgs s = a;
     s.q = at(imp(qg), 0, 2 * nh * hd);
     s.q_head_stride = 2 * hd;
     s.out = imp(o2);
     be->attention(*st, s);
-    EXPECT_TRUE(bits_equal(o2, ref)) << "head-strided attention differs from dense";
+    EXPECT_TRUE(bitwise(o2, ref)) << "head-strided attention differs from dense";
 }
 
 TEST_F(CpuBackendTest, LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNPoisonsOnlyItsRow) {
@@ -487,7 +487,7 @@ TEST_F(CpuBackendTest, LmHeadAcrossSlabsEqualsMatmulArgmaxAndNaNPoisonsOnlyItsRo
     be->lm_head(*st, a);
     cpu::matmul(cpu::ConstRows(std::span<const float>(x), n, E), cpu::WeightMatrix::dense(cpu::ConstRows(std::span<const float>(w), V, E)),
                 cpu::Rows(std::span(ref), n, V));
-    EXPECT_TRUE(bits_equal(logits, ref));
+    EXPECT_TRUE(bitwise(logits, ref));
     const auto best = decode_argmax(res);
     for (std::size_t i = 0; i < n; ++i) {
         const auto e = cpu::argmax(std::span<const float>(&ref[i * V], V));
@@ -578,14 +578,14 @@ TEST_F(CpuBackendTest, GetRowsAndCopyEqualDequantizeRow) {
     std::vector<float> out(ids.size() * cols);
     be->get_rows(*st, {DType::F32, imp(t), imp(ids), imp(out), rows, cols, 4, {}, {}});
     for (std::size_t i = 0; i < ids.size(); ++i) {
-        EXPECT_TRUE(bits_equal(std::span(&out[i * cols], cols), std::span(&t[static_cast<std::size_t>(ids[i]) * cols], cols)));
+        EXPECT_TRUE(bitwise(std::span(&out[i * cols], cols), std::span(&t[static_cast<std::size_t>(ids[i]) * cols], cols)));
     }
     std::vector<std::int32_t> bad{3, 10};
     expect_code(ErrorCode::Kernel, [&] { be->get_rows(*st, {DType::F32, imp(t), imp(bad), imp(out), rows, cols, 2, {}, {}}); },
                 "id outside the table");
     std::vector<float> dst(cols);
     be->copy(*st, {at(imp(t), cols), imp(dst), cols * 4, {}});
-    EXPECT_TRUE(bits_equal(dst, std::span(&t[cols], cols)));
+    EXPECT_TRUE(bitwise(dst, std::span(&t[cols], cols)));
     const TensorRef rt = imp(t);
     expect_code(ErrorCode::Kernel, [&] { be->copy(*st, {rt, at(rt, 4), cols * 4, {}}); }, "overlapping copy");
     // run_op dispatches to the typed method.

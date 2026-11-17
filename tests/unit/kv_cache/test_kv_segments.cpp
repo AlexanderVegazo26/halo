@@ -11,7 +11,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <random>
@@ -22,6 +21,8 @@
 #include "halo/backends/cpu/thread_pool.h"
 #include "halo/core/error.h"
 #include "halo/kv_cache/paged_kv.h"
+
+#include "../bitwise.h"
 
 namespace cpu = halo::cpu;
 namespace hb = halo::backend;
@@ -44,9 +45,7 @@ std::vector<float> rnd(std::size_t n, std::uint32_t seed) {
     return v;
 }
 
-bool bits_equal(const std::vector<float>& a, const std::vector<float>& b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
-}
+using halo::test::bitwise;
 
 /// What one scripted run produced; compared across placements.
 struct ScriptResult {
@@ -271,11 +270,11 @@ TEST(KvSegments, SequencesScatteredOverAllSegmentsAttendLikeTheContiguousPool) {
     ASSERT_EQ(single.attn.size(), 2 * kLayers);
     ASSERT_EQ(per.attn.size(), 2 * kLayers);
     for (std::size_t i = 0; i < per.attn.size(); ++i) {
-        EXPECT_TRUE(bits_equal(per.attn[i], single.attn[i])) << "(sequence, layer) " << i << " differs between placements";
-        EXPECT_TRUE(bits_equal(per.attn[i], per.ref[i])) << "(sequence, layer) " << i << " differs from cpu::attention_gqa";
-        EXPECT_TRUE(bits_equal(single.attn[i], single.ref[i])) << "(sequence, layer) " << i;
+        EXPECT_TRUE(bitwise(per.attn[i], single.attn[i])) << "(sequence, layer) " << i << " differs between placements";
+        EXPECT_TRUE(bitwise(per.attn[i], per.ref[i])) << "(sequence, layer) " << i << " differs from cpu::attention_gqa";
+        EXPECT_TRUE(bitwise(single.attn[i], single.ref[i])) << "(sequence, layer) " << i;
     }
-    EXPECT_TRUE(bits_equal(per.image, single.image)) << "the logical pool image differs";
+    EXPECT_TRUE(bitwise(per.image, single.image)) << "the logical pool image differs";
 }
 
 TEST(KvSegments, CopyOnWriteInAPerLayerPoolMatchesTheContiguousPool) {
@@ -329,9 +328,9 @@ TEST(KvSegments, CopyOnWriteInAPerLayerPoolMatchesTheContiguousPool) {
     EXPECT_EQ(prc, 2u);
     EXPECT_NE(sat, sbt) << "the partially shared block was copied";
     EXPECT_NE(pat, pbt);
-    EXPECT_TRUE(bits_equal(pa, sa)) << "the source sequence changed under copy-on-write";
-    EXPECT_TRUE(bits_equal(pb, sb));
-    EXPECT_TRUE(bits_equal(pi, si));
+    EXPECT_TRUE(bitwise(pa, sa)) << "the source sequence changed under copy-on-write";
+    EXPECT_TRUE(bitwise(pb, sb));
+    EXPECT_TRUE(bitwise(pi, si));
     // Rows 0..20 of the copy equal the source (layer 0, K of row 20: the shared part of the copied block).
     const std::size_t stride = 2 * kKvd;
     EXPECT_TRUE(std::equal(pb.begin() + 20 * stride, pb.begin() + 21 * stride, pa.begin() + 20 * stride));

@@ -6,10 +6,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <random>
 #include <span>
 #include <vector>
+
+#include "../bitwise.h"
 
 // fp64 reference code: float -> double promotion is intentional here (see test files).
 #pragma GCC diagnostic push
@@ -100,8 +101,9 @@ struct Rng {
     }
 };
 
-[[nodiscard]] inline bool bitwise_equal(std::span<const float> a, std::span<const float> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+// Bit-for-bit equality as a gtest assertion naming the first differing float (tests/unit/bitwise.h).
+[[nodiscard]] inline ::testing::AssertionResult bitwise_equal(std::span<const float> a, std::span<const float> b) {
+    return ::halo::test::bitwise(a, b);
 }
 
 }  // namespace halo::cpu::test

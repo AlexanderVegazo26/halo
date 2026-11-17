@@ -339,35 +339,3 @@ TEST(VkShapes, MatvecRowBytesFollowGgmlBlockSizes) {
         EXPECT_EQ(e.code(), halo::ErrorCode::Unsupported);
     }
 }
-
-// ---------------------------------------------------------------- test helpers
-
-// hv::test::bitwise is the bit-for-bit gate of the device tests: it must compare bit patterns (not
-// values) and, on failure, say where the arrays diverge so a log is enough to start debugging.
-TEST(VkTestUtil, BitwiseComparesBitPatternsAndNamesTheFirstDifferingFloat) {
-    using hv::test::bitwise;
-    const float nan = std::numeric_limits<float>::quiet_NaN();
-    const std::vector<float> a{1.0f, 0.0f, nan, 3.0f, 4.0f};
-
-    const ::testing::AssertionResult same = bitwise(a, std::vector<float>(a));
-    EXPECT_TRUE(same) << "identical arrays (incl. the same NaN) must compare equal: " << same.message();
-    EXPECT_EQ(std::string(same.message()), "all 5 floats bit-identical");
-
-    std::vector<float> b = a;
-    b[1] = -0.0f;  // == 0.0f as a value, a different bit pattern
-    b[4] = 5.0f;
-    const ::testing::AssertionResult diff = bitwise(a, b);
-    EXPECT_FALSE(diff) << "+0 vs -0 and 4 vs 5 must fail the bitwise gate";
-    EXPECT_EQ(std::string(diff.message()), "2 of 5 floats differ; first at [1]: 0 (0x00000000) vs -0 (0x80000000)");
-
-    std::vector<float> c = a;
-    c[2] = -nan;  // a NaN with the sign bit set: unequal bits even though both are NaN
-    EXPECT_FALSE(bitwise(a, c)) << "NaNs with different bits must fail";
-
-    const ::testing::AssertionResult sizes = bitwise(a, std::span(a).first(4));
-    EXPECT_FALSE(sizes);
-    EXPECT_EQ(std::string(sizes.message()), "sizes differ: 5 vs 4");
-
-    EXPECT_TRUE(bitwise(a.data() + 3, b.data() + 3, 1)) << "pointer form over a matching 1-float row";
-    EXPECT_FALSE(bitwise(a.data() + 3, b.data() + 3, 2)) << "pointer form over a row with 4 vs 5";
-}

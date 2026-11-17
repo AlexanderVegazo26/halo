@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <map>
 
+#include "../bitwise.h"
 #include "../tensor/ref_data.h"
 #include "halo/model/inspect.h"
 #include "halo/model/mapped_file.h"
@@ -199,7 +200,7 @@ TEST(ModelTiny, F32TensorsMatchHfCheckpoint) {
         const auto a = all_f32(g);
         const auto b = hf.f32(hf_name);
         ASSERT_EQ(a.size(), b.size()) << g.name();
-        EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size() * 4), 0) << g.name() << " != " << hf_name;
+        EXPECT_TRUE(halo::test::bitwise(a, b)) << g.name() << " != " << hf_name;
     };
     // D-004: GGUF stores zero-centered HF norm weights as w + 1 (computed in float32).
     auto plus_one = [&](const WeightRef& g, const std::string& hf_name) {

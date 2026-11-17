@@ -38,6 +38,7 @@
 #include <tuple>
 #include <vector>
 
+#include "../bitwise.h"
 #include "halo/backend/backend.h"
 #include "halo/core/error.h"
 #include "halo/model/gguf.h"
@@ -65,17 +66,9 @@ constexpr std::size_t kBlocks = 96;
 constexpr std::size_t kSeqs = 5;
 constexpr float kSentinel = -7.25f;
 
+// Bit-for-bit, new path (a) vs legacy (b); the failure names the first differing float (tests/unit/bitwise.h).
 ::testing::AssertionResult same_bits(std::span<const float> a, std::span<const float> b, const std::string& what) {
-    if (a.size() != b.size()) {
-        return ::testing::AssertionFailure() << what << ": " << a.size() << " vs " << b.size() << " floats";
-    }
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (std::bit_cast<std::uint32_t>(a[i]) != std::bit_cast<std::uint32_t>(b[i])) {
-            return ::testing::AssertionFailure() << what << ": first difference at element " << i << " of " << a.size()
-                                                 << " (new " << a[i] << ", legacy " << b[i] << ")";
-        }
-    }
-    return ::testing::AssertionSuccess();
+    return halo::test::bitwise(a, b, what + " (new vs legacy)");
 }
 
 std::span<const float> pool_storage(const KvPool& p) {

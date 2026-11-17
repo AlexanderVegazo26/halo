@@ -120,18 +120,8 @@ Pair make_pair(const std::shared_ptr<hv::Context>& ctx, const hb::VulkanBackendO
                                          << cpu[at] << ") > " << tol;
 }
 
-::testing::AssertionResult bitwise(std::span<const float> vk, std::span<const float> cpu, const std::string& what) {
-    if (vk.size() == cpu.size() && std::memcmp(vk.data(), cpu.data(), vk.size_bytes()) == 0) {
-        return ::testing::AssertionSuccess();
-    }
-    for (std::size_t i = 0; i < std::min(vk.size(), cpu.size()); ++i) {
-        if (std::bit_cast<std::uint32_t>(vk[i]) != std::bit_cast<std::uint32_t>(cpu[i])) {
-            return ::testing::AssertionFailure() << what << ": first difference at " << i << " (vk " << vk[i] << ", cpu "
-                                                 << cpu[i] << ")";
-        }
-    }
-    return ::testing::AssertionFailure() << what << ": sizes " << vk.size() << " vs " << cpu.size();
-}
+// bitwise(vk, cpu, what): tests/unit/bitwise.h, named failure with the first differing float's bits.
+using halo::test::bitwise;
 
 template <class F>
 void expect_code(F&& f, halo::ErrorCode code, const std::string& what) {
@@ -542,8 +532,8 @@ TEST(VulkanBackend, ConvAndGatedDeltaRuleBothFormsMatchCpu) {
         // either backend): guards against a form that is silently ignored.
         (ch ? chunked_out : recurrent_out) = {c[3], v[3]};
     }
-    EXPECT_NE(std::memcmp(recurrent_out[0].data(), chunked_out[0].data(), recurrent_out[0].size() * 4), 0) << "cpu forms";
-    EXPECT_NE(std::memcmp(recurrent_out[1].data(), chunked_out[1].data(), recurrent_out[1].size() * 4), 0) << "vulkan forms";
+    EXPECT_FALSE(bitwise(recurrent_out[0], chunked_out[0], "recurrent vs chunked")) << "cpu forms";
+    EXPECT_FALSE(bitwise(recurrent_out[1], chunked_out[1], "recurrent vs chunked")) << "vulkan forms";
     for (std::size_t s = 0; s < 2; ++s) {
         double m = 0;
         for (std::size_t i = 0; i < recurrent_out[s].size(); ++i) {
