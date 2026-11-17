@@ -65,7 +65,7 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
         EXPECT_EQ(s->spirv[0], 0x07230203u) << s->name << ": not SPIR-V (magic)";
         EXPECT_EQ(s->sha256.size(), 64u) << s->name;
         EXPECT_TRUE(hv::verify_shader(*s)) << s->name << ": embedded hash does not match the bytes";
-        EXPECT_FALSE(s->source_path.starts_with("/")) << "absolute path embedded: " << s->source_path;
+        EXPECT_FALSE(s->source_path.starts_with('/')) << "absolute path embedded: " << s->source_path;
         std::cout << "[vk-shader] " << s->name << " (" << s->source_path << ") " << s->spirv.size_bytes()
                   << " B sha256=" << s->sha256 << "\n";
     }

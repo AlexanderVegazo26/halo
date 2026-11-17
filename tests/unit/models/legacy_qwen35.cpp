@@ -324,6 +324,7 @@ struct LegacyQwen35::Impl {
         mixer(ConstRows(std::span<const float>(xn), R, E), Rows(std::span(y), R, E));
         cpu::add(x, ConstRows(std::span<const float>(y), R, E), x, pool);
         rms_norm(x, l.post_norm, Rows(std::span(xn), R, E), cost);
+        HALO_CHECK(l.ffn.has_value(), ErrorCode::Model, "qwen35: decoder layer has no FFN weights");
         ffn(*l.ffn, ConstRows(std::span<const float>(xn), R, E), Rows(std::span(y), R, E), cost);
         cpu::add(x, ConstRows(std::span<const float>(y), R, E), x, pool);
         cost.activation_bytes += 2 * cpu::traffic_binary(R * E).total();

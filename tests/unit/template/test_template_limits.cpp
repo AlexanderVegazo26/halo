@@ -380,7 +380,7 @@ TEST(TemplateLimitsUnit, ReplaceAndSplitKeepUpstreamSemantics) {
 // ---- parse-side hardening beyond the table -----------------------------------------------
 
 TEST_F(TemplateRows, ParseDepthCoversEveryRecursivePath) {
-    const auto deep = [](std::string src) {
+    const auto deep = [](const std::string& src) {
         return [src] { const ChatTemplate t(src, {}, {}, rows()); };
     };
     const std::size_t n = 2000;

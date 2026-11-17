@@ -95,6 +95,7 @@ TEST(ThreadPool, ConcurrentExternalCallersAreSerializedCorrectly) {
     std::atomic<long> total{0};
     {
         std::vector<std::jthread> callers;
+        callers.reserve(4);
         for (int c = 0; c < 4; ++c) {
             callers.emplace_back([&] {
                 for (int r = 0; r < 50; ++r) {

@@ -66,6 +66,7 @@ protected:
         }
         env.insert(env.end(), vars.begin(), vars.end());
         std::vector<char*> envp;
+        envp.reserve(env.size() + 1);
         for (auto& e : env) envp.push_back(e.data());
         envp.push_back(nullptr);
         std::string exe = HALO_LOG_ENV_HELPER;

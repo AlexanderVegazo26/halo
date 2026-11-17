@@ -772,6 +772,7 @@ protected:
     double concurrent_ms() {
         std::vector<GenerateResult> results(kSlots);
         std::vector<std::thread> threads;
+        threads.reserve(kSlots);
         const auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < kSlots; ++i) {
             threads.emplace_back([&, i] { results[i] = run_one(static_cast<std::int32_t>('a' + i)); });
