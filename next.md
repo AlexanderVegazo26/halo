@@ -183,8 +183,15 @@ Qwen3.8-27B UD-Q4_K_XL, Vulkan/RADV, `-n 128 --ctx 4096`, default prompt, **one 
 | `HALO_FUSE_GEMV=all` | 6 | 15.86 | -0.3% | same |
 | `HALO_COOPMAT=1` | 7 | 15.71 | -1.3% | same |
 | `HALO_REPACK=1` | 8 | 16.11 | +1.3% | same |
-| `HALO_KV_FP16=1`, `HALO_KV_TYPE=q8`, `HALO_FUSE_NORM=1`, `HALO_NGRAM_DRAFT=1` | 9-11 | not measured | | another model server took the GPU mid-sweep (the sweep stopped, as designed) |
+| `HALO_KV_FP16=1` | 9 | 15.78 | -0.3% * | same |
+| `HALO_KV_TYPE=q8` | 9 | 15.75 | -0.4% * | same |
+| `HALO_FUSE_NORM=1` | 10 | 14.70 | -7.1% * | same |
+| `HALO_NGRAM_DRAFT=1` | 11 | 15.70 | -0.8% * | same (n-gram: 0 hits in 57 lookups) |
 
-Reading: only subgroup-reduce (step 1) and the reduced draft head (step 2) clearly beat the baseline; gdn-reg and repack are within noise. Deeper drafts and tree verification cost more than their extra accepted tokens on this prompt. Next: `--repeat 3` on the four positive flags and their combination, then the four unmeasured variants.
+\* Measured in a second sweep the same morning (08:42, `--variants kv-fp16,kv-q8,fuse-norm,ngram`), against that sweep's own baseline of 15.82 tok/s (70 / 114 drafts accepted). The Ornith model server was loaded but idle (gpu_busy_percent 0, about 46 GiB VRAM free). The lossy KV formats (fp16, q8) still gave greedy output identical to the baseline on this prompt.
+
+Reading: only subgroup-reduce (step 1) and the reduced draft head (step 2) clearly beat the baseline; gdn-reg and repack are within noise. Deeper drafts and tree verification cost more than their extra accepted tokens on this prompt. The KV formats (step 9) don't change decode speed at 4096 context: attention over 145 rows is a tiny share of a tick, so their payoff is VRAM and long contexts, which this prompt doesn't measure. Norm fusion (step 10) is the only clear loss among the bitwise flags (-7.1%): the FFN gate/up `_normed` gemvs stage the whole normed row in shared memory per workgroup, which seems to cost more than the separate rms_norm dispatch it saves. N-gram drafts (step 11) never hit on this prompt (a short story without repeated 3-grams), so the -0.8% is only lookup overhead and noise; a code-editing or summarizing prompt would show its upside. Next: `--repeat 3` on the four positive flags and their combination, then a long-context prompt for steps 9 and 11.
+
+The second sweep's first attempt (08:39) lost the device on `HALO_KV_FP16=1` with MTP after 27 tokens (`VK_ERROR_DEVICE_LOST`; the kernel logged an illegal-opcode reset of ring comp_1.0.1 blamed on halo). It did not reproduce: the same command right after ran 128 tokens clean twice (once with `--mtp-draft 0` at 11.08 tok/s, once with MTP at 15.78) and in the sweep, with no reset. It matches the intermittent illegal-opcode resets the GPU gate has seen in other suites, so it is not attributed to the fp16 KV path.
 
 The sweep's first attempt discarded every run: amdgpu smooths gpu_busy_percent, so halo's own load reads 72% at exit and 28% a second later, fading to <= 5% only after ~2.75 s. The post-run check now polls for up to `--busy-settle` (default 10 s) before it calls the GPU shared.

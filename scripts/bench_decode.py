@@ -156,11 +156,16 @@ def wait_settled(a) -> int | None:
         time.sleep(max(a.busy_interval, 0.05))
 
 
-def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
+def speed_command(v: Variant, a) -> tuple[list, str]:
+    """The variant's speed command as argv, and as the shell line that reruns it alone."""
     cmd = [a.halo, "run", a.model, "-p", a.prompt, "--raw", "--temperature", "0", "-n", str(a.max_tokens),
            "--ctx", str(a.ctx), "--parallel", "1", *v.args]
-    r = Result(v.name, v.step, dict(v.env), list(v.args), v.bitwise,
-               command=" ".join([*(f"{k}={shlex.quote(x)}" for k, x in v.env.items()), *map(shlex.quote, cmd)]))
+    return cmd, " ".join([*(f"{k}={shlex.quote(x)}" for k, x in v.env.items()), *map(shlex.quote, cmd)])
+
+
+def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
+    cmd, line = speed_command(v, a)
+    r = Result(v.name, v.step, dict(v.env), list(v.args), v.bitwise, command=line)
     outputs = []
     for i in range(a.repeat):
         busy = gpu_busy(a.busy_file, a.busy_samples, a.busy_interval)
@@ -275,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
     busy = False
     for v in variants:
         if busy:  # once busy, measure nothing more: a later idle moment would mix conditions
-            results.append(Result(v.name, v.step, dict(v.env), list(v.args), v.bitwise, note="skipped after GPU busy"))
+            results.append(Result(v.name, v.step, dict(v.env), list(v.args), v.bitwise, note="skipped after GPU busy",
+                                  command=speed_command(v, a)[1]))
             continue
         r, outs = run_variant(v, a, env)
         results.append(r)

@@ -186,6 +186,20 @@ class BenchDecode(unittest.TestCase):
         self.assertEqual(self.results["ngram"]["note"], "skipped after GPU busy")
         self.assertIn("| gdn-reg | 3 | - | - |", self.summary)
 
+    def test_skipped_variants_still_print_their_rerun_command(self):
+        # The sweep stopped at gdn-reg, so stream-reuse and ngram never ran: the summary must still
+        # say how to measure each of them alone later (it printed an empty `` before).
+        self.spec["busy_after"] = {"HALO_GDN_REG": str(self.busy)}
+        self.run_bench("--variants", "gdn-reg,stream-reuse,ngram")
+        for name, flag in (("stream-reuse", "HALO_STREAM_REUSE=1"), ("ngram", "HALO_NGRAM_DRAFT=1")):
+            cmd = self.results[name]["command"]
+            self.assertTrue(cmd.startswith(f"{flag} {self.halo} run /models/m.gguf "),
+                            f"skipped {name} must keep its own speed command, got {cmd!r}")
+            self.assertIn(f"- {name}: `{cmd}`", self.summary, f"summary lacks {name}'s rerun line:\n{self.summary}")
+        self.assertEqual(self.results["stream-reuse"]["command"].split(" ", 1)[1],
+                         self.results["baseline"]["command"],
+                         "a skipped variant's command is the baseline's plus only its own flag")
+
     def test_overlap_in_any_repeat_discards_the_whole_variant(self):
         # Repeats 1 and 2 are clean, repeat 3 overlaps: a median over the clean two would hide
         # that the sweep's conditions changed, so the variant reports no tok/s at all.
