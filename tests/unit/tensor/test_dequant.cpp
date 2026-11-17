@@ -44,6 +44,8 @@ TEST(RowBytes, GeometryAndChecks) {
     EXPECT_EQ(code_of([] { (void)ht::row_bytes(DType::F32, -1); }), ErrorCode::Model);
     constexpr auto big = std::numeric_limits<std::int64_t>::max() / 32 * 32;
     EXPECT_EQ(code_of([&] { (void)ht::row_bytes(DType::Q8_0, big); }), ErrorCode::Model);  // overflow
+    // DType 5 is a quant id GGML removed; a GGUF file can still carry it, so it must be refused, not crash.
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): deliberately out-of-range id
     EXPECT_EQ(code_of([] { (void)ht::row_bytes(static_cast<DType>(5), 32); }), ErrorCode::Unsupported);
 }
 
@@ -86,7 +88,7 @@ TEST(Dequant, RejectsBadArguments) {
 
 // vec_dot_row must equal the double-precision dot of the dequantized row.
 TEST(VecDot, MatchesDequantThenDot) {
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     for (DType t : {DType::F32, DType::F16, DType::BF16, DType::Q4_0, DType::Q8_0, DType::Q4_K, DType::Q6_K,
                     DType::IQ4_NL, DType::IQ3_S}) {
         const std::int64_t n = 1024;

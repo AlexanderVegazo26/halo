@@ -135,7 +135,7 @@ TEST(VkRows, GetRowsTokenEmbeddingShapeQ4K) {
     // token_embd of the 27B pack: Q4_K, 5120 columns (fewer rows than the 248320 vocabulary).
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t rows = 1000, cols = 5120;
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const RowsFixture f = make_rows(ref::WType::Q4_K, rows, cols, 0, rng);
     const std::vector<std::int32_t> ids{999, 0, 512, 999};
     const auto [out, status] = run_get_rows(ctx, ref::WType::Q4_K, f, rows, cols, ids);
@@ -149,7 +149,7 @@ TEST(VkRows, GetRowsTokenEmbeddingShapeQ4K) {
 TEST(VkRows, GetRowsBadIdSetsStatusAndLeavesOnlyThatRowUnwritten) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t rows = 37, cols = 256;
-    std::mt19937 rng(8);
+    std::mt19937 rng(8);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const RowsFixture f = make_rows(ref::WType::Q6_K, rows, cols, 2, rng);
     const std::vector<std::int32_t> ids{3, -1, 37, 36, 2147483647, 4};
     const auto [out, status] = run_get_rows(ctx, ref::WType::Q6_K, f, rows, cols, ids);
@@ -179,7 +179,7 @@ TEST(VkRows, GetRowsStatusWordIsZeroedByEachCall) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t rows = 4, cols = 32;
-    std::mt19937 rng(9);
+    std::mt19937 rng(9);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const RowsFixture f = make_rows(ref::WType::Q8_0, rows, cols, 0, rng);
     hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(f.arena));
     const std::vector<std::int32_t> bad{9}, good{1};
@@ -264,7 +264,7 @@ TEST(VkRows, GetRowsSplitsTablesLargerThanOneBindingIntoSlabs) {
     // split on a small table: same bytes out as the unsplit run, bad ids flagged once.
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t rows = 37, cols = 768;
-    std::mt19937 rng(10);
+    std::mt19937 rng(10);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const RowsFixture f = make_rows(ref::WType::Q6_K, rows, cols, 3, rng);
     const std::vector<std::int32_t> ids{36, 0, 5, 18, 19, 36, -2, 37, 2};
     hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(f.arena));
