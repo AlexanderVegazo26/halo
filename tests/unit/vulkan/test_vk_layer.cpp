@@ -343,6 +343,45 @@ TEST(VkLayer, GatedRmsNormMatchesCpu) {
     }
 }
 
+// The tolerance test above can't see the operation order: (w * (x * inv)) * silu(z) and, say,
+// ((w * x) * inv) * silu(z) are both well inside its bound. This pins it: IEEE * is commutative,
+// so the HF order is bit for bit Ops::swiglu(z, Ops::rms_norm(x, w)) = silu(z) * ((x * inv) * w),
+// with the same reduction (both norm kernels take sum/tree/inv from common/rms_norm_tree.glsl at
+// reduce_workgroup) and the same `precise` halo_silu. cpu::gated_rms_norm has the same order.
+TEST(VkLayer, GatedRmsNormIsRmsNormThenSwigluBitwise) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    struct Shape {
+        std::uint32_t rows, cols;
+    };
+    // 144x128: the model's T x n_v_heads x d_v (cols < workgroup: idle lanes add 0); 3x640: a
+    // row longer than the workgroup (several squares per lane), cols not a multiple of it.
+    for (const Shape sh : {Shape{3 * 48, 128}, Shape{3, 640}}) {
+        hv::Ops ops(ctx);
+        const std::size_t n = std::size_t{sh.rows} * sh.cols;
+        ct::Rng rng(90 + sh.cols);
+        auto x = rng.normal(n, 2.0f);
+        for (std::size_t i = 0; i < 2 * std::size_t{sh.cols}; ++i) x[i] *= 5e-4f;  // eps-sized rows
+        const auto z = rng.normal(n, 3.0f);
+        const auto w = rng.normal(sh.cols, 1.0f);
+        hv::Buffer bx = upload(ctx, std::span<const float>(x));
+        hv::Buffer bz = upload(ctx, std::span<const float>(z));
+        hv::Buffer bw = upload(ctx, std::span<const float>(w));
+        hv::Buffer bg = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+        hv::Buffer bn = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::DeviceLocal);
+        hv::Buffer bc = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+        hv::Stream s(ctx);
+        ops.gated_rms_norm(s, hv::GatedNormArgs{bx, bz, bw, bg, sh.rows, sh.cols, 1e-6f});
+        ops.rms_norm(s, bx, bw, bn, sh.rows, sh.cols, 1e-6f);
+        ops.swiglu(s, hv::EltwiseArgs{bz, bn, bc, sh.rows, sh.cols});
+        s.submit_and_wait();
+        const std::string what = "gated_rms_norm " + std::to_string(sh.rows) + "x" + std::to_string(sh.cols) +
+                                 " wg" + std::to_string(ops.options().reduce_workgroup);
+        EXPECT_TRUE(bitwise(download<float>(bg, n), download<float>(bc, n), what))
+            << "gated_rms_norm != Ops::swiglu(z, Ops::rms_norm(x, w)): its order is no longer "
+            << "(w * (x * inv)) * silu(z) with rms_norm's inv";
+    }
+}
+
 TEST(VkLayer, PerHeadQkRmsNormOnInterleavedQGateRows) {
     // attn_q output rows are [n_head x (256 Q | 256 gate)] (D-004). Per-head q-norm reads the
     // Q halves as rows = T * n_head of 256 with row stride 512 (no de-interleave copy); the
