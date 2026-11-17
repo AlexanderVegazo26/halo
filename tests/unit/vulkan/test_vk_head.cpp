@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstddef>
@@ -81,6 +82,9 @@ hc::WeightMatrix weight_matrix(const ref::Weights& w, ref::WType t, std::uint32_
         }
     });
 }
+
+// Bit patterns, not values: +0 != -0 and a NaN equals itself only with the same payload.
+bool same_bits(float a, float b) { return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b); }
 
 bool bitwise(std::span<const float> a, std::span<const float> b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size_bytes()) == 0;
@@ -237,7 +241,8 @@ TEST(VkHead, LmHeadArgmaxMatchesCpuOnTheSameLogitsAndCpuMatmulArgmax) {
                 const std::span<const float> lv(logits.data() + std::size_t{v} * rows, rows);
                 const hc::TopKEntry c = hc::argmax(lv);
                 EXPECT_EQ(r.index, static_cast<std::uint32_t>(c.index)) << "v " << v << " vs cpu::argmax on vk logits";
-                EXPECT_EQ(std::memcmp(&r.value, &c.value, 4), 0) << "v " << v;
+                EXPECT_TRUE(same_bits(r.value, c.value))
+                    << "v " << v << ": vk argmax value " << r.value << ", cpu " << c.value;
                 // vs the CPU's own logits: the chosen row is a CPU maximum up to the GEMV bound.
                 const std::span<const float> xv(x.data() + std::size_t{v} * cols, cols);
                 const hc::TopKEntry cm = hc::matmul_argmax(xv, wm);
@@ -262,7 +267,7 @@ TEST(VkHead, LmHeadNanRaisesLikeCpu) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t rows = 300, cols = 64, n_vec = 2;
-    std::mt19937 rng(3);
+    std::mt19937 rng(3);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::vector<float> wv = ref::random_vec(std::size_t{rows} * cols, rng);
     wv[std::size_t{123} * cols + 5] = std::numeric_limits<float>::quiet_NaN();  // row 123
     std::vector<float> x = ref::random_vec(std::size_t{n_vec} * cols, rng);
@@ -289,7 +294,7 @@ TEST(VkHead, LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogits) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
     const std::uint32_t rows = 20, cols = 4, valid_rows = 15;
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::vector<float> w = ref::random_vec(std::size_t{rows} * cols, rng);
     for (std::uint32_t r = 0; r < rows; ++r) w[std::size_t{r} * cols] = 0.0f;
     w[10 * cols] = 1.0f;    // best real row (< valid_rows)
@@ -413,7 +418,7 @@ void topk_case(const std::shared_ptr<hv::Context>& ctx, std::uint32_t n, std::ui
         const auto want = hc::top_k(std::span<const float>(lg.data() + std::size_t{v} * stride, n), k);
         for (std::uint32_t i = 0; i < k; ++i) {
             const std::size_t o = std::size_t{v} * k + i;
-            const bool same = ids[o] == want[i].index && std::memcmp(&vals[o], &want[i].value, 4) == 0;
+            const bool same = ids[o] == want[i].index && same_bits(vals[o], want[i].value);
             if (!same && bad++ < 3) {
                 ADD_FAILURE() << "v " << v << " rank " << i << ": vk (" << ids[o] << ", " << vals[o] << ") cpu ("
                               << want[i].index << ", " << want[i].value << ")";
@@ -496,7 +501,7 @@ TEST(VkHead, GemvSplitsWeightsLargerThanOneBindingIntoRowSlabs) {
     // per output row is unchanged, so the split result is bitwise the unsplit one.
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t rows = 53, cols = 512, n_vec = 3;
-    std::mt19937 rng(21);
+    std::mt19937 rng(21);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const ref::Weights w = ref::random_weights(ref::WType::Q4_K, rows, cols, rng, 14);
     std::vector<float> x;
     for (std::uint32_t v = 0; v < n_vec; ++v) {
@@ -584,7 +589,7 @@ TEST(VkHead, GemvRepackedIsBitwiseTheRawGemv) {
                         const auto b = download<float>(yrp, std::size_t{n_vec} * rows);
                         std::size_t diff = 0, first = a.size();
                         for (std::size_t i = 0; i < a.size(); ++i) {
-                            if (std::memcmp(&a[i], &b[i], 4) != 0) {
+                            if (!same_bits(a[i], b[i])) {
                                 ++diff;
                                 first = std::min(first, i);
                             }
@@ -607,7 +612,7 @@ TEST(VkHead, GemvRepackedSplitsIntoRowSlabsAtTheRepackedStride) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const std::uint32_t rows = 29, cols = 512, n_vec = 3;
     const halo::DType dt = halo::DType::Q6_K;  // 420 B rows, 432 B repacked stride
-    std::mt19937 rng(77);
+    std::mt19937 rng(77);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     const ref::Weights w = ref::random_weights(ref::WType::Q6_K, rows, cols, rng, 14);
     const std::size_t rb = halo::tensor::row_bytes(dt, cols);
     const std::size_t stride = halo::tensor::gemv_repack_row_stride(dt, cols);
@@ -730,7 +735,7 @@ NormedRun normed_case(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, hv:
 std::string first_diff(std::span<const float> a, std::span<const float> b, std::uint32_t rows) {
     std::size_t diff = 0, first = a.size();
     for (std::size_t i = 0; i < a.size(); ++i) {
-        if (std::memcmp(&a[i], &b[i], 4) != 0) {
+        if (!same_bits(a[i], b[i])) {
             ++diff;
             first = std::min(first, i);
         }
@@ -785,7 +790,7 @@ TEST(VkHead, GemvFusedNormKeepsTheTreeReductionAndSplitsIntoRowSlabs) {
     hv::Ops slabs(ctx, small);
     for (hv::Ops* ops : {&sg, &slabs}) {
         const std::string what = ops == &sg ? "Ops with subgroup_reduce on" : "W split into row slabs";
-        std::mt19937 rng(4242);
+        std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
         const NormedRun r = normed_case(ctx, *ops, tree, ref::WType::Q4_K, 53, 768, 3, 3, 5, rng);
         EXPECT_EQ(first_diff(r.fused, r.separate, 53), "") << what;
     }
