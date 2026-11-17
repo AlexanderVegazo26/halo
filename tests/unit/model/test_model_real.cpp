@@ -237,7 +237,7 @@ TEST(RealHeaders, UnslothEmbeddedMtpAndDecisionNumbers) {
     EXPECT_EQ(t.eos_id, 248046u);
     EXPECT_EQ(t.pad_id, 248055u);
     EXPECT_FALSE(t.add_bos.has_value());  // unsloth file carries no add_bos_token key
-    ASSERT_TRUE(t.chat_template.has_value());
+    if (!t.chat_template) GTEST_FAIL() << "unsloth header should carry tokenizer.chat_template";
     EXPECT_EQ(t.chat_template->size(), 9993u);
     EXPECT_EQ(err([&] { (void)m.token_embd().data(); }, "header-only"), ErrorCode::Model);
 }
@@ -261,6 +261,7 @@ TEST(RealHeaders, GgmlOrgTrunkAndSeparateMtpFile) {
     const auto t = m.tokenizer();
     EXPECT_EQ(t.pad_id, 248044u);
     EXPECT_EQ(t.add_bos, false);
+    if (!t.chat_template) GTEST_FAIL() << "ggml-org-q4km header should carry tokenizer.chat_template";
     EXPECT_EQ(t.chat_template->size(), 8952u);
     const auto r0 = m.inspect();
     EXPECT_TRUE(r0.multimodal_source_model);  // general.tags image-text-to-text, no vision tensors

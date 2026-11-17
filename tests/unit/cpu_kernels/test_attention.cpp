@@ -103,6 +103,7 @@ TEST(CpuAttention, PagedShuffledBlocksEqualContiguousBitwise) {
     const std::size_t n_blocks = (S + block_rows - 1) / block_rows;
     std::vector<std::size_t> phys(n_blocks);
     std::iota(phys.begin(), phys.end(), 0);
+    // NOLINTNEXTLINE(bugprone-random-generator-seed): fixed seed = reproducible block order
     std::shuffle(phys.begin(), phys.end(), std::mt19937(3));
     const std::size_t stride = cols + pad;
     std::vector<float> kpool(n_blocks * block_rows * stride, -7.0f), vpool(kpool.size(), -7.0f);
@@ -257,6 +258,7 @@ TEST(CpuAttentionTree, LeafEqualsPlainDecodeOfItsPathBitwise) {
         const std::size_t n_blocks = (S + block_rows - 1) / block_rows;
         std::vector<std::size_t> phys(n_blocks);
         std::iota(phys.begin(), phys.end(), 0);
+        // NOLINTNEXTLINE(bugprone-random-generator-seed): fixed seed = reproducible block order
         std::shuffle(phys.begin(), phys.end(), std::mt19937(5));
         std::vector<float> kpool(n_blocks * block_rows * cols, -3.0f), vpool(kpool.size(), -3.0f);
         std::vector<const float*> kt(n_blocks), vt(n_blocks);
