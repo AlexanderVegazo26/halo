@@ -44,6 +44,8 @@
 namespace hv = halo::vulkan;
 namespace hc = halo::cpu;
 namespace ref = halo::vulkan::ref;
+using hv::test::bitwise;
+using hv::test::same_bits;
 using hv::test::download;
 using hv::test::upload;
 
@@ -81,13 +83,6 @@ hc::WeightMatrix weight_matrix(const ref::Weights& w, ref::WType t, std::uint32_
                                          out.data() + r * cols, cols);
         }
     });
-}
-
-// Bit patterns, not values: +0 != -0 and a NaN equals itself only with the same payload.
-bool same_bits(float a, float b) { return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b); }
-
-bool bitwise(std::span<const float> a, std::span<const float> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size_bytes()) == 0;
 }
 
 }  // namespace

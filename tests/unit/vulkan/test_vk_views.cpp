@@ -37,6 +37,7 @@ namespace hc = halo::cpu;
 namespace ct = halo::cpu::test;
 namespace ref = halo::vulkan::ref;
 using hv::test::compare;
+using hv::test::bitwise;
 using hv::test::download;
 using hv::test::report;
 using hv::test::upload;
@@ -51,10 +52,6 @@ double sum_bound_factor(std::uint32_t n, std::uint32_t lanes, double c = 4.0) {
 }
 
 std::vector<double> to_dbl(std::span<const float> v) { return {v.begin(), v.end()}; }
-
-bool bitwise_equal(std::span<const float> a, std::span<const float> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size_bytes()) == 0;
-}
 
 // halo::cpu::matmul of one x row with W rows read from `bytes` at `offset + r * stride`
 // (tensor::dequantize_row for quantized types, a strided float view for F32).
@@ -177,7 +174,7 @@ TEST(VkViews, ArenaWeightsAtOddByteOffsetsAndStridesMatchCpu) {
         hv::Stream s2(ctx);
         ops.matvec(s2, ref::dtype(a.t), dw, dx, dy, a.rows, a.cols);
         s2.submit_and_wait();
-        EXPECT_TRUE(bitwise_equal(y, download<float>(dy, a.rows))) << what << ": view result != dense result";
+        EXPECT_TRUE(bitwise(y, download<float>(dy, a.rows))) << what << ": view result != dense result";
     }
     // Guards between the outputs are untouched.
     std::vector<bool> inside(y_total, false);
@@ -274,7 +271,7 @@ TEST(VkViews, RmsNormStridedViewsMatchCpuAndDense) {
     hv::Stream s2(ctx);
     ops.rms_norm(s2, dx, dw, dy, rows, cols, 1e-6f);
     s2.submit_and_wait();
-    EXPECT_TRUE(bitwise_equal(y, download<float>(dy, xd.size()))) << "strided result != dense result";
+    EXPECT_TRUE(bitwise(y, download<float>(dy, xd.size()))) << "strided result != dense result";
 }
 
 // ---------------------------------------------------------------- argmax sub-views

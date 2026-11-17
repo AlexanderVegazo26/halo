@@ -44,6 +44,7 @@
 namespace hv = halo::vulkan;
 namespace hc = halo::cpu;
 namespace ct = halo::cpu::test;
+using hv::test::bitwise;
 using hv::test::download;
 using hv::test::upload;
 
@@ -52,10 +53,6 @@ namespace {
 constexpr double k_u = 0x1p-24;
 constexpr double k_floor = 1.1754943508222875e-38;  // FLT_MIN
 constexpr std::uint32_t k_cpu_lanes = 8;
-
-bool bitwise(std::span<const float> a, std::span<const float> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size_bytes()) == 0;
-}
 
 /// max over i of |vk - cpu| / (f(i) * u * |cpu| + floor); EXPECTs <= 1; prints the ratio.
 template <class F>

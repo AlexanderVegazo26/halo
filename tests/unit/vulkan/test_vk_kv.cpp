@@ -52,6 +52,7 @@
 namespace hv = halo::vulkan;
 namespace hc = halo::cpu;
 namespace kv = halo::kv_cache;
+using hv::test::bitwise;
 using hv::test::download;
 using hv::test::upload;
 
@@ -119,10 +120,6 @@ struct PoolFixture {
         return {seq->blocks().begin(), seq->blocks().end()};
     }
 };
-
-bool bitwise(std::span<const float> a, std::span<const float> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size_bytes()) == 0;
-}
 
 /// Data uploaded at byte `lead` of a buffer whose other bytes are 0xFF, used through a view at
 /// that offset. Leads that are not multiples of the device alignment (16 on lavapipe) make every

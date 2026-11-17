@@ -20,6 +20,7 @@
 
 namespace hv = halo::vulkan;
 namespace ref = halo::vulkan::ref;
+using hv::test::bitwise;
 using hv::test::download;
 using hv::test::upload;
 
@@ -96,8 +97,6 @@ std::pair<std::vector<float>, std::uint32_t> run_get_rows(const std::shared_ptr<
     return {out, hv::read_status(bs, 12)};
 }
 
-bool row_bitwise(const float* a, const float* b, std::size_t n) { return std::memcmp(a, b, n * 4) == 0; }
-
 }  // namespace
 
 TEST(VkRows, GetRowsIsBitIdenticalToDequantizeRowForEveryType) {
@@ -121,7 +120,7 @@ TEST(VkRows, GetRowsIsBitIdenticalToDequantizeRowForEveryType) {
         std::size_t bad_rows = 0;
         for (std::size_t r = 0; r < ids.size(); ++r) {
             const float* want = f.deq.data() + static_cast<std::size_t>(ids[r]) * c.cols;
-            if (!row_bitwise(out.data() + r * c.cols, want, c.cols)) {
+            if (!bitwise(out.data() + r * c.cols, want, c.cols)) {
                 ++bad_rows;
                 ADD_FAILURE() << "row " << r << " (id " << ids[r] << ") differs from tensor::dequantize_row";
             }
@@ -141,7 +140,7 @@ TEST(VkRows, GetRowsTokenEmbeddingShapeQ4K) {
     const auto [out, status] = run_get_rows(ctx, ref::WType::Q4_K, f, rows, cols, ids);
     EXPECT_EQ(status, 0u);
     for (std::size_t r = 0; r < ids.size(); ++r) {
-        EXPECT_TRUE(row_bitwise(out.data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
+        EXPECT_TRUE(bitwise(out.data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
             << "row " << r;
     }
 }
@@ -159,7 +158,7 @@ TEST(VkRows, GetRowsBadIdSetsStatusAndLeavesOnlyThatRowUnwritten) {
         if (bad) {
             for (std::size_t c = 0; c < cols; ++c) ASSERT_EQ(out[r * cols + c], k_sentinel) << "bad row " << r << " written";
         } else {
-            EXPECT_TRUE(row_bitwise(out.data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
+            EXPECT_TRUE(bitwise(out.data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
                 << "good row " << r;
         }
     }
@@ -205,7 +204,7 @@ TEST(VkRows, GetRowsStatusWordIsZeroedByEachCall) {
     ops.get_rows(s, a);
     s.submit_and_wait();
     EXPECT_EQ(hv::read_status(bs, 8), 0u);
-    EXPECT_TRUE(row_bitwise(download<float>(bo, cols).data(), f.deq.data() + cols, cols));
+    EXPECT_TRUE(bitwise(download<float>(bo, cols).data(), f.deq.data() + cols, cols));
 }
 
 TEST(VkRows, GetRowsValidation) {
@@ -296,13 +295,13 @@ TEST(VkRows, GetRowsSplitsTablesLargerThanOneBindingIntoSlabs) {
         status.push_back(hv::read_status(bs));
     }
     for (std::size_t i = 1; i < outs.size(); ++i) {
-        EXPECT_TRUE(row_bitwise(outs[i].data(), outs[0].data(), outs[0].size())) << "split run " << i << " differs";
+        EXPECT_TRUE(bitwise(outs[i].data(), outs[0].data(), outs[0].size())) << "split run " << i << " differs";
         EXPECT_EQ(status[i], hv::k_status_bad_index);
     }
     EXPECT_EQ(status[0], hv::k_status_bad_index);
     for (std::size_t r = 0; r < ids.size(); ++r) {
         if (ids[r] < 0 || ids[r] >= static_cast<std::int32_t>(rows)) continue;
-        EXPECT_TRUE(row_bitwise(outs[2].data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
+        EXPECT_TRUE(bitwise(outs[2].data() + r * cols, f.deq.data() + static_cast<std::size_t>(ids[r]) * cols, cols))
             << "row " << r;
     }
 }

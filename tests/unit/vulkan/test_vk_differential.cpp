@@ -46,6 +46,7 @@
 namespace hv = halo::vulkan;
 namespace hc = halo::cpu;
 namespace ct = halo::cpu::test;
+using hv::test::bitwise;
 using hv::test::download;
 using hv::test::upload;
 
@@ -358,9 +359,8 @@ void fused_qkv_case(const std::shared_ptr<hv::Context>& ctx, const GdnCase& c, s
 
     // Bitwise vs the same kernel on dense copies.
     const GdnOut dense = run_vk(ctx, ops, d, true, std::nullopt);
-    EXPECT_EQ(std::memcmp(vk.out.data(), dense.out.data(), vk.out.size() * 4), 0) << what << ": view out != dense out";
-    EXPECT_EQ(std::memcmp(vk.state.data(), dense.state.data(), vk.state.size() * 4), 0)
-        << what << ": view state != dense state";
+    EXPECT_TRUE(bitwise(vk.out, dense.out)) << what << ": view out != dense out";
+    EXPECT_TRUE(bitwise(vk.state, dense.state)) << what << ": view state != dense state";
 }
 
 }  // namespace
@@ -542,7 +542,7 @@ TEST(VkDiffGdn, InPlaceMultiRowWithSlotsMatchesCpu) {
                     << what << " slot " << sl << " (>= T) must be untouched";
             }
         }
-        EXPECT_EQ(std::memcmp(slice(sl_off).data(), vk.state.data(), S * 4), 0) << what << ": slot 0 != final state";
+        EXPECT_TRUE(bitwise(slice(sl_off), vk.state)) << what << ": slot 0 != final state";
         for (std::size_t i = 0; i < arena.size(); ++i) {
             const bool in_state = i >= s_off && i < s_off + S;
             const bool in_slots = i >= sl_off && i < sl_off + std::min(T, K) * S;
@@ -771,9 +771,9 @@ TEST(VkChunkedGdn, RollbackSlotsAcrossChunksAndOutOfPlaceState) {
     const ChunkRun b = run_vk_chunked(ctx, d, oop);
     EXPECT_TRUE(std::equal(b.state_in_after.begin(), b.state_in_after.end(), d.s0.begin()))
         << "out-of-place run modified the input state region";
-    EXPECT_EQ(std::memcmp(a.r.out.data(), b.r.out.data(), a.r.out.size() * 4), 0);
-    EXPECT_EQ(std::memcmp(a.r.state.data(), b.r.state.data(), a.r.state.size() * 4), 0);
-    EXPECT_EQ(std::memcmp(a.slots.data(), b.slots.data(), a.slots.size() * 4), 0);
+    EXPECT_TRUE(bitwise(a.r.out, b.r.out)) << "out: in-place != out-of-place";
+    EXPECT_TRUE(bitwise(a.r.state, b.r.state)) << "state: in-place != out-of-place";
+    EXPECT_TRUE(bitwise(a.slots, b.slots)) << "slots: in-place != out-of-place";
     check_chunked(d, b, run_cpu_chunked(d, oop), oop, "small T=23 cs=4 slots=3 out of place");
 }
 
