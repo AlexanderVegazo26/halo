@@ -12,6 +12,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include "fake_http.h"
 #include "halo/profiling/baseline.h"
@@ -324,5 +325,16 @@ TEST(SecurityS29, AnswerFromAProcessOtherThanTheSpawnedChildIsRejected) {
     EXPECT_TRUE(a.records.empty()) << "a non-child answer was recorded";
     EXPECT_TRUE(has_note(a, "is not the spawned server")) << nlohmann::json(a.notes).dump();
     EXPECT_FALSE(a.valid);
-    EXPECT_TRUE(loopback_port_free(port));  // the whole group (incl. the grandchild) was torn down
+    // The whole group (incl. the grandchild) was torn down. The grandchild is not ours to reap:
+    // the group SIGKILL has reached it when run_llama_server returns, but its listener closes only
+    // once the kernel finishes its exit, which a loaded runner (TSan CI) can delay past that point.
+    // So wait for the port, far below the grandchild's 30 s alarm: a broken group kill still fails.
+    const auto until = std::chrono::steady_clock::now() + 5s;
+    bool freed = loopback_port_free(port);
+    while (!freed && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(10ms);
+        freed = loopback_port_free(port);
+    }
+    EXPECT_TRUE(freed) << "127.0.0.1:" << port << " still has a listener 5 s after run_llama_server returned: "
+                       << "the grandchild survived the group kill";
 }
