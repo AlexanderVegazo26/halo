@@ -6,8 +6,13 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -241,6 +246,57 @@ TEST(VkStream, CopyTimestampsAndReuse) {
     const auto back = download<std::uint32_t>(a, 4);
     EXPECT_EQ(back, (std::vector<std::uint32_t>{1, 2, 3, 4}));
     EXPECT_THROW(s.copy(a, 0, b, 1, a.size()), halo::Error);
+}
+
+// HALO_VK_OP_TIMINGS (next.md step 3): each completed fence wait appends that submission's
+// "<kernel> <ns>" lines and then one "# wait" line, so scripts/op_profile.py can count fences
+// (and dispatches per fence) from the profile alone. A wait() with nothing submitted adds nothing.
+TEST(VkStream, OpTimingsProfileMarksEachFenceWaitAfterItsDispatches) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const std::filesystem::path path =
+        std::filesystem::path(::testing::TempDir()) /
+        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".txt");
+    std::filesystem::remove(path);
+    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
+    const std::optional<std::string> old = old_env ? std::optional<std::string>(old_env) : std::nullopt;
+    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+    {
+        constexpr std::uint32_t rows = 2, cols = 64;
+        const std::vector<float> x(rows * cols, 0.5f), w(cols, 1.0f);
+        hv::Buffer xb = upload(ctx, std::span<const float>(x));
+        hv::Buffer wb = upload(ctx, std::span<const float>(w));
+        hv::Buffer yb = hv::Buffer::create(ctx, xb.size(), hv::MemoryUsage::DeviceLocal);
+        hv::Ops ops(ctx);
+        hv::Stream s(ctx);
+        ops.rms_norm(s, xb, wb, yb, rows, cols, 1e-6f);
+        ops.rms_norm(s, yb, wb, xb, rows, cols, 1e-6f);
+        s.submit_and_wait();  // submission 1: two dispatches
+        s.wait();             // nothing in flight: no marker
+        s.copy(xb, 0, yb, 0, xb.size());
+        s.submit_and_wait();  // submission 2: a copy, no dispatch
+    }
+    if (old) {
+        ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
+    } else {
+        ::unsetenv("HALO_VK_OP_TIMINGS");
+    }
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(path);
+        for (std::string l; std::getline(in, l);) lines.push_back(l);
+    }
+    std::filesystem::remove(path);
+    std::string got;
+    for (const std::string& l : lines) got += "\n  " + l;
+    std::vector<std::string> shape;  // kernel lines reduced to their name
+    shape.reserve(lines.size());
+    for (const std::string& l : lines) shape.push_back(l.starts_with('#') ? l : l.substr(0, l.find(' ')));
+    const std::vector<std::string> want =
+        ctx->info().timestamps_supported()
+            ? std::vector<std::string>{"rms_norm", "rms_norm", "# wait", "# wait"}
+            : std::vector<std::string>{"# wait", "# wait"};
+    EXPECT_EQ(shape, want) << "profile " << path << " should hold each submission's dispatch lines followed by one "
+                           << "'# wait' per completed fence wait (2 here; the idle wait() adds none); got:" << got;
 }
 
 TEST(VkKernel, DispatchValidatesBindingsPushAndGroups) {

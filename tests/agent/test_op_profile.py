@@ -1,7 +1,8 @@
 """Contract tests for scripts/op_profile.py (HALO_VK_OP_TIMINGS aggregation, next.md step 3).
 
-Profiles are temp files in the `<kernel> <ns>` format Stream::wait() appends
-(backends/vulkan/src/stream.cpp). Run: python3 -m unittest discover -s tests/agent
+Profiles are temp files in the `<kernel> <ns>` + `# wait` format Stream::wait() appends
+(backends/vulkan/src/stream.cpp; VkStream.OpTimingsProfileMarksEachFenceWaitAfterItsDispatches
+pins the writer side on the GPU). Run: python3 -m unittest discover -s tests/agent
 (ctest runs it as `test_agent_report`).
 """
 
@@ -116,7 +117,55 @@ class OpProfileTest(unittest.TestCase):
         rc, out, _ = self.run_cli("summary", str(REPO / "process_tools" / "op_timings.txt"))
         self.assertEqual(rc, 0)
         self.assertIn("9396 dispatches, 4299.73 ms GPU time; matvec_* 96.0% of it.", out, out[:400])
+        self.assertIn("fence waits: not recorded", out,
+                      f"the 2026-09-29 file predates the '# wait' markers; got:\n{out[:400]}")
         self.assertIn("| matvec_q5_k | 1719 | 1866.75 | 1086.0 |", out, out[:800])
+
+    def test_summary_counts_fence_waits_and_dispatches_per_wait(self) -> None:
+        p = self.write(
+            "p.txt",
+            "matvec_q5_k 1000\nrms_norm 10\nmatvec_q5_k 1000\n# wait\n"
+            "  # a comment line is skipped\nrms_norm 10\n# wait\n# wait\n",
+        )
+        rc, out, err = self.run_cli("summary", str(p), "--json", str(self.dir / "s.json"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("4 dispatches, 0.00 ms GPU time;", out, f"'#' lines are not dispatches; got:\n{out}")
+        self.assertIn("3 fence waits, 1.3 dispatches per wait.", out,
+                      f"3 '# wait' lines over 4 dispatches; got:\n{out}")
+        self.assertNotIn("comment", out, f"the comment is not a kernel row; got:\n{out}")
+        self.assertEqual(json.loads((self.dir / "s.json").read_text())["fence_waits"], 3)
+        rc, out, _ = self.run_cli("summary", str(p), "--per", "2")
+        self.assertEqual(rc, 0)
+        self.assertIn("1.5 fence waits per 2, 1.3 dispatches per wait.", out,
+                      f"--per divides the wait count, not the dispatches-per-wait ratio; got:\n{out}")
+
+    def test_compare_reports_the_fence_wait_change_per_token(self) -> None:
+        before = self.write("b.txt", "eltwise 1000\n# wait\n" * 8)  # 8 waits over 2 tokens
+        after = self.write("a.txt", "eltwise 1000\neltwise 1000\n# wait\n" * 3)  # 3 waits over 3 tokens
+        rc, out, err = self.run_cli("compare", str(before), str(after), "--per-before", "2", "--per-after", "3",
+                                    "--json", str(self.dir / "c.json"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("fence waits 4 -> 1 (-75.0%).", out, f"4 waits/token before, 1 after; got:\n{out}")
+        data = json.loads((self.dir / "c.json").read_text())
+        self.assertEqual((data["fence_waits_before"], data["fence_waits_after"]), (4, 1), f"JSON: {data}")
+
+    def test_compare_says_which_side_has_no_wait_markers(self) -> None:
+        old = self.write("old.txt", "eltwise 1000\n")
+        new = self.write("new.txt", "eltwise 1000\n# wait\n")
+        for argv, needle in [
+            ((old, new), "not recorded in before"),
+            ((new, old), "not recorded in after"),
+            ((old, old), "not recorded in before and after"),
+        ]:
+            with self.subTest(argv=[a.name for a in argv]):
+                rc, out, _ = self.run_cli("compare", *map(str, argv), "--json", str(self.dir / "c.json"))
+                self.assertEqual(rc, 0)
+                self.assertIn(f"fence waits: {needle} (no '# wait' lines).", out, out)
+                data = json.loads((self.dir / "c.json").read_text())
+                self.assertIsNone(
+                    data["fence_waits_before"] if "before" in needle else data["fence_waits_after"],
+                    f"an unrecorded side is null in the JSON, not 0: {data}",
+                )
 
     def test_malformed_line_is_named_with_file_and_line(self) -> None:
         for body, needle in [

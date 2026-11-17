@@ -2,19 +2,21 @@
 """Aggregate HALO_VK_OP_TIMINGS profiles by kernel, and compare two of them (next.md step 3).
 
 HALO_VK_OP_TIMINGS=<path> makes the Vulkan backend append one `<kernel> <ns>` line per dispatch
-(GPU timestamps) to <path> at every Stream::wait(). The file is appended to, so delete it before
-each profiled run.
+(GPU timestamps) to <path> at every Stream::wait(), followed by one `# wait` line per completed
+fence wait. The file is appended to, so delete it before each profiled run.
 
     scripts/op_profile.py summary PROFILE [--per N] [--top K] [--json OUT]
     scripts/op_profile.py compare BEFORE AFTER [--per-before N] [--per-after N] [--top K] [--json OUT]
 
 `summary` prints, per kernel: dispatches, total ms, average and max us, and the share of all GPU
-time, largest first, plus the matvec_* share (process.md section 13.2's table). `compare`
-prints the per-kernel change in total ms and dispatches between two profiles, largest change
-first, with kernels that only one side ran marked new/gone: the attribution check of next.md
-("re-profile with HALO_VK_OP_TIMINGS and aggregate by kernel ... confirm the per-tick wall time
-and fence count drop"). `--per N` divides every total and count by N (e.g. the generated tokens
-or decode ticks of that run), so runs of different lengths compare per token.
+time, largest first, plus the matvec_* share (process.md section 13.2's table) and the fence
+waits (with dispatches per wait). `compare` prints the per-kernel change in total ms and
+dispatches between two profiles, largest change first, with kernels that only one side ran marked
+new/gone, plus the fence-wait change: the attribution check of next.md ("re-profile with
+HALO_VK_OP_TIMINGS and aggregate by kernel ... confirm the per-tick wall time and fence count
+drop"). `--per N` divides every total and count by N (e.g. the generated tokens or decode ticks
+of that run), so runs of different lengths compare per token. Profiles written before the
+`# wait` markers existed report fence waits as not recorded. Other `#` lines are comments.
 
 Exit: 0 ok · 2 usage, unreadable file, or a malformed line (named as file:line). stdlib only.
 """
@@ -45,16 +47,31 @@ class KernelStat:
         return self.total_ns / self.dispatches if self.dispatches else 0.0
 
 
-def parse(path: Path) -> dict[str, KernelStat]:
-    """Per-kernel totals of one HALO_VK_OP_TIMINGS file. Blank lines are skipped; any other line
-    must be `<kernel> <ns>` with a finite ns >= 0."""
+WAIT_MARKER = "# wait"
+
+
+@dataclass
+class Profile:
+    kernels: dict[str, KernelStat]
+    waits: int  # `# wait` lines = completed Stream fence waits; 0 = not recorded
+
+
+def parse(path: Path) -> Profile:
+    """Per-kernel totals and fence waits of one HALO_VK_OP_TIMINGS file. Blank lines and `#`
+    comments are skipped (`# wait` counts a fence wait); any other line must be `<kernel> <ns>`
+    with a finite ns >= 0."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as e:
         raise ProfileError(f"{path}: cannot read: {e.strerror or e}") from e
     stats: dict[str, KernelStat] = {}
+    waits = 0
     for no, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
+            continue
+        if line.lstrip().startswith("#"):
+            if line.strip() == WAIT_MARKER:
+                waits += 1
             continue
         parts = line.split()
         if len(parts) != 2:
@@ -75,7 +92,7 @@ def parse(path: Path) -> dict[str, KernelStat]:
             s.max_ns = max(s.max_ns, ns)
     if not stats:
         raise ProfileError(f"{path}: no dispatches (was HALO_VK_OP_TIMINGS set for the run?)")
-    return stats
+    return Profile(stats, waits)
 
 
 def _ms(ns: float) -> str:
@@ -89,6 +106,13 @@ def _us(ns: float) -> str:
 def _num(x: float) -> str:
     """Counts stay integers unless --per made them fractional."""
     return str(int(x)) if float(x).is_integer() else f"{x:.1f}"
+
+
+def fence_line(waits: int, dispatches: int, per: float) -> str:
+    if not waits:
+        return "fence waits: not recorded (no '# wait' lines; profile predates the markers)."
+    unit = f" per {_num(per)}" if per != 1 else ""
+    return f"{_num(waits / per)} fence waits{unit}, {dispatches / waits:.1f} dispatches per wait."
 
 
 def summary_rows(stats: dict[str, KernelStat], per: float) -> list[dict]:
@@ -108,7 +132,8 @@ def summary_rows(stats: dict[str, KernelStat], per: float) -> list[dict]:
     return rows
 
 
-def render_summary(path: Path, stats: dict[str, KernelStat], per: float, top: int) -> str:
+def render_summary(path: Path, prof: Profile, per: float, top: int) -> str:
+    stats = prof.kernels
     rows = summary_rows(stats, per)
     total_ns = sum(r["total_ns"] for r in rows)
     total_d = sum(r["dispatches"] for r in rows)
@@ -119,6 +144,7 @@ def render_summary(path: Path, stats: dict[str, KernelStat], per: float, top: in
         "",
         f"{_num(total_d)} dispatches, {_ms(total_ns)} ms GPU time{unit}; "
         f"matvec_* {100.0 * matvec_ns / total_ns if total_ns else 0.0:.1f}% of it.",
+        fence_line(prof.waits, sum(s.dispatches for s in stats.values()), per),
         "",
         "| kernel | dispatches | total ms | avg us | max us | % GPU |",
         "|---|---|---|---|---|---|",
@@ -166,8 +192,22 @@ def _pct(p: float | None) -> str:
     return "n/a" if p is None else f"{p:+.1f}%"
 
 
+def fence_change(waits_before: int, waits_after: int, per_before: float, per_after: float) -> str:
+    missing = [side for side, w in (("before", waits_before), ("after", waits_after)) if not w]
+    if missing:
+        return f"fence waits: not recorded in {' and '.join(missing)} (no '# wait' lines)."
+    wb, wa = waits_before / per_before, waits_after / per_after
+    return f"fence waits {_num(wb)} -> {_num(wa)} ({_pct(100.0 * (wa - wb) / wb)})."
+
+
 def render_compare(
-    before_path: Path, after_path: Path, rows: list[dict], per_before: float, per_after: float, top: int
+    before_path: Path,
+    after_path: Path,
+    rows: list[dict],
+    per_before: float,
+    per_after: float,
+    top: int,
+    waits: tuple[int, int] = (0, 0),
 ) -> str:
     tb = sum(r["before_ns"] for r in rows)
     ta = sum(r["after_ns"] for r in rows)
@@ -181,6 +221,7 @@ def render_compare(
         "",
         f"GPU time {_ms(tb)} -> {_ms(ta)} ms ({_pct(100.0 * (ta - tb) / tb if tb else None)}), "
         f"dispatches {_num(db)} -> {_num(da)} ({_pct(100.0 * (da - db) / db if db else None)}).",
+        fence_change(waits[0], waits[1], per_before, per_after),
         "",
         "| kernel | before ms | after ms | change ms | change | dispatches before -> after |",
         "|---|---|---|---|---|---|",
@@ -230,20 +271,28 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     try:
         if args.cmd == "summary":
-            stats = parse(args.profile)
-            sys.stdout.write(render_summary(args.profile, stats, args.per, args.top))
-            data = {"profile": str(args.profile), "per": args.per, "kernels": summary_rows(stats, args.per)}
+            prof = parse(args.profile)
+            sys.stdout.write(render_summary(args.profile, prof, args.per, args.top))
+            data = {
+                "profile": str(args.profile),
+                "per": args.per,
+                "fence_waits": prof.waits / args.per if prof.waits else None,
+                "kernels": summary_rows(prof.kernels, args.per),
+            }
         else:
             before, after = parse(args.before), parse(args.after)
-            rows = compare_rows(before, after, args.per_before, args.per_after)
+            rows = compare_rows(before.kernels, after.kernels, args.per_before, args.per_after)
+            waits = (before.waits, after.waits)
             sys.stdout.write(
-                render_compare(args.before, args.after, rows, args.per_before, args.per_after, args.top)
+                render_compare(args.before, args.after, rows, args.per_before, args.per_after, args.top, waits)
             )
             data = {
                 "before": str(args.before),
                 "after": str(args.after),
                 "per_before": args.per_before,
                 "per_after": args.per_after,
+                "fence_waits_before": before.waits / args.per_before if before.waits else None,
+                "fence_waits_after": after.waits / args.per_after if after.waits else None,
                 "kernels": rows,
             }
     except ProfileError as e:

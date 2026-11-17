@@ -202,7 +202,8 @@ private:
     std::size_t n_touched_ = 0;
     std::uint32_t dispatches_ = 0;
     // HALO_VK_OP_TIMINGS=<path>: per-dispatch GPU timestamps, appended to <path> at wait()
-    // as "<kernel> <ns>" lines (diagnostics; off by default, one branch per dispatch).
+    // as "<kernel> <ns>" lines, then one "# wait" line per completed fence wait
+    // (diagnostics; off by default, one branch per dispatch).
     bool op_timings_ = false;
     std::string op_timings_path_;
     // HALO_VK_SYNC_EVERY=N: log each dispatch's kernel name to stderr and submit+wait every

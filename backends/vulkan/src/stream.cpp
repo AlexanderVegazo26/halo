@@ -382,11 +382,14 @@ void Stream::wait(std::uint64_t timeout_ns) {
                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
                          "vkGetQueryPoolResults");
     }
-    if (op_timings_ && !op_marks_.empty()) {
+    if (op_timings_) {
+        // One "# wait" line per completed fence wait, after that submission's dispatches, so a
+        // profile also counts fences (scripts/op_profile.py: fence waits, dispatches per wait).
         if (std::FILE* f = std::fopen(op_timings_path_.c_str(), "a")) {
             for (const OpMark& m : op_marks_)
                 if (const std::optional<double> ns = elapsed_ns(m.begin, m.end); ns.has_value())
                     std::fprintf(f, "%s %.0f\n", m.name.c_str(), *ns);
+            std::fputs("# wait\n", f);
             std::fclose(f);
         }
     }
