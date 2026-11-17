@@ -247,6 +247,91 @@ class BenchDecode(unittest.TestCase):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
             bd.main(["--halo", "h", "--model", "m", "--busy-settle", "-1"])
 
+    def no_poll_sleep(self):
+        return mock.patch.object(bd, "WAIT_POLL_S", 0.0)
+
+    def test_without_wait_idle_a_busy_gpu_is_not_waited_for(self):
+        # The GPU would be idle on the next reading, but the default gives up at once.
+        with self.busy_readings([100, 0]), self.no_poll_sleep():
+            rc = self.run_bench("--variants", "baseline")
+        self.assertEqual(rc, 3, f"default --wait-idle 0 must not wait: {self.results['baseline']}")
+        self.assertEqual(self.calls(), [])
+
+    def test_wait_idle_runs_once_the_gpu_turns_idle(self):
+        # A model server keeps the GPU busy for two readings, then goes quiet: the sweep waits
+        # instead of giving up, and halo starts only after an idle reading.
+        with self.busy_readings([100, 90, 0, 0]), self.no_poll_sleep():
+            rc = self.run_bench("--variants", "baseline", "--wait-idle", "60")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 0, f"--wait-idle must wait out a busy GPU: {b}\n{self.stderr}")
+        self.assertEqual((b["status"], b["tps_median"], b["busy_before"]), ("measured", 10.0, 0), b)
+        self.assertEqual(len(self.calls()), 1, "halo runs once, after the GPU turned idle")
+        self.assertEqual((self.meta["wait_idle"], self.meta["overlap_retries"]), (60.0, 0), self.meta)
+        self.assertIn("- waited up to 60 s for an idle GPU before each run", self.summary)
+
+    def test_wait_idle_gives_up_when_the_gpu_stays_busy(self):
+        with self.busy_readings([100]), mock.patch.object(bd, "WAIT_POLL_S", 0.01):
+            rc = self.run_bench("--variants", "baseline,ngram", "--wait-idle", "0.05")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 3, f"a GPU busy for the whole wait is not measured: {b}")
+        self.assertEqual(self.calls(), [], "no halo run may start on a busy GPU, however long the wait")
+        self.assertEqual(b["note"], "GPU busy 100% > 5% before run 1 (still after waiting 0.05 s)")
+        self.assertGreaterEqual(b["idle_wait_s"], 0.05, b)
+        self.assertEqual(self.results["ngram"]["note"], "skipped after GPU busy")
+
+    def test_overlapped_run_is_rerun_with_overlap_retries(self):
+        # Run 1 overlaps another GPU user (busy after it, slow tok/s): it is discarded and run
+        # again on the idle GPU, and only the clean run's tok/s counts.
+        self.spec["tps_seq"] = [4.0, 10.0]
+        with self.busy_readings([0, 100, 0, 0]), self.no_poll_sleep():
+            rc = self.run_bench("--variants", "baseline", "--overlap-retries", "1")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 0, f"a rerun on an idle GPU must count: {b}\n{self.stderr}")
+        self.assertEqual((b["status"], b["tps"], b["overlap_reruns"]), ("measured", [10.0], 1), b)
+        self.assertEqual(len(self.calls()), 2, "the overlapped run is run again once")
+        self.assertEqual(b["note"], "1 overlapped run(s) discarded and run again")
+        self.assertIn("1 overlapped run(s) run again (up to 1 per run)", self.summary)
+
+    def test_overlap_after_every_retry_discards_the_run(self):
+        with self.busy_readings([0, 100, 0, 100]), self.no_poll_sleep():
+            rc = self.run_bench("--variants", "baseline", "--overlap-retries", "1")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 3, f"overlapped twice with one retry allowed is not measured: {b}")
+        self.assertEqual((b["status"], b["tps"], b["overlap_reruns"]), ("not measured", [], 1), b)
+        self.assertEqual(len(self.calls()), 2, "one run plus one retry, no more")
+        self.assertIn("tok/s discarded after 1 rerun(s)", b["note"])
+
+    def test_retry_replaces_only_the_overlapped_repeat(self):
+        # Repeat 2 overlaps and is rerun: the median is over three clean runs.
+        self.spec["tps_seq"] = [10.0, 3.0, 10.4, 10.2]
+        with self.busy_readings([0, 0, 0, 100, 0, 0, 0, 0]), self.no_poll_sleep():
+            rc = self.run_bench("--variants", "baseline", "--repeat", "3", "--overlap-retries", "2")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 0, f"{b}\n{self.stderr}")
+        self.assertEqual((b["tps"], b["tps_median"], b["overlap_reruns"]), ([10.0, 10.4, 10.2], 10.2, 1), b)
+
+    def test_wait_idle_does_not_wait_on_an_unreadable_busy_file(self):
+        # No gpu_busy_percent will not appear by waiting: report at once instead of spending the wait.
+        with mock.patch.object(bd, "WAIT_POLL_S", 0.01):
+            rc = self.run_bench("--busy-file", str(self.root / "missing*"), "--variants", "baseline",
+                                "--wait-idle", "3")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 3, b)
+        self.assertLess(b["idle_wait_s"], 1.0, f"waited on an unreadable busy file: {b}")
+        self.assertIn("unreadable", b["note"])
+
+    def test_unreadable_reading_after_a_run_is_never_retried(self):
+        self.spec["busy_gone_on_call"] = 1
+        rc = self.run_bench("--variants", "baseline", "--overlap-retries", "3")
+        b = self.results["baseline"]
+        self.assertEqual(rc, 3, f"an unreadable gpu_busy_percent is not an idle GPU to retry on: {b}")
+        self.assertEqual((len(self.calls()), b["overlap_reruns"]), (1, 0), b)
+
+    def test_wait_idle_and_overlap_retries_must_not_be_negative(self):
+        for flag in ("--wait-idle", "--overlap-retries"):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                bd.main(["--halo", "h", "--model", "m", flag, "-1"])
+
     def test_repeat_takes_the_median(self):
         self.spec["tps_seq"] = [9.0, 30.0, 11.0]
         rc = self.run_bench("--variants", "baseline", "--repeat", "3")

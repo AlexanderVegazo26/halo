@@ -10,6 +10,7 @@ measures several flags together (env and args merged; bitwise only if every part
     scripts/bench_decode.py --halo build-dev/tools/halo/halo --model Qwen3.8-27B-UD-Q4_K_XL.gguf \
         [--variants all|NAME,NAME+NAME] [--workload story|long-context|code-edit | --prompt TEXT] [-n 128] \
         [--ctx N (default: the workload's)] [--repeat 1] [--busy-max 5] [--busy-settle 10] \
+        [--wait-idle 0] [--overlap-retries 0] \
         [--report-dir .test-report/bench-decode]
 
 Numbers taken while another process keeps the GPU busy are not benchmarks (2026-11-14: a
@@ -21,6 +22,12 @@ smoothed by amdgpu, so halo's own load takes a few seconds to fade once it has e
 until the reading is back under --busy-max, for up to --busy-settle seconds; a GPU still busy
 after that means another process overlapped the run, so that run's tok/s is discarded the same
 way instead of being reported as measured.
+On a machine that shares the GPU (the EVO-X2's model server keeps it at 85-100% for most of
+the day), `--wait-idle S` waits up to S seconds before each run for the reading to drop under
+--busy-max instead of giving up at once, and `--overlap-retries N` reruns a run that another
+process overlapped (after waiting again) up to N times before discarding it. Every tok/s that
+counts still comes from a run with an idle GPU before and after it; the time waited and the
+reruns are reported per variant.
 Every inherited HALO_* speed flag is removed so the baseline really is the default build
 behaviour.
 
@@ -221,6 +228,8 @@ class Result:
     same_output: bool | None = None
     busy_before: int | None = None
     busy_after: int | None = None  # highest sample right after the last run that finished
+    idle_wait_s: float = 0.0  # seconds spent waiting for an idle GPU before this variant's runs
+    overlap_reruns: int = 0  # runs discarded as overlapped and run again (--overlap-retries)
     command: str = ""
 
 
@@ -266,6 +275,22 @@ def wait_settled(a) -> int | None:
         time.sleep(max(a.busy_interval, 0.05))
 
 
+WAIT_POLL_S = 5.0  # seconds between busy readings while --wait-idle waits
+
+
+def wait_idle(a) -> tuple[int | None, float]:
+    """Busy reading before a run: with --wait-idle, polls until <= --busy-max or the wait has
+    run out. Returns the last reading (None if unreadable: never waited on) and the seconds waited."""
+    start = time.monotonic()
+    deadline = start + a.wait_idle
+    while True:
+        busy = gpu_busy(a.busy_file, a.busy_samples, a.busy_interval)
+        left = deadline - time.monotonic()
+        if busy is None or busy <= a.busy_max or left <= 0:
+            return busy, time.monotonic() - start
+        time.sleep(min(WAIT_POLL_S, left))
+
+
 # bash $'...' escapes: a prompt with a newline still reruns from a single summary.md line.
 _ANSI_C = {"\\": "\\\\", "'": "\\'", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
@@ -287,37 +312,49 @@ def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
     r = Result(v.name, v.step, dict(v.env), list(v.args), v.bitwise, command=line)
     outputs = []
     for i in range(a.repeat):
-        busy = gpu_busy(a.busy_file, a.busy_samples, a.busy_interval)
-        if i == 0:
-            r.busy_before = busy
-        if busy is None:
-            r.note = f"gpu_busy_percent unreadable ({a.busy_file}): idle GPU not confirmed"
-            return r, outputs
-        if busy > a.busy_max:
-            r.note = f"GPU busy {busy}% > {a.busy_max}% before run {i + 1}"
-            r.tps = []
-            return r, outputs
-        try:
-            p = subprocess.run(cmd, env={**env, **v.env}, capture_output=True, text=True, timeout=a.timeout)
-        except subprocess.TimeoutExpired:
-            r.status, r.note = "failed", f"timed out after {a.timeout} s"
-            return r, outputs
-        info = parse_run(p.stderr)
-        if p.returncode != 0 or "tps" not in info:
-            tail = " | ".join(p.stderr.strip().splitlines()[-3:])
-            r.status, r.note = "failed", f"exit {p.returncode}{'' if 'tps' in info else ', no tok/s line'}: {tail}"
-            return r, outputs
-        # halo has exited, so its own work is done once its smoothed load has faded: a GPU
-        # still busy after the settle window was shared with another process during the run,
-        # and the run's tok/s is not a benchmark.
-        after = wait_settled(a)
-        r.busy_after = after
-        if after is None or after > a.busy_max:
-            seen = "unreadable" if after is None else f"{after}% > {a.busy_max}%"
-            r.note = (f"GPU busy {seen} right after run {i + 1} (still after {a.busy_settle:g} s settle): "
-                      "another process overlapped it, tok/s discarded")
-            r.tps = []
-            return r, []
+        attempt = 0
+        while True:
+            busy, waited = wait_idle(a)
+            r.idle_wait_s += waited
+            if i == 0 and attempt == 0:
+                r.busy_before = busy
+            if busy is None:
+                r.note = f"gpu_busy_percent unreadable ({a.busy_file}): idle GPU not confirmed"
+                r.tps = []
+                return r, outputs
+            if busy > a.busy_max:
+                r.note = f"GPU busy {busy}% > {a.busy_max}% before run {i + 1}" + (
+                    f" (still after waiting {a.wait_idle:g} s)" if a.wait_idle else "")
+                r.tps = []
+                return r, outputs
+            try:
+                p = subprocess.run(cmd, env={**env, **v.env}, capture_output=True, text=True, timeout=a.timeout)
+            except subprocess.TimeoutExpired:
+                r.status, r.note = "failed", f"timed out after {a.timeout} s"
+                return r, outputs
+            info = parse_run(p.stderr)
+            if p.returncode != 0 or "tps" not in info:
+                tail = " | ".join(p.stderr.strip().splitlines()[-3:])
+                r.status, r.note = "failed", f"exit {p.returncode}{'' if 'tps' in info else ', no tok/s line'}: {tail}"
+                return r, outputs
+            # halo has exited, so its own work is done once its smoothed load has faded: a GPU
+            # still busy after the settle window was shared with another process during the run,
+            # and the run's tok/s is not a benchmark. With --overlap-retries it is run again once
+            # the GPU is idle (an unreadable reading is never retried).
+            after = wait_settled(a)
+            r.busy_after = after
+            if after is not None and after > a.busy_max and attempt < a.overlap_retries:
+                attempt += 1
+                r.overlap_reruns += 1
+                continue
+            if after is None or after > a.busy_max:
+                seen = "unreadable" if after is None else f"{after}% > {a.busy_max}%"
+                r.note = (f"GPU busy {seen} right after run {i + 1} (still after {a.busy_settle:g} s settle): "
+                          "another process overlapped it, tok/s discarded"
+                          + (f" after {attempt} rerun(s)" if attempt else ""))
+                r.tps = []
+                return r, []
+            break
         r.tps.append(info["tps"])
         r.prompt_tokens, r.generated = info["prompt_tokens"], info["generated"]
         r.drafts = info.get("drafts", "")
@@ -327,6 +364,8 @@ def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
         return r, outputs
     r.status = "measured"
     r.tps_median = statistics.median(r.tps)
+    if r.overlap_reruns:
+        r.note = f"{r.overlap_reruns} overlapped run(s) discarded and run again"
     return r, outputs
 
 
@@ -374,13 +413,19 @@ def write_report(a, results: list[Result], stripped: list, rc: int) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     meta = {"halo": a.halo, "model": a.model, "workload": a.workload, "prompt": a.prompt,
             "prompt_file": str(a.prompt_file) if a.prompt_file else None, "max_tokens": a.max_tokens, "ctx": a.ctx,
-            "repeat": a.repeat, "busy_max": a.busy_max, "busy_settle": a.busy_settle, "stripped_env": stripped,
+            "repeat": a.repeat, "busy_max": a.busy_max, "busy_settle": a.busy_settle, "wait_idle": a.wait_idle,
+            "overlap_retries": a.overlap_retries, "stripped_env": stripped,
             "exit": rc,
             "date": time.strftime("%Y-%m-%d %H:%M:%S %z")}
     (d / "bench-decode.json").write_text(json.dumps({"meta": meta, "results": [asdict(r) for r in results]}, indent=2) + "\n")
     lines = [f"# Decode sweep: {'PASS' if rc == 0 else 'GPU BUSY: not measured' if rc == 3 else 'FAIL'}", "",
              f"- model `{a.model}`, workload `{a.workload}`, `-n {a.max_tokens} --ctx {a.ctx}`, {a.repeat} run(s) per variant (median), "
              f"busy limit {a.busy_max}%, {meta['date']}"]
+    if a.wait_idle or a.overlap_retries:
+        waited = sum(r.idle_wait_s for r in results)
+        reruns = sum(r.overlap_reruns for r in results)
+        lines.append(f"- waited up to {a.wait_idle:g} s for an idle GPU before each run ({waited:.0f} s in all); "
+                     f"{reruns} overlapped run(s) run again (up to {a.overlap_retries} per run)")
     if stripped:
         lines.append(f"- removed from the inherited environment: {', '.join(stripped)}")
     lines += ["", "| variant | step | tok/s | vs baseline | drafts | output == baseline | status |", "|---|---|---|---|---|---|---|"]
@@ -416,13 +461,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--busy-settle", type=float, default=10.0,
                     help="seconds a run's own smoothed GPU load may take to fade before the GPU counts as "
                          "shared with another process")
+    ap.add_argument("--wait-idle", type=float, default=0.0,
+                    help="seconds to wait before each run for gpu_busy_percent to drop under --busy-max "
+                         "(default 0: give up at once)")
+    ap.add_argument("--overlap-retries", type=int, default=0,
+                    help="times a run another process overlapped is run again (after --wait-idle) "
+                         "before it is discarded")
     ap.add_argument("--timeout", type=int, default=900, help="seconds per run")
     ap.add_argument("--report-dir", default=".test-report/bench-decode")
     a = ap.parse_args(argv)
     if a.repeat < 1 or a.max_tokens < 1:
         ap.error("--repeat and -n must be >= 1")
-    if a.busy_settle < 0:
-        ap.error("--busy-settle must be >= 0")
+    if a.busy_settle < 0 or a.wait_idle < 0 or a.overlap_retries < 0:
+        ap.error("--busy-settle, --wait-idle and --overlap-retries must be >= 0")
     w = WORKLOADS[a.workload]
     if a.prompt is not None:
         a.workload = "custom"
