@@ -229,7 +229,8 @@ TEST(MicroSuite, BeforeSnapshotIsTakenBeforeTheRun) {
     c.environment.utc_now = [&] { return phase.load() == 0 ? std::string("before-run") : std::string("after-run"); };
     c.benchmarks.push_back({"NOP", [&] { phase.store(1); }, 0});
     const SuiteArtifact a = run_micro_suite(c, clock);
-    ASSERT_TRUE(a.hardware_before && a.hardware_after);
+    if (!a.hardware_before) GTEST_FAIL() << "micro suite should capture hardware_before";
+    if (!a.hardware_after) GTEST_FAIL() << "micro suite should capture hardware_after";
     EXPECT_EQ(a.hardware_before->captured_at, "before-run");
     EXPECT_EQ(a.hardware_after->captured_at, "after-run");
 }
@@ -253,6 +254,7 @@ TEST(Environment, UnpinnedPowerModeDriftAndDisabledCaptureInvalidate) {
     c.environment.patch_states = [](HardwareState&, HardwareState& after) { after.temperature_c = 70.0; };
     a = run_micro_suite(c, clock);
     EXPECT_FALSE(a.thermal.valid);
+    if (!a.thermal.drift_c) GTEST_FAIL() << "after.temperature_c patched to 70 C should report thermal.drift_c";
     EXPECT_DOUBLE_EQ(*a.thermal.drift_c, 25.0);
     EXPECT_FALSE(a.valid);
 
@@ -544,7 +546,7 @@ TEST(SystemSuite, FourAgentReplayReusesPrefix) {
     for (const auto& r : a.records) {
         EXPECT_EQ(r.concurrency, 4u);
         EXPECT_EQ(r.extra.at("generated_tokens").get<std::size_t>(), expected_generated);
-        ASSERT_TRUE(r.prefix_cache_hit_rate);
+        if (!r.prefix_cache_hit_rate) GTEST_FAIL() << "system-suite record should report prefix_cache_hit_rate";
         EXPECT_GT(*r.prefix_cache_hit_rate, 0.5);  // turns 1-2 resend the whole conversation
         ASSERT_TRUE(r.ttft_cached_ms && r.ttft_ms);
     }
