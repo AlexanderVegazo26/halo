@@ -24,6 +24,8 @@ set(HALO_VK_SHADERS
   norm/rms_norm
   matmul/matvec_f32
   matmul/matvec_q8_0
+  matmul/matvec_f32_gates  # GDN gates epilogue on the fused beta|alpha gemv (HALO_FUSE_GEMV=ba)
+  matmul/matvec_q8_0_gates
   matmul/matvec_q4_k
   matmul/matvec_q5_k
   matmul/matvec_q6_k

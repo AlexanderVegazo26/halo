@@ -224,6 +224,8 @@ bool fuse_norm = false;
     bool fuse_ffn = false, fuse_ba = false, fuse_qkv = false;
     // Which forms the loaded model actually contains (decides the scratch make_acts allocates).
     bool has_plain_ffn = false, has_fused_ffn = false, has_plain_ba = false, has_fused_ba = false, has_fused_qkv = false;
+    // GDN layers whose gates run in the fused beta|alpha gemv's epilogue / as a separate gdn_gates dispatch.
+    bool has_gated_ba = false, has_separate_gates = false;
 
     void parse_fuse_env(const char* e) {
         if (e == nullptr || *e == '\0') return;
@@ -287,7 +289,10 @@ bool fuse_norm = false;
 
     void note_forms(const LayerW& l) {
         (l.ffn.gu.present() ? has_fused_ffn : has_plain_ffn) = true;
-        if (l.gdn) (l.gdn->ba.present() ? has_fused_ba : has_plain_ba) = true;
+        if (l.gdn) {
+            (l.gdn->ba.present() ? has_fused_ba : has_plain_ba) = true;
+            (gates_in_gemv(*l.gdn) ? has_gated_ba : has_separate_gates) = true;
+        }
         if (l.attn && l.attn->qkv.present()) has_fused_qkv = true;
     }
 
@@ -477,13 +482,16 @@ bool fuse_norm = false;
     // ---- blocks ------------------------------------------------------------------------
 
     /// `norm` != nullptr: x is the RAW row and the gemv applies rms_norm(x) * norm itself (see fuse_norm).
-    void gemv(Step& st, TensorRef x, std::size_t R, const Mat& w, TensorRef y, const Vec* norm = nullptr) const {
+    /// `gates` != nullptr: w is that GDN layer's fused beta|alpha and the gemv applies its gates (gates_in_gemv).
+    void gemv(Step& st, TensorRef x, std::size_t R, const Mat& w, TensorRef y, const Vec* norm = nullptr,
+              const GdnW* gates = nullptr) const {
         backend::GemvArgs g{w.type, w.ref(), x, y, w.rows, w.cols, u32(R), {w.variant}};
         g.allow_gemm = st.allow_gemm;
         if (norm != nullptr) {
             g.norm_w = norm->ref();
             g.norm_eps = eps;
         }
+        if (gates != nullptr) g.gates = {gates->dt_bias.ref(), gates->a.ref(), u32(n_v)};
         be->gemv(*st.s, g);
         st.cost.weight_bytes += w.bytes;
         st.cost.activation_bytes += cpu::traffic_matmul(R, w.cols, w.rows, 0).total();
@@ -498,6 +506,13 @@ bool fuse_norm = false;
     void add_rms_norm(Step& st, TensorRef x, TensorRef y, std::size_t R, const Vec& w, TensorRef out) const {
         be->add_rms_norm(*st.s, backend::AddRmsNormArgs{x, y, x, w.ref(), out, u32(R), u32(E), eps, {}});
         st.cost.activation_bytes += cpu::traffic_binary(R * E).total() + cpu::traffic_rms_norm(R, E).total();
+    }
+
+    /// Does this GDN layer's fused beta|alpha gemv apply the gates itself (GemvArgs::gates)? Bitwise the
+    /// separate gdn_gates, so it is used whenever the backend has it for the weight type.
+    [[nodiscard]] bool gates_in_gemv(const GdnW& w) const {
+        return limits.gemv_gdn_gates && w.ba.present() && w.ba.variant == 0 &&
+               (w.ba.type == DType::F32 || w.ba.type == DType::Q8_0);
     }
 
     /// Can `w` run the fused-norm gemv (see fuse_norm)? Not for repacked or row-fused Mats.
@@ -546,8 +561,10 @@ bool fuse_norm = false;
                 a.alpha = st.alloc(R * n_v);
             }
             if (has_fused_ba) a.ba = st.alloc(R * 2 * n_v);
-            a.g = st.alloc(R * n_v);
-            a.bs = st.alloc(R * n_v);
+            if (has_separate_gates) {
+                a.g = st.alloc(R * n_v);
+                a.bs = st.alloc(R * n_v);
+            }
             a.o = st.alloc(R * value_dim);
             a.on = st.alloc(R * value_dim);
         }
@@ -670,18 +687,33 @@ bool fuse_norm = false;
         gemv(st, a.xn, R, w.gate, a.z);
         // beta / alpha: two small latency-bound gemvs, or (HALO_FUSE_GEMV=ba) one over the beta|alpha
         // rows; the fused [R, 2 n_v] output is read as two strided [R, n_v] views.
-        TensorRef beta = a.beta, alpha = a.alpha;
-        if (w.ba.present()) {
-            gemv(st, a.xn, R, w.ba, a.ba);
-            beta = a.ba.with_stride(2 * nv * kF32);
-            alpha = a.ba.shifted(nv * kF32).with_stride(2 * nv * kF32);
+        // beta = sigmoid(beta); g = ssm_a * softplus(alpha + dt_bias), ssm_a = -exp(A_log) (GGUF): a separate
+        // gdn_gates into a.bs / a.g, or (gates_in_gemv) the fused gemv's epilogue, whose [R, 2 n_v] output then
+        // holds beta_out | g per row. g_rows / bs_rows are [R, gb_cols]-strided; the GDN reads n_v of each row.
+        TensorRef bs_rows = a.bs, g_rows = a.g;
+        std::size_t gb_cols = nv;
+        if (gates_in_gemv(w)) {
+            gemv(st, a.xn, R, w.ba, a.ba, nullptr, &w);
+            gb_cols = 2 * nv;
+            bs_rows = a.ba;
+            g_rows = a.ba.shifted(nv * kF32);
         } else {
-            gemv(st, a.xn, R, w.beta, beta);
-            gemv(st, a.xn, R, w.alpha, alpha);
+            TensorRef beta = a.beta, alpha = a.alpha;
+            if (w.ba.present()) {
+                gemv(st, a.xn, R, w.ba, a.ba);
+                beta = a.ba.with_stride(2 * nv * kF32);
+                alpha = a.ba.shifted(nv * kF32).with_stride(2 * nv * kF32);
+            } else {
+                gemv(st, a.xn, R, w.beta, beta);
+                gemv(st, a.xn, R, w.alpha, alpha);
+            }
+            be->gdn_gates(*st.s, backend::GdnGateArgs{alpha, beta, w.dt_bias.ref(), w.a.ref(), a.g, a.bs, u32(R), u32(nv), {}});
+            cost.activation_bytes += 4 * cpu::traffic_unary(R * nv).total();
         }
-        // beta = sigmoid(beta); g = ssm_a * softplus(alpha + dt_bias), ssm_a = -exp(A_log) (GGUF).
-        be->gdn_gates(*st.s, backend::GdnGateArgs{alpha, beta, w.dt_bias.ref(), w.a.ref(), a.g, a.bs, u32(R), u32(nv), {}});
-        cost.activation_bytes += 4 * cpu::traffic_unary(R * nv).total();
+        const auto gate_rows = [gb_cols, nv](TensorRef t, std::size_t row0) {
+            const TensorRef r = rows_at(t, row0, gb_cols);
+            return gb_cols == nv ? r : r.with_stride(gb_cols * kF32);
+        };
 
         const cpu::GdnDims dims{n_k, n_v, d_k, d_v, cpu::GdnHeadMapping::Tiled};
         const std::uint64_t cstride = conv_c * kF32;
@@ -709,8 +741,8 @@ bool fuse_norm = false;
                 ga.q = xs.with_stride(cstride);
                 ga.k = xs.shifted(key_dim * kF32).with_stride(cstride);
                 ga.v = xs.shifted(2 * key_dim * kF32).with_stride(cstride);
-                ga.g = rows_at(a.g, row0, nv);
-                ga.beta = rows_at(a.bs, row0, nv);
+                ga.g = gate_rows(g_rows, row0);
+                ga.beta = gate_rows(bs_rows, row0);
                 ga.state = gdn_st.recurrent_ref(gdn_layer);
                 ga.out = rows_at(a.o, row0, value_dim);
                 ga.n_k = u32(n_k);
@@ -980,7 +1012,10 @@ const model::Qwen35HParams& Qwen35::hparams() const noexcept { return *impl_->hp
 bool Qwen35::has_mtp() const noexcept { return impl_->mtp.has_value(); }
 bool Qwen35::reuse_streams() const noexcept { return impl_->reuse_streams; }
 FusedProjections Qwen35::fused_projections() const noexcept {
-    return {.ffn = impl_->has_fused_ffn, .ba = impl_->has_fused_ba, .qkv = impl_->has_fused_qkv};
+    return {.ffn = impl_->has_fused_ffn,
+            .ba = impl_->has_fused_ba,
+            .qkv = impl_->has_fused_qkv,
+            .ba_gates = impl_->has_gated_ba && !impl_->has_separate_gates};
 }
 std::size_t Qwen35::repacked_mats() const noexcept { return impl_->n_repacked; }
 std::size_t Qwen35::mtp_draft_vocab() const noexcept {

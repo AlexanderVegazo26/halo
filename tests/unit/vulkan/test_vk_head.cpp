@@ -828,6 +828,174 @@ TEST(VkHead, GemvFusedNormRejectsWhatItCannotFuse) {
 }
 
 
+// ---------------------------------------------------------------- GDN gates epilogue (next.md step 6)
+
+namespace {
+
+/// One gates-epilogue case: W = 2 * nv rows (beta rows, then alpha rows) of `cols`, n_vec input rows, dt_bias /
+/// ssm_a views `lead` floats into poisoned buffers. Returns the fused gemv's output and the reference: the plain
+/// gemv, then gdn_gates on its two row halves into separate buffers (as qwen35 ran it before), laid out like the
+/// fused output; plus the alpha rows' softplus inputs s = y + dt_bias and the dispatch counts of both forms.
+/// `fused_ops` runs the fused gemv (e.g. with a small binding limit: row slabs).
+struct GatesRun {
+    std::vector<float> fused, separate, s_in;
+    std::uint32_t fused_dispatches = 0, separate_dispatches = 0;
+};
+
+GatesRun gates_case(const std::shared_ptr<hv::Context>& ctx, hv::Ops& ops, hv::Ops& fused_ops, ref::WType t,
+                    std::uint32_t nv, std::uint32_t cols, std::uint32_t n_vec, std::uint32_t lead, std::mt19937& rng) {
+    const halo::DType dt = ref::dtype(t);
+    const std::uint32_t rows = 2 * nv;
+    const ref::Weights w = ref::random_weights(t, rows, cols, rng, 14);
+    std::vector<float> x;
+    for (std::uint32_t v = 0; v < n_vec; ++v) {
+        const auto xv = ref::random_vec(cols, rng, v % 2 == 0 ? 1.0f : 8.0f);
+        x.insert(x.end(), xv.begin(), xv.end());
+    }
+    hv::Buffer bw = upload(ctx, std::span<const std::uint8_t>(w.bytes));
+    hv::Buffer bx = upload(ctx, std::span<const float>(x));
+    const std::size_t n = std::size_t{n_vec} * rows, nh = std::size_t{n_vec} * nv;
+    hv::Buffer yraw = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+    {
+        hv::Stream s(ctx);
+        ops.gemv(s, hv::GemvArgs{dt, bw, bx, yraw, rows, cols, n_vec});
+        s.submit_and_wait();
+    }
+    const auto raw = download<float>(yraw, n);
+    // dt_bias puts vector 0's softplus input s = y + dt_bias on each branch of halo_softplus, whatever the gemv
+    // gave (random Q8_0 scales reach |y| ~ 1e3): s ~ 25 (> 20: returns s), s ~ -3 (exp(s) <= 0.5: log1p
+    // series), s ~ 1.5 (log(1 + e)). ssm_a = -exp(A_log) <= 0 as in a GGUF.
+    std::vector<float> dtb(lead + std::size_t{nv}, 1e30f), sa(lead + std::size_t{nv}, 1e30f);
+    for (std::uint32_t j = 0; j < nv; ++j) {
+        const float target = j % 3 == 0 ? 25.0f : j % 3 == 1 ? -3.0f : 1.5f;
+        dtb[lead + j] = target - raw[nv + j];
+        sa[lead + j] = -std::abs(ref::random_vec(1, rng, 4.0f)[0]) - 0.01f;
+    }
+    hv::Buffer bdt = upload(ctx, std::span<const float>(dtb));
+    hv::Buffer bsa = upload(ctx, std::span<const float>(sa));
+    hv::Buffer beta = hv::Buffer::create(ctx, nh * 4, hv::MemoryUsage::HostCached);
+    hv::Buffer g = hv::Buffer::create(ctx, nh * 4, hv::MemoryUsage::HostCached);
+    hv::Buffer yfused = hv::Buffer::create(ctx, n * 4, hv::MemoryUsage::HostCached);
+    const hv::BufferView dtv(bdt, std::uint64_t{lead} * 4, std::uint64_t{nv} * 4);
+    const hv::BufferView sav(bsa, std::uint64_t{lead} * 4, std::uint64_t{nv} * 4);
+    const std::uint64_t ys = std::uint64_t{rows} * 4;
+    GatesRun out;
+    {
+        hv::Stream s(ctx);
+        ops.gemv(s, hv::GemvArgs{dt, bw, bx, yraw, rows, cols, n_vec});
+        ops.gdn_gates(s, hv::GdnGateArgs{hv::BufferView(yraw, 0, 0, ys), hv::BufferView(yraw, std::uint64_t{nv} * 4, 0, ys),
+                                         dtv, sav, beta, g, n_vec, nv});
+        out.separate_dispatches = s.dispatch_count();
+        s.submit_and_wait();
+    }
+    {
+        hv::Stream s(ctx);
+        hv::GemvArgs ga{dt, bw, bx, yfused, rows, cols, n_vec};
+        ga.gate_n_v = nv;
+        ga.gate_dt_bias = dtv;
+        ga.gate_ssm_a = sav;
+        fused_ops.gemv(s, ga);
+        out.fused_dispatches = s.dispatch_count();
+        s.submit_and_wait();
+    }
+    out.fused = download<float>(yfused, n);
+    const auto vb = download<float>(beta, nh), vg = download<float>(g, nh);
+    out.separate.resize(n);
+    out.s_in.resize(nh);
+    for (std::size_t v = 0; v < n_vec; ++v) {
+        std::copy_n(vb.begin() + v * nv, nv, out.separate.begin() + v * rows);
+        std::copy_n(vg.begin() + v * nv, nv, out.separate.begin() + v * rows + nv);
+        for (std::size_t j = 0; j < nv; ++j) out.s_in[v * nv + j] = raw[v * rows + nv + j] + dtb[lead + j];
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(VkHead, GemvGdnGatesIsBitwiseTheGemvThenGdnGates) {
+    // qwen35's fused beta|alpha gemv (HALO_FUSE_GEMV=ba) stores the gated values itself when the backend has
+    // GemvArgs::gates (matvec_<type>_gates): one dispatch per 8 vectors instead of gemv + gdn_gates. Greedy
+    // output is unchanged only if every output is bit for bit the separate path's: beta rows sigmoid(y), alpha
+    // row j ssm_a[j] * softplus(y + dt_bias[j]). Covered: F32 (tiny models) and Q8_0 (the 27B's beta/alpha),
+    // nv 48 at the 27B's 5120 cols and a small odd shape, n_vec 1 (decode), 3 (MTP verify) and 9 (two dispatch
+    // chunks), dt_bias / ssm_a view offsets, all three softplus branches; and with W split into row slabs.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    for (const ref::WType t : {ref::WType::F32, ref::WType::Q8_0}) {
+        for (const auto [nv, cols] : {std::pair{48u, 5120u}, std::pair{5u, 96u}}) {
+            for (const std::uint32_t n_vec : {1u, 3u, 9u}) {
+                for (const std::uint32_t lead : {0u, 3u}) {
+                    const std::string what = std::string(tname(t)) + " nv " + std::to_string(nv) + " cols " +
+                                             std::to_string(cols) + " n_vec " + std::to_string(n_vec) + " lead " +
+                                             std::to_string(lead);
+                    SCOPED_TRACE(what);
+                    std::mt19937 rng(static_cast<unsigned>(t) * 7919 + nv * 31 + cols + n_vec + lead);
+                    const GatesRun r = gates_case(ctx, ops, ops, t, nv, cols, n_vec, lead, rng);
+                    EXPECT_EQ(first_diff(r.fused, r.separate, 2 * nv), "") << what << " (fused vs gemv + gdn_gates)";
+                    const std::uint32_t chunks = (n_vec + 7) / 8;
+                    EXPECT_EQ(r.fused_dispatches, chunks) << what << ": the epilogue must not add dispatches";
+                    EXPECT_EQ(r.separate_dispatches, chunks + 1) << what << ": reference = gemv chunks + one gdn_gates";
+                    // Vector 0's softplus inputs: one per branch (see gates_case).
+                    bool big = false, series = false, log_branch = false;
+                    for (std::size_t j = 0; j < nv; ++j) {
+                        const float sv = r.s_in[j];
+                        big = big || sv > 20.0f;
+                        series = series || std::exp(sv) <= 0.5f;
+                        log_branch = log_branch || (sv <= 20.0f && std::exp(sv) > 0.5f);
+                    }
+                    EXPECT_TRUE(big && series && log_branch) << what << ": softplus branches covered: s > 20 " << big
+                                                             << ", exp(s) <= 0.5 " << series << ", log(1 + e) "
+                                                             << log_branch;
+                }
+            }
+        }
+    }
+}
+
+TEST(VkHead, GemvGdnGatesKeepsTheRowBaseAcrossRowSlabs) {
+    // A W larger than one binding runs as row slabs whose dispatches restart at row 0: the epilogue must still
+    // gate rows by their index in the whole W (gate_row0), including a slab that straddles beta and alpha rows.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    for (const ref::WType t : {ref::WType::F32, ref::WType::Q8_0}) {
+        hv::OpsOptions small;
+        small.max_binding_bytes = t == ref::WType::F32 ? 5 * 96 * 4 : 5 * 102;  // 5 rows of 96 cols per slab
+        hv::Ops slabs(ctx, small);
+        const std::string what = std::string(tname(t)) + " nv 7 cols 96, 5-row slabs";
+        std::mt19937 rng(static_cast<unsigned>(t) + 515);
+        const GatesRun r = gates_case(ctx, ops, slabs, t, 7, 96, 3, 3, rng);
+        EXPECT_GE(r.fused_dispatches, 3u) << what << ": W was not split into row slabs";
+        EXPECT_EQ(first_diff(r.fused, r.separate, 14), "") << what << " (slabbed fused vs gemv + gdn_gates)";
+    }
+}
+
+TEST(VkHead, GemvGdnGatesRejectsWhatItCannotFuse) {
+    // The epilogue tells beta from alpha rows by the row index and exists only on the shared quant matvec body
+    // (F32, Q8_0): anything else must throw, never store plain y where the model expects gated values.
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    hv::Ops ops(ctx);
+    const std::uint32_t nv = 8, cols = 256;
+    hv::Buffer w = hv::Buffer::create(ctx, 2 * nv * cols * 4 + 64, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer x = hv::Buffer::create(ctx, cols * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer v = hv::Buffer::create(ctx, 2 * nv * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer y = hv::Buffer::create(ctx, 2 * nv * 4, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx);
+    const auto args = [&](halo::DType t, std::uint32_t rows, std::uint32_t c) {
+        hv::GemvArgs g{t, hv::BufferView(w, 0, rows * halo::tensor::row_bytes(t, c)), hv::BufferView(x, 0, c * 4),
+                       hv::BufferView(y, 0, rows * 4), rows, c, 1};
+        g.gate_n_v = nv;
+        g.gate_dt_bias = hv::BufferView(v, 0, nv * 4);
+        g.gate_ssm_a = hv::BufferView(v, nv * 4, nv * 4);
+        return g;
+    };
+    EXPECT_NO_THROW(ops.gemv(s, args(halo::DType::F32, 2 * nv, cols))) << "F32, 2 * gate_n_v rows";
+    EXPECT_NO_THROW(ops.gemv(s, args(halo::DType::Q8_0, 2 * nv, cols))) << "Q8_0, 2 * gate_n_v rows";
+    EXPECT_THROW(ops.gemv(s, args(halo::DType::F32, 2 * nv - 1, cols)), halo::Error) << "rows != 2 * gate_n_v";
+    EXPECT_THROW(ops.gemv(s, args(halo::DType::Q4_K, 2 * nv, cols)), halo::Error) << "Q4_K has no _gates shader";
+    EXPECT_THROW(ops.gemv_repacked(s, args(halo::DType::Q6_K, 2 * nv, cols)), halo::Error) << "repacked rows";
+    s.submit_and_wait();
+}
+
 // ---------------------------------------------------------------- cooperative-matrix prefill GEMM (HALO_COOPMAT)
 
 namespace {

@@ -22,7 +22,32 @@ layout(push_constant) uniform Push {
     uint w_off;     // sub-alignment remainder of the W view (quantized: bytes; F32: elements)
     uint w_stride;  // row stride of W (same unit)
     uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+#ifdef HALO_GDN_GATES
+    uint gate_n_v;        // rows [0, gate_n_v) are beta rows, [gate_n_v, 2 gate_n_v) alpha rows
+    uint dt_off, sa_off;  // element remainders of the dt_bias / ssm_a views
+    uint gate_row0;       // row of the whole W this dispatch's row 0 is (row slabs of a W larger than one binding)
+#endif
 } pc;
+
+// GDN gates epilogue (matvec_<type>_gates, next.md step 6): the gemv over qwen35's fused beta|alpha rows
+// (HALO_FUSE_GEMV=ba) writes the gated values itself instead of a separate gdn_gates dispatch:
+//   beta rows: sigmoid(y);  alpha row j: ssm_a[j] * softplus(y + dt_bias[j])
+// with exactly eltwise/gdn_gates.comp's expressions, so the output is bit for bit gemv then gdn_gates.
+#ifdef HALO_GDN_GATES
+#include "halo_math.glsl"
+layout(std430, binding = 3) readonly buffer GateDt { float gate_dt[]; };
+layout(std430, binding = 4) readonly buffer GateSa { float gate_sa[]; };
+float halo_gemv_out(uint row, float v) {
+    const uint r = pc.gate_row0 + row;
+    if (r < pc.gate_n_v) return halo_sigmoid(v);
+    const uint j = r - pc.gate_n_v;
+    precise float s = v + gate_dt[pc.dt_off + j];
+    precise float gv = gate_sa[pc.sa_off + j] * halo_softplus(s);
+    return gv;
+}
+#else
+float halo_gemv_out(uint row, float v) { return v; }
+#endif
 
 // Specialization constant 1 (host: 0 when n_vec == 1). The decode pipeline variant is compiled
 // without the batched body: the unrolled MAX_VEC accumulator loop triples register pressure,
@@ -76,7 +101,7 @@ void main() {
             if (tid < s) red[tid] += red[tid + s];
             barrier();
         }
-        if (tid == 0u) y[pc.y_off + row] = red[0];
+        if (tid == 0u) y[pc.y_off + row] = halo_gemv_out(row, red[0]);
         return;
     }
 
@@ -119,7 +144,7 @@ void main() {
     }
     if (tid == 0u) {
         for (uint t = 0u; t < MAX_VEC; ++t)
-            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
+            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = halo_gemv_out(row, redb[t * WG]);
     }
 }
 

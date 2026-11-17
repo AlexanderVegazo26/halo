@@ -56,7 +56,7 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
                                          "matvec_q4_k_sg", "matvec_q5_k_sg", "matvec_q6_k_sg", "matvec_iq4_xs_sg", "argmax_ids",
                                          "matvec_iq4_xs_rp", "matvec_q4_k_normed", "matvec_q5_k_normed",
                                          "matvec_q6_k_normed", "matvec_iq4_xs_normed", "kv_write_f16", "kv_write_q8",    "attention_f16",
-                                         "attention_q8", "attention_tree"};
+                                         "attention_q8", "attention_tree", "matvec_f32_gates", "matvec_q8_0_gates"};
     std::set<std::string> seen;
     for (const hv::EmbeddedShader* s : hv::embedded_shaders()) {
         ASSERT_NE(s, nullptr);

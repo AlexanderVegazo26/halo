@@ -472,6 +472,14 @@ struct GemvArgs {
     /// rows stay bitwise their n_vec = 1 matvec, which decode and MTP verify need: a verify of
     /// mtp_max_draft 8 (9 rows) or several sequences' rows in one forward exceed 8 vectors.
     bool allow_gemm = false;
+    /// GDN gates epilogue (next.md step 6; qwen35's fused beta|alpha gemv, HALO_FUSE_GEMV=ba): with
+    /// gate_n_v != 0 the gemv writes, instead of y, rows [0, gate_n_v) as sigmoid(y) and row gate_n_v + j as
+    /// gate_ssm_a[j] * softplus(y + gate_dt_bias[j]), with gdn_gates' expressions, so the result is bit for bit
+    /// this gemv followed by gdn_gates on its two row halves (VkHead.GemvGdnGates*), also when W runs as row slabs.
+    /// Requires rows == 2 * gate_n_v and wtype F32 or Q8_0 (the shared matvec_quant_main body; so never norm_w,
+    /// repacked or lm_head: all throw). gate_dt_bias, gate_ssm_a: [gate_n_v] fp32 views.
+    std::uint32_t gate_n_v = 0;
+    BufferView gate_dt_bias{}, gate_ssm_a{};
 };
 
 /// [LOGITS_MATMUL + ARGMAX] (cpu::matmul then cpu::argmax per vector; = cpu::matmul_argmax):
@@ -609,7 +617,9 @@ public:
 
 private:
     void eltwise(Stream& stream, const EltwiseArgs& args, std::uint32_t op_code, std::string_view name);
-    void gemv_impl(Stream& stream, const GemvArgs& args, std::string_view op, bool repacked = false);
+    /// slab_row0: set when `args` is one row slab of a larger W (its first row there; the gates epilogue's row base).
+    void gemv_impl(Stream& stream, const GemvArgs& args, std::string_view op, bool repacked = false,
+                   std::optional<std::uint32_t> slab_row0 = std::nullopt);
     void gdn_impl(Stream& stream, const GdnDecodeArgs& args, const GdnChunkedArgs* chunked);
     const Kernel& kernel(const std::string& shader, std::uint32_t num_buffers,
                          std::uint32_t push_bytes, std::vector<SpecConstant> spec,

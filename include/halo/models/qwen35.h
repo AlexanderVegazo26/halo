@@ -227,6 +227,9 @@ struct FusedProjections {
     bool ffn = false;
     bool ba = false;
     bool qkv = false;
+    /// The fused beta|alpha gemv also applies the GDN gates (GemvArgs::gates; backend::Limits::gemv_gdn_gates and
+    /// F32 / Q8_0 beta|alpha weights), so no layer runs a separate gdn_gates dispatch.
+    bool ba_gates = false;
 };
 
 class Qwen35 {

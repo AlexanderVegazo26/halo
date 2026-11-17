@@ -50,6 +50,7 @@ std::uint64_t Ops::lm_head_workspace_bytes(std::uint32_t rows, std::uint32_t n_v
 void Ops::lm_head(Stream& stream, const LmHeadArgs& a) {
     constexpr std::string_view op = "lm_head";
     const GemvArgs& g = a.gemv;
+    HALO_CHECK(g.gate_n_v == 0, ErrorCode::Unsupported, "{}: the GDN gates epilogue would overwrite the logits", op);
     HALO_CHECK(g.rows > 0 && g.cols > 0 && g.n_vec > 0, ErrorCode::Kernel, "{}: empty shape {}x{} n_vec={}", op,
                g.rows, g.cols, g.n_vec);
     const bool in_ws = g.y.empty();

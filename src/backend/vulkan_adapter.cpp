@@ -358,6 +358,7 @@ public:
         l.max_rope_dims = std::numeric_limits<std::uint32_t>::max();  // host cos/sin table; rot <= head_dim
         l.gdn_chunked = true;
         l.lm_head_ids = true;
+        l.gemv_gdn_gates = true;  // Ops gemv with GemvArgs::gate_n_v (matvec_{f32,q8_0}_gates)
         // matvec_<type>_normed always reduces with the shared-memory tree, and its row RMS matches
         // rms_norm.comp only at WG 256: with subgroupAdd matvecs or another reduce workgroup, fusing would
         // make R == 1 decode differ from the R > 1 verify forward (MTP on/off greedy output).
@@ -508,6 +509,16 @@ public:
             r.no_overlap(r.f32(a.y, a.n_vec, a.rows, Access::Write, "y"), nw);
             g.norm_w = nw.view;
             g.norm_eps = a.norm_eps;
+        }
+        if (a.gates.n_v != 0) {
+            const Ref dt = r.f32(a.gates.dt_bias, 1, a.gates.n_v, Access::Read, "gates.dt_bias");
+            const Ref ga = r.f32(a.gates.a, 1, a.gates.n_v, Access::Read, "gates.a");
+            const Ref y = r.f32(a.y, a.n_vec, a.rows, Access::Write, "y");
+            r.no_overlap(y, dt);
+            r.no_overlap(y, ga);
+            g.gate_n_v = a.gates.n_v;
+            g.gate_dt_bias = dt.view;
+            g.gate_ssm_a = ga.view;
         }
         if (a.n_vec == 0 || a.rows == 0) return;
         if (repacked)
@@ -844,6 +855,7 @@ public:
         const Resolver r(this, "LM_HEAD", st);
         const GemvArgs& g = a.gemv;
         HALO_CHECK(g.norm_w.empty(), ErrorCode::Unsupported, "LM_HEAD: a fused norm is not supported");
+        HALO_CHECK(g.gates.n_v == 0, ErrorCode::Unsupported, "LM_HEAD: the GDN gates epilogue is not supported");
         const hv::GemvArgs hg = resolve_gemv(r, g, !g.y.empty());
         const Ref w = r.get(g.w, g.rows, weight_row_bytes(g.wtype, g.cols), g.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
         const Ref x = r.f32(g.x, g.n_vec, g.cols, Access::Read, "x");

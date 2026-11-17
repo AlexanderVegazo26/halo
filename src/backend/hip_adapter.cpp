@@ -613,6 +613,7 @@ public:
         HipStream& st = stream(s, "MATMUL");
         const hip::Ops& ops = select(OpId::Gemv, a.kernel);
         HALO_CHECK(a.norm_w.empty(), ErrorCode::Unsupported, "MATMUL: a fused norm (GemvArgs::norm_w) is Vulkan-only");
+        HALO_CHECK(a.gates.n_v == 0, ErrorCode::Unsupported, "MATMUL: the GDN gates epilogue (GemvArgs::gates) is Vulkan-only");
         const Resolver r(this, "MATMUL");
         const std::uint64_t rb = weight_row_bytes(a.wtype, a.cols, r.op());
         const Operand w = r.get(a.w, a.rows, rb, a.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
@@ -1025,6 +1026,7 @@ public:
         check_status_ref(a.status, OpId::LmHead);
         const Resolver r(this, "LM_HEAD");
         const GemvArgs& g = a.gemv;
+        HALO_CHECK(g.gates.n_v == 0, ErrorCode::Unsupported, "LM_HEAD: the GDN gates epilogue is not supported");
         const std::uint64_t rb = weight_row_bytes(g.wtype, g.cols, r.op());
         const Operand w = r.get(g.w, g.rows, rb, g.wtype == DType::F32 ? kF32 : 1, Access::Read, "w");
         const Operand x = r.f32(g.x, g.n_vec, g.cols, Access::Read, "x");

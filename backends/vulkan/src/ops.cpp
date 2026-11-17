@@ -4,9 +4,12 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <format>
 #include <initializer_list>
+#include <optional>
+#include <span>
 #include <utility>
 
 #include "halo/backends/vulkan/context.h"
@@ -199,7 +202,8 @@ std::uint32_t Ops::fused_norm_max_cols() const noexcept {
     return floats <= fixed ? 0u : static_cast<std::uint32_t>(std::min<std::uint64_t>(16384, floats - fixed));
 }
 
-void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool repacked) {
+void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool repacked,
+                    std::optional<std::uint32_t> slab_row0) {
     HALO_CHECK(a.rows > 0 && a.cols > 0 && a.n_vec > 0, ErrorCode::Kernel, "{}: empty shape {}x{} n_vec={}", op,
                a.rows, a.cols, a.n_vec);
     // The repacked layout (halo/tensor/repack.h) keeps the row footprint of the GGUF layout, so
@@ -215,6 +219,17 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     HALO_CHECK(!repacked || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K || a.wtype == DType::IQ4_XS,
                ErrorCode::Unsupported, "{}: no repacked matvec for weight type id {} (Q5_K, Q6_K, IQ4_XS)", op,
                static_cast<std::uint32_t>(a.wtype));
+    // GDN gates epilogue: only the shared matvec_quant_main body (F32, Q8_0) has it, which also rules out a fused
+    // norm and repacking (K-quant / IQ4_XS only). A row slab (below) covers rows [slab_row0, +rows) of the whole W.
+    const bool gates = a.gate_n_v != 0;
+    const std::uint32_t gate_row0 = slab_row0.value_or(0);
+    HALO_CHECK(!gates || ((a.wtype == DType::F32 || a.wtype == DType::Q8_0) &&
+                          (slab_row0 ? std::uint64_t{gate_row0} + a.rows <= 2 * std::uint64_t{a.gate_n_v}
+                                     : a.rows == 2 * std::uint64_t{a.gate_n_v})),
+               ErrorCode::Unsupported,
+               "{}: the GDN gates epilogue needs an F32/Q8_0 weight of 2 * gate_n_v rows (got type id {}, rows {}, "
+               "gate_n_v {})",
+               op, static_cast<std::uint32_t>(a.wtype), a.rows, a.gate_n_v);
     const std::uint64_t row_bytes = matvec_row_bytes(a.wtype, a.cols);
     const std::string shader = detail::weight_shader("matvec", a.wtype) + (repacked ? "_rp" : "");
     const std::uint64_t align = ctx_->info().min_storage_buffer_offset_alignment;
@@ -242,7 +257,7 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
             s.rows = n;
             s.w = BufferView(*a.w.buffer, a.w.offset + r0 * ws, (n - 1) * ws + row_bytes, ws);
             s.y = BufferView(*a.y.buffer, a.y.offset + r0 * k_f32, (a.n_vec - 1) * ys + std::uint64_t{n} * k_f32, ys);
-            gemv_impl(stream, s, op, repacked);
+            gemv_impl(stream, s, op, repacked, static_cast<std::uint32_t>(gate_row0 + r0));
         }
         return;
     }
@@ -302,14 +317,30 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
                         0b100);  // y written
         return;
     }
+    // The trailing gate_* words exist only in the _gates shaders' push block (GemvArgs::gate_n_v).
     struct Push {
         std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
+        std::uint32_t gate_n_v, dt_off, sa_off, gate_row0;
     };
+    constexpr std::size_t plain_push = offsetof(Push, gate_n_v);
+    const std::size_t push_bytes = gates ? sizeof(Push) : plain_push;
+    std::array<BufferBinding, 5> bindings{ow.binding, ox.binding, oy.binding, {}, {}};
+    Push push{a.rows, a.cols, 0, ow.off, ow.stride, 0, ox.stride, 0, oy.stride, a.gate_n_v, 0, 0, gate_row0};
+    if (gates) {
+        const std::uint64_t vrow = std::uint64_t{a.gate_n_v} * k_f32;
+        const Operand odt = operand(a.gate_dt_bias, 1, vrow, Access::Floats, align, op, "gate_dt_bias");
+        const Operand osa = operand(a.gate_ssm_a, 1, vrow, Access::Floats, align, op, "gate_ssm_a");
+        require_disjoint(oy, "y", {{&odt, "gate_dt_bias"}, {&osa, "gate_ssm_a"}}, op);
+        bindings[3] = odt.binding;
+        bindings[4] = osa.binding;
+        push.dt_off = odt.off;
+        push.sa_off = osa.off;
+    }
+    const std::span<const BufferBinding> bound(bindings.data(), gates ? 5 : 3);
     // Specialization constant 1 (BATCHED): decode dispatches get a pipeline compiled without
     // the batched accumulator body (matvec_quant_main.glsl).
-    const Kernel& k =
-        kernel(shader, 3, sizeof(Push), {{0, wg}, {1, a.n_vec == 1 ? 0u : 1u}}, {wg, 1, 1});
-    const std::array bindings{ow.binding, ox.binding, oy.binding};
+    const Kernel& k = kernel(gates ? shader + "_gates" : shader, static_cast<std::uint32_t>(bound.size()), push_bytes,
+                             {{0, wg}, {1, a.n_vec == 1 ? 0u : 1u}}, {wg, 1, 1});
     const DeviceInfo& info = ctx_->info();
     const GroupCount groups = grid_1d(a.rows, info.max_workgroup_count[0], info.max_workgroup_count[1]);
     // subgroup_reduce_: EVERY chunk (n_vec == 1 and a lone trailing vector too) of the four hot K-quant types
@@ -324,17 +355,11 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     // later chunks stay inside the index range operand() checked for the whole extent.
     for (std::uint32_t t0 = 0; t0 < a.n_vec; t0 += k_gemv_max_vec) {
         const std::uint32_t n = std::min(k_gemv_max_vec, a.n_vec - t0);
-        const Kernel& kc = sg_reduce ? kernel(shader + "_sg", 3, sizeof(Push), {{0, wg}, {2, n}}, {wg, 1, 1}) : k;
-        const Push push{a.rows,
-                        a.cols,
-                        n,
-                        ow.off,
-                        ow.stride,
-                        ox.off + t0 * ox.stride,
-                        ox.stride,
-                        oy.off + t0 * oy.stride,
-                        oy.stride};
-        stream.dispatch(kc, bindings, push, groups, 0b100);  // y written
+        const Kernel& kc = sg_reduce ? kernel(shader + "_sg", 3, plain_push, {{0, wg}, {2, n}}, {wg, 1, 1}) : k;
+        push.n_vec = n;
+        push.x_off = ox.off + t0 * ox.stride;
+        push.y_off = oy.off + t0 * oy.stride;
+        stream.dispatch(kc, bound, std::as_bytes(std::span(&push, 1)).first(push_bytes), groups, 0b100);  // y written
     }
 }
 

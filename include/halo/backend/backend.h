@@ -235,6 +235,9 @@ struct Limits {
     /// shaders have no subgroupAdd form). Models fuse only within it: a fused R == 1 decode must stay
     /// bitwise the unfused R > 1 MTP verify forward, or MTP could change greedy output.
     std::uint32_t max_fused_norm_cols = 0;
+    /// GemvArgs::gates (the GDN gates epilogue) is implemented for F32 and Q8_0 weights (Vulkan). Models then
+    /// run their fused beta|alpha gemv with it instead of gemv + gdn_gates (one dispatch less per GDN layer).
+    bool gemv_gdn_gates = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -293,6 +296,15 @@ struct GemvArgs {
     /// n_vec == 1 gemv whatever the batch, which decode and MTP verify rows rely on. qwen35 sets it
     /// only in a forward whose every step is a prefill (SeqStep::prefill).
     bool allow_gemm = false;
+    /// GDN gates epilogue (Vulkan only, Limits::gemv_gdn_gates; next.md step 6): with n_v != 0 the gemv over
+    /// a model's fused beta|alpha rows (rows == 2 * n_v: beta rows first) stores GdnGateArgs' outputs instead of
+    /// y: row r < n_v gets sigmoid(y), row n_v + j gets a[j] * softplus(y + dt_bias[j]), bit for bit gemv then
+    /// gdn_gates on the two row halves. F32 / Q8_0 weights only, no norm_w; the CPU and HIP backends and every
+    /// other case throw (never silently store plain y). dt_bias, a: [n_v] fp32.
+    struct Gates {
+        TensorRef dt_bias{}, a{};
+        std::uint32_t n_v = 0;
+    } gates{};
 };
 
 /// GDN gates (= the qwen35 sequence: beta_out = cpu::sigmoid(beta); t = alpha + dt_bias;

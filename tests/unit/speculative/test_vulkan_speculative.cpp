@@ -327,13 +327,16 @@ TEST_F(VulkanSpec, FusedProjectionsAreBitwiseTheSeparateGemvs) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const VkModel plain(ctx, *nm_, hm::Qwen35Options{.reuse_streams = false, .fuse_gemv = ""});
     const hm::FusedProjections none = plain.model->fused_projections();
-    ASSERT_FALSE(none.ffn || none.ba || none.qkv) << "fuse_gemv = \"\" must override HALO_FUSE_GEMV and load no fused form";
+    ASSERT_FALSE(none.ffn || none.ba || none.qkv || none.ba_gates)
+        << "fuse_gemv = \"\" must override HALO_FUSE_GEMV and load no fused form";
     struct Fuse {
         const char* spec;
         hm::FusedProjections expect;
     };
-    const Fuse fusions[] = {{"ffn", {.ffn = true}}, {"ba", {.ba = true}}, {"qkv", {.qkv = true}},
-                            {"all", {.ffn = true, .ba = true, .qkv = true}}};
+    // ba on Vulkan with F32 (tiny) beta|alpha weights also moves the GDN gates into the gemv's epilogue
+    // (GemvArgs::gates): the separate-gemv run below then checks that epilogue against gemv + gdn_gates too.
+    const Fuse fusions[] = {{"ffn", {.ffn = true}}, {"ba", {.ba = true, .ba_gates = true}}, {"qkv", {.qkv = true}},
+                            {"all", {.ffn = true, .ba = true, .qkv = true, .ba_gates = true}}};
     for (const Fuse& fu : fusions) {
         SCOPED_TRACE(std::string("fuse_gemv=") + fu.spec);
         const VkModel fused(ctx, *nm_, hm::Qwen35Options{.reuse_streams = false, .fuse_gemv = fu.spec});
@@ -341,6 +344,7 @@ TEST_F(VulkanSpec, FusedProjectionsAreBitwiseTheSeparateGemvs) {
         ASSERT_EQ(got.ffn, fu.expect.ffn) << fu.spec << ": fused gate|up loaded";
         ASSERT_EQ(got.ba, fu.expect.ba) << fu.spec << ": fused beta|alpha loaded (tiny model needs GDN layers)";
         ASSERT_EQ(got.qkv, fu.expect.qkv) << fu.spec << ": fused q|k|v loaded (tiny model needs attention layers)";
+        ASSERT_EQ(got.ba_gates, fu.expect.ba_gates) << fu.spec << ": GDN gates in the fused beta|alpha gemv's epilogue";
         for (const char* p : {"p0", "p1", "p2"}) {
             SCOPED_TRACE(p);
             const Toks pr = prompt(p);
