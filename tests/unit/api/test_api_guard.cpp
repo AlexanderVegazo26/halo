@@ -516,6 +516,7 @@ TEST(ApiGuard, AQueuedCompleteRequestIsNotCutOffByTheHeaderDeadline) {
     ts.engine->script = [](const auto&, int) { return slow_answer(); };
     std::atomic<int> slow_ok{0};
     std::vector<std::thread> gens;
+    gens.reserve(2);
     for (int i = 0; i < 2; ++i) {
         gens.emplace_back([&] {
             auto r = make_client(ts.port, 30s)->Post("/v1/completions", Json{{"prompt", "x"}}.dump(), "application/json");
@@ -724,6 +725,7 @@ TEST(ApiGuard, RollingReconnectDribblersCannotStarveHealth) {
     cfg.http_queue = 64;
     TestServer ts(cfg);
     std::vector<std::unique_ptr<Dribbler>> d;
+    d.reserve(40);
     for (int i = 0; i < 40; ++i) d.push_back(std::make_unique<Dribbler>(ts.port, "127.0.0.1", 200ms, true));
     std::this_thread::sleep_for(1s);
     int ok = 0, total = 0;

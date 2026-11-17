@@ -254,7 +254,8 @@ TEST(SequenceKv, MoveTransfersOwnership) {
     const auto snap = dump(a);
     SequenceKv b(std::move(a));
     EXPECT_EQ(dump(b), snap);
-    EXPECT_EQ(a.length(), 0u);  // NOLINT(bugprone-use-after-move): moved-from state is specified
+    // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move): moved-from state is specified
+    EXPECT_EQ(a.length(), 0u);
     EXPECT_EQ(pool.used_blocks(), 2u);
     SequenceKv c(pool);
     append(c, 1, 0);
@@ -268,7 +269,7 @@ TEST(SequenceKv, PagedViewsDriveAttentionLikeContiguousRows) {
     const halo::cpu::AttentionDims dims{4, 2, 4};
     KvPool pool(kLayout, 4);
     SequenceKv kv(pool);
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): fixed seed = reproducible test data
     std::normal_distribution<float> nd;
     const std::size_t T = 11;
     std::vector<float> K(T * 8), V(T * 8);
