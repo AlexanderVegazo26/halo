@@ -20,6 +20,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "../models/tiny_golden.h"
@@ -55,7 +56,7 @@ struct Probe {
     Toks drafts;
     std::unique_ptr<Engine> engine;  // last: destroyed (worker joined) before mu / drafts
 
-    static std::unique_ptr<Probe> make(EngineConfig c) {
+    static std::unique_ptr<Probe> make(const EngineConfig& c) {
         auto p = std::make_unique<Probe>();
         CpuEngineOptions o;
         o.gate_mode = GateMode::Always;  // draft on every greedy decode step
@@ -103,8 +104,14 @@ protected:
             if (!fs::exists(split(p))) GTEST_SKIP() << split(p) << " missing; " << kRegen;
         }
     }
-    Toks prompt(const char* p) const { return golden_->i32(std::string(p) + ".tokens"); }
-    Toks gold(const char* p) const { return golden_->i32(std::string(p) + ".decode_tokens"); }
+    Toks prompt(const char* p) const { return golden().i32(std::string(p) + ".tokens"); }
+    Toks gold(const char* p) const { return golden().i32(std::string(p) + ".decode_tokens"); }
+    /// Checked access: throws (naming what is missing) instead of dereferencing an empty optional;
+    /// SetUp skips every test before that can happen.
+    const Golden& golden() const {
+        if (!golden_) throw std::logic_error("tiny golden data not loaded (SplitMtp::SetUp)");
+        return *golden_;
+    }
 
     std::optional<Golden> golden_;
 };

@@ -287,7 +287,7 @@ TEST(CheckpointStore, BudgetEvictsLeastRecentlyUsedAndRejectsOversize) {
 TEST(SequenceState, ResetDropsEverything) {
     halo::kv_cache::KvPool trunk({1, 4, 4}, 4), mtp({1, 4, 4}, 4);
     halo::state::SequenceState s(trunk, &mtp, kShape, 2);
-    ASSERT_TRUE(s.mtp_kv.has_value());
+    if (!s.mtp_kv) GTEST_FAIL() << "a SequenceState given an MTP pool should own an mtp_kv";
     s.kv.reserve(3);
     s.kv.commit(3);
     s.mtp_kv->reserve(2);
@@ -298,6 +298,7 @@ TEST(SequenceState, ResetDropsEverything) {
     s.gdn.recurrent(0)[0] = 3.0f;
     s.reset();
     EXPECT_EQ(s.length(), 0u);
+    if (!s.mtp_kv) GTEST_FAIL() << "reset() should clear the mtp_kv in place, not drop it";
     EXPECT_EQ(s.mtp_kv->length(), 0u);
     EXPECT_EQ(trunk.used_blocks(), 0u);
     EXPECT_EQ(mtp.used_blocks(), 0u);
