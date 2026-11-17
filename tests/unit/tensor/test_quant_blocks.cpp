@@ -51,8 +51,9 @@ TEST(QuantBlocks, BitExactVsGgufPy) {
     for (const auto& e : (*m)["entries"]) {
         const auto id = e["id"].get<std::string>();
         SCOPED_TRACE(id);
-        const auto t = halo::dtype_from_id(e["type_id"].get<std::uint32_t>());
-        ASSERT_TRUE(t.has_value());
+        const auto type_id = e["type_id"].get<std::uint32_t>();
+        const auto t = halo::dtype_from_id(type_id);
+        if (!t) GTEST_FAIL() << "manifest type_id " << type_id << " should map to a known DType";
         const auto rows = e["rows"].get<std::size_t>();
         const auto ne0 = e["ne0"].get<std::int64_t>();
         const auto raw = read_bytes(dir / e["raw"].get<std::string>());

@@ -33,7 +33,8 @@ TEST(HwState, CapturedFromEvoX2Fixture) {
     EXPECT_EQ(s.gpu_device, "1002:1586");
     EXPECT_EQ(s.gpu_performance_level, "auto");
     EXPECT_EQ(s.gpu_power_profile, "BOOTUP_DEFAULT");
-    ASSERT_TRUE(s.temperature_c);
+    if (!s.temperature_c) GTEST_FAIL() << "evo_x2 fixture should yield temperature_c";
+    if (!s.power_w) GTEST_FAIL() << "evo_x2 fixture should yield power_w";
     EXPECT_DOUBLE_EQ(*s.temperature_c, 45.0);
     EXPECT_DOUBLE_EQ(*s.power_w, 12.0);
     EXPECT_EQ(s.clocks_mhz.at("sclk"), 1000u);
@@ -84,10 +85,12 @@ TEST(HwState, CrossPowerModeComparisonRejected) {
 TEST(HwState, ThermalDriftInvalidatesRun) {
     const auto ok = check_thermal_drift(pinned(50), pinned(55));  // exactly at threshold: valid
     EXPECT_TRUE(ok.valid);
+    if (!ok.drift_c) GTEST_FAIL() << "50 -> 55 C should report drift_c";
     EXPECT_DOUBLE_EQ(*ok.drift_c, 5.0);
 
     const auto hot = check_thermal_drift(pinned(50), pinned(55.5));
     EXPECT_FALSE(hot.valid);
+    if (!hot.drift_c) GTEST_FAIL() << "50 -> 55.5 C should report drift_c";
     EXPECT_DOUBLE_EQ(*hot.drift_c, 5.5);
     EXPECT_NE(hot.reason.find("exceeds"), std::string::npos);
 
