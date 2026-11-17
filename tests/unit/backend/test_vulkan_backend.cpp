@@ -189,7 +189,7 @@ TEST(VulkanBackend, FusedNormIsOfferedOnlyWhereItIsBitwiseTheSeparateGemv) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     EXPECT_EQ(hb::make_vulkan_backend(ctx, {.ops = {.subgroup_reduce = false}})->limits().max_fused_norm_cols,
               hv::Ops(ctx, hv::OpsOptions{.subgroup_reduce = false}).fused_norm_max_cols())
-        << "tree reduction, reduce_workgroup 256: the fused norm is bitwise the separate path up to the LDS cap";
+        << "tree reduction, reduce_workgroup 256: the fused norm is bitwise the separate path at any width";
     hv::OpsOptions wg128{.subgroup_reduce = false};
     wg128.reduce_workgroup = 128;
     EXPECT_EQ(hb::make_vulkan_backend(ctx, {.ops = wg128})->limits().max_fused_norm_cols, 0u)

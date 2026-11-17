@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <format>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <span>
 #include <utility>
@@ -194,12 +195,9 @@ void Ops::gemv(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "
 void Ops::gemv_repacked(Stream& stream, const GemvArgs& args) { gemv_impl(stream, args, "gemv(repacked)", true); }
 
 std::uint32_t Ops::fused_norm_max_cols() const noexcept {
-    // matvec_<type>_normed shared memory, in floats: x[XCOLS] + rn[256] + red[WG] + redb[1] (BATCHED = 0) +
-    // IQ4_XS's sh_kv[16]. WG is the K-quant gemv workgroup gemv_impl picks (64 unless gemv_workgroup).
-    const std::uint64_t wg = options_.gemv_workgroup != 0 ? options_.gemv_workgroup : 64;
-    const std::uint64_t fixed = 256 + wg + 1 + 16;
-    const std::uint64_t floats = ctx_->info().max_shared_memory / k_f32;
-    return floats <= fixed ? 0u : static_cast<std::uint32_t>(std::min<std::uint64_t>(16384, floats - fixed));
+    // matvec_<type>_normed normalizes each input element as the main reads it (HALO_X): nothing row-sized
+    // lives in shared memory, so the width is not capped by the device.
+    return std::numeric_limits<std::uint32_t>::max();
 }
 
 void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool repacked,
@@ -209,13 +207,12 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     // The repacked layout (halo/tensor/repack.h) keeps the row footprint of the GGUF layout, so
     // row_bytes and every extent check below are unchanged; only the shader differs ("_rp").
     const bool normed = !a.norm_w.empty();
-    HALO_CHECK(!normed || (!repacked && a.n_vec == 1 && a.cols <= fused_norm_max_cols() &&
+    HALO_CHECK(!normed || (!repacked && a.n_vec == 1 &&
                            (a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K ||
                             a.wtype == DType::IQ4_XS)),
                ErrorCode::Unsupported,
-               "{}: fused norm needs a non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS weight, n_vec == 1 and cols <= {} (got "
-               "cols {}, n_vec {})",
-               op, fused_norm_max_cols(), a.cols, a.n_vec);
+               "{}: fused norm needs a non-repacked Q4_K/Q5_K/Q6_K/IQ4_XS weight and n_vec == 1 (got n_vec {})", op,
+               a.n_vec);
     HALO_CHECK(!repacked || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K || a.wtype == DType::IQ4_XS,
                ErrorCode::Unsupported, "{}: no repacked matvec for weight type id {} (Q5_K, Q6_K, IQ4_XS)", op,
                static_cast<std::uint32_t>(a.wtype));
@@ -300,18 +297,18 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
                              : swar_main                ? 64
                                                         : options_.reduce_workgroup;
     if (normed) {
-        // Fused rms_norm + decode matvec (n_vec == 1): x is the raw row; the shader stages
-        // (x * inv_rms) * norm_w in shared memory (XCOLS = cols floats) and runs the unmodified main.
+        // Fused rms_norm + decode matvec (n_vec == 1): x is the raw row; the shader computes the row's
+        // inv_rms once per workgroup and the main reads (x * inv_rms) * norm_w element by element (HALO_X).
         const Operand onw = operand(a.norm_w, 1, std::uint64_t{a.cols} * k_f32, Access::Floats, align, op, "norm_w");
         require_disjoint(oy, "y", {{&onw, "norm_w"}}, op);
         struct NPush {
             std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride, xr_off, nw_off;
             float eps;
         };
-        const Kernel& kn = kernel(shader + "_normed", 4, sizeof(NPush), {{0, wg}, {1, 0u}, {2, a.cols}}, {wg, 1, 1});
+        const Kernel& kn = kernel(shader + "_normed", 4, sizeof(NPush), {{0, wg}, {1, 0u}}, {wg, 1, 1});
         const std::array nbindings{ow.binding, ox.binding, oy.binding, onw.binding};
         const DeviceInfo& ninfo = ctx_->info();
-        // x_off = 0: the shader stages the normalized row at index 0; the raw view remainder is xr_off.
+        // x_off = 0: the main's x indices are element indices of the row; the raw view remainder is xr_off.
         const NPush npush{a.rows, a.cols, 1, ow.off, ow.stride, 0, 0, oy.off, oy.stride, ox.off, onw.off, a.norm_eps};
         stream.dispatch(kn, nbindings, npush, grid_1d(a.rows, ninfo.max_workgroup_count[0], ninfo.max_workgroup_count[1]),
                         0b100);  // y written

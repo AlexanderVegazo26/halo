@@ -16,6 +16,12 @@
 //   IQ4_FN        -> function-name token (pasted as iq4_<IQ4_FN>)
 // plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp.
 
+// Input element i of the vector being dotted. Default: the x buffer; the _normed shaders define
+// HALO_X(i) to normalize x on the fly (HALO_FUSE_NORM, matmul/matvec_<type>_normed.comp).
+#ifndef HALO_X
+#define HALO_X(i) x[i]
+#endif
+
 #define IQ4_PASTE2(a, b) a##b
 #define IQ4_PASTE(a, b) IQ4_PASTE2(a, b)
 
@@ -43,10 +49,10 @@ float IQ4_PASTE(iq4_apply_, IQ4_FN)(const QI4Block b, const uint xb, const float
         const uvec4 nib = uvec4(w, w >> 8u, w >> 16u, w >> 24u);
         const uvec4 q0 = nib & 0xFu;         // lo nibbles: elements 4l..4l+3
         const uvec4 q1 = (nib >> 4u) & 0xFu;  // hi nibbles: elements 16+4l..16+4l+3
-        const float x0 = x[xb + 4u * l], x1 = x[xb + 4u * l + 1u];
-        const float x2 = x[xb + 4u * l + 2u], x3 = x[xb + 4u * l + 3u];
-        const float x4 = x[xb + 16u + 4u * l], x5 = x[xb + 16u + 4u * l + 1u];
-        const float x6 = x[xb + 16u + 4u * l + 2u], x7 = x[xb + 16u + 4u * l + 3u];
+        const float x0 = HALO_X(xb + 4u * l), x1 = HALO_X(xb + 4u * l + 1u);
+        const float x2 = HALO_X(xb + 4u * l + 2u), x3 = HALO_X(xb + 4u * l + 3u);
+        const float x4 = HALO_X(xb + 16u + 4u * l), x5 = HALO_X(xb + 16u + 4u * l + 1u);
+        const float x6 = HALO_X(xb + 16u + 4u * l + 2u), x7 = HALO_X(xb + 16u + 4u * l + 3u);
         sum = fma(x0, float(sh_kv[q0.x]),
               fma(x1, float(sh_kv[q0.y]),
               fma(x2, float(sh_kv[q0.z]),

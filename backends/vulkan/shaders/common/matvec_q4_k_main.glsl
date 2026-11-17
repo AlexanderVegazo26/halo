@@ -16,6 +16,12 @@
 //   Q4K_FN        -> function-name token (pasted as q4k_<Q4K_FN>)
 // plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp.
 
+// Input element i of the vector being dotted. Default: the x buffer; the _normed shaders define
+// HALO_X(i) to normalize x on the fly (HALO_FUSE_NORM, matmul/matvec_<type>_normed.comp).
+#ifndef HALO_X
+#define HALO_X(i) x[i]
+#endif
+
 #define Q4K_PASTE2(a, b) a##b
 #define Q4K_PASTE(a, b) Q4K_PASTE2(a, b)
 
@@ -58,10 +64,10 @@ Q4KBlock Q4K_PASTE(q4k_dequant_, Q4K_FN)(const uint bo, const uint v_im, const u
 // Dot this thread's 16 dequantized elements against x at element offset xb, add to acc.
 // Every float op is precise (same expression in decode and batched paths -> bitwise equal).
 float Q4K_PASTE(q4k_apply_, Q4K_FN)(const Q4KBlock b, const uint xb, const float acc) {
-    const float x0 = x[xb], x1 = x[xb + 1u], x2 = x[xb + 2u], x3 = x[xb + 3u];
-    const float x4 = x[xb + 32u], x5 = x[xb + 33u], x6 = x[xb + 34u], x7 = x[xb + 35u];
-    const float x8 = x[xb + 128u], x9 = x[xb + 129u], x10 = x[xb + 130u], x11 = x[xb + 131u];
-    const float x12 = x[xb + 160u], x13 = x[xb + 161u], x14 = x[xb + 162u], x15 = x[xb + 163u];
+    const float x0 = HALO_X(xb), x1 = HALO_X(xb + 1u), x2 = HALO_X(xb + 2u), x3 = HALO_X(xb + 3u);
+    const float x4 = HALO_X(xb + 32u), x5 = HALO_X(xb + 33u), x6 = HALO_X(xb + 34u), x7 = HALO_X(xb + 35u);
+    const float x8 = HALO_X(xb + 128u), x9 = HALO_X(xb + 129u), x10 = HALO_X(xb + 130u), x11 = HALO_X(xb + 131u);
+    const float x12 = HALO_X(xb + 160u), x13 = HALO_X(xb + 161u), x14 = HALO_X(xb + 162u), x15 = HALO_X(xb + 163u);
 
     const float m0 = b.sc_lo.z, m1 = b.sc_lo.w, m4 = b.sc_hi.z, m5 = b.sc_hi.w;
     precise float sx = fma(x0, b.qA.x, fma(x1, b.qA.y, fma(x2, b.qA.z, x3 * b.qA.w)));

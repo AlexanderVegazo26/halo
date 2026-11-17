@@ -748,17 +748,15 @@ TEST(VkHead, GemvFusedNormIsBitwiseRmsNormThenTheBatchedGemv) {
     // (matvec_<type>_normed), while R > 1 forwards (MTP verify, prefill) keep rms_norm + the batched gemv.
     // Greedy output with MTP on and off stays identical only if every fused row is bit for bit that
     // row of the unfused batch. Covered: the four fusable types, cols 256 / 768 / 5120 (the 27B's
-    // n_embd) / the device's fused_norm_max_cols rounded down to whole blocks (the staged row nearly fills
-    // shared memory), rows far apart in magnitude, and x / norm_w view offsets (element remainders the
-    // shader must add). Before the norm math was `precise` on both sides, about a third of the outputs
+    // n_embd) / 16384 and 20480 (past the old shared-memory cap of 16047 on RADV: the shader used to stage
+    // the normed row there, and 16384 crashed RADV's compiler), rows far apart in magnitude, and x / norm_w
+    // view offsets (element remainders the shader must add). Before the norm math was `precise` on both sides, about a third of the outputs
     // were 1 ulp off: the compiler contracted / rewrote the separate and fused RMS differently.
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops tree(ctx, hv::OpsOptions{.subgroup_reduce = false});
     ASSERT_EQ(tree.options().reduce_workgroup, 256u) << "the bitwise claim is for the default reduce workgroup";
-    const std::uint32_t cap = tree.fused_norm_max_cols() / 256 * 256;
-    ASSERT_GE(cap, 5120u) << "fused_norm_max_cols " << tree.fused_norm_max_cols() << ": the 27B's n_embd must fuse";
     for (const ref::WType t : {ref::WType::Q4_K, ref::WType::Q5_K, ref::WType::Q6_K, ref::WType::IQ4_XS}) {
-        for (const std::uint32_t cols : {256u, 768u, 5120u, cap}) {
+        for (const std::uint32_t cols : {256u, 768u, 5120u, 16384u, 20480u}) {
             for (const auto [x_lead, nw_lead] : {std::pair{0u, 0u}, std::pair{3u, 5u}}) {
                 const std::string what = std::string(tname(t)) + " cols " + std::to_string(cols) + " x lead " +
                                          std::to_string(x_lead) + " norm_w lead " + std::to_string(nw_lead);
@@ -792,16 +790,14 @@ TEST(VkHead, GemvFusedNormKeepsTheTreeReductionAndSplitsIntoRowSlabs) {
 }
 
 TEST(VkHead, GemvFusedNormRejectsWhatItCannotFuse) {
-    // A fused norm the shader cannot honour must throw, never silently run an unnormalized gemv, and never
-    // reach the driver with a row that cannot fit in shared memory (RADV's compiler dies with SIGFPE).
+    // A fused norm the shader cannot honour must throw, never silently run an unnormalized gemv. The width is
+    // not one of them: the shader keeps nothing row-sized in shared memory (it once did, and cols 16384
+    // crashed RADV's compiler with SIGFPE), so any cols runs.
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     hv::Ops ops(ctx);
-    const std::uint32_t max_cols = ops.fused_norm_max_cols();
-    ASSERT_GT(max_cols, 0u);
-    // The cap and the first whole-block width past it (Q4_K rows are 256-column blocks).
-    const std::uint32_t at_cap = max_cols / 256 * 256, rows = 4, cols = (max_cols / 256 + 1) * 256;
-    std::cout << "[vk-head] fused_norm_max_cols " << max_cols << " (max_shared_memory "
-              << ctx->info().max_shared_memory << " B)\n";
+    EXPECT_EQ(ops.fused_norm_max_cols(), std::numeric_limits<std::uint32_t>::max())
+        << "fused_norm_max_cols: no shared-memory cap on the fused width";
+    const std::uint32_t rows = 4, cols = 16384;
     hv::Buffer w = hv::Buffer::create(ctx, rows * halo::tensor::row_bytes(halo::DType::Q4_K, cols) + 64,
                                       hv::MemoryUsage::DeviceLocal);
     hv::Buffer x = hv::Buffer::create(ctx, 2 * cols * 4, hv::MemoryUsage::DeviceLocal);
@@ -813,8 +809,7 @@ TEST(VkHead, GemvFusedNormRejectsWhatItCannotFuse) {
         g.norm_w = hv::BufferView(nw, 0, std::uint64_t{c} * 4);
         return g;
     };
-    EXPECT_NO_THROW(ops.gemv(s, args(halo::DType::Q4_K, at_cap, 1))) << "cols " << at_cap << " is within the cap";
-    EXPECT_THROW(ops.gemv(s, args(halo::DType::Q4_K, cols, 1)), halo::Error) << "cols " << cols << " > " << max_cols;
+    EXPECT_NO_THROW(ops.gemv(s, args(halo::DType::Q4_K, cols, 1))) << "cols " << cols << ": no width cap";
     EXPECT_THROW(ops.gemv(s, args(halo::DType::Q4_K, 256, 2)), halo::Error) << "n_vec 2: the fused form is decode only";
     EXPECT_THROW(ops.gemv(s, args(halo::DType::F32, 256, 1)), halo::Error) << "F32 has no _normed shader";
     EXPECT_THROW(ops.gemv(s, args(halo::DType::Q8_0, 256, 1)), halo::Error) << "Q8_0 has no _normed shader";

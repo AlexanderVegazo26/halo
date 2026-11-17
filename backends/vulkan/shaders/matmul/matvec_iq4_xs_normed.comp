@@ -7,7 +7,7 @@
 // arbitrary byte offsets (VkViews arena gate) via HALO_DEFINE_BYTE_READERS with identical
 // integer content, so both produce bitwise-identical results.
 // NORMED variant (opt-in HALO_FUSE_NORM=1, decode n_vec == 1 only): y = W * (rms_norm(x) * nw).
-// Wraps the unmodified per-type main; see the prologue below. Copy of matvec_iq4_xs.comp otherwise.
+// Wraps the per-type main (its input reads go through HALO_X); see the prologue below. Copy of matvec_iq4_xs.comp otherwise.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
@@ -34,13 +34,18 @@ layout(push_constant) uniform Push {
 layout(constant_id = 1) const uint BATCHED = 1;
 const uint MAX_VEC = 8u;
 
-// HALO_FUSE_NORM: the row RMS is computed here and the normalized input
-// x[c] = (xr[c] * inv_rms) * nw[c] is staged once per workgroup in shared memory under the name
-// `x`, so the included main (which indexes x[pc.x_off + ...]) runs unmodified; the host sends
-// x_off = 0. XCOLS = cols (specialization constant 2; cols x 4 bytes of LDS).
-layout(constant_id = 2) const uint XCOLS = 5120;
-shared float x[XCOLS];
+// HALO_FUSE_NORM: the row RMS is computed here once per workgroup, and the included main reads the
+// normalized input x[c] = (xr[c] * inv_rms) * nw[c] through HALO_X(c), computed as it is read. A workgroup
+// covers one row and reads each input element once, so staging the normalized row in shared memory
+// (cols x 4 bytes: 20 KiB at the 27B's 5120) bought no reuse, capped cols by the shared-memory size and cut
+// how many workgroups fit on a CU. The host sends x_off = 0, so the main's indices are element indices c.
 shared float rn[256];
+float g_inv_rms;  // set by norm_prologue() before the main runs; the same value in every invocation
+float normed_x(const uint c) {
+    precise float r = (xr[pc.xr_off + c] * g_inv_rms) * nw[pc.nw_off + c];
+    return r;
+}
+#define HALO_X(c) normed_x(c)
 
 shared float red[WG];
 shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
@@ -92,11 +97,7 @@ void norm_prologue() {
         barrier();
     }
     precise float inv = 1.0 / sqrt(rn[0] / float(pc.cols) + pc.eps);
-    for (uint i = tid; i < pc.cols; i += WG) {
-        precise float r = (xr[pc.xr_off + i] * inv) * nw[pc.nw_off + i];
-        x[i] = r;
-    }
-    barrier();
+    g_inv_rms = inv;
 }
 
 void main() {

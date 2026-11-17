@@ -230,10 +230,11 @@ struct Limits {
     /// LmHeadArgs::ids is implemented (dense int32 winning ids written in stream order; CPU, Vulkan).
     bool lm_head_ids = false;
     /// Largest `cols` of a gemv with GemvArgs::norm_w (the fused input norm, HALO_FUSE_NORM) whose result is
-    /// bit for bit rms_norm then the backend's own unfused gemv; 0 = no such gemv. Vulkan: the staged row
-    /// must fit in shared memory, and only with the tree reduction at reduce_workgroup 256 (the _normed
-    /// shaders have no subgroupAdd form). Models fuse only within it: a fused R == 1 decode must stay
-    /// bitwise the unfused R > 1 MTP verify forward, or MTP could change greedy output.
+    /// bit for bit rms_norm then the backend's own unfused gemv; 0 = no such gemv. Vulkan: unbounded
+    /// (UINT32_MAX; bitwise-checked up to 20480 cols, VkHead.GemvFusedNorm*), but only with the tree
+    /// reduction at reduce_workgroup 256 (the _normed shaders have no subgroupAdd form). Models fuse only
+    /// within it: a fused R == 1 decode must stay bitwise the unfused R > 1 MTP verify forward, or MTP could
+    /// change greedy output.
     std::uint32_t max_fused_norm_cols = 0;
     /// GemvArgs::gates (the GDN gates epilogue) is implemented for F32 and Q8_0 weights (Vulkan). Models then
     /// run their fused beta|alpha gemv with it instead of gemv + gdn_gates (one dispatch less per GDN layer).
