@@ -4,10 +4,11 @@
 Runs next.md's "Verification (every step)" speed command once per variant (the baseline,
 plain decode, deeper drafts, and each opt-in HALO_* flag alone) and writes a table with
 tok/s, the change against the baseline, the request's draft acceptance, and whether the
-greedy output is identical to the baseline's.
+greedy output is identical to the baseline's. `--variants subgroup-reduce+draft-vocab-32k`
+measures several flags together (env and args merged; bitwise only if every part is).
 
     scripts/bench_decode.py --halo build-dev/tools/halo/halo --model Qwen3.8-27B-UD-Q4_K_XL.gguf \
-        [--variants all|NAME,NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] [--busy-settle 10] \
+        [--variants all|NAME,NAME+NAME] [-n 128] [--ctx 4096] [--repeat 1] [--busy-max 5] [--busy-settle 10] \
         [--report-dir .test-report/bench-decode]
 
 Numbers taken while another process keeps the GPU busy are not benchmarks (2026-11-14: a
@@ -211,16 +212,43 @@ def run_variant(v: Variant, a, env: dict) -> tuple[Result, list]:
     return r, outputs
 
 
+def combine(name: str, parts: list[Variant]) -> Variant:
+    """One variant that applies every part's flags at once (`a+b`): its env and args merged, bitwise
+    only if every part is. Parts that set the same HALO_* knob or both pass CLI args (e.g. two
+    --mtp-draft depths) can't be combined: one would silently override the other."""
+    env: dict = {}
+    args: list = []
+    for p in parts:
+        clash = sorted(k for k in p.env if k in env)
+        if clash:
+            raise SystemExit(f"bench_decode: variant {name}: {p.name} sets {', '.join(clash)} again")
+        if p.args and args:
+            raise SystemExit(f"bench_decode: variant {name}: {p.name} passes {' '.join(p.args)} after "
+                             f"{' '.join(args)}; only one part may set CLI args")
+        env.update(p.env)
+        args += p.args
+    return Variant(name, "+".join(p.step for p in parts), env, tuple(args), all(p.bitwise for p in parts))
+
+
 def select(names: str) -> list[Variant]:
     if names == "all":
         return list(VARIANTS)
     by_name = {v.name: v for v in VARIANTS}
     wanted = [n.strip() for n in names.split(",") if n.strip()]
-    unknown = [n for n in wanted if n not in by_name]
+    unknown = [p for n in wanted for p in n.split("+") if p not in by_name]
     if unknown:
         raise SystemExit(f"bench_decode: unknown variant(s) {', '.join(unknown)}; known: {', '.join(by_name)}")
+    chosen = []
+    for n in wanted:
+        parts = n.split("+")
+        if len(parts) == 1:
+            chosen.append(by_name[n])
+            continue
+        if len(set(parts)) != len(parts) or "baseline" in parts:
+            raise SystemExit(f"bench_decode: variant {n}: a combination needs distinct parts other than baseline")
+        chosen.append(combine(n, [by_name[p] for p in parts]))
     # The baseline always runs first: every comparison is against it.
-    return [by_name["baseline"], *(by_name[n] for n in wanted if n != "baseline")]
+    return [by_name["baseline"], *(v for v in chosen if v.name != "baseline")]
 
 
 def write_report(a, results: list[Result], stripped: list, rc: int) -> Path:
@@ -257,7 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-n", "--max-tokens", type=int, default=128)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--repeat", type=int, default=1)
-    ap.add_argument("--variants", default="all", help="all, or a comma list (baseline always runs first)")
+    ap.add_argument("--variants", default="all",
+                    help="all, or a comma list; a+b runs those variants' flags together (baseline always runs first)")
     ap.add_argument("--busy-max", type=int, default=5, help="highest gpu_busy_percent allowed before a run")
     ap.add_argument("--busy-file", default=DEFAULT_BUSY_GLOB, help="glob of gpu_busy_percent files")
     ap.add_argument("--busy-samples", type=int, default=5)

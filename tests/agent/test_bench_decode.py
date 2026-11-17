@@ -260,6 +260,42 @@ class BenchDecode(unittest.TestCase):
             bd.select("baseline,warp-drive")
         self.assertIn("warp-drive", str(cm.exception))
 
+    def test_combined_variant_runs_every_parts_flags_in_one_command(self):
+        self.spec["tps_by_env"] = {"HALO_MTP_DRAFT_VOCAB": 11.0}
+        rc = self.run_bench("--variants", "subgroup-reduce+draft-vocab-32k+mtp-draft-3,repack")
+        self.assertEqual(rc, 0, f"stderr: {self.stderr}\n{self.summary}")
+        base, combo, repack = self.calls()
+        self.assertEqual(combo["halo_env"], {"HALO_SUBGROUP_REDUCE": "1", "HALO_MTP_DRAFT_VOCAB": "32768"},
+                         "a+b must run with both parts' HALO_* flags at once")
+        self.assertEqual(combo["argv"][-2:], ["--mtp-draft", "3"], f"the part's CLI args must be kept: {combo['argv']}")
+        self.assertEqual(repack["halo_env"], {"HALO_REPACK": "1"}, "a variant after a combination runs alone")
+        r = self.results["subgroup-reduce+draft-vocab-32k+mtp-draft-3"]
+        self.assertEqual((r["step"], r["tps_median"], r["bitwise"]), ("1+2+5", 11.0, True), r)
+        self.assertIn("HALO_SUBGROUP_REDUCE=1 HALO_MTP_DRAFT_VOCAB=32768 ", r["command"])
+        self.assertIn("| subgroup-reduce+draft-vocab-32k+mtp-draft-3 | 1+2+5 | 11.00 | +10.0% |", self.summary)
+
+    def test_combination_with_a_lossy_part_is_lossy(self):
+        self.spec["output_by_env"] = {"HALO_KV_FP16": "390"}
+        rc = self.run_bench("--variants", "subgroup-reduce+kv-fp16")
+        self.assertEqual(rc, 0, f"a lossy part may change the combination's output: {self.summary}")
+        self.assertEqual(self.results["subgroup-reduce+kv-fp16"]["bitwise"], False)
+
+    def test_combinations_that_would_override_a_part_are_usage_errors(self):
+        for names, why in (("plain+mtp-draft-3", "--mtp-draft 3 after --mtp-draft 0"),
+                           ("kv-fp16+kv-fp16", "distinct parts"),
+                           ("baseline+repack", "other than baseline"),
+                           ("repack+warp-drive", "warp-drive")):
+            with self.subTest(names=names), self.assertRaises(SystemExit) as cm:
+                bd.select(names)
+            self.assertIn(why, str(cm.exception), f"select({names!r}) must refuse and say why")
+
+    def test_parts_setting_the_same_knob_cannot_be_combined(self):
+        a = bd.Variant("a", "1", {"HALO_GDN_DV_TILE": "32"})
+        b = bd.Variant("b", "3", {"HALO_GDN_DV_TILE": "64"})
+        with self.assertRaises(SystemExit) as cm:
+            bd.combine("a+b", [a, b])
+        self.assertIn("b sets HALO_GDN_DV_TILE again", str(cm.exception))
+
     def test_every_speed_flag_halo_reads_is_stripped(self):
         # A new HALO_* knob in the sources must be added to SPEED_FLAGS (or knowingly left out).
         import re
