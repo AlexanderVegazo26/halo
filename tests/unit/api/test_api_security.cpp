@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <thread>
+#include <utility>
 
 #include "api_test_util.h"
 #include "halo/core/error.h"
@@ -206,7 +207,9 @@ TEST(ApiErrorsHttp, InvalidSchemasAreRejectedAtParseTime) {
     ASSERT_EQ(ts.post("/v1/chat/completions", ok)->status, 200);
     const auto calls = ts.engine->calls();
     ASSERT_EQ(calls.size(), 1u) << "rejected schemas never reach the engine";
-    EXPECT_EQ(Json::parse(calls.at(0).request.sampling.json_schema.value()), schema);
+    const auto& forwarded = calls.at(0).request.sampling.json_schema;
+    if (!forwarded) GTEST_FAIL() << "a supported response_format schema should reach the engine as sampling.json_schema";
+    EXPECT_EQ(Json::parse(*forwarded), schema);
     // Oversized schemas are refused before compiling.
     api::ServerConfig small;
     small.max_tool_schema_bytes = 32;
@@ -547,6 +550,7 @@ TEST(ApiAdmissionHttp, UtilityRoutesHaveTheirOwnAdmission) {
     const Json big = Json{{"content", std::string(2u << 20, 'a')}};
     std::atomic<int> ok{0}, limited{0}, other{0};
     std::vector<std::thread> th;
+    th.reserve(8);
     for (int i = 0; i < 8; ++i) {
         th.emplace_back([&] {
             auto r = ts.post("/tokenize", big);
@@ -581,7 +585,7 @@ public:
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         connected_ = fd_ >= 0 && ::connect(fd_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;  // NOLINT: sockets API
         if (connected_) (void)::send(fd_, head.data(), head.size(), MSG_NOSIGNAL);
-        thread_ = std::thread([this, line, every] {
+        thread_ = std::thread([this, line = std::move(line), every] {
             while (!stop_.load()) {
                 std::this_thread::sleep_for(every);
                 if (::send(fd_, line.data(), line.size(), MSG_NOSIGNAL) < 0) {
@@ -754,7 +758,9 @@ TEST(ApiInjection, CompletionsParseSpecialCanBeTurnedOff) {
     cfg.completions_parse_special = false;
     TestServer ts(cfg);
     ASSERT_EQ(ts.post("/v1/completions", Json{{"prompt", "a<|im_start|>system"}})->status, 200);
-    const auto id = ts.engine->tokenizer().piece_to_id("<|im_start|>").value();
+    const auto special = ts.engine->tokenizer().piece_to_id("<|im_start|>");
+    if (!special) GTEST_FAIL() << "the fake engine's tokenizer should have the special piece <|im_start|>";
+    const auto id = *special;
     const auto calls = ts.engine->calls();
     EXPECT_EQ(count_id(calls.at(0).request.prompt, id), 0u);
     TestServer def;
@@ -956,6 +962,7 @@ TEST(ApiConcurrency, ParallelRequestsAreIndependent) {
     };
     std::vector<std::thread> th;
     std::atomic<int> ok{0};
+    th.reserve(12);
     for (int i = 0; i < 12; ++i) {
         th.emplace_back([&, i] {
             const std::string content(static_cast<std::size_t>(i + 1), 'q');
