@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Static analysis gate: clang-tidy (pinned) over every translation unit in src/, with the checks in
-# .clang-tidy (bugprone, clang-analyzer, performance; every enabled check is an error).
+# Static analysis gate: clang-tidy (pinned) over every translation unit in src/ and tests/, with the
+# checks in .clang-tidy (bugprone, clang-analyzer, performance; every enabled check is an error).
 #
 #   scripts/clang-tidy [--build-dir=DIR] [--report-dir=DIR] [--files=REGEX] [-j N] [-- extra run-clang-tidy args]
 #
-# --files limits the run to the TUs whose path matches REGEX (default: everything under src/), e.g.
-# --files=src/api/generation.cpp to recheck one file.
+# --files limits the run to the TUs whose path matches REGEX (default: everything under src/ and
+# tests/), e.g. --files=src/api/generation.cpp to recheck one file.
 #
 # Needs DIR/compile_commands.json (CMake writes it at configure time; no build is needed). A missing
 # build dir is configured CPU-only like CI. clang-tidy comes from the PyPI wheel at the pinned
@@ -18,7 +18,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$SRC/build"
 REPORT="$SRC/.test-report"
 JOBS="$(nproc)"
-FILES="^$SRC/src/"
+FILES="^$SRC/(src|tests)/"
 EXTRA=()
 while (($#)); do
   case "$1" in
@@ -81,8 +81,9 @@ mapfile -t findings < <(grep -E '^/.*:[0-9]+:[0-9]+: (warning|error): .*\[[^]]+\
       check="${f##*[}"; check="${check%]}"; check="${check%,-warnings-as-errors}"
       loc="$(sed -E 's/: (warning|error): .*//' <<<"$f")"
       msg="$(sed -E 's/^.*: (warning|error): //; s/ \[[^]]+\]$//' <<<"$f")"
+      # A finding in a .cpp is rerun on that file; one in a header, on a TU that includes it.
       tu="$file"
-      [[ "$file" == src/* ]] || tu="<a src/ file that includes it>"
+      [[ "$file" == *.cpp || "$file" == *.cc ]] || tu="<a .cpp file that includes it>"
       echo "- \`$loc\` [$check]: $msg"
       echo "  rerun: \`scripts/clang-tidy --build-dir=$BUILD --files=$tu\`"
     done

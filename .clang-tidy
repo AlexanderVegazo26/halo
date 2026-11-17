@@ -1,4 +1,5 @@
-# clang-tidy gate for halo's own code (src/ and include/halo/). Run it with scripts/clang-tidy;
+# clang-tidy gate for halo's own code (src/, include/halo/ and, since 2026-11-17, the tests/
+# translation units: they were worked down to zero findings). Run it with scripts/clang-tidy;
 # CI's `clang-tidy` job runs the same script with the same pinned clang-tidy.
 #
 # Every enabled check is an error: a new finding fails the job. Two kinds of checks are off:

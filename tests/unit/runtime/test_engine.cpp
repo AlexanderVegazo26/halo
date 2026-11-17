@@ -767,6 +767,9 @@ protected:
     };
     /// Vulkan engine, MTP drafting k = 3 with the gate forced on. Null = no Vulkan device.
     static std::unique_ptr<Built> build(std::optional<bool> ngram,
+                                        // By-value sink: moved into o.draft_hook when Vulkan is
+                                        // built; only the CPU-only #else branch leaves it unused.
+                                        // NOLINTNEXTLINE(performance-unnecessary-value-param)
                                         CpuEngineOptions::DraftHook hook = {}) {
 #if defined(HALO_TEST_VULKAN)
         auto b = std::make_unique<Built>();

@@ -230,7 +230,7 @@ jobs:
           if-no-files-found: ignore
 
   # Static analysis: clang-tidy 23.1.4 (PyPI wheel, pinned in scripts/clang-tidy) over every TU in
-  # src/ with the checks in .clang-tidy (bugprone, clang-analyzer, performance; findings are errors).
+  # src/ and tests/ with the checks in .clang-tidy (bugprone, clang-analyzer, performance; findings are errors).
   # Configure only: compile_commands.json is all it needs. The report lists each finding with
   # file:line, check and a rerun-one-file command; checks still being worked down are the RATCHET
   # list in .clang-tidy.
