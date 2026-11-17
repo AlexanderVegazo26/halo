@@ -58,9 +58,9 @@ TEST(Discovery, EvoX2GpuAndTiers) {
     EXPECT_EQ(g.compute_units, 40u);
     EXPECT_EQ(g.wavefront_size, 32u);
     EXPECT_EQ(g.max_engine_clock_mhz, 2900u);
-    ASSERT_TRUE(g.telemetry.temperature_c);
+    if (!g.telemetry.temperature_c) GTEST_FAIL() << "temperature_c should be read from the fake hwmon temp1_input";
     EXPECT_DOUBLE_EQ(*g.telemetry.temperature_c, 45.0);
-    ASSERT_TRUE(g.telemetry.power_w);
+    if (!g.telemetry.power_w) GTEST_FAIL() << "power_w should fall back to the fake hwmon power1_input";
     EXPECT_DOUBLE_EQ(*g.telemetry.power_w, 12.0);  // power1_input fallback
     EXPECT_EQ(g.telemetry.sclk_mhz, 1000u);
     EXPECT_EQ(g.telemetry.mclk_mhz, 4000u);

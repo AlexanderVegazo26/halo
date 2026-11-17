@@ -16,7 +16,7 @@ TEST(DType, IdsMapOneToOneWithGgml) {
             EXPECT_TRUE(halo::ggml_type_name(id).empty());
             continue;
         }
-        ASSERT_TRUE(t.has_value()) << id;
+        if (!t) GTEST_FAIL() << "dtype_from_id(" << id << ") should map to a DType";
         EXPECT_EQ(static_cast<std::uint32_t>(*t), id);
         EXPECT_EQ(halo::traits(*t).name, halo::ggml_type_name(id));
     }

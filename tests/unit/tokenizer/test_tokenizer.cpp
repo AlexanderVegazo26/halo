@@ -227,6 +227,8 @@ TEST(TokenizerSpec, RejectsMalformedSpecsWithTypedErrors) {
     size_mismatch.types.pop_back();
     EXPECT_EQ(code_of(size_mismatch), ErrorCode::Model);
     auto garbage_type = tiny_spec();
+    // 42 is deliberately outside TokenType: from_spec must reject an unknown type id.
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
     garbage_type.types[7] = static_cast<TokenType>(42);
     EXPECT_EQ(code_of(garbage_type), ErrorCode::Model);
 }
@@ -430,6 +432,7 @@ TEST(TokenizerGolden, CodepointSweepMatchesHf) {
         std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
         halo::tokenizer::split_qwen35(cps, ranges);
         std::vector<std::size_t> lens;
+        lens.reserve(ranges.size());
         for (auto [a, b] : ranges) lens.push_back(b - a);
         if (lens != c["piece_lens"].get<std::vector<std::size_t>>()) {
             if (++failures <= 5) {
