@@ -187,7 +187,8 @@ TEST(VkBuffer, MoveTransfersOwnership) {
     hv::Buffer a = hv::Buffer::create(ctx, 256, hv::MemoryUsage::HostVisible);
     const VkBuffer h = a.handle();
     hv::Buffer b = std::move(a);
-    EXPECT_FALSE(a.valid());  // NOLINT(bugprone-use-after-move): moved-from state is specified
+    // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move): moved-from state is specified
+    EXPECT_FALSE(a.valid());
     EXPECT_EQ(b.handle(), h);
     hv::Buffer c = hv::Buffer::create(ctx, 128, hv::MemoryUsage::DeviceLocal);
     c = std::move(b);
@@ -220,9 +221,12 @@ TEST(VkStream, CopyTimestampsAndReuse) {
     s.submit_and_wait();
     EXPECT_EQ(download<std::uint32_t>(b, src.size()), src);
     if (ctx->info().timestamps_supported()) {
-        ASSERT_TRUE(t0 && t1);
+        if (!t0 || !t1) {
+            GTEST_FAIL() << "timestamps are supported but timestamp() returned no query (t0 "
+                         << (t0 ? "set" : "empty") << ", t1 " << (t1 ? "set" : "empty") << ")";
+        }
         const auto ns = s.elapsed_ns(*t0, *t1);
-        ASSERT_TRUE(ns.has_value());
+        if (!ns) GTEST_FAIL() << "elapsed_ns(t0, t1) around a 256 KiB copy returned no value";
         EXPECT_GT(*ns, 0.0) << "timestamps around a 256 KiB copy did not advance";
         std::cout << "[vk-timing] 256 KiB copy: " << *ns << " ns — "
                   << (ctx->info().correctness_only ? "lavapipe (CPU) timing — not a GPU performance number"
