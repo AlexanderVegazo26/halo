@@ -55,7 +55,7 @@ struct Streamed {
     std::string body;
     httplib::Headers headers;
 };
-Streamed post_stream(const TestServer& ts, const std::string& path, const Json& body, httplib::Headers h = {}) {
+Streamed post_stream(const TestServer& ts, const std::string& path, const Json& body, const httplib::Headers& h = {}) {
     Streamed s;
     auto c = ts.client();
     auto r = c->Post(path, h, body.dump(), "application/json", [&](const char* d, std::size_t n) {
@@ -191,7 +191,9 @@ TEST(ApiServer, ServedModelNameOverride) {
 TEST(ApiServer, TokenizeAndApplyTemplate) {
     TestServer ts;
     const auto& tok = ts.engine->tokenizer();
-    const auto im_end = tok.piece_to_id("<|im_end|>").value();
+    const auto special = tok.piece_to_id("<|im_end|>");
+    if (!special) GTEST_FAIL() << "the fake engine's tokenizer should have the special piece <|im_end|>";
+    const auto im_end = *special;
     auto r = ts.post("/tokenize", Json{{"content", "a<|im_end|>"}});
     ASSERT_EQ(r->status, 200);
     Json j = Json::parse(r->body);
@@ -361,7 +363,9 @@ TEST(ApiOpenAI, StructuredOutputPassthrough) {
     EXPECT_EQ(ts.post("/v1/chat/completions", b)->status, 400);
     const auto calls = ts.engine->calls();
     ASSERT_EQ(calls.size(), 3u);
-    EXPECT_EQ(Json::parse(calls.at(0).request.sampling.json_schema.value()), schema);
+    const auto& forwarded = calls.at(0).request.sampling.json_schema;
+    if (!forwarded) GTEST_FAIL() << "a json_schema response_format should reach the engine as sampling.json_schema";
+    EXPECT_EQ(Json::parse(*forwarded), schema);
     EXPECT_FALSE(calls.at(0).request.sampling.json_object);
     EXPECT_TRUE(calls.at(1).request.sampling.json_object);
     EXPECT_FALSE(calls.at(1).request.sampling.json_schema.has_value());
@@ -755,7 +759,9 @@ TEST(ApiAnthropic, ThinkingBudgetEffortAndStructuredOutput) {
     EXPECT_EQ(js.at("content").at(0).at("text"), "{\"a\":1}");
     EXPECT_NE(js.value("warnings", Json::array()).dump().find("disables thinking"), std::string::npos) << js.dump();
     const std::size_t last = ts.engine->calls().size() - 1;
-    EXPECT_EQ(Json::parse(ts.engine->calls().at(last).request.sampling.json_schema.value()), schema);
+    const auto forwarded = ts.engine->calls().at(last).request.sampling.json_schema;
+    if (!forwarded) GTEST_FAIL() << "output_config.format json_schema on /v1/messages should reach the engine as sampling.json_schema";
+    EXPECT_EQ(Json::parse(*forwarded), schema);
     EXPECT_TRUE(ts.engine->prompt_text(last).ends_with("<think>\n\n</think>\n\n")) << ts.engine->prompt_text(last);
 
     b = user_messages("x");
