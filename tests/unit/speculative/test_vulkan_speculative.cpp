@@ -39,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -205,7 +206,8 @@ void expect_same_state(Speculator& sa, SequenceState& a, Speculator& sb, Sequenc
     EXPECT_TRUE(dump_kv(a.kv) == dump_kv(b.kv)) << what << ": trunk KV rows differ from the reference";
     EXPECT_TRUE(a.gdn.snapshot().data == b.gdn.snapshot().data) << what << ": GDN recurrent/conv state differs";
     EXPECT_TRUE(a.last_hidden == b.last_hidden) << what << ": carried trunk hidden differs";
-    ASSERT_TRUE(a.mtp_kv && b.mtp_kv) << what;
+    if (!a.mtp_kv) GTEST_FAIL() << what << ": the subject sequence has no MTP KV";
+    if (!b.mtp_kv) GTEST_FAIL() << what << ": the reference sequence has no MTP KV";
     EXPECT_EQ(a.mtp_kv->length(), b.mtp_kv->length()) << what << ": MTP KV length";
     EXPECT_TRUE(dump_kv(*a.mtp_kv) == dump_kv(*b.mtp_kv)) << what << ": MTP KV rows differ from the reference";
 }
@@ -232,7 +234,10 @@ protected:
         if (!std::filesystem::exists(p)) GTEST_SKIP() << "tiny model missing: " << p;
         nm_ = std::make_unique<halo::model::NormalizedModel>(halo::model::NormalizedModel::load(p));
     }
-    [[nodiscard]] Toks prompt(const char* p) const { return golden_->i32(std::string(p) + ".tokens"); }
+    [[nodiscard]] Toks prompt(const char* p) const {
+        if (!golden_) throw std::logic_error(std::string("VulkanSpec::prompt(\"") + p + "\"): golden data not loaded");
+        return golden_->i32(std::string(p) + ".tokens");
+    }
 
     std::optional<halo::test::Golden> golden_;
     std::unique_ptr<halo::model::NormalizedModel> nm_;
