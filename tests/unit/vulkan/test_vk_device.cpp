@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <numeric>
 #include <optional>
@@ -403,10 +404,13 @@ TEST(VkKernel, DispatchValidatesBindingsPushAndGroups) {
 
 namespace {
 
-/// 600 dependent rms_norm dispatches (past the stream's 512-dispatch submit split, so pools are reset
-/// mid-chain on the descriptor-set path) ping-ponging between two offset views of one buffer; returns
-/// the final rows and the stream's descriptor pool count.
-std::pair<std::vector<float>, std::size_t> rms_norm_chain(const std::shared_ptr<hv::Context>& ctx) {
+/// `n` dependent rms_norm dispatches (600 = past the stream's 512-dispatch submit split, so the
+/// recording continues in the stream's second command buffer with its own descriptor pools)
+/// ping-ponging between two offset views of one buffer; `flush_every` > 0 submits and waits after
+/// every that many dispatches instead (no split). Returns the final rows and the stream's
+/// descriptor pool count.
+std::pair<std::vector<float>, std::size_t> rms_norm_chain(const std::shared_ptr<hv::Context>& ctx, int n = 600,
+                                                          int flush_every = 0) {
     constexpr std::uint32_t rows = 4, cols = 256;
     constexpr std::uint64_t region = 4096;  // bytes; rows * cols * 4, aligned for any device's offset rule
     std::vector<float> x0(2 * rows * cols), w(cols);
@@ -416,9 +420,10 @@ std::pair<std::vector<float>, std::size_t> rms_norm_chain(const std::shared_ptr<
     hv::Buffer wb = upload(ctx, std::span<const float>(w));
     hv::Ops ops(ctx);
     hv::Stream s(ctx);
-    for (int i = 0; i < 600; ++i) {
+    for (int i = 0; i < n; ++i) {
         const std::uint64_t src = (i % 2) * region, dst = region - src;
         ops.rms_norm(s, hv::BufferView(xb, src, region), wb, hv::BufferView(xb, dst, region), rows, cols, 1e-6f);
+        if (flush_every > 0 && (i + 1) % flush_every == 0) s.submit_and_wait();
     }
     s.submit_and_wait();
     return {download<float>(xb, x0.size()), s.descriptor_pool_count()};
@@ -456,6 +461,90 @@ TEST(VkStream, PushDescriptorsBindTheSameBuffersWithoutDescriptorSets) {
     EXPECT_EQ(diff, 0u) << diff << " of " << got.size() << " floats differ after 600 rms_norm dispatches; first at "
                         << first << ": push " << (first < got.size() ? got[first] : 0.0f) << " vs set "
                         << (first < got.size() ? want[first] : 0.0f);
+}
+
+namespace {
+
+/// Runs `body` with HALO_VK_OP_TIMINGS pointed at a fresh file named after the current test plus
+/// `tag`, restores the variable (also when `body` throws) and returns the profile's lines.
+std::vector<std::string> op_timings_profile(const std::string& tag, const std::function<void()>& body) {
+    const std::filesystem::path path =
+        std::filesystem::path(::testing::TempDir()) /
+        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "_" +
+         tag + ".txt");
+    std::filesystem::remove(path);
+    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
+    struct Restore {
+        std::optional<std::string> old;
+        ~Restore() {
+            if (old) {
+                ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
+            } else {
+                ::unsetenv("HALO_VK_OP_TIMINGS");
+            }
+        }
+    } restore{old_env ? std::optional<std::string>(old_env) : std::nullopt};
+    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+    body();
+    ::unsetenv("HALO_VK_OP_TIMINGS");
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(path);
+        for (std::string l; std::getline(in, l);) lines.push_back(l);
+    }
+    std::filesystem::remove(path);
+    return lines;
+}
+
+}  // namespace
+
+// next.md step 4: the 512-dispatch submit split no longer makes the host wait mid-recording. The
+// full command buffer is submitted and recording goes on in the stream's second one behind a full
+// barrier; only a third buffer's worth waits (for the oldest, which is then reused). So a 600-dispatch
+// chain completes with one fence wait (two before) and an 1100-dispatch chain with two (three before),
+// and every dependent dispatch still sees its predecessor's output across the splits: the result is
+// bit for bit a chain that submits and waits every 100 dispatches.
+TEST(VkStream, SubmitSplitKeepsRecordingWithoutAFenceWait) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const bool timestamps = ctx->info().timestamps_supported();
+    for (const int n : {600, 1100}) {
+        const std::vector<float> want = rms_norm_chain(ctx, n, 100).first;
+        std::vector<float> got;
+        const std::vector<std::string> lines = op_timings_profile(std::to_string(n), [&] {
+            got = rms_norm_chain(ctx, n).first;
+        });
+        std::size_t waits = 0, kernels = 0, other = 0;
+        std::string shown;
+        for (const std::string& l : lines) {
+            if (l == "# wait") {
+                ++waits;
+                shown += "\n  # wait (after " + std::to_string(kernels) + " kernel lines)";
+            } else if (l.starts_with("rms_norm ")) {
+                ++kernels;
+            } else if (!l.starts_with("# transfer ")) {  // staged input uploads, see VkContext.OpTimings*
+                ++other;
+                shown += "\n  " + l;
+            }
+        }
+        const std::size_t want_waits = n > 1024 ? 2 : 1;
+        EXPECT_EQ(waits, want_waits) << n << " dispatches in one recording should need " << want_waits
+                                     << " fence wait(s): the split submits without waiting, only a third "
+                                     << "command buffer waits for the oldest; profile:" << shown;
+        EXPECT_EQ(kernels, timestamps ? static_cast<std::size_t>(n) : 0u)
+            << "every dispatch of the " << n << "-dispatch chain should have its kernel line in the profile";
+        EXPECT_EQ(other, 0u) << "unexpected profile lines:" << shown;
+        ASSERT_EQ(got.size(), want.size());
+        std::size_t diff = 0, first = got.size();
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            if (std::bit_cast<std::uint32_t>(got[i]) != std::bit_cast<std::uint32_t>(want[i])) {
+                if (diff++ == 0) first = i;
+            }
+        }
+        EXPECT_EQ(diff, 0u) << diff << " of " << got.size() << " floats differ after " << n
+                            << " dependent rms_norm dispatches split without a wait vs flushed every 100; first at "
+                            << first << ": split " << (first < got.size() ? got[first] : 0.0f) << " vs flushed "
+                            << (first < got.size() ? want[first] : 0.0f);
+    }
 }
 
 TEST(VkKernel, PipelineCacheRoundTripsIntoANewContext) {

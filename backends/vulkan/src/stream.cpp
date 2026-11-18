@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -51,11 +52,15 @@ Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx
         cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cai.commandPool = pool_;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 1;
-        detail::vk_check(vkAllocateCommandBuffers(dev, &cai, &cmd_), "vkAllocateCommandBuffers");
+        cai.commandBufferCount = 2;  // the recording one and the one a submit split hands over to
+        std::array<VkCommandBuffer, 2> cmds{};
+        detail::vk_check(vkAllocateCommandBuffers(dev, &cai, cmds.data()), "vkAllocateCommandBuffers");
+        cmd_ = cmds[0];
+        other_cmd_ = cmds[1];
         VkFenceCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         detail::vk_check(vkCreateFence(dev, &fci, nullptr, &fence_), "vkCreateFence");
+        detail::vk_check(vkCreateFence(dev, &fci, nullptr, &other_fence_), "vkCreateFence");
         if (ctx_->info().timestamps_supported() && max_timestamps > 0) {
             VkQueryPoolCreateInfo qpi{};
             qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -71,7 +76,7 @@ Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx
 }
 
 Stream::~Stream() {
-    if (state_ == State::Submitted && fence_ != VK_NULL_HANDLE) discard();
+    if ((state_ == State::Submitted || other_pending_) && fence_ != VK_NULL_HANDLE) discard();
     if (state_ == State::Hung) {
         // The pending submission still uses the command buffer, fence and descriptor sets:
         // destroying them is invalid and may block. Leak them; Context teardown is skipped too.
@@ -86,13 +91,18 @@ void Stream::release() noexcept {
     const VkDevice dev = ctx_->device();
     for (VkDescriptorPool p : desc_pools_) vkDestroyDescriptorPool(dev, p, nullptr);
     desc_pools_.clear();
+    for (VkDescriptorPool p : other_pools_) vkDestroyDescriptorPool(dev, p, nullptr);
+    other_pools_.clear();
     if (queries_ != VK_NULL_HANDLE) vkDestroyQueryPool(dev, queries_, nullptr);
     if (fence_ != VK_NULL_HANDLE) vkDestroyFence(dev, fence_, nullptr);
-    if (pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(dev, pool_, nullptr);  // frees cmd_
+    if (other_fence_ != VK_NULL_HANDLE) vkDestroyFence(dev, other_fence_, nullptr);
+    if (pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(dev, pool_, nullptr);  // frees cmd_ and other_cmd_
     queries_ = VK_NULL_HANDLE;
     fence_ = VK_NULL_HANDLE;
+    other_fence_ = VK_NULL_HANDLE;
     pool_ = VK_NULL_HANDLE;
     cmd_ = VK_NULL_HANDLE;
+    other_cmd_ = VK_NULL_HANDLE;
 }
 
 void Stream::ensure_recording() {
@@ -102,21 +112,67 @@ void Stream::ensure_recording() {
     HALO_CHECK(state_ != State::Hung && !ctx_->hung(), ErrorCode::Backend,
                "the Vulkan device is hung (a submission did not complete); restart the process");
     if (state_ == State::Submitted) wait();
-    const VkDevice dev = ctx_->device();
-    detail::vk_check(vkResetCommandBuffer(cmd_, 0), "vkResetCommandBuffer");
-    for (VkDescriptorPool p : desc_pools_) {
-        detail::vk_check(vkResetDescriptorPool(dev, p, 0), "vkResetDescriptorPool");
-    }
+    begin_command_buffer(cmd_, desc_pools_);
     current_pool_ = 0;
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    detail::vk_check(vkBeginCommandBuffer(cmd_, &bi), "vkBeginCommandBuffer");
     if (queries_ != VK_NULL_HANDLE) vkCmdResetQueryPool(cmd_, queries_, 0, max_timestamps_);
     used_timestamps_ = 0;
     op_marks_.clear();
+    split_waits_ = 0;
     dispatches_ = 0;
     n_touched_ = 0;
+    state_ = State::Recording;
+}
+
+void Stream::begin_command_buffer(VkCommandBuffer cmd, std::span<const VkDescriptorPool> pools) {
+    const VkDevice dev = ctx_->device();
+    detail::vk_check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
+    for (VkDescriptorPool p : pools) {
+        detail::vk_check(vkResetDescriptorPool(dev, p, 0), "vkResetDescriptorPool");
+    }
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    detail::vk_check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+}
+
+void Stream::split_submit() {
+    // With per-dispatch timestamps (HALO_VK_OP_TIMINGS) the recording keeps its slots across a
+    // split, so when the free slots can't hold another full command buffer's dispatch
+    // timestamps (2 each), wait here as before: wait() writes the profile and the next
+    // recording starts at slot 0.
+    if (op_timings_ && queries_ != VK_NULL_HANDLE &&
+        used_timestamps_ + 2 * kMaxDispatchesPerSubmit > max_timestamps_) {
+        submit();
+        wait();
+        return;
+    }
+    submit();
+    if (other_pending_) {
+        // The other command buffer still runs the part of this recording before the previous
+        // split: wait for it before resetting it and its descriptor pools.
+        const VkResult r = vkWaitForFences(ctx_->device(), 1, &other_fence_, VK_TRUE, kWaitNs);
+        if (r == VK_TIMEOUT) {
+            ctx_->mark_hung();
+            throw_error(ErrorCode::Backend, "Stream: a split submission did not complete in {} ns", kWaitNs);
+        }
+        detail::vk_check(r, "vkWaitForFences");
+        other_pending_ = false;
+        ++split_waits_;
+    }
+    // Begin the other buffer before swapping: if this throws, cmd_/fence_ are still the
+    // submission state_ (Submitted) refers to, so wait()/discard() wait on the right fence.
+    begin_command_buffer(other_cmd_, other_pools_);
+    std::swap(cmd_, other_cmd_);
+    std::swap(fence_, other_fence_);
+    std::swap(desc_pools_, other_pools_);
+    other_pending_ = true;
+    current_pool_ = 0;
+    // The touch marks don't cover the submitted part, so order everything recorded from here
+    // after it (a pipeline barrier's first scope includes earlier submissions to the queue).
+    // The timestamp slots and op marks carry on: the query pool was reset at the recording's
+    // start, and query commands on one queue run in submission order.
+    barrier();
+    dispatches_ = 0;
     state_ = State::Recording;
 }
 
@@ -199,13 +255,10 @@ void Stream::dispatch(const Kernel& kernel, std::span<const BufferBinding> buffe
     // Very long single command buffers (thousands of compute dispatches, e.g. a large
     // prefill) wedge the compute ring on this platform (gfx1151 / RADV, observed as
     // VK_ERROR_DEVICE_LOST at prompts >= 24 tokens). Bound a command buffer to
-    // kMaxDispatchesPerSubmit dispatches: submit and re-open (the next ensure_recording
-    // waits the fence before descriptor pools are reused, so this is a cheap periodic
-    // fence: ~1 per 1.5 tokens at kMaxDispatchesPerSubmit = 512).
-    if (dispatches_ >= kMaxDispatchesPerSubmit && state_ == State::Recording) {
-        submit();
-        wait();
-    }
+    // kMaxDispatchesPerSubmit dispatches: submit it and continue in the stream's other
+    // command buffer (split_submit), so the GPU starts on the first part while the rest is
+    // recorded and the host waits for nothing until wait() (or a third buffer's worth).
+    if (dispatches_ >= kMaxDispatchesPerSubmit && state_ == State::Recording) split_submit();
     const KernelDesc& d = kernel.desc();
     const DeviceInfo& info = ctx_->info();
     const std::string_view name = kernel.name();
@@ -313,10 +366,15 @@ void Stream::copy(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst,
 
 void Stream::discard() noexcept {
     if (state_ == State::Hung) return;
-    if (state_ == State::Submitted) {
+    // A submit split's earlier part may be in flight while this part is still recording.
+    std::array<VkFence, 2> fences{};
+    std::uint32_t n = 0;
+    if (other_pending_) fences[n++] = other_fence_;
+    if (state_ == State::Submitted) fences[n++] = fence_;
+    if (n > 0) {
         // Bounded: with UINT64_MAX a hung GPU froze the caller (the engine's only worker, which
         // gets here from VkStream::wait()'s abort() after wait() already timed out) for good.
-        const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, kDiscardWaitNs);
+        const VkResult r = vkWaitForFences(ctx_->device(), n, fences.data(), VK_TRUE, kDiscardWaitNs);
         if (r != VK_SUCCESS) {
             HALO_ERROR("vulkan", "Stream::discard: fence wait failed: {}; marking the device hung", detail::result_string(r));
             ctx_->mark_hung();
@@ -326,6 +384,8 @@ void Stream::discard() noexcept {
     }
     // A Recording command buffer is never submitted; ensure_recording() resets it (and the
     // descriptor pools) before the next recording begins.
+    other_pending_ = false;
+    split_waits_ = 0;
     state_ = State::Idle;
 }
 
@@ -367,12 +427,16 @@ void Stream::submit() {
 
 void Stream::wait(std::uint64_t timeout_ns) {
     if (state_ != State::Submitted) return;
-    const VkResult r = vkWaitForFences(ctx_->device(), 1, &fence_, VK_TRUE, timeout_ns);
+    // The last submission and, if a split left it in flight, the earlier part of the recording.
+    const std::array<VkFence, 2> fences{fence_, other_fence_};
+    const VkResult r =
+        vkWaitForFences(ctx_->device(), other_pending_ ? 2u : 1u, fences.data(), VK_TRUE, timeout_ns);
     if (r == VK_TIMEOUT) {
         ctx_->mark_hung();
         throw_error(ErrorCode::Backend, "Stream::wait timed out after {} ns", timeout_ns);
     }
     detail::vk_check(r, "vkWaitForFences");
+    other_pending_ = false;
     state_ = State::Idle;
     timestamp_values_.assign(used_timestamps_, 0);
     if (used_timestamps_ > 0) {
@@ -389,10 +453,12 @@ void Stream::wait(std::uint64_t timeout_ns) {
             for (const OpMark& m : op_marks_)
                 if (const std::optional<double> ns = elapsed_ns(m.begin, m.end); ns.has_value())
                     std::fprintf(f, "%s %.0f\n", m.name.c_str(), *ns);
-            std::fputs("# wait\n", f);
+            // split_submit()'s fence waits inside this recording, then this one.
+            for (std::uint32_t i = 0; i <= split_waits_; ++i) std::fputs("# wait\n", f);
             std::fclose(f);
         }
     }
+    split_waits_ = 0;
 }
 
 std::optional<double> Stream::elapsed_ns(std::uint32_t begin, std::uint32_t end) const {

@@ -106,8 +106,8 @@ using GroupCount = std::array<std::uint32_t, 3>;
 class Stream {
 public:
     explicit Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps = 64);
-    /// Waits for in-flight work on this stream's fence, at most kDiscardWaitNs (errors are
-    /// logged, not thrown). If the work never completes the context is marked hung and the
+    /// Waits for in-flight work on this stream's fences (the last submission and a submit
+    /// split's earlier part), at most kDiscardWaitNs (errors are logged, not thrown). If the work never completes the context is marked hung and the
     /// stream's Vulkan objects are left alone (a pending submission still uses them).
     ~Stream();
     Stream(const Stream&) = delete;
@@ -118,6 +118,13 @@ public:
     /// write_mask: bit i = binding i is written by the kernel (default: all bindings, the
     /// conservative answer). Read-only bindings let the barrier elision skip a barrier
     /// between two dispatches that only READ the same buffer.
+    /// A command buffer holds at most 512 dispatches (longer ones wedge the compute ring on
+    /// gfx1151 / RADV). The dispatch past that submits the full one and goes on recording into
+    /// the stream's second command buffer behind a full barrier, without waiting: the host
+    /// blocks only when a recording needs a third buffer (the oldest is then waited for and
+    /// reused) and in wait(). (With HALO_VK_OP_TIMINGS, when the free timestamp slots can't
+    /// hold another full buffer's dispatch timestamps, the split waits as before and the
+    /// recording's timestamps start over; a caller's own timestamp() calls are not budgeted.)
     void dispatch(const Kernel& kernel, std::span<const BufferBinding> buffers,
                   std::span<const std::byte> push, GroupCount groups, std::uint64_t write_mask = ~0ULL);
 
@@ -142,14 +149,18 @@ public:
 
     /// Submit the recording (no-op if nothing was recorded). Non-blocking.
     void submit();
-    /// Wait for the last submission. Throws Error(Backend) on timeout / device loss; a timeout
-    /// marks the context hung (Context::hung()).
-    void wait(std::uint64_t timeout_ns = 120'000'000'000ull);
+    /// Wait for the last submission (and the earlier part of the same recording that a
+    /// submit split left in flight, see dispatch()). Throws Error(Backend) on timeout / device
+    /// loss; a timeout marks the context hung (Context::hung()).
+    void wait(std::uint64_t timeout_ns = kWaitNs);
+    /// Default budget of wait(), also used for a submit split's wait for the oldest buffer.
+    static constexpr std::uint64_t kWaitNs = 120'000'000'000ull;
     /// Upper bound of the wait in discard() and ~Stream(). Short: discard() runs after wait()
     /// already spent its whole budget on the same fence, on the engine's only worker thread.
     static constexpr std::uint64_t kDiscardWaitNs = 5'000'000'000ull;
-    /// Drop an unsubmitted recording (nothing of it executes) or, if a submission is in
-    /// flight, wait for it for at most kDiscardWaitNs (errors are logged, not thrown). The
+    /// Drop the unsubmitted part of a recording (nothing of it executes; parts a submit split
+    /// already submitted do run, as they did when the split waited) and wait for whatever is
+    /// in flight for at most kDiscardWaitNs (errors are logged, not thrown). The
     /// stream is Idle afterwards -- unless the submission did not complete: then the context is
     /// marked hung and this stream stays unusable (every later use throws Error(Backend)).
     void discard() noexcept;
@@ -165,7 +176,9 @@ public:
     [[nodiscard]] std::uint32_t dispatch_count() const noexcept { return dispatches_; }
     /// Descriptor pools this stream has created (they are reused across recordings). Stays 0 when the
     /// context pushes descriptors (Context::push_descriptors_enabled()): no set is ever allocated.
-    [[nodiscard]] std::size_t descriptor_pool_count() const noexcept { return desc_pools_.size(); }
+    [[nodiscard]] std::size_t descriptor_pool_count() const noexcept {
+        return desc_pools_.size() + other_pools_.size();
+    }
 
 private:
     enum class State { Idle, Recording, Submitted, Hung };
@@ -176,12 +189,27 @@ private:
     void barrier_for(std::span<const BufferBinding> buffers, std::uint64_t write_mask);
     void mark_touched(const Buffer* buf, bool write);
     VkDescriptorSet allocate_set(VkDescriptorSetLayout layout);
+    /// The submit split in dispatch(): submit the recording and continue it in the other
+    /// command buffer (waiting for that one first if a previous split left it in flight).
+    void split_submit();
+    /// Reset `cmd` and `pools` (both idle) and begin recording into `cmd`.
+    void begin_command_buffer(VkCommandBuffer cmd, std::span<const VkDescriptorPool> pools);
     void release() noexcept;
 
     std::shared_ptr<Context> ctx_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
+    // The command buffer being recorded, its fence and descriptor pools (desc_pools_ below),
+    // and the other set split_submit() swaps in. other_pending_: the other command buffer was
+    // submitted by a split of the current recording and has not been waited for.
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    VkCommandBuffer other_cmd_ = VK_NULL_HANDLE;
+    VkFence other_fence_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorPool> other_pools_;
+    bool other_pending_ = false;
+    // Fence waits split_submit() did inside the current recording; wait() writes their
+    // "# wait" lines to the HALO_VK_OP_TIMINGS profile after the recording's kernel lines.
+    std::uint32_t split_waits_ = 0;
     VkQueryPool queries_ = VK_NULL_HANDLE;
     std::uint32_t max_timestamps_ = 0;
     std::uint32_t used_timestamps_ = 0;
