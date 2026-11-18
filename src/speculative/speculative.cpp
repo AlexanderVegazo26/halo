@@ -33,7 +33,8 @@ bool device_hidden_enabled() {
 /// fence, Qwen35::mtp_draft_chain) instead of one mtp_forward per depth: the winning token of depth d feeds
 /// depth d + 1's embedding lookup from device memory and the MTP hidden stays on the device (so
 /// HALO_MTP_DEVICE_HIDDEN is moot in this mode). Needs a backend with Limits::lm_head_ids (CPU, Vulkan);
-/// otherwise the per-depth path runs. The trunk verify is still its own forward().
+/// otherwise the per-depth path runs. Speculator::step() records the trunk verify into the same submit
+/// (draft_verify -> Qwen35::mtp_draft_chain_verify): one fence wait per tick.
 bool chain_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("HALO_MTP_CHAIN");
@@ -176,9 +177,22 @@ std::size_t Speculator::effective_k(const StepRequest& r) const {
     return std::min({r.max_draft, cfg_.max_draft, cap});
 }
 
-void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
+/// Depth-1 MTP inputs of one tick (built by build_depth_one): the drafting sequences' request indices and,
+/// per sequence, the catch-up queue + (x, h_{L-1}) rows. `steps` point into the other members.
+struct Speculator::DepthOne {
+    std::vector<std::size_t> idx;
+    std::vector<std::vector<std::int32_t>> toks;
+    std::vector<std::vector<float>> hid;
+    std::vector<std::size_t> last_row;
+    std::vector<MtpStep> steps;
+};
+
+bool Speculator::chained() const {
+    return cfg_.chain.value_or(false) && model_->backend().limits().lm_head_ids;
+}
+
+void Speculator::begin_draft(std::span<const StepRequest> reqs, Tick& tick) {
     const std::size_t n = reqs.size();
-    const std::size_t E = model_->n_embd();
     tick.out.assign(n, {});
     tick.seqs.assign(n, {});
     tick.phase = Tick::Phase::Empty;
@@ -195,70 +209,99 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         s.tree = tree_ok(r, s.k);  // provisional: confirmed below once the runner-up draft exists
         s.mtp_len0 = r.seq->mtp_kv ? r.seq->mtp_kv->length() : 0;
     }
+}
 
-    // ---- depth 1: catch-up queue + (x, h_{L-1}) + first draft, one batched call --------------
-    std::vector<std::size_t> idx;
-    std::vector<std::vector<std::int32_t>> toks;
-    std::vector<std::vector<float>> hid;
-    std::vector<std::size_t> last_row;
-    for (std::size_t i = 0; i < n; ++i) {
+void Speculator::build_depth_one(std::span<const StepRequest> reqs, const Tick& tick, DepthOne& d) const {
+    for (std::size_t i = 0; i < reqs.size(); ++i) {
         const StepRequest& r = reqs[i];
         if (tick.seqs[i].k == 0 || !mtp_on(*model_, *r.seq) || r.seq->length() == 0) continue;
-        idx.push_back(i);
+        d.idx.push_back(i);
         std::vector<std::int32_t> t(r.seq->mtp_queue_tokens);
         t.push_back(r.token);
         std::vector<float> h(r.seq->mtp_queue_hidden);
         h.insert(h.end(), r.seq->last_hidden.begin(), r.seq->last_hidden.end());
-        last_row.push_back(t.size() - 1);
-        toks.push_back(std::move(t));
-        hid.push_back(std::move(h));
+        d.last_row.push_back(t.size() - 1);
+        d.toks.push_back(std::move(t));
+        d.hid.push_back(std::move(h));
     }
     const bool dev_hidden = cfg_.device_hidden.value_or(false);
-    const bool chained = cfg_.chain.value_or(false) && model_->backend().limits().lm_head_ids;
+    d.steps.resize(d.idx.size());
+    for (std::size_t j = 0; j < d.idx.size(); ++j) {
+        const StepRequest& r = reqs[d.idx[j]];
+        const bool forced = !r.forced_drafts.empty();
+        MtpStep& m = d.steps[j];
+        m.tokens = d.toks[j];
+        m.hidden = d.hid[j];
+        m.kv = &mtp_kv_of(*r.seq);
+        m.first_position = static_cast<std::int32_t>(tick.seqs[d.idx[j]].mtp_len0 + 1);
+        m.logit_rows = std::span(&d.last_row[j], forced ? 0 : 1);
+        // Tree sequences need the whole depth-1 logit row for the runner-up d1' (host scan below).
+        m.logits = forced ? LogitsMode::None : tick.seqs[d.idx[j]].tree ? LogitsMode::Full : LogitsMode::Argmax;
+        const bool keep = !forced && tick.seqs[d.idx[j]].k > 1;  // a deeper draft will need this hidden
+        m.want_hidden = keep && !dev_hidden;
+        m.want_hidden_device = keep && dev_hidden;
+    }
+}
+
+/// Every depth of every drafting sequence in one chain (HALO_MTP_CHAIN): forced-draft sequences only flush
+/// their rows (k = 0); the others get all s.k drafts back, in depth order.
+std::vector<std::size_t> Speculator::chain_ks(std::span<const StepRequest> reqs, const Tick& tick, const DepthOne& d) {
+    std::vector<std::size_t> ks(d.idx.size());
+    for (std::size_t j = 0; j < d.idx.size(); ++j) ks[j] = reqs[d.idx[j]].forced_drafts.empty() ? tick.seqs[d.idx[j]].k : 0;
+    return ks;
+}
+
+/// The chain's drafts of one sequence, in depth order, ending before the first poisoned (-1) depth: the device
+/// chain fed id 0 past it, so the deeper drafts are not continuations of anything (usable_drafts).
+namespace {
+std::vector<std::int32_t> chain_drafts(std::span<const cpu::TopKEntry> argmax) {
+    std::vector<std::int32_t> drafts;
+    drafts.reserve(argmax.size());
+    for (const cpu::TopKEntry& a : argmax) drafts.push_back(a.index);
+    drafts.resize(usable_drafts(drafts));
+    return drafts;
+}
+}  // namespace
+
+void Speculator::add_cost(const models::StepResult& res) noexcept {
+    metrics_.last_cost += res.cost;
+    metrics_.last_weight_passes += res.cost.weight_passes;
+    metrics_.weight_passes += res.cost.weight_passes;
+}
+
+void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
+    begin_draft(reqs, tick);
+    DepthOne d;
     try {
-        if (!idx.empty()) {
-            std::vector<MtpStep> steps(idx.size());
-            for (std::size_t j = 0; j < idx.size(); ++j) {
-                const StepRequest& r = reqs[idx[j]];
-                const bool forced = !r.forced_drafts.empty();
-                MtpStep& m = steps[j];
-                m.tokens = toks[j];
-                m.hidden = hid[j];
-                m.kv = &mtp_kv_of(*r.seq);
-                m.first_position = static_cast<std::int32_t>(tick.seqs[idx[j]].mtp_len0 + 1);
-                m.logit_rows = std::span(&last_row[j], forced ? 0 : 1);
-                // Tree sequences need the whole depth-1 logit row for the runner-up d1' (host scan below).
-                m.logits = forced ? LogitsMode::None : tick.seqs[idx[j]].tree ? LogitsMode::Full : LogitsMode::Argmax;
-                const bool keep = !forced && tick.seqs[idx[j]].k > 1;  // a deeper draft will need this hidden
-                m.want_hidden = keep && !dev_hidden;
-                m.want_hidden_device = keep && dev_hidden;
-            }
+        build_depth_one(reqs, tick, d);
+    } catch (...) {
+        abort_draft(reqs, tick);
+        throw;
+    }
+    run_draft(reqs, tick, d);
+}
+
+void Speculator::run_draft(std::span<const StepRequest> reqs, Tick& tick, DepthOne& d) {
+    const std::size_t n = reqs.size();
+    const std::size_t E = model_->n_embd();
+    // ---- depth 1: catch-up queue + (x, h_{L-1}) + first draft, one batched call --------------
+    const bool dev_hidden = cfg_.device_hidden.value_or(false);
+    const bool chain = chained();
+    try {
+        if (!d.idx.empty()) {
             models::StepResult res;
-            if (chained) {
-                // Every depth of every sequence in one submit (HALO_MTP_CHAIN): forced-draft sequences only
-                // flush their rows (k = 0); the others get all s.k drafts back, in depth order.
-                std::vector<std::size_t> ks(idx.size());
-                for (std::size_t j = 0; j < idx.size(); ++j) {
-                    ks[j] = reqs[idx[j]].forced_drafts.empty() ? tick.seqs[idx[j]].k : 0;
-                }
-                model_->mtp_draft_chain(steps, ks, res);
+            if (chain) {
+                model_->mtp_draft_chain(d.steps, chain_ks(reqs, tick, d), res);
             } else {
-                model_->mtp_forward(steps, res);
+                model_->mtp_forward(d.steps, res);
             }
-            metrics_.last_cost += res.cost;
-            metrics_.last_weight_passes += res.cost.weight_passes;
-            metrics_.weight_passes += res.cost.weight_passes;
-            for (std::size_t j = 0; j < idx.size(); ++j) {
-                Tick::Seq& s = tick.seqs[idx[j]];
+            add_cost(res);
+            for (std::size_t j = 0; j < d.idx.size(); ++j) {
+                Tick::Seq& s = tick.seqs[d.idx[j]];
                 s.mtp_flushed = true;
-                if (!reqs[idx[j]].forced_drafts.empty()) continue;
-                if (chained) {
-                    // A poisoned depth (-1) ends the chain; the device chain fed id 0 past it, so
-                    // the deeper drafts are not continuations of anything: drop them too.
-                    for (const cpu::TopKEntry& a : res.seqs[j].argmax) {
-                        if (a.index < 0) break;
-                        tick.out[idx[j]].drafts.push_back(a.index);
-                    }
+                if (!reqs[d.idx[j]].forced_drafts.empty()) continue;
+                if (chain) {
+                    tick.out[d.idx[j]].drafts = chain_drafts(res.seqs[j].argmax);
                     continue;
                 }
                 const std::int32_t d1 = res.seqs[j].argmax.at(0).index;
@@ -266,7 +309,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
                     s.k = 0;
                     continue;
                 }
-                tick.out[idx[j]].drafts.push_back(d1);
+                tick.out[d.idx[j]].drafts.push_back(d1);
                 if (s.tree) s.alt = runner_up(res.seqs[j].logits, res.seqs[j].argmax.at(0).index);
                 if (s.k > 1) {
                     if (dev_hidden) {
@@ -280,7 +323,7 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         // ---- depth i >= 2: the MTP's own hidden (D-005 amendment) --------------------------
         std::size_t max_k = 0;
         for (const auto& s : tick.seqs) max_k = std::max(max_k, s.k);
-        if (chained) max_k = 0;  // mtp_draft_chain already produced every depth
+        if (chain) max_k = 0;  // mtp_draft_chain already produced every depth
         const std::size_t row0 = 0;
         for (std::size_t depth = 2; depth <= max_k; ++depth) {
             std::vector<std::size_t> at;
@@ -310,16 +353,14 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
             if (steps.empty()) break;
             models::StepResult res;
             model_->mtp_forward(steps, res);
-            metrics_.last_cost += res.cost;
-            metrics_.last_weight_passes += res.cost.weight_passes;
-    metrics_.weight_passes += res.cost.weight_passes;
+            add_cost(res);
             for (std::size_t j = 0; j < at.size(); ++j) {
-                const std::int32_t d = res.seqs[j].argmax.at(0).index;
-                if (d < 0) {  // NaN-poisoned MTP row: the chain ends at the previous depth (usable_drafts)
+                const std::int32_t tok = res.seqs[j].argmax.at(0).index;
+                if (tok < 0) {  // NaN-poisoned MTP row: the chain ends at the previous depth (usable_drafts)
                     tick.seqs[at[j]].k = depth - 1;
                     continue;
                 }
-                tick.out[at[j]].drafts.push_back(d);
+                tick.out[at[j]].drafts.push_back(tok);
                 if (depth < tick.seqs[at[j]].k) {
                     if (dev_hidden) {
                         tick.seqs[at[j]].mtp_hidden_dev = std::move(res.seqs[j].hidden_device);
@@ -335,7 +376,11 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
         abort_draft(reqs, tick);
         throw;
     }
-    for (std::size_t i = 0; i < n; ++i) {
+    finish_draft(reqs, tick);
+}
+
+void Speculator::finish_draft(std::span<const StepRequest> reqs, Tick& tick) const {
+    for (std::size_t i = 0; i < reqs.size(); ++i) {
         const StepRequest& r = reqs[i];
         if (!r.forced_drafts.empty()) tick.out[i].drafts.assign(r.forced_drafts.begin(), r.forced_drafts.end());
         // An MTP sequence without an MTP depth-1 call (length 0) cannot draft; forced drafts keep k.
@@ -357,6 +402,63 @@ void Speculator::draft(std::span<const StepRequest> reqs, Tick& tick) {
     tick.phase = Tick::Phase::Drafted;
 }
 
+void Speculator::draft_verify(std::span<const StepRequest> reqs, Tick& tick) {
+    // The fused path needs at least one sequence whose drafts the chain produces (a linked verify step);
+    // without one, or without chained drafting, this is exactly draft() then verify().
+    if (!chained()) {
+        draft(reqs, tick);
+        verify(reqs, tick);
+        return;
+    }
+    begin_draft(reqs, tick);
+    DepthOne d;
+    std::vector<std::size_t> ks;
+    try {
+        build_depth_one(reqs, tick, d);
+        ks = chain_ks(reqs, tick, d);
+    } catch (...) {
+        abort_draft(reqs, tick);
+        throw;
+    }
+    if (std::ranges::none_of(ks, [](std::size_t k) { return k > 0; })) {
+        run_draft(reqs, tick, d);  // only forced-draft sequences reach the MTP: their flush + the verify
+        verify(reqs, tick);
+        return;
+    }
+    std::vector<std::ptrdiff_t> chain_of(reqs.size(), -1);
+    VerifyIn v;
+    models::StepResult dres;
+    models::StepResult vres;
+    try {
+        // The chain's drafts reach the verify rows on the device; the host rows 1..k are placeholders (id 0,
+        // the id the fused call embeds after a poisoned depth), replaced by the real drafts below.
+        for (std::size_t j = 0; j < d.idx.size(); ++j) {
+            if (ks[j] == 0) continue;
+            chain_of[d.idx[j]] = static_cast<std::ptrdiff_t>(j);
+            tick.out[d.idx[j]].drafts.assign(ks[j], 0);
+        }
+        finish_draft(reqs, tick);
+        build_verify(reqs, tick, v);
+        model_->mtp_draft_chain_verify(d.steps, ks, dres, v.steps, chain_of, vres);
+        for (std::size_t j = 0; j < d.idx.size(); ++j) tick.seqs[d.idx[j]].mtp_flushed = true;
+    } catch (...) {
+        abort_draft(reqs, tick);
+        throw;
+    }
+    add_cost(dres);
+    ++metrics_.fused_ticks;
+    for (std::size_t i = 0; i < reqs.size(); ++i) {
+        if (chain_of[i] < 0) continue;
+        // The verify kept every row (s.k stays the verified count, for the GDN commit); the drafts end before
+        // the first poisoned depth, whose verify rows continue nothing, so acceptance never reaches past it.
+        // Rows past it keep placeholder 0, the id the fused call embedded there.
+        std::vector<std::int32_t>& drafts = tick.out[i].drafts;
+        drafts = chain_drafts(dres.seqs[static_cast<std::size_t>(chain_of[i])].argmax);
+        std::copy(drafts.begin(), drafts.end(), tick.seqs[i].fed.begin() + 1);
+    }
+    finish_verify(reqs, tick, vres);
+}
+
 void Speculator::abort_draft(std::span<const StepRequest> reqs, Tick& tick) noexcept {
     for (std::size_t i = 0; i < reqs.size() && i < tick.seqs.size(); ++i) {
         state::SequenceState* const seq = reqs[i].seq;
@@ -369,9 +471,22 @@ void Speculator::abort_draft(std::span<const StepRequest> reqs, Tick& tick) noex
 void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
     HALO_CHECK(tick.phase == Tick::Phase::Drafted && tick.seqs.size() == reqs.size(), ErrorCode::Api,
                "Speculator::verify: call draft() first with the same requests");
+    VerifyIn v;
+    models::StepResult res;
+    try {
+        build_verify(reqs, tick, v);
+        model_->forward(v.steps, res);
+    } catch (...) {
+        abort_draft(reqs, tick);
+        throw;
+    }
+    finish_verify(reqs, tick, res);
+}
+
+void Speculator::build_verify(std::span<const StepRequest> reqs, Tick& tick, VerifyIn& v) const {
     const std::size_t n = reqs.size();
-    std::vector<SeqStep> steps(n);
-    std::vector<std::vector<std::size_t>> rows(n);
+    v.steps.assign(n, {});
+    v.rows.assign(n, {});
     for (std::size_t i = 0; i < n; ++i) {
         const StepRequest& r = reqs[i];
         Tick::Seq& s = tick.seqs[i];
@@ -384,36 +499,32 @@ void Speculator::verify(std::span<const StepRequest> reqs, Tick& tick) {
             s.fed.assign(r.prefill.begin(), r.prefill.end());
         }
         s.alt_win = false;
-        SeqStep& st = steps[i];
+        SeqStep& st = v.steps[i];
         st.tokens = s.fed;
         st.kv = &r.seq->kv;
         st.gdn = &r.seq->gdn;
         if (s.tree) st.tree_parents = s.parents;
         st.want_hidden = mtp_on(*model_, *r.seq);
+        std::vector<std::size_t>& rows = v.rows[i];
         if (is_decode(r)) {
-            rows[i].resize(r.greedy ? s.fed.size() : 1);
-            for (std::size_t j = 0; j < rows[i].size(); ++j) rows[i][j] = j;
+            rows.resize(r.greedy ? s.fed.size() : 1);
+            for (std::size_t j = 0; j < rows.size(); ++j) rows[j] = j;
             st.logits = r.greedy ? LogitsMode::Argmax : LogitsMode::Full;
             st.n_state_slots = s.k > 0 ? s.k + 1 : 0;
             st.gdn_path = models::GdnPath::Recurrent;
         } else {
-            if (r.want_output) rows[i].push_back(s.fed.size() - 1);
+            if (r.want_output) rows.push_back(s.fed.size() - 1);
             st.logits = !r.want_output ? LogitsMode::None : r.greedy ? LogitsMode::Argmax : LogitsMode::Full;
             st.gdn_path = models::GdnPath::Auto;
             st.prefill = true;
         }
-        st.logit_rows = rows[i];
+        st.logit_rows = rows;
     }
-    models::StepResult res;
-    try {
-        model_->forward(steps, res);
-    } catch (...) {
-        abort_draft(reqs, tick);
-        throw;
-    }
-    metrics_.last_cost += res.cost;
-    metrics_.last_weight_passes += res.cost.weight_passes;
-    metrics_.weight_passes += res.cost.weight_passes;
+}
+
+void Speculator::finish_verify(std::span<const StepRequest> reqs, Tick& tick, models::StepResult& res) {
+    const std::size_t n = reqs.size();
+    add_cost(res);
     metrics_.last_trunk_passes += res.cost.weight_passes;
     metrics_.trunk_passes += res.cost.weight_passes;
     for (std::size_t i = 0; i < n; ++i) {
@@ -562,9 +673,11 @@ void Speculator::commit(std::span<const StepRequest> reqs, Tick& tick, std::span
         metrics_.predicted_bytes += cost_.spec_step(s.k);
         if (s.k > 0) {
             ++metrics_.spec_steps;
-            metrics_.drafted += s.k;
+            // drafts.size() < s.k only after a poisoned depth of a fused tick (draft_verify): the verify still
+            // ran s.k + 1 rows (the cost below), but only drafts.size() drafts exist to accept.
+            metrics_.drafted += o.drafts.size();
             metrics_.accepted += o.accepted;
-            if (metrics_.accepted_at.size() < s.k) metrics_.accepted_at.resize(s.k, 0);
+            if (metrics_.accepted_at.size() < o.drafts.size()) metrics_.accepted_at.resize(o.drafts.size(), 0);
             for (std::size_t j = 0; j < o.accepted; ++j) ++metrics_.accepted_at[j];
             // L6: record what was actually kept (nk, post max_emit/stop-token cap), not
             // accepted+1 -- the uncapped count overstated speedup for workloads that mostly
@@ -595,9 +708,7 @@ void Speculator::flush_mtp(std::span<state::SequenceState* const> seqs) {
     if (steps.empty()) return;
     models::StepResult res;
     model_->mtp_forward(steps, res);
-    metrics_.last_cost += res.cost;
-    metrics_.last_weight_passes += res.cost.weight_passes;
-    metrics_.weight_passes += res.cost.weight_passes;
+    add_cost(res);
     for (state::SequenceState* s : at) {
         metrics_.mtp_flush_rows += s->mtp_queue_tokens.size();
         s->mtp_queue_tokens.clear();
@@ -607,8 +718,7 @@ void Speculator::flush_mtp(std::span<state::SequenceState* const> seqs) {
 
 void Speculator::step(std::span<const StepRequest> reqs, Tick& tick) {
     if (reqs.empty()) return;
-    draft(reqs, tick);
-    verify(reqs, tick);
+    draft_verify(reqs, tick);
     commit(reqs, tick);
     ++metrics_.ticks;
     std::vector<state::SequenceState*> full;

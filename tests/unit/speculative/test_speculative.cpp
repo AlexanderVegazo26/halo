@@ -699,6 +699,81 @@ TEST_F(Spec, DraftChainVerifyRejectsAMislinkedStepBeforeTouchingState) {
     EXPECT_NO_THROW(sp.step(std::span(&q, 1), t)) << "the rejected call left the sequence unusable";
 }
 
+// next.md step 4: with chained drafts, Speculator::step() runs the draft chain and the trunk verify as ONE
+// Qwen35::mtp_draft_chain_verify call (draft_verify). A batched tick must equal the separate draft() +
+// verify() + commit() phases bit for bit, tick after tick: drafts, verify targets, emitted tokens, weight
+// passes, trunk KV, GDN state and MTP KV. The batch mixes a k = 3 and a k = 1 drafting sequence, a
+// forced-draft sequence (chain flush only, host draft rows) and a plain one (k = 0), and the fused side's
+// greedy output must also be plain greedy decoding (the per-depth host path).
+TEST_F(Spec, ChainedTickFusesDraftAndVerifyAndEqualsTheSeparatePhases) {
+    SpecConfig c;
+    c.max_draft = 3;
+    c.gate.mode = GateMode::Always;
+    c.chain = true;
+    ASSERT_TRUE(model().backend().limits().lm_head_ids) << "the CPU backend must support device token ids";
+    Speculator fused(model(), c), phases(model(), c);
+    auto host = spec(GateMode::Off);
+    const Toks p0 = prompt("p0"), p1 = prompt("p1");
+    constexpr std::array<std::size_t, 4> max_draft{3, 1, 2, 0};
+    const std::array<const Toks*, 4> prompts{&p0, &p1, &p1, &p0};
+    std::array<std::unique_ptr<SequenceState>, 4> a, b, plain;
+    std::array<Toks, 4> out, ref;
+    for (std::size_t i = 0; i < 4; ++i) {
+        a[i] = seq();
+        b[i] = seq();
+        plain[i] = seq();
+        out[i] = prefill(fused, *a[i], *prompts[i]);
+        ASSERT_EQ(prefill(phases, *b[i], *prompts[i]), out[i]) << "sequence " << i << ": prefill differs";
+        ref[i] = prefill(host, *plain[i], *prompts[i]);
+    }
+    for (std::size_t tick = 0; tick < 4; ++tick) {
+        std::array<Toks, 4> forced;
+        forced[2] = {out[2].back(), out[2].front()};  // forced drafts: verified as host rows, chain only flushes
+        std::array<StepRequest, 4> ra, rb;
+        for (std::size_t i = 0; i < 4; ++i) {
+            for (auto [r, s] : {std::pair{&ra[i], a[i].get()}, std::pair{&rb[i], b[i].get()}}) {
+                r->seq = s;
+                r->token = out[i].back();
+                r->max_draft = max_draft[i];
+                r->max_emit = 4;
+                r->forced_drafts = forced[i];
+            }
+        }
+        Tick ta, tb;
+        fused.step(ra, ta);
+        const auto wa = fused.metrics().last_weight_passes, trunk_a = fused.metrics().last_trunk_passes;
+        phases.draft(rb, tb);
+        phases.verify(rb, tb);
+        phases.commit(rb, tb);
+        EXPECT_EQ(wa, phases.metrics().last_weight_passes) << "tick " << tick << ": weight passes";
+        EXPECT_EQ(trunk_a, phases.metrics().last_trunk_passes) << "tick " << tick << ": trunk passes";
+        for (std::size_t i = 0; i < 4; ++i) {
+            const std::string what = "tick " + std::to_string(tick) + " sequence " + std::to_string(i);
+            EXPECT_EQ(ta.out[i].drafts, tb.out[i].drafts) << what << ": drafts";
+            // The fed rows are what commit() queues for MTP catch-up; the tiny model rarely accepts a draft,
+            // so compare them directly instead of relying on an accepted row to expose a stale host id.
+            EXPECT_EQ(ta.seqs[i].fed, tb.seqs[i].fed) << what << ": verify rows fed (x + drafts)";
+            EXPECT_EQ(ta.out[i].drafts.size(), i == 2 ? 2 : max_draft[i]) << what << ": draft count";
+            EXPECT_EQ(ta.out[i].targets, tb.out[i].targets) << what << ": verify targets";
+            EXPECT_EQ(ta.out[i].tokens, tb.out[i].tokens) << what << ": emitted tokens";
+            EXPECT_EQ(ta.out[i].accepted, tb.out[i].accepted) << what << ": accepted drafts";
+            ASSERT_FALSE(ta.out[i].tokens.empty()) << what << ": nothing emitted";
+            out[i].insert(out[i].end(), ta.out[i].tokens.begin(), ta.out[i].tokens.end());
+        }
+    }
+    // Prefill ticks have nothing to chain (plain draft() + verify()); every decode tick drafts from the MTP.
+    EXPECT_EQ(fused.metrics().fused_ticks, 4u) << "step() must run each chained decode tick as one fused call";
+    EXPECT_EQ(phases.metrics().fused_ticks, 0u) << "the separate phases never fuse";
+    for (std::size_t i = 0; i < 4; ++i) {
+        SCOPED_TRACE("sequence " + std::to_string(i));
+        expect_same_state(fused, *a[i], *b[i]);
+        const Toks greedy = feed_plain(host, *plain[i], std::span(out[i]).subspan(ref[i].size() - 1, out[i].size() - ref[i].size()));
+        Toks want = ref[i];
+        want.insert(want.end(), greedy.begin(), greedy.end());
+        EXPECT_EQ(out[i], want) << "chained speculative output must be plain greedy decoding";
+    }
+}
+
 // Review R-5(b): the draft chain against llama.cpp, the only executable MTP reference (D-005).
 // llamacpp_draft_chain.json holds llama-server's (bd4f514db, --spec-type draft-mtp, 3 drafts,
 // greedy, one fresh server per prompt) top-3 draft candidates of every draft call and depth on

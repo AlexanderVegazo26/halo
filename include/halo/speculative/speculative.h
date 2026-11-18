@@ -226,6 +226,7 @@ struct Metrics {
     std::uint32_t last_trunk_passes = 0;   ///< trunk weight passes of the last tick (1 per verify)
     std::uint64_t trunk_passes = 0;        ///< cumulative trunk weight passes
     std::uint64_t weight_passes = 0;       ///< cumulative trunk + MTP weight passes
+    std::uint64_t fused_ticks = 0;         ///< ticks whose draft chain + verify ran in one submit (draft_verify)
 };
 
 /// Per-tick working state (one entry per StepRequest, same order).
@@ -258,14 +259,24 @@ public:
     /// The model must outlive the speculator.
     Speculator(const models::Qwen35& model, SpecConfig cfg);
 
-    /// draft + verify + commit, gate and metrics. On an exception every sequence is at its
+    /// draft_verify + commit, gate and metrics. On an exception every sequence is at its
     /// pre-tick state (see the header comment for the Error(Kernel) caveat).
     void step(std::span<const StepRequest> reqs, Tick& tick);
 
-    // ---- phases (step() = draft, verify, commit; exposed for cancellation) ---------------
+    // ---- phases (step() = draft_verify, commit; exposed for cancellation) ---------------
     void draft(std::span<const StepRequest> reqs, Tick& tick);
     void abort_draft(std::span<const StepRequest> reqs, Tick& tick) noexcept;
     void verify(std::span<const StepRequest> reqs, Tick& tick);
+    /// draft() then verify(), in ONE submit / fence wait when the drafts are chained (SpecConfig::chain on a
+    /// backend with Limits::lm_head_ids) and at least one sequence drafts from the MTP: the draft chain and
+    /// the trunk verify go through Qwen35::mtp_draft_chain_verify, the verify rows embedding the drafts from
+    /// device memory (next.md step 4). Otherwise exactly draft() then verify(). Either way the tick ends
+    /// Verified with the same outputs and state. A poisoned (NaN) draft depth differs: draft()'s
+    /// mtp_draft_chain fails the tick with Error(Api), while the fused verify has already run every row, so
+    /// tick.seqs[i].k stays the requested count and out[i].drafts stops before the poisoned depth
+    /// (acceptance never reaches past it). On an exception every sequence is at its pre-tick state, as for
+    /// draft() / verify().
+    void draft_verify(std::span<const StepRequest> reqs, Tick& tick);
     /// n_keep: optional per-request override, 1 <= n_keep[i] <= tick.out[i].n_keep (a
     /// rollback to fewer rows; Error(Api) otherwise, nothing changed). Ignored for prefill.
     void commit(std::span<const StepRequest> reqs, Tick& tick, std::span<const std::size_t> n_keep = {});
@@ -280,6 +291,22 @@ public:
     [[nodiscard]] const models::Qwen35& model() const noexcept { return *model_; }
 
 private:
+    struct DepthOne;  // depth-1 MTP inputs (speculative.cpp)
+    /// Trunk verify inputs; steps point into rows and the tick's fed rows.
+    struct VerifyIn {
+        std::vector<models::SeqStep> steps;
+        std::vector<std::vector<std::size_t>> rows;
+    };
+    [[nodiscard]] bool chained() const;
+    void begin_draft(std::span<const StepRequest> reqs, Tick& tick);
+    void build_depth_one(std::span<const StepRequest> reqs, const Tick& tick, DepthOne& d) const;
+    [[nodiscard]] static std::vector<std::size_t> chain_ks(std::span<const StepRequest> reqs, const Tick& tick,
+                                                           const DepthOne& d);
+    void run_draft(std::span<const StepRequest> reqs, Tick& tick, DepthOne& d);
+    void add_cost(const models::StepResult& res) noexcept;
+    void finish_draft(std::span<const StepRequest> reqs, Tick& tick) const;
+    void build_verify(std::span<const StepRequest> reqs, Tick& tick, VerifyIn& v) const;
+    void finish_verify(std::span<const StepRequest> reqs, Tick& tick, models::StepResult& res);
     [[nodiscard]] std::size_t effective_k(const StepRequest& r) const;
     /// Whether `r` (with k drafts) verifies a tree this tick: cfg.tree, a greedy MTP decode without
     /// forced drafts, max_emit >= 2, an fp32 KV cache, a CPU/Vulkan backend, a GDN ring with room

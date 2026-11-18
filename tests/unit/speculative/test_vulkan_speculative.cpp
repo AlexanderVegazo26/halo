@@ -530,7 +530,8 @@ TEST_F(VulkanSpec, TreeChainWinsOrBothWrongEqualsPlainDecode) {
 // verify forward; every Qwen35 forward / MTP step / draft chain submits once and waits on one fence.
 // Pass condition: every profiled steady-state tick (after a warm-up tick that attaches the MTP KV pool)
 // has exactly `waits` "# wait" lines and no "# transfer" line (no staged per-step upload), for k = 1..3
-// on the per-depth host path (k MTP steps + 1 verify) and with chained drafts (1 chain + 1 verify).
+// on the per-depth host path (k MTP steps + 1 verify) and with chained drafts: ONE wait, the draft chain and
+// the verify recorded into one stream (Speculator::draft_verify -> Qwen35::mtp_draft_chain_verify).
 TEST_F(VulkanSpec, SpeculativeTickFenceWaitsPerDraftPath) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const VkModel vk(ctx, *nm_, /*reuse=*/false);
@@ -563,10 +564,10 @@ TEST_F(VulkanSpec, SpeculativeTickFenceWaitsPerDraftPath) {
             tick();  // warm-up, not profiled: the first MTP step attaches the MTP KV pool (its own submit + wait)
             for (std::size_t i = 0; i < k_profiled; ++i) {
                 const Profile p = op_timings_profile(std::to_string(k) + "_" + std::to_string(i), tick);
-                const std::size_t want = f.chain ? 2 : k + 1;
+                const std::size_t want = f.chain ? 1 : k + 1;
                 EXPECT_EQ(p.marks, std::vector<std::string>(want, "# wait"))
                     << f.name << " k=" << k << " steady tick " << i << ": expected " << want << " fence waits ("
-                    << (f.chain ? "1 draft chain + 1 verify" : "k MTP steps + 1 verify") << ") and no '# transfer' line, got "
+                    << (f.chain ? "draft chain + verify in one submit" : "k MTP steps + 1 verify") << ") and no '# transfer' line, got "
                     << p.marks.size() << " markers (" << p.transfers() << " transfers); " << p.shown;
             }
         }
