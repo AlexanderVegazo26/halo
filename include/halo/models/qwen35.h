@@ -295,6 +295,25 @@ public:
     /// token check.
     void mtp_draft_chain(std::span<const MtpStep> steps, std::span<const std::size_t> k, StepResult& out) const;
 
+    /// A speculative tick in ONE submit / fence wait (next.md step 4): mtp_draft_chain(mtp, k) and then
+    /// forward(verify) recorded into the same command stream, the verify rows embedding the chain's
+    /// drafts straight from device memory. chain_of[i] (one per verify step) names the chain step whose
+    /// k drafts are rows 1..k of verify[i].tokens (row 0 is the host token x), or is < 0 for a step whose
+    /// rows are all host tokens. A linked verify step needs k >= 1 and exactly 1 + k tokens, no
+    /// tree_parents and no positions; its host ids at rows 1..k are ignored (any in-vocab id); each chain
+    /// step is linked at most once, and only to the same sequence's verify (the chain's x row at MTP
+    /// position L = the verify's trunk KV length, Error(Api) otherwise). Results: draft_out as
+    /// mtp_draft_chain's and verify_out as forward's, each with its own cost, bitwise those of the two
+    /// calls made one after the other with the drafts as host tokens -- except that a poisoned (NaN)
+    /// draft is not an error here: its argmax entry and every deeper one of that sequence carry index -1.
+    /// The poisoned depth's verify row embedded id 0 (LmHeadArgs::ids) and the deeper drafts were drafted
+    /// from it, so those verify rows continue nothing and the caller keeps none of them.
+    /// On Error nothing changes: every touched MTP KV is truncated back and the trunk KV / GDN state is
+    /// committed only after the sync. Requires Limits::lm_head_ids and an MTP block (Error(Unsupported)).
+    void mtp_draft_chain_verify(std::span<const MtpStep> mtp, std::span<const std::size_t> k, StepResult& draft_out,
+                                std::span<const SeqStep> verify, std::span<const std::ptrdiff_t> chain_of,
+                                StepResult& verify_out) const;
+
     /// Copies KV row `from` to row `to` (both < kv.length()) of every trunk attention layer, K and
     /// V, on the model's backend (synchronous). The tree-verify commit of the alternate branch
     /// (SeqStep::tree_parents). fp32 KV pools only (Error(Unsupported) otherwise); the destination

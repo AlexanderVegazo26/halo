@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "backend/vulkan_adapter.h"
+#include "chain_verify_case.h"
 #include "halo/backend/backend.h"
 #include "halo/kv_cache/paged_kv.h"
 #include "halo/models/qwen35.h"
@@ -569,6 +570,53 @@ TEST_F(VulkanSpec, SpeculativeTickFenceWaitsPerDraftPath) {
                     << p.marks.size() << " markers (" << p.transfers() << " transfers); " << p.shown;
             }
         }
+    }
+}
+
+// next.md step 4, the chain's last fence: Qwen35::mtp_draft_chain_verify records the draft chain and the
+// trunk verify into one stream (the verify rows embed the chain's device ids), so a speculative tick
+// waits on ONE fence, where mtp_draft_chain + forward wait on two. On the device it must still equal the
+// two calls bit for bit: drafts, verify targets, hidden rows, costs, trunk KV, GDN state and MTP KV.
+// Sequences: k = 3, k = 1 and an unlinked plain row, so host rows sit on both sides of device rows.
+TEST_F(VulkanSpec, DraftChainVerifyIsOneFenceAndBitwiseChainThenForward) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel vk(ctx, *nm_, /*reuse=*/false);
+    ASSERT_TRUE(vk.model->has_mtp()) << "tiny-f32.gguf has no MTP head";
+    ASSERT_TRUE(vk.be->limits().lm_head_ids) << "the Vulkan backend must support device token ids";
+    auto sp = vk.spec(GateMode::Always, false, false);
+    const Toks p0 = prompt("p0"), p1 = prompt("p1");
+    struct Side {
+        std::vector<std::unique_ptr<SequenceState>> s;
+        std::vector<halo::test::ChainVerifySeq> in;
+    };
+    const auto make = [&] {
+        Side side;
+        const std::array<std::pair<const Toks*, std::size_t>, 3> plan{{{&p0, 3}, {&p1, 1}, {&p0, 0}}};
+        for (const auto& [p, k] : plan) {
+            side.s.push_back(vk.seq());
+            StepRequest pre;
+            pre.seq = side.s.back().get();
+            pre.prefill = *p;
+            const Toks first = step1(sp, pre).out.at(0).tokens;
+            SequenceState* one[] = {side.s.back().get()};
+            sp.flush_mtp(one);  // also attaches the MTP pool: the profiled tick below is steady
+            side.in.push_back({side.s.back().get(), first.at(0), k});
+        }
+        return side;
+    };
+    Side fused = make(), ref = make();
+    halo::test::ChainVerifyTick tf, tr;
+    const Profile pf = op_timings_profile("fused", [&] { tf = halo::test::run_chain_verify_tick(*vk.model, fused.in, true); });
+    const Profile pr = op_timings_profile("two_calls", [&] { tr = halo::test::run_chain_verify_tick(*vk.model, ref.in, false); });
+    EXPECT_EQ(pf.marks, std::vector<std::string>(1, "# wait"))
+        << "mtp_draft_chain_verify: expected one fence wait for the chain + verify and no '# transfer' line, got "
+        << pf.marks.size() << " markers (" << pf.transfers() << " transfers); " << pf.shown;
+    EXPECT_EQ(pr.marks, std::vector<std::string>(2, "# wait"))
+        << "mtp_draft_chain + forward: expected two fence waits, got " << pr.marks.size() << " markers; " << pr.shown;
+    halo::test::expect_same_tick(tf, tr, "vulkan");
+    for (std::size_t i = 0; i < fused.in.size(); ++i) {
+        halo::test::expect_same_seq_state(*fused.s[i], *ref.s[i], dump_kv,
+                                          "vulkan sequence " + std::to_string(i) + " k=" + std::to_string(fused.in[i].k));
     }
 }
 

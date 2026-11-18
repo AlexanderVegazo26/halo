@@ -19,6 +19,7 @@
 #include <stdexcept>
 
 #include "../models/tiny_golden.h"
+#include "chain_verify_case.h"
 #include "halo/backends/cpu/ops.h"
 #include "halo/core/error.h"
 #include "halo/speculative/speculative.h"
@@ -577,6 +578,125 @@ TEST_F(Spec, DraftChainEqualsDirectMtpCallsFedTheirOwnHidden) {
     EXPECT_EQ(t.out[0].drafts, direct);
     EXPECT_EQ(dump_kv(mtp_kv_of(*s)), dump_kv(mtp_kv_of(*twin))) << "chain rows written at the same MTP positions";
     sp.abort_draft(std::span(&q, 1), t);
+}
+
+// next.md step 4: Qwen35::mtp_draft_chain_verify records the draft chain and the trunk verify into one
+// stream, the verify's draft rows embedding the chain's device ids. It must equal mtp_draft_chain followed
+// by forward() with the drafts as host tokens, bit for bit: drafts, verify targets, hidden rows, costs, and
+// the trunk KV, GDN state and MTP KV it leaves. Three sequences cover k = 3, k = 1 and an unlinked
+// plain row (host rows on both sides of the device-sourced ones).
+TEST_F(Spec, DraftChainVerifyInOneStreamEqualsChainThenForward) {
+    auto sp = spec(GateMode::Always);
+    const Toks p0 = prompt("p0"), p1 = prompt("p1");
+    struct Side {
+        std::vector<std::unique_ptr<SequenceState>> s;
+        std::vector<halo::test::ChainVerifySeq> in;
+    };
+    const auto make = [&] {
+        Side side;
+        const std::array<std::pair<const Toks*, std::size_t>, 3> plan{{{&p0, 3}, {&p1, 1}, {&p0, 0}}};
+        for (const auto& [p, k] : plan) {
+            side.s.push_back(seq());
+            const Toks first = prefill(sp, *side.s.back(), *p);
+            SequenceState* one[] = {side.s.back().get()};
+            sp.flush_mtp(one);
+            side.in.push_back({side.s.back().get(), first.at(0), k});
+        }
+        return side;
+    };
+    Side fused = make(), ref = make();
+    const auto tf = halo::test::run_chain_verify_tick(model(), fused.in, /*fused=*/true);
+    const auto tr = halo::test::run_chain_verify_tick(model(), ref.in, /*fused=*/false);
+    halo::test::expect_same_tick(tf, tr, "cpu");
+    for (std::size_t i = 0; i < fused.in.size(); ++i) {
+        halo::test::expect_same_seq_state(*fused.s[i], *ref.s[i], dump_kv,
+                                          "cpu sequence " + std::to_string(i) + " k=" + std::to_string(fused.in[i].k));
+    }
+}
+
+// A rejected mtp_draft_chain_verify changes nothing: a linked verify step whose row count is not 1 + k is
+// Error(Api) before any MTP KV row, trunk KV row or GDN step is touched.
+TEST_F(Spec, DraftChainVerifyRejectsAMislinkedStepBeforeTouchingState) {
+    auto sp = spec(GateMode::Always);
+    auto s = seq();
+    const Toks first = prefill(sp, *s, prompt("p0"));
+    SequenceState* one[] = {s.get()};
+    sp.flush_mtp(one);
+    const std::size_t L = s->length(), mtp_len = mtp_kv_of(*s).length();
+    const std::vector<float> kv0 = dump_kv(s->kv), mtp0 = dump_kv(mtp_kv_of(*s));
+    const auto gdn0 = s->gdn.snapshot().data;
+    halo::models::MtpStep m;
+    m.tokens = std::span(&first.at(0), 1);
+    m.hidden = s->last_hidden;
+    m.kv = &mtp_kv_of(*s);
+    m.first_position = static_cast<std::int32_t>(L);
+    const std::size_t k = 2;
+    const Toks fed = {first.at(0), 0};  // 2 rows for k = 2: one short
+    const std::size_t rows[] = {0, 1};
+    halo::models::SeqStep v;
+    v.tokens = fed;
+    v.kv = &s->kv;
+    v.gdn = &s->gdn;
+    v.logit_rows = rows;
+    v.n_state_slots = k + 1;
+    v.gdn_path = halo::models::GdnPath::Recurrent;
+    const std::ptrdiff_t link = 0;
+    halo::models::StepResult dr, vr;
+    try {
+        model().mtp_draft_chain_verify(std::span(&m, 1), std::span(&k, 1), dr, std::span(&v, 1), std::span(&link, 1), vr);
+        ADD_FAILURE() << "a linked verify step of 2 rows for k = 2 drafts was accepted";
+    } catch (const halo::Error& e) {
+        EXPECT_EQ(e.code(), halo::ErrorCode::Api) << e.what();
+        EXPECT_NE(std::string(e.what()).find("1 + k tokens"), std::string::npos) << e.what();
+    }
+    EXPECT_EQ(s->length(), L) << "trunk KV length";
+    EXPECT_EQ(mtp_kv_of(*s).length(), mtp_len) << "MTP KV length";
+    EXPECT_TRUE(dump_kv(s->kv) == kv0) << "trunk KV rows changed";
+    EXPECT_TRUE(dump_kv(mtp_kv_of(*s)) == mtp0) << "MTP KV rows changed";
+    EXPECT_TRUE(s->gdn.snapshot().data == gdn0) << "GDN state changed";
+    // Crossed links between two sequences (each chain linked to the OTHER sequence's verify, same k) are
+    // rejected too: the chain's x row sits at the wrong trunk position.
+    {
+        auto o = seq();
+        const Toks of = prefill(sp, *o, prompt("p1"));
+        SequenceState* other[] = {o.get()};
+        sp.flush_mtp(other);
+        ASSERT_NE(o->length(), L) << "the crossed-link case needs two sequences of different lengths";
+        halo::models::MtpStep mo = m;
+        mo.tokens = std::span(&of.at(0), 1);
+        mo.hidden = o->last_hidden;
+        mo.kv = &mtp_kv_of(*o);
+        mo.first_position = static_cast<std::int32_t>(o->length());
+        const halo::models::MtpStep chains[] = {m, mo};
+        const std::size_t ks[] = {1, 1};
+        const Toks fs = {first.at(0), 0}, fo = {of.at(0), 0};
+        halo::models::SeqStep vs = v, vo = v;
+        vs.tokens = fs;
+        vs.n_state_slots = 2;
+        vo.tokens = fo;
+        vo.kv = &o->kv;
+        vo.gdn = &o->gdn;
+        vo.n_state_slots = 2;
+        const halo::models::SeqStep verifies[] = {vs, vo};
+        const std::ptrdiff_t crossed[] = {1, 0};
+        const std::size_t olen = o->length(), omtp = mtp_kv_of(*o).length();
+        try {
+            model().mtp_draft_chain_verify(chains, ks, dr, verifies, crossed, vr);
+            ADD_FAILURE() << "crossed chain links between two sequences were accepted";
+        } catch (const halo::Error& e) {
+            EXPECT_EQ(e.code(), halo::ErrorCode::Api) << e.what();
+            EXPECT_NE(std::string(e.what()).find("not the same sequence"), std::string::npos) << e.what();
+        }
+        EXPECT_EQ(o->length(), olen) << "crossed links: other sequence's trunk KV length";
+        EXPECT_EQ(mtp_kv_of(*o).length(), omtp) << "crossed links: other sequence's MTP KV length";
+        EXPECT_EQ(mtp_kv_of(*s).length(), mtp_len) << "crossed links: MTP KV length";
+    }
+    // The sequence still decodes: a plain step after the rejected call is accepted.
+    StepRequest q;
+    q.seq = s.get();
+    q.token = first.at(0);
+    Tick t;
+    EXPECT_NO_THROW(sp.step(std::span(&q, 1), t)) << "the rejected call left the sequence unusable";
 }
 
 // Review R-5(b): the draft chain against llama.cpp, the only executable MTP reference (D-005).

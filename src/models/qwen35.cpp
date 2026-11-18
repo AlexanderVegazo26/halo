@@ -1089,44 +1089,58 @@ void check_all_distinct(std::span<T* const> ptrs, const char* what, const char* 
 
 }  // namespace
 
-void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const ForwardOptions& opts) const {
-    const Impl& I = *impl_;
-    const state::GdnShape shape = gdn_shape();
-    const kv_cache::KvLayout want_kv = kv_layout();
-    // ---- validate everything before touching any state ---------------------------------
-    std::vector<SeqRows> seqs(steps.size());
-    std::vector<Impl::GdnSeq> gseqs(steps.size());
+namespace {
+
+using Impl = Qwen35::Impl;
+
+/// A validated trunk step (forward, mtp_draft_chain_verify). The host vectors are read by recorded ops at
+/// submit time: keep it alive until the sync returns.
+struct TrunkRec {
+    std::vector<SeqRows> seqs;
+    std::vector<Impl::GdnSeq> gseqs;
+    std::size_t R = 0;
+    std::vector<std::int32_t> ids, pos;
+    std::vector<std::vector<std::int32_t>> tree_par;  // per-step copies of tree_parents (imported)
+};
+
+/// Every check of a trunk step, before any state is touched.
+void validate_forward(const Impl& I, const state::GdnShape& shape, const kv_cache::KvLayout& want_kv,
+                      std::span<const SeqStep> steps, TrunkRec& tr, const char* what) {
+    std::vector<SeqRows>& seqs = tr.seqs;
+    std::vector<Impl::GdnSeq>& gseqs = tr.gseqs;
+    seqs.assign(steps.size(), {});
+    gseqs.assign(steps.size(), {});
     std::vector<kv_cache::SequenceKv*> kv_ptrs(steps.size());
     std::vector<state::GdnState*> gdn_ptrs(steps.size());
     std::size_t R = 0;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const SeqStep& s = steps[si];
-        check_tokens(s.tokens, I.n_vocab, "forward", si);
-        check_kv(s.kv, want_kv, "forward", si);
-        HALO_CHECK(s.gdn != nullptr, ErrorCode::Api, "forward step {}: no GDN state", si);
+        check_tokens(s.tokens, I.n_vocab, what, si);
+        check_kv(s.kv, want_kv, what, si);
+        HALO_CHECK(s.gdn != nullptr, ErrorCode::Api, "{} step {}: no GDN state", what, si);
         const auto& gs = s.gdn->shape();
         HALO_CHECK(gs.n_layers == shape.n_layers && gs.recurrent_floats() == shape.recurrent_floats() &&
                        gs.conv_floats() == shape.conv_floats(),
-                   ErrorCode::Api, "forward step {}: GDN state shape does not match the model", si);
-        HALO_CHECK(s.n_state_slots <= s.gdn->max_slots(), ErrorCode::Api, "forward step {}: {} state slots, state has {}", si,
+                   ErrorCode::Api, "{} step {}: GDN state shape does not match the model", what, si);
+        HALO_CHECK(s.n_state_slots <= s.gdn->max_slots(), ErrorCode::Api, "{} step {}: {} state slots, state has {}", what, si,
                    s.n_state_slots, s.gdn->max_slots());
         kv_ptrs[si] = s.kv;
         gdn_ptrs[si] = s.gdn;
         const std::size_t len = s.kv->length();
         HALO_CHECK(len + s.tokens.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()), ErrorCode::Api,
-                   "forward step {}: position overflow", si);
+                   "{} step {}: position overflow", what, si);
         if (!s.positions.empty()) {
-            HALO_CHECK(s.positions.size() == s.tokens.size(), ErrorCode::Api, "forward step {}: {} positions for {} tokens", si,
+            HALO_CHECK(s.positions.size() == s.tokens.size(), ErrorCode::Api, "{} step {}: {} positions for {} tokens", what, si,
                        s.positions.size(), s.tokens.size());
             for (std::size_t i = 0; i < s.positions.size(); ++i) {
                 HALO_CHECK(s.positions[i] == static_cast<std::int32_t>(len + i), ErrorCode::Unsupported,
-                           "forward step {}: position {} at row {} (text-only 1-D RoPE needs {})", si, s.positions[i], i,
+                           "{} step {}: position {} at row {} (text-only 1-D RoPE needs {})", what, si, s.positions[i], i,
                            len + i);
             }
         }
-        check_rows(s.logit_rows, s.tokens.size(), "forward", si);
+        check_rows(s.logit_rows, s.tokens.size(), what, si);
         HALO_CHECK(s.gdn_path != GdnPath::Chunked || I.limits.gdn_chunked, ErrorCode::Unsupported,
-                   "forward step {}: the {} backend has no chunked GDN form", si, backend::to_string(I.be->kind()));
+                   "{} step {}: the {} backend has no chunked GDN form", what, si, backend::to_string(I.be->kind()));
         seqs[si] = {R, s.tokens.size(), s.kv, static_cast<std::int32_t>(len), {}};
         const bool tree = !s.tree_parents.empty();
         if (tree) {
@@ -1135,23 +1149,36 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
             // state after x (chain rollback slot k, needing all k+1 slots) and writes one more ring state.
             const std::size_t T = s.tokens.size() - 1;  // chain rows
             HALO_CHECK(s.tree_parents.size() == s.tokens.size() && cpu::is_chain_plus_root_leaf(s.tree_parents), ErrorCode::Api,
-                       "forward step {}: tree_parents must be [-1, 0, 1 .. k-1, 0] (a chain plus one root leaf), {} rows", si,
+                       "{} step {}: tree_parents must be [-1, 0, 1 .. k-1, 0] (a chain plus one root leaf), {} rows", what, si,
                        s.tokens.size());
-            HALO_CHECK(s.positions.empty(), ErrorCode::Api, "forward step {}: a tree step cannot carry explicit positions", si);
+            HALO_CHECK(s.positions.empty(), ErrorCode::Api, "{} step {}: a tree step cannot carry explicit positions", what, si);
             HALO_CHECK(s.gdn_path != GdnPath::Chunked && s.n_state_slots == T && s.gdn->fits_tree_leaf(T), ErrorCode::Api,
-                       "forward step {}: a tree step needs the recurrent GDN path, exactly {} state slots and a ring of at "
+                       "{} step {}: a tree step needs the recurrent GDN path, exactly {} state slots and a ring of at "
                        "least {} states (state has {} slots)",
-                       si, T, T + 2, s.gdn->max_slots());
+                       what, si, T, T + 2, s.gdn->max_slots());
             HALO_CHECK(s.kv->pool().layout().type == backend::KvType::F32, ErrorCode::Unsupported,
-                       "forward step {}: tree verification needs an fp32 KV cache", si);
+                       "{} step {}: tree verification needs an fp32 KV cache", what, si);
         }
         const bool chunked = !tree && (s.gdn_path == GdnPath::Chunked ||
                              (s.gdn_path == GdnPath::Auto && I.limits.gdn_chunked && s.tokens.size() > 1 && s.n_state_slots == 0));
         gseqs[si] = {s.gdn, s.n_state_slots, chunked, tree};
         R += s.tokens.size();
     }
-    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "forward", "KV cache");
-    check_all_distinct<state::GdnState>(gdn_ptrs, "forward", "GDN state");
+    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, what, "KV cache");
+    check_all_distinct<state::GdnState>(gdn_ptrs, what, "GDN state");
+    tr.R = R;
+}
+
+/// A call's result before it records anything: one empty output per step, no cost, no extras.
+void reset_result(StepResult& out, std::size_t n_steps) {
+    out.seqs.assign(n_steps, {});
+    out.cost = {};
+    out.layer_inputs.clear();
+    out.gdn_paths.clear();
+}
+
+/// Begins a validated trunk step: GDN begin_step, `out` reset, KV rows reserved (lengths unchanged).
+void begin_forward(const Impl& I, std::span<const SeqStep> steps, const TrunkRec& tr, StepResult& out) {
     // ADR-001 §5.3: attach the ring slab to this backend on first use, then record the
     // step's base (live) — an uncommitted verify on this sequence is Error(Api) here. Done
     // after the distinctness check so a duplicated state is never begun twice.
@@ -1160,30 +1187,34 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         // A tree step's GDN state advances over its T = rows - 1 chain rows only (the leaf's state waits in the ring).
         s.gdn->begin_step(s.tree_parents.empty() ? s.tokens.size() : s.tokens.size() - 1, s.n_state_slots);
     }
-    out.seqs.assign(steps.size(), {});
-    out.cost = {};
-    out.layer_inputs.clear();
-    out.gdn_paths.clear();
-    for (const auto& g : gseqs) out.gdn_paths.push_back(g.chunked ? GdnPath::Chunked : GdnPath::Recurrent);
-    if (steps.empty()) return;
+    reset_result(out, steps.size());
+    for (const auto& g : tr.gseqs) out.gdn_paths.push_back(g.chunked ? GdnPath::Chunked : GdnPath::Recurrent);
     for (const SeqStep& s : steps) s.kv->reserve(s.tokens.size());  // Error(Memory); lengths unchanged
+}
 
-    // ---- trunk -----------------------------------------------------------------------------
-    StepCost& cost = out.cost;
-    cost.weight_passes = 1;
+/// Records the trunk and the head of a begun step into `st`. The head's sync (if any row wants logits)
+/// submits everything recorded into `st` so far. `draft_ids` is empty, or holds per step the device
+/// int32 ids that rows 1.. of that step embed instead of their host tokens (empty = all host rows).
+void record_forward(const Impl& I, Impl::Step& st, std::span<const SeqStep> steps, TrunkRec& tr, StepResult& out,
+                    const ForwardOptions& opts, std::span<const std::vector<TensorRef>> draft_ids, std::uint64_t embd_row_bytes) {
+    std::vector<SeqRows>& seqs = tr.seqs;
+    const std::size_t R = tr.R;
+    StepCost& cost = st.cost;
     const std::size_t E = I.E;
-    Impl::Step st(I, cost);
     st.allow_gemm = std::all_of(steps.begin(), steps.end(), [](const SeqStep& s) { return s.prefill; });
-    std::vector<std::int32_t> ids(R), pos(R);
-    std::vector<std::vector<std::int32_t>> tree_par(steps.size());  // per-step copies of tree_parents (imported below)
+    std::vector<std::int32_t>& ids = tr.ids;
+    std::vector<std::int32_t>& pos = tr.pos;
+    ids.assign(R, 0);
+    pos.assign(R, 0);
+    tr.tree_par.assign(steps.size(), {});
     for (std::size_t si = 0; si < steps.size(); ++si) {
         std::copy(steps[si].tokens.begin(), steps[si].tokens.end(), &ids[seqs[si].r0]);
         for (std::size_t i = 0; i < seqs[si].n; ++i) pos[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(i);
         if (!steps[si].tree_parents.empty()) {
             // RoPE position of a tree row = L + its depth (the leaf sits next to d1, not after dk).
-            tree_par[si].assign(steps[si].tree_parents.begin(), steps[si].tree_parents.end());
+            tr.tree_par[si].assign(steps[si].tree_parents.begin(), steps[si].tree_parents.end());
             for (std::size_t i = 0; i < seqs[si].n; ++i) {
-                pos[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(cpu::tree_depth(tree_par[si], i));
+                pos[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(cpu::tree_depth(tr.tree_par[si], i));
             }
         }
     }
@@ -1191,15 +1222,31 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
     const TensorRef rpos = st.import_ro(std::as_bytes(std::span(pos)));
     for (SeqRows& s : seqs) I.import_kv(st, s);
     for (std::size_t si = 0; si < steps.size(); ++si) {
-        if (!tree_par[si].empty()) seqs[si].tree_parent = st.import_ro(std::as_bytes(std::span(tree_par[si])));
+        if (!tr.tree_par[si].empty()) seqs[si].tree_parent = st.import_ro(std::as_bytes(std::span(tr.tree_par[si])));
     }
     const bool any_gdn = std::any_of(I.layers.begin(), I.layers.end(), [](const LayerW& l) { return l.gdn.has_value(); });
     const Impl::Acts a = I.make_acts(st, R, any_gdn);
     const TensorRef hbuf = st.alloc(R * E);
 
-    I.be->get_rows(*st.s, backend::GetRowsArgs{I.embd.ref.type(), TensorRef::of(*I.embd.buf), rids, a.x,
-                                               u32(I.embd.ref.ne(1)), u32(E), u32(R), {}, {}});
-    cost.embedding_bytes += R * embedding_row_bytes();
+    const auto embed = [&](TensorRef row_ids, std::size_t r0, std::size_t n) {
+        I.be->get_rows(*st.s, backend::GetRowsArgs{I.embd.ref.type(), TensorRef::of(*I.embd.buf), row_ids, Impl::rows_at(a.x, r0, E),
+                                                   u32(I.embd.ref.ne(1)), u32(E), u32(n), {}, {}});
+    };
+    if (draft_ids.empty()) {
+        embed(rids, 0, R);
+    } else {
+        // Host rows in runs, device-sourced draft rows one id each: every row of a.x is written once.
+        std::size_t run0 = 0;  // first row of the pending host run
+        for (std::size_t si = 0; si < steps.size(); ++si) {
+            if (draft_ids[si].empty()) continue;
+            const std::size_t r0 = seqs[si].r0;
+            embed(rids.shifted(run0 * sizeof(std::int32_t)), run0, r0 + 1 - run0);  // ... up to and including row 0 (x)
+            for (std::size_t j = 0; j < draft_ids[si].size(); ++j) embed(draft_ids[si][j], r0 + 1 + j, 1);
+            run0 = r0 + seqs[si].n;
+        }
+        if (run0 < R) embed(rids.shifted(run0 * sizeof(std::int32_t)), run0, R - run0);
+    }
+    cost.embedding_bytes += R * embd_row_bytes;
     if (!I.layers.empty()) I.rms_norm(st, a.x, R, E, I.layers.front().attn_norm, a.xn);
     for (std::size_t li = 0; li < I.layers.size(); ++li) {
         const LayerW& l = I.layers[li];
@@ -1213,14 +1260,14 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         if (l.kind == LayerKind::FullAttention) {
             I.decoder_layer(st, a, l, R, [&] { I.attention(st, a, *l.attn, l.kind_index, R, seqs, rpos); }, next_norm, next_out);
         } else {
-            I.decoder_layer(st, a, l, R, [&] { I.gdn(st, a, *l.gdn, l.kind_index, R, seqs, gseqs); }, next_norm, next_out);
+            I.decoder_layer(st, a, l, R, [&] { I.gdn(st, a, *l.gdn, l.kind_index, R, seqs, tr.gseqs); }, next_norm, next_out);
         }
         // attn_norm (layer 0) / post_norm / next norm accounting as one rms_norm per norm:
         // add_rms_norm counted the add and the norm; the 2 adds of the layer are counted there.
     }
     if (I.layers.empty()) I.rms_norm(st, a.x, R, E, I.output_norm, hbuf);
     // No sync here: the hidden download and the head are recorded into the same command
-    // buffer, so one submit and one fence wait (in head() / below) cover the whole forward.
+    // buffer, so one submit and one fence wait (in head() / the caller's sync) cover the whole forward.
 
     // ---- head ------------------------------------------------------------------------------
     // H1/M1 (ADR-001 WS-BI-2 step 1): KV/GDN commit happens AFTER head() succeeds, not before.
@@ -1244,13 +1291,271 @@ void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const Forw
         }
     }
     I.head(st, I.lm_head, I.head_bytes, hbuf, reqs);
-    st.sync();
+}
 
-    for (std::size_t si = 0; si < steps.size(); ++si) {
-        steps[si].kv->commit(steps[si].tokens.size());
-        steps[si].gdn->mark_slots_written(steps[si].tree_parents.empty() ? steps[si].tokens.size() : steps[si].tokens.size() - 1,
-                                          steps[si].n_state_slots);
+/// After the step's sync: every sequence's KV grows by its rows, its GDN slots count as written.
+void commit_forward(std::span<const SeqStep> steps) {
+    for (const SeqStep& s : steps) {
+        s.kv->commit(s.tokens.size());
+        s.gdn->mark_slots_written(s.tree_parents.empty() ? s.tokens.size() : s.tokens.size() - 1, s.n_state_slots);
     }
+}
+
+/// One depth of a recorded draft chain: what it leaves behind for the next depth, the verify and the decode.
+struct ChainDepth {
+    std::vector<std::size_t> at;        // sequences drafting at this depth (ascending)
+    std::vector<std::size_t> last_row;  // per participant: its row in `hbuf` (head input / next hidden)
+    TensorRef hbuf{}, ids{};            // ids: one device int32 winning id per participant (when recorded)
+    std::vector<std::byte> words;       // argmax result words, downloaded at the sync
+};
+
+/// A validated draft chain (mtp_draft_chain, mtp_draft_chain_verify). The host vectors are read by recorded
+/// ops at submit time: keep it alive until the sync returns.
+struct ChainRec {
+    std::vector<SeqRows> seqs;  // the depth-1 rows of every sequence
+    std::vector<std::size_t> len0;  // MTP KV lengths on entry (the rollback point)
+    std::size_t R1 = 0, max_k = 0;
+    std::vector<std::int32_t> ids1, pos1;
+    std::vector<std::vector<std::int32_t>> pos_d;
+    std::vector<ChainDepth> depths;
+};
+
+/// Every check of a draft chain, before any state is touched.
+void validate_chain(const Impl& I, const kv_cache::KvLayout& want_kv, std::span<const MtpStep> steps,
+                    std::span<const std::size_t> k, ChainRec& rc, const char* what) {
+    HALO_CHECK(I.mtp.has_value(), ErrorCode::Unsupported, "{}: the model has no MTP block", what);
+    HALO_CHECK(I.limits.lm_head_ids, ErrorCode::Unsupported,
+               "{}: the {} backend cannot write device-side winning ids (Limits::lm_head_ids)", what,
+               backend::to_string(I.be->kind()));
+    HALO_CHECK(k.size() == steps.size(), ErrorCode::Api, "{}: {} draft counts for {} steps", what, k.size(), steps.size());
+    const std::size_t E = I.E;
+    const std::size_t n_seq = steps.size();
+    rc.seqs.assign(n_seq, {});
+    std::vector<kv_cache::SequenceKv*> kv_ptrs(n_seq);
+    std::size_t R1 = 0, max_k = 0;
+    for (std::size_t si = 0; si < n_seq; ++si) {
+        const MtpStep& s = steps[si];
+        check_tokens(s.tokens, I.n_vocab, what, si);
+        check_kv(s.kv, want_kv, what, si);
+        if (s.hidden_device) {
+            HALO_CHECK(s.hidden.empty() && s.tokens.size() == 1 && s.hidden_device->bytes() >= E * kF32 &&
+                           s.hidden_device->backend() == I.be,
+                       ErrorCode::Api,
+                       "{} step {}: hidden_device needs a one-row step with no host hidden and a {}-byte buffer of "
+                       "this backend",
+                       what, si, E * kF32);
+        } else {
+            HALO_CHECK(s.hidden.size() == s.tokens.size() * E, ErrorCode::Api, "{} step {}: {} hidden floats for {} rows", what,
+                       si, s.hidden.size(), s.tokens.size());
+        }
+        HALO_CHECK(s.first_position >= 0 &&
+                       static_cast<std::size_t>(s.first_position) + s.tokens.size() + k[si] <=
+                           static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
+                   ErrorCode::Api, "{} step {}: bad first position {}", what, si, s.first_position);
+        kv_ptrs[si] = s.kv;
+        rc.seqs[si] = {R1, s.tokens.size(), s.kv, s.first_position, {}};
+        R1 += s.tokens.size();
+        max_k = std::max(max_k, k[si]);
+    }
+    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, what, "KV cache");
+    rc.R1 = R1;
+    rc.max_k = max_k;
+    rc.len0.resize(n_seq);
+    for (std::size_t si = 0; si < n_seq; ++si) rc.len0[si] = steps[si].kv->length();
+}
+
+/// Records every depth of a validated, non-empty draft chain into `st` (no sync). MTP KV lengths advance
+/// as the depths are recorded: on any exception the caller truncates them back to rc.len0. Device winning
+/// ids are kept for every depth that feeds a further one, and for every depth when `ids_every_depth`.
+void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps, std::span<const std::size_t> k, ChainRec& rc,
+                  bool ids_every_depth) {
+    HALO_CHECK(I.mtp.has_value(), ErrorCode::Unsupported, "draft chain: the model has no MTP block");  // validate_chain checked
+    const MtpW& M = *I.mtp;
+    const std::size_t E = I.E;
+    const std::size_t n_seq = steps.size();
+    const std::size_t R1 = rc.R1, max_k = rc.max_k;
+    std::vector<SeqRows>& seqs = rc.seqs;
+    StepCost& cost = st.cost;
+    // Rows of every depth are reserved up front: the block table imported once below stays valid for
+    // the whole chain, while the host-side length is advanced per depth as the ops are recorded
+    // (attention / kv_write read kv->length() at record time).
+    for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->reserve(steps[si].tokens.size() + (k[si] > 1 ? k[si] - 1 : 0));
+
+    std::vector<std::int32_t>& ids1 = rc.ids1;
+    std::vector<std::int32_t>& pos1 = rc.pos1;
+    ids1.assign(R1, 0);
+    pos1.assign(R1, 0);
+    rc.pos_d.assign(max_k + 1, {});
+    for (std::size_t si = 0; si < n_seq; ++si) {
+        std::copy(steps[si].tokens.begin(), steps[si].tokens.end(), &ids1[seqs[si].r0]);
+        for (std::size_t i = 0; i < seqs[si].n; ++i) pos1[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(i);
+    }
+    for (SeqRows& s : seqs) I.import_kv(st, s);
+    const TensorRef rids = st.import_ro(std::as_bytes(std::span(ids1)));
+    const TensorRef rpos1 = st.import_ro(std::as_bytes(std::span(pos1)));
+    const std::uint64_t emb_row_bytes = tensor::row_bytes(M.embedding.ref.type(), static_cast<std::int64_t>(E));
+    const TensorRef emb_table = TensorRef::of(*M.embedding.buf);
+
+    // One MTP layer pass over Rd rows (mtp_forward's body); returns the post-head-norm hidden rows.
+    const auto layer_pass = [&](std::size_t Rd, std::span<const SeqRows> sd, TensorRef rpos, const auto& fill_embed,
+                                const auto& fill_hidden) {
+        cost.weight_passes += 1;
+        const Impl::Acts a = I.make_acts(st, Rd, false);
+        const TensorRef e = st.alloc(Rd * E), hh = st.alloc(Rd * E), cat = st.alloc(Rd * 2 * E), hbuf = st.alloc(Rd * E);
+        fill_embed(e);
+        fill_hidden(hh);
+        cost.embedding_bytes += Rd * emb_row_bytes;
+        I.rms_norm(st, e, Rd, E, M.enorm, cat.with_stride(2 * E * kF32));
+        I.rms_norm(st, hh, Rd, E, M.hnorm, cat.shifted(E * kF32).with_stride(2 * E * kF32));
+        I.gemv(st, cat, Rd, M.eh_proj, a.x);
+        I.rms_norm(st, a.x, Rd, E, M.block.attn_norm, a.xn);
+        I.decoder_layer(st, a, M.block, Rd, [&] { I.attention(st, a, *M.block.attn, 0, Rd, sd, rpos); }, M.head_norm, hbuf);
+        return hbuf;
+    };
+
+    std::vector<ChainDepth>& depths = rc.depths;
+    depths.assign(std::max<std::size_t>(max_k, 1), {});
+
+    // Head over one row per participant: no host round trip. Winning ids stay on the device (`want_ids`)
+    // for the next depth's GET_ROWS; the result words are downloaded at the single sync.
+    const std::size_t vocab_rows = (I.draft_vocab == 0 || I.draft_vocab > I.n_vocab) ? I.n_vocab : I.draft_vocab;
+    const auto head_rows = [&](ChainDepth& D, bool want_ids) {
+        const std::size_t n = D.at.size();
+        const TensorRef xs = st.alloc(n * E);
+        for (std::size_t i = 0; i < n; ++i) {
+            I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(D.hbuf, D.last_row[i], E), Impl::rows_at(xs, i, E), E * kF32, {}});
+        }
+        st.arena.push_back(I.be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
+        const TensorRef res = TensorRef::of(*st.arena.back());
+        if (want_ids) {
+            st.arena.push_back(I.be->allocate(n * sizeof(std::int32_t), backend::Tier::Vram));
+            D.ids = TensorRef::of(*st.arena.back());
+        }
+        I.be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{M.lm_head.ref.type(), TensorRef::of(*M.lm_head.buf), xs,
+                                                                   TensorRef{}, u32(vocab_rows), u32(E), u32(n), {}},
+                                                 res,
+                                                 u32(std::min<std::size_t>(I.valid_vocab, vocab_rows)),
+                                                 {},
+                                                 {},
+                                                 D.ids});
+        D.words.resize(n * backend::kArgmaxResultBytes);
+        I.be->download(*st.s, res, std::span(D.words));
+        const std::uint64_t bytes = M.lm_head.ref.n_bytes();
+        cost.weight_bytes += vocab_rows == I.n_vocab ? bytes : bytes / I.n_vocab * vocab_rows;
+        cost.activation_bytes += cpu::traffic_matmul(n, E, vocab_rows, 0).total();
+    };
+
+    // ---- depth 1: teacher-forced rows (+ the first draft) ---------------------------------
+    {
+        const TensorRef hbuf = layer_pass(
+            R1, seqs, rpos1,
+            [&](TensorRef e) {
+                I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table, rids, e,
+                                                           u32(M.embedding.ref.ne(1)), u32(E), u32(R1), {}, {}});
+            },
+            [&](TensorRef hh) {
+                for (std::size_t si = 0; si < n_seq; ++si) {
+                    if (steps[si].hidden_device) {
+                        I.be->copy(*st.s, backend::CopyArgs{TensorRef::of(*steps[si].hidden_device),
+                                                            Impl::rows_at(hh, seqs[si].r0, E), E * kF32, {}});
+                    } else {
+                        I.be->upload(*st.s, Impl::rows_at(hh, seqs[si].r0, E), std::as_bytes(steps[si].hidden));
+                    }
+                }
+            });
+        for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->commit(seqs[si].n);
+        ChainDepth& D = depths[0];
+        D.hbuf = hbuf;
+        for (std::size_t si = 0; si < n_seq; ++si) {
+            if (k[si] == 0) continue;
+            D.at.push_back(si);
+            D.last_row.push_back(seqs[si].r0 + seqs[si].n - 1);
+        }
+        if (!D.at.empty()) head_rows(D, ids_every_depth || max_k > 1);
+    }
+
+    // ---- depth d >= 2: one row per sequence still drafting; token and hidden come from depth d-1
+    // on the device (ids -> GET_ROWS, D2D copy of the hidden row) ------------------------------
+    for (std::size_t d = 2; d <= max_k; ++d) {
+        const ChainDepth& P = depths[d - 2];
+        ChainDepth& D = depths[d - 1];
+        for (std::size_t si = 0; si < n_seq; ++si) {
+            if (k[si] >= d) D.at.push_back(si);
+        }
+        const std::size_t Rd = D.at.size();
+        std::vector<std::size_t> prev(Rd);  // index of each participant among P.at
+        std::vector<SeqRows> sd(Rd);
+        rc.pos_d[d].resize(Rd);
+        for (std::size_t i = 0; i < Rd; ++i) {
+            const std::size_t si = D.at[i];
+            prev[i] = static_cast<std::size_t>(std::lower_bound(P.at.begin(), P.at.end(), si) - P.at.begin());
+            const std::int32_t pos = seqs[si].pos0 + static_cast<std::int32_t>(seqs[si].n + d - 2);
+            sd[i] = {i, 1, steps[si].kv, pos, seqs[si].table};
+            rc.pos_d[d][i] = pos;
+            D.last_row.push_back(i);
+        }
+        const TensorRef rpos = st.import_ro(std::as_bytes(std::span(rc.pos_d[d])));
+        D.hbuf = layer_pass(
+            Rd, sd, rpos,
+            [&](TensorRef e) {
+                for (std::size_t i = 0; i < Rd; ++i) {
+                    I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table,
+                                                               P.ids.shifted(prev[i] * sizeof(std::int32_t)),
+                                                               Impl::rows_at(e, i, E), u32(M.embedding.ref.ne(1)), u32(E), 1, {}, {}});
+                }
+            },
+            [&](TensorRef hh) {
+                for (std::size_t i = 0; i < Rd; ++i) {
+                    I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(P.hbuf, P.last_row[prev[i]], E), Impl::rows_at(hh, i, E),
+                                                        E * kF32, {}});
+                }
+            });
+        for (std::size_t i = 0; i < Rd; ++i) steps[D.at[i]].kv->commit(1);
+        head_rows(D, ids_every_depth || d < max_k);
+    }
+}
+
+/// The device id of sequence `si`'s depth-`d` draft (recorded with ids for that depth).
+TensorRef chain_draft_id(const ChainRec& rc, std::size_t si, std::size_t d) {
+    const ChainDepth& D = rc.depths.at(d - 1);
+    const auto it = std::lower_bound(D.at.begin(), D.at.end(), si);
+    HALO_CHECK(it != D.at.end() && *it == si && !D.ids.empty(), ErrorCode::Api,
+               "draft chain: sequence {} has no device id at depth {}", si, d);
+    return D.ids.shifted(static_cast<std::size_t>(it - D.at.begin()) * sizeof(std::int32_t));
+}
+
+/// After the chain's sync: every depth's winners into out.seqs[i].argmax, in depth order. A poisoned
+/// (NaN) winner is Error(Api) when `poison_is_error`; otherwise it and every deeper draft of that
+/// sequence (fed id 0 on the device, not a continuation of anything) are reported with index -1.
+void decode_chain(const ChainRec& rc, StepResult& out, bool poison_is_error, const char* what) {
+    std::vector<char> poisoned(out.seqs.size(), 0);
+    for (std::size_t d = 1; d <= rc.max_k; ++d) {
+        const ChainDepth& D = rc.depths[d - 1];
+        const std::vector<backend::ArgmaxResult> best = backend::decode_argmax(D.words);
+        for (std::size_t i = 0; i < D.at.size(); ++i) {
+            const std::size_t si = D.at[i];
+            HALO_CHECK(!poison_is_error || best[i].index >= 0, ErrorCode::Api,
+                       "{} step {}: draft depth {} is poisoned (NaN logit / no result), token id {}", what, si, d, best[i].index);
+            poisoned[si] = static_cast<char>(poisoned[si] != 0 || best[i].index < 0);
+            out.seqs[si].argmax.push_back(cpu::TopKEntry{poisoned[si] != 0 ? -1 : best[i].index, best[i].value});
+        }
+    }
+}
+
+}  // namespace
+
+void Qwen35::forward(std::span<const SeqStep> steps, StepResult& out, const ForwardOptions& opts) const {
+    const Impl& I = *impl_;
+    TrunkRec tr;
+    validate_forward(I, gdn_shape(), kv_layout(), steps, tr, "forward");
+    begin_forward(I, steps, tr, out);
+    if (steps.empty()) return;
+    StepCost& cost = out.cost;
+    cost.weight_passes = 1;
+    Impl::Step st(I, cost);
+    record_forward(I, st, steps, tr, out, opts, {}, embedding_row_bytes());
+    st.sync();
+    commit_forward(steps);
 }
 
 void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const {
@@ -1360,209 +1665,82 @@ void Qwen35::mtp_forward(std::span<const MtpStep> steps, StepResult& out) const 
 
 void Qwen35::mtp_draft_chain(std::span<const MtpStep> steps, std::span<const std::size_t> k, StepResult& out) const {
     const Impl& I = *impl_;
-    HALO_CHECK(I.mtp.has_value(), ErrorCode::Unsupported, "mtp_draft_chain: the model has no MTP block");
-    HALO_CHECK(I.limits.lm_head_ids, ErrorCode::Unsupported,
-               "mtp_draft_chain: the {} backend cannot write device-side winning ids (Limits::lm_head_ids)",
-               backend::to_string(I.be->kind()));
-    HALO_CHECK(k.size() == steps.size(), ErrorCode::Api, "mtp_draft_chain: {} draft counts for {} steps", k.size(), steps.size());
-    const MtpW& M = *I.mtp;
-    const kv_cache::KvLayout want_kv = mtp_kv_layout();
-    const std::size_t E = I.E;
-    const std::size_t n_seq = steps.size();
-    std::vector<SeqRows> seqs(n_seq);  // the depth-1 rows of every sequence
-    std::vector<kv_cache::SequenceKv*> kv_ptrs(n_seq);
-    std::size_t R1 = 0, max_k = 0;
-    for (std::size_t si = 0; si < n_seq; ++si) {
-        const MtpStep& s = steps[si];
-        check_tokens(s.tokens, I.n_vocab, "mtp_draft_chain", si);
-        check_kv(s.kv, want_kv, "mtp_draft_chain", si);
-        if (s.hidden_device) {
-            HALO_CHECK(s.hidden.empty() && s.tokens.size() == 1 && s.hidden_device->bytes() >= E * kF32 &&
-                           s.hidden_device->backend() == I.be,
-                       ErrorCode::Api,
-                       "mtp_draft_chain step {}: hidden_device needs a one-row step with no host hidden and a {}-byte buffer of "
-                       "this backend",
-                       si, E * kF32);
-        } else {
-            HALO_CHECK(s.hidden.size() == s.tokens.size() * E, ErrorCode::Api,
-                       "mtp_draft_chain step {}: {} hidden floats for {} rows", si, s.hidden.size(), s.tokens.size());
-        }
-        HALO_CHECK(s.first_position >= 0 &&
-                       static_cast<std::size_t>(s.first_position) + s.tokens.size() + k[si] <=
-                           static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
-                   ErrorCode::Api, "mtp_draft_chain step {}: bad first position {}", si, s.first_position);
-        kv_ptrs[si] = s.kv;
-        seqs[si] = {R1, s.tokens.size(), s.kv, s.first_position, {}};
-        R1 += s.tokens.size();
-        max_k = std::max(max_k, k[si]);
-    }
-    check_all_distinct<kv_cache::SequenceKv>(kv_ptrs, "mtp_draft_chain", "KV cache");
-    out.seqs.assign(n_seq, {});
-    out.cost = {};
-    out.layer_inputs.clear();
-    out.gdn_paths.clear();
+    constexpr const char* what = "mtp_draft_chain";
+    ChainRec rc;
+    validate_chain(I, mtp_kv_layout(), steps, k, rc, what);
+    reset_result(out, steps.size());
     if (steps.empty()) return;
-    std::vector<std::size_t> len0(n_seq);
-    for (std::size_t si = 0; si < n_seq; ++si) len0[si] = steps[si].kv->length();
     try {
-        // Rows of every depth are reserved up front: the block table imported once below stays valid for
-        // the whole chain, while the host-side length is advanced per depth as the ops are recorded
-        // (attention / kv_write read kv->length() at record time).
-        for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->reserve(steps[si].tokens.size() + (k[si] > 1 ? k[si] - 1 : 0));
-
-        StepCost& cost = out.cost;
-        Impl::Step st(I, cost);
-        // Host data read by recorded ops at submit time: alive until st.sync() returns.
-        std::vector<std::int32_t> ids1(R1), pos1(R1);
-        std::vector<std::vector<std::int32_t>> pos_d(max_k + 1);
-        for (std::size_t si = 0; si < n_seq; ++si) {
-            std::copy(steps[si].tokens.begin(), steps[si].tokens.end(), &ids1[seqs[si].r0]);
-            for (std::size_t i = 0; i < seqs[si].n; ++i) pos1[seqs[si].r0 + i] = seqs[si].pos0 + static_cast<std::int32_t>(i);
-        }
-        for (SeqRows& s : seqs) I.import_kv(st, s);
-        const TensorRef rids = st.import_ro(std::as_bytes(std::span(ids1)));
-        const TensorRef rpos1 = st.import_ro(std::as_bytes(std::span(pos1)));
-        const std::uint64_t emb_row_bytes = tensor::row_bytes(M.embedding.ref.type(), static_cast<std::int64_t>(E));
-        const TensorRef emb_table = TensorRef::of(*M.embedding.buf);
-
-        // One MTP layer pass over Rd rows (mtp_forward's body); returns the post-head-norm hidden rows.
-        const auto layer_pass = [&](std::size_t Rd, std::span<const SeqRows> sd, TensorRef rpos, const auto& fill_embed,
-                                    const auto& fill_hidden) {
-            cost.weight_passes += 1;
-            const Impl::Acts a = I.make_acts(st, Rd, false);
-            const TensorRef e = st.alloc(Rd * E), hh = st.alloc(Rd * E), cat = st.alloc(Rd * 2 * E), hbuf = st.alloc(Rd * E);
-            fill_embed(e);
-            fill_hidden(hh);
-            cost.embedding_bytes += Rd * emb_row_bytes;
-            I.rms_norm(st, e, Rd, E, M.enorm, cat.with_stride(2 * E * kF32));
-            I.rms_norm(st, hh, Rd, E, M.hnorm, cat.shifted(E * kF32).with_stride(2 * E * kF32));
-            I.gemv(st, cat, Rd, M.eh_proj, a.x);
-            I.rms_norm(st, a.x, Rd, E, M.block.attn_norm, a.xn);
-            I.decoder_layer(st, a, M.block, Rd, [&] { I.attention(st, a, *M.block.attn, 0, Rd, sd, rpos); }, M.head_norm, hbuf);
-            return hbuf;
-        };
-
-        // What each depth leaves behind for the next one and for the final decode.
-        struct Depth {
-            std::vector<std::size_t> at;        // sequences drafting at this depth (ascending)
-            std::vector<std::size_t> last_row;  // per participant: its row in `hbuf` (head input / next hidden)
-            TensorRef hbuf{}, ids{};
-            std::vector<std::byte> words;       // argmax result words, downloaded at the sync
-        };
-        std::vector<Depth> depths(std::max<std::size_t>(max_k, 1));
-
-        // Head over one row per participant: no host round trip. Winning ids stay on the device (`want_ids`)
-        // for the next depth's GET_ROWS; the result words are downloaded at the single sync.
-        const std::size_t vocab_rows = (I.draft_vocab == 0 || I.draft_vocab > I.n_vocab) ? I.n_vocab : I.draft_vocab;
-        const auto head_rows = [&](Depth& D, bool want_ids) {
-            const std::size_t n = D.at.size();
-            const TensorRef xs = st.alloc(n * E);
-            for (std::size_t i = 0; i < n; ++i) {
-                I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(D.hbuf, D.last_row[i], E), Impl::rows_at(xs, i, E), E * kF32, {}});
-            }
-            st.arena.push_back(I.be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
-            const TensorRef res = TensorRef::of(*st.arena.back());
-            if (want_ids) {
-                st.arena.push_back(I.be->allocate(n * sizeof(std::int32_t), backend::Tier::Vram));
-                D.ids = TensorRef::of(*st.arena.back());
-            }
-            I.be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{M.lm_head.ref.type(), TensorRef::of(*M.lm_head.buf), xs,
-                                                                       TensorRef{}, u32(vocab_rows), u32(E), u32(n), {}},
-                                                     res,
-                                                     u32(std::min<std::size_t>(I.valid_vocab, vocab_rows)),
-                                                     {},
-                                                     {},
-                                                     D.ids});
-            D.words.resize(n * backend::kArgmaxResultBytes);
-            I.be->download(*st.s, res, std::span(D.words));
-            const std::uint64_t bytes = M.lm_head.ref.n_bytes();
-            cost.weight_bytes += vocab_rows == I.n_vocab ? bytes : bytes / I.n_vocab * vocab_rows;
-            cost.activation_bytes += cpu::traffic_matmul(n, E, vocab_rows, 0).total();
-        };
-
-        // ---- depth 1: teacher-forced rows (+ the first draft) ---------------------------------
-        {
-            const TensorRef hbuf = layer_pass(
-                R1, seqs, rpos1,
-                [&](TensorRef e) {
-                    I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table, rids, e,
-                                                               u32(M.embedding.ref.ne(1)), u32(E), u32(R1), {}, {}});
-                },
-                [&](TensorRef hh) {
-                    for (std::size_t si = 0; si < n_seq; ++si) {
-                        if (steps[si].hidden_device) {
-                            I.be->copy(*st.s, backend::CopyArgs{TensorRef::of(*steps[si].hidden_device),
-                                                                Impl::rows_at(hh, seqs[si].r0, E), E * kF32, {}});
-                        } else {
-                            I.be->upload(*st.s, Impl::rows_at(hh, seqs[si].r0, E), std::as_bytes(steps[si].hidden));
-                        }
-                    }
-                });
-            for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->commit(seqs[si].n);
-            Depth& D = depths[0];
-            D.hbuf = hbuf;
-            for (std::size_t si = 0; si < n_seq; ++si) {
-                if (k[si] == 0) continue;
-                D.at.push_back(si);
-                D.last_row.push_back(seqs[si].r0 + seqs[si].n - 1);
-            }
-            if (!D.at.empty()) head_rows(D, max_k > 1);
-        }
-
-        // ---- depth d >= 2: one row per sequence still drafting; token and hidden come from depth d-1
-        // on the device (ids -> GET_ROWS, D2D copy of the hidden row) ------------------------------
-        for (std::size_t d = 2; d <= max_k; ++d) {
-            const Depth& P = depths[d - 2];
-            Depth& D = depths[d - 1];
-            for (std::size_t si = 0; si < n_seq; ++si) {
-                if (k[si] >= d) D.at.push_back(si);
-            }
-            const std::size_t Rd = D.at.size();
-            std::vector<std::size_t> prev(Rd);  // index of each participant among P.at
-            std::vector<SeqRows> sd(Rd);
-            pos_d[d].resize(Rd);
-            for (std::size_t i = 0; i < Rd; ++i) {
-                const std::size_t si = D.at[i];
-                prev[i] = static_cast<std::size_t>(std::lower_bound(P.at.begin(), P.at.end(), si) - P.at.begin());
-                const std::int32_t pos = seqs[si].pos0 + static_cast<std::int32_t>(seqs[si].n + d - 2);
-                sd[i] = {i, 1, steps[si].kv, pos, seqs[si].table};
-                pos_d[d][i] = pos;
-                D.last_row.push_back(i);
-            }
-            const TensorRef rpos = st.import_ro(std::as_bytes(std::span(pos_d[d])));
-            D.hbuf = layer_pass(
-                Rd, sd, rpos,
-                [&](TensorRef e) {
-                    for (std::size_t i = 0; i < Rd; ++i) {
-                        I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table,
-                                                                   P.ids.shifted(prev[i] * sizeof(std::int32_t)),
-                                                                   Impl::rows_at(e, i, E), u32(M.embedding.ref.ne(1)), u32(E), 1, {}, {}});
-                    }
-                },
-                [&](TensorRef hh) {
-                    for (std::size_t i = 0; i < Rd; ++i) {
-                        I.be->copy(*st.s, backend::CopyArgs{Impl::rows_at(P.hbuf, P.last_row[prev[i]], E), Impl::rows_at(hh, i, E),
-                                                            E * kF32, {}});
-                    }
-                });
-            for (std::size_t i = 0; i < Rd; ++i) steps[D.at[i]].kv->commit(1);
-            head_rows(D, d < max_k);
-        }
-
+        Impl::Step st(I, out.cost);
+        record_chain(I, st, steps, k, rc, false);
         // ---- the one submit / fence of the chain, then decode every depth's winners ----------------
         st.sync();
-        for (std::size_t d = 1; d <= max_k; ++d) {
-            const Depth& D = depths[d - 1];
-            const std::vector<backend::ArgmaxResult> best = backend::decode_argmax(D.words);
-            for (std::size_t i = 0; i < D.at.size(); ++i) {
-                HALO_CHECK(best[i].index >= 0, ErrorCode::Api,
-                           "mtp_draft_chain step {}: draft depth {} is poisoned (NaN logit / no result), token id {}", D.at[i], d,
-                           best[i].index);
-                out.seqs[D.at[i]].argmax.push_back(cpu::TopKEntry{best[i].index, best[i].value});
-            }
-        }
+        decode_chain(rc, out, true, what);
     } catch (...) {
-        for (std::size_t si = 0; si < n_seq; ++si) steps[si].kv->truncate(len0[si]);
+        for (std::size_t si = 0; si < steps.size(); ++si) steps[si].kv->truncate(rc.len0[si]);
+        throw;
+    }
+}
+
+void Qwen35::mtp_draft_chain_verify(std::span<const MtpStep> mtp, std::span<const std::size_t> k, StepResult& draft_out,
+                                    std::span<const SeqStep> verify, std::span<const std::ptrdiff_t> chain_of,
+                                    StepResult& verify_out) const {
+    const Impl& I = *impl_;
+    constexpr const char* what = "mtp_draft_chain_verify";
+    ChainRec rc;
+    validate_chain(I, mtp_kv_layout(), mtp, k, rc, what);
+    TrunkRec tr;
+    validate_forward(I, gdn_shape(), kv_layout(), verify, tr, what);
+    HALO_CHECK(chain_of.size() == verify.size(), ErrorCode::Api, "{}: {} chain links for {} verify steps", what, chain_of.size(),
+               verify.size());
+    std::vector<char> linked(mtp.size(), 0);
+    for (std::size_t i = 0; i < verify.size(); ++i) {
+        const std::ptrdiff_t c = chain_of[i];
+        if (c < 0) continue;
+        HALO_CHECK(static_cast<std::size_t>(c) < mtp.size() && linked[static_cast<std::size_t>(c)] == 0, ErrorCode::Api,
+                   "{} verify step {}: chain link {} is not one of the {} chain steps, or is linked twice", what, i, c, mtp.size());
+        linked[static_cast<std::size_t>(c)] = 1;
+        const std::size_t kc = k[static_cast<std::size_t>(c)];
+        const SeqStep& v = verify[i];
+        HALO_CHECK(kc >= 1 && v.tokens.size() == kc + 1 && v.tree_parents.empty() && v.positions.empty(), ErrorCode::Api,
+                   "{} verify step {}: a linked step needs k >= 1 drafts (k = {}), exactly 1 + k tokens (has {}), no "
+                   "tree_parents and no positions",
+                   what, i, kc, v.tokens.size());
+        // A link joins ONE sequence's chain and verify: the chain's last depth-1 row (x, after any queued
+        // catch-up rows) sits at MTP position L, the verify's row 0 at trunk position L.
+        const MtpStep& mc = mtp[static_cast<std::size_t>(c)];
+        const std::size_t x_pos = static_cast<std::size_t>(mc.first_position) + mc.tokens.size() - 1;
+        HALO_CHECK(x_pos == v.kv->length(), ErrorCode::Api,
+                   "{} verify step {}: linked chain step {} has its x row at MTP position {}, but the trunk KV holds {} rows "
+                   "(not the same sequence?)",
+                   what, i, c, x_pos, v.kv->length());
+    }
+    reset_result(draft_out, mtp.size());
+    begin_forward(I, verify, tr, verify_out);
+    if (mtp.empty() && verify.empty()) return;
+    try {
+        StepCost total{};
+        Impl::Step st(I, total);  // one stream: the chain, then the verify behind it
+        if (!mtp.empty()) record_chain(I, st, mtp, k, rc, /*ids_every_depth=*/true);
+        draft_out.cost = total;
+        total = {};
+        if (!verify.empty()) {
+            total.weight_passes = 1;
+            std::vector<std::vector<TensorRef>> draft_ids(verify.size());
+            for (std::size_t i = 0; i < verify.size(); ++i) {
+                if (chain_of[i] < 0) continue;
+                const auto c = static_cast<std::size_t>(chain_of[i]);
+                for (std::size_t d = 1; d <= k[c]; ++d) draft_ids[i].push_back(chain_draft_id(rc, c, d));
+            }
+            record_forward(I, st, verify, tr, verify_out, ForwardOptions{}, draft_ids, embedding_row_bytes());
+        }
+        // ---- the one submit / fence of the tick: chain + verify ------------------------------
+        st.sync();
+        verify_out.cost = total;
+        if (!mtp.empty()) decode_chain(rc, draft_out, false, what);
+        commit_forward(verify);
+    } catch (...) {
+        for (std::size_t si = 0; si < mtp.size(); ++si) mtp[si].kv->truncate(rc.len0[si]);
         throw;
     }
 }
