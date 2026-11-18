@@ -1317,7 +1317,7 @@ struct ChainDepth {
     std::vector<std::size_t> last_row;  // per participant: its row in `hbuf` (head input / next hidden)
     TensorRef hbuf{}, ids{};            // ids: one device int32 winning id per participant (when recorded)
     std::vector<std::byte> words;       // argmax result words, downloaded at the sync
-    std::vector<std::uint32_t> slots;   // per participant: its id's element in ChainRec::seq_ids (when kept)
+    std::size_t slot0 = 0;              // first of its participants' entries in ChainRec::slots (when kept)
 };
 
 /// A validated draft chain (mtp_draft_chain, mtp_draft_chain_verify). The host vectors are read by recorded
@@ -1334,6 +1334,10 @@ struct ChainRec {
     // sequence's drafts with one GET_ROWS in any batch. Empty when the depth-major ids already are that.
     TensorRef seq_ids{};
     std::vector<std::size_t> seq_base;
+    // One entry per participant of every depth with ids, depth after depth (the order of the depth-major ids):
+    // its id's element in seq_ids. Imported once for the whole chain (slots_dev), each depth reads its run.
+    std::vector<std::uint32_t> slots;
+    TensorRef slots_dev{};
 };
 
 /// Every check of a draft chain, before any state is touched.
@@ -1462,12 +1466,23 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
         }
         st.arena.push_back(I.be->allocate(n_seq_ids * sizeof(std::int32_t), backend::Tier::Vram));
         rc.seq_ids = TensorRef::of(*st.arena.back());
+        // Depth d's participants are the sequences with k >= d, ascending: every depth's slots are known now.
+        rc.slots.clear();
+        rc.slots.reserve(n_ids);
+        for (std::size_t d = 1; d <= max_k; ++d) {
+            if (!wants_ids(d)) continue;
+            for (std::size_t si = 0; si < n_seq; ++si) {
+                if (k[si] >= d) rc.slots.push_back(u32(rc.seq_base[si] + d - 1));
+            }
+        }
+        HALO_CHECK(rc.slots.size() == n_ids, ErrorCode::Api, "draft chain: {} slots for {} device ids", rc.slots.size(), n_ids);
+        rc.slots_dev = st.import_ro(std::as_bytes(std::span(rc.slots)));
     }
 
     // Head over one row per participant: no host round trip. Winning ids stay on the device (`want_ids`)
     // for the next depth's GET_ROWS; the result words are downloaded at the single sync.
     const std::size_t vocab_rows = (I.draft_vocab == 0 || I.draft_vocab > I.n_vocab) ? I.n_vocab : I.draft_vocab;
-    const auto head_rows = [&](ChainDepth& D, std::size_t d, bool want_ids) {
+    const auto head_rows = [&](ChainDepth& D, bool want_ids) {
         const std::size_t n = D.at.size();
         const TensorRef xs = st.alloc(n * E);
         for (std::size_t i = 0; i < n; ++i) {
@@ -1475,19 +1490,19 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
         }
         st.arena.push_back(I.be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
         const TensorRef res = TensorRef::of(*st.arena.back());
+        TensorRef slots;
         if (want_ids) {
             HALO_CHECK(ids_used + n <= n_ids, ErrorCode::Api, "draft chain: {} + {} device ids past the {} reserved", ids_used, n,
                        n_ids);
             D.ids = all_ids.shifted(ids_used * sizeof(std::int32_t));
             D.ids.bytes = n * sizeof(std::int32_t);
+            if (!rc.seq_ids.empty()) {
+                // Depth d of sequence si -> element seq_base[si] + d - 1: this depth's run of rc.slots.
+                D.slot0 = ids_used;
+                slots = rc.slots_dev.shifted(ids_used * sizeof(std::uint32_t));
+                slots.bytes = n * sizeof(std::uint32_t);
+            }
             ids_used += n;
-        }
-        TensorRef slots;
-        if (want_ids && !rc.seq_ids.empty()) {
-            // Depth d of sequence si -> element seq_base[si] + d - 1 (D.slots outlives the sync with rc).
-            D.slots.resize(n);
-            for (std::size_t i = 0; i < n; ++i) D.slots[i] = u32(rc.seq_base[D.at[i]] + d - 1);
-            slots = st.import_ro(std::as_bytes(std::span(D.slots)));
         }
         I.be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{M.lm_head.ref.type(), TensorRef::of(*M.lm_head.buf), xs,
                                                                    TensorRef{}, u32(vocab_rows), u32(E), u32(n), {}},
@@ -1531,7 +1546,7 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
             D.at.push_back(si);
             D.last_row.push_back(seqs[si].r0 + seqs[si].n - 1);
         }
-        if (!D.at.empty()) head_rows(D, 1, wants_ids(1));
+        if (!D.at.empty()) head_rows(D, wants_ids(1));
     }
 
     // ---- depth d >= 2: one row per sequence still drafting; token and hidden come from depth d-1
@@ -1576,7 +1591,7 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
                 }
             });
         for (std::size_t i = 0; i < Rd; ++i) steps[D.at[i]].kv->commit(1);
-        head_rows(D, d, wants_ids(d));
+        head_rows(D, wants_ids(d));
     }
 }
 
@@ -1588,8 +1603,8 @@ TensorRef chain_draft_id(const ChainRec& rc, std::size_t si, std::size_t d) {
     HALO_CHECK(it != D.at.end() && *it == si && !D.ids.empty(), ErrorCode::Api,
                "draft chain: sequence {} has no device id at depth {}", si, d);
     const std::size_t i = static_cast<std::size_t>(it - D.at.begin());
-    if (!D.slots.empty()) {
-        return TensorRef{rc.seq_ids.buffer, rc.seq_ids.offset + D.slots.at(i) * sizeof(std::int32_t), sizeof(std::int32_t), 0};
+    if (!rc.seq_ids.empty()) {
+        return TensorRef{rc.seq_ids.buffer, rc.seq_ids.offset + rc.slots.at(D.slot0 + i) * sizeof(std::int32_t), sizeof(std::int32_t), 0};
     }
     return D.ids.shifted(i * sizeof(std::int32_t));
 }
