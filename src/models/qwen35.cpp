@@ -1235,13 +1235,23 @@ void record_forward(const Impl& I, Impl::Step& st, std::span<const SeqStep> step
     if (draft_ids.empty()) {
         embed(rids, 0, R);
     } else {
-        // Host rows in runs, device-sourced draft rows one id each: every row of a.x is written once.
+        // Host rows in runs, device-sourced draft rows in runs of ids adjacent in one buffer (e.g. a lone
+        // drafting sequence's chain ids, see record_chain): every row of a.x is written once.
         std::size_t run0 = 0;  // first row of the pending host run
         for (std::size_t si = 0; si < steps.size(); ++si) {
-            if (draft_ids[si].empty()) continue;
+            const std::vector<TensorRef>& d = draft_ids[si];
+            if (d.empty()) continue;
             const std::size_t r0 = seqs[si].r0;
             embed(rids.shifted(run0 * sizeof(std::int32_t)), run0, r0 + 1 - run0);  // ... up to and including row 0 (x)
-            for (std::size_t j = 0; j < draft_ids[si].size(); ++j) embed(draft_ids[si][j], r0 + 1 + j, 1);
+            for (std::size_t j = 0; j < d.size();) {
+                std::size_t n = 1;
+                while (j + n < d.size() && d[j + n].buffer == d[j].buffer &&
+                       d[j + n].offset == d[j].offset + n * sizeof(std::int32_t)) {
+                    ++n;
+                }
+                embed(TensorRef{d[j].buffer, d[j].offset, n * sizeof(std::int32_t), 0}, r0 + 1 + j, n);
+                j += n;
+            }
             run0 = r0 + seqs[si].n;
         }
         if (run0 < R) embed(rids.shifted(run0 * sizeof(std::int32_t)), run0, R - run0);
@@ -1416,6 +1426,22 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
     std::vector<ChainDepth>& depths = rc.depths;
     depths.assign(std::max<std::size_t>(max_k, 1), {});
 
+    // Every depth's device winning ids live in ONE buffer, depth after depth (each depth's participants in
+    // sequence order). A sequence's ids for depths d..d+m sit side by side when it is the last participant at
+    // depth d and the only one at d+1..d+m (e.g. a lone drafting sequence's d1..dk), and the verify embeds
+    // each such run with one GET_ROWS (record_forward joins adjacent ids).
+    const auto wants_ids = [&](std::size_t d) { return ids_every_depth || d < max_k; };
+    std::size_t n_ids = 0;
+    for (std::size_t d = 1; d <= max_k; ++d) {
+        if (wants_ids(d)) n_ids += static_cast<std::size_t>(std::count_if(k.begin(), k.end(), [&](std::size_t ks) { return ks >= d; }));
+    }
+    TensorRef all_ids;
+    if (n_ids > 0) {
+        st.arena.push_back(I.be->allocate(n_ids * sizeof(std::int32_t), backend::Tier::Vram));
+        all_ids = TensorRef::of(*st.arena.back());
+    }
+    std::size_t ids_used = 0;
+
     // Head over one row per participant: no host round trip. Winning ids stay on the device (`want_ids`)
     // for the next depth's GET_ROWS; the result words are downloaded at the single sync.
     const std::size_t vocab_rows = (I.draft_vocab == 0 || I.draft_vocab > I.n_vocab) ? I.n_vocab : I.draft_vocab;
@@ -1428,8 +1454,11 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
         st.arena.push_back(I.be->allocate(n * backend::kArgmaxResultBytes, backend::Tier::Host));
         const TensorRef res = TensorRef::of(*st.arena.back());
         if (want_ids) {
-            st.arena.push_back(I.be->allocate(n * sizeof(std::int32_t), backend::Tier::Vram));
-            D.ids = TensorRef::of(*st.arena.back());
+            HALO_CHECK(ids_used + n <= n_ids, ErrorCode::Api, "draft chain: {} + {} device ids past the {} reserved", ids_used, n,
+                       n_ids);
+            D.ids = all_ids.shifted(ids_used * sizeof(std::int32_t));
+            D.ids.bytes = n * sizeof(std::int32_t);
+            ids_used += n;
         }
         I.be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{M.lm_head.ref.type(), TensorRef::of(*M.lm_head.buf), xs,
                                                                    TensorRef{}, u32(vocab_rows), u32(E), u32(n), {}},
@@ -1471,7 +1500,7 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
             D.at.push_back(si);
             D.last_row.push_back(seqs[si].r0 + seqs[si].n - 1);
         }
-        if (!D.at.empty()) head_rows(D, ids_every_depth || max_k > 1);
+        if (!D.at.empty()) head_rows(D, wants_ids(1));
     }
 
     // ---- depth d >= 2: one row per sequence still drafting; token and hidden come from depth d-1
@@ -1498,10 +1527,15 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
         D.hbuf = layer_pass(
             Rd, sd, rpos,
             [&](TensorRef e) {
-                for (std::size_t i = 0; i < Rd; ++i) {
+                // One GET_ROWS per run of participants that were consecutive at depth d-1 (all of them when
+                // every sequence drafts this deep).
+                for (std::size_t i = 0; i < Rd;) {
+                    std::size_t n = 1;
+                    while (i + n < Rd && prev[i + n] == prev[i] + n) ++n;
                     I.be->get_rows(*st.s, backend::GetRowsArgs{M.embedding.ref.type(), emb_table,
                                                                P.ids.shifted(prev[i] * sizeof(std::int32_t)),
-                                                               Impl::rows_at(e, i, E), u32(M.embedding.ref.ne(1)), u32(E), 1, {}, {}});
+                                                               Impl::rows_at(e, i, E), u32(M.embedding.ref.ne(1)), u32(E), u32(n), {}, {}});
+                    i += n;
                 }
             },
             [&](TensorRef hh) {
@@ -1511,7 +1545,7 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
                 }
             });
         for (std::size_t i = 0; i < Rd; ++i) steps[D.at[i]].kv->commit(1);
-        head_rows(D, ids_every_depth || d < max_k);
+        head_rows(D, wants_ids(d));
     }
 }
 

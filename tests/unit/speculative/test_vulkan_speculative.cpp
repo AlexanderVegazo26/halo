@@ -621,6 +621,124 @@ TEST_F(VulkanSpec, DraftChainVerifyIsOneFenceAndBitwiseChainThenForward) {
     }
 }
 
+// next.md step 4, per-dispatch cost of the fused tick: the chain keeps every depth's device draft ids in ONE
+// buffer, depth after depth (each depth's participants in sequence order), and both consumers gather runs of
+// adjacent ids with one GET_ROWS: depth d >= 2 embeds all participants that were consecutive at depth d-1 at
+// once, and the verify embeds each run of a sequence's ids that sit side by side in that buffer at once (a
+// lone drafting sequence's d1..dk). Before, every device id was its own GET_ROWS (on the 27B each is one
+// dispatch per embedding slab). Pass condition, in GET_ROWS dispatches of one fused tick, with a = MTP
+// embedding dispatches per call and b = trunk embedding dispatches per call (each measured on its own):
+//   - one sequence with k drafts: k*a (one per depth) + 2*b (verify: host x row, then d1..dk);
+//   - k = [2, 2]: 2a + 6b (their verify ids interleave by depth, so each id stays its own GET_ROWS);
+//   - k = [2, 3]: 3a + 6b (sequence 1's d2 and d3 sit in different depth regions but side by side: one call);
+//   - k = [3, 1, 3]: 4a + 10b (depth 2 is two runs, prev = [0, 2]; depth 3 one run).
+// And every batched sequence drafts and verifies exactly what it does alone, with distinct depth-1 winners
+// across the batch so that reading another sequence's id would change the result.
+TEST_F(VulkanSpec, ChainedDraftIdsAreGatheredOneGetRowsPerAdjacentRun) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel vk(ctx, *nm_, /*reuse=*/false);
+    ASSERT_TRUE(vk.model->has_mtp()) << "tiny-f32.gguf has no MTP head";
+    ASSERT_TRUE(vk.be->limits().lm_head_ids) << "the Vulkan backend must support device token ids";
+    auto sp = vk.spec(GateMode::Always, false, false);
+    // A sequence ready to draft (MTP queue flushed and its pool attached, so the profiled tick is steady).
+    const auto ready = [&](const Toks& p, std::size_t k, std::vector<std::unique_ptr<SequenceState>>& keep) {
+        keep.push_back(vk.seq());
+        StepRequest pre;
+        pre.seq = keep.back().get();
+        pre.prefill = p;
+        const Toks first = step1(sp, pre).out.at(0).tokens;
+        SequenceState* one[] = {keep.back().get()};
+        sp.flush_mtp(one);
+        return halo::test::ChainVerifySeq{keep.back().get(), first.at(0), k};
+    };
+    const auto get_rows_dispatches = [](const Profile& p) {
+        return static_cast<std::size_t>(
+            std::count_if(p.lines.begin(), p.lines.end(), [](const std::string& l) { return l.starts_with("get_rows"); }));
+    };
+    const Toks prompts[] = {prompt("p0"), prompt("p1"), prompt("p2")};
+    std::vector<std::unique_ptr<SequenceState>> keep;
+
+    // b: a plain trunk forward over one host run embeds with exactly one GET_ROWS call.
+    std::size_t b = 0;
+    {
+        auto s = vk.seq();
+        const std::vector<std::size_t> last{prompts[0].size() - 1};
+        hm::SeqStep st;
+        st.tokens = prompts[0];
+        st.kv = &s->kv;
+        st.gdn = &s->gdn;
+        st.logit_rows = last;
+        hm::StepResult r;
+        const Profile p = op_timings_profile("trunk", [&] { vk.model->forward(std::span(&st, 1), r); });
+        b = get_rows_dispatches(p);
+        ASSERT_GT(b, 0u) << "plain trunk forward: expected one GET_ROWS call, got 0 dispatches; " << p.shown;
+    }
+    // a: a k = 1 fused tick is depth 1 (a) + verify host x and d1 (2b), whether or not ids are joined.
+    std::size_t a = 0;
+    for (std::size_t k = 1; k <= 3; ++k) {
+        const std::vector<halo::test::ChainVerifySeq> in{ready(prompts[0], k, keep)};
+        const Profile p = op_timings_profile("one_k" + std::to_string(k), [&] { (void)halo::test::run_chain_verify_tick(*vk.model, in, true); });
+        const std::size_t n = get_rows_dispatches(p);
+        if (k == 1) {
+            ASSERT_GT(n, 2 * b) << "k = 1 fused tick: expected a + 2b dispatches with b = " << b << ", got " << n << "; " << p.shown;
+            a = n - 2 * b;
+            continue;
+        }
+        EXPECT_EQ(n, k * a + 2 * b) << "one sequence, k = " << k << ": expected " << k << " depth GET_ROWS of " << a
+                                    << " dispatch(es) + 2 verify calls (host x, one for d1..d" << k << ") of " << b
+                                    << ", got " << n << " dispatches; " << p.shown;
+    }
+
+    struct Batch {
+        std::vector<std::size_t> ks;
+        std::size_t depth_calls, verify_calls;
+    };
+    for (const Batch& c : {Batch{{2, 2}, 2, 6}, Batch{{2, 3}, 3, 6}, Batch{{3, 1, 3}, 4, 10}}) {
+        std::string what = "k = [";
+        for (std::size_t i = 0; i < c.ks.size(); ++i) what += (i ? ", " : "") + std::to_string(c.ks[i]);
+        what += ']';
+        std::vector<std::unique_ptr<SequenceState>> batch_keep, alone_keep;
+        std::vector<halo::test::ChainVerifySeq> batch;
+        batch.reserve(c.ks.size());
+        for (std::size_t i = 0; i < c.ks.size(); ++i) batch.push_back(ready(prompts[i], c.ks[i], batch_keep));
+        halo::test::ChainVerifyTick tb;
+        const Profile pb = op_timings_profile("batch" + std::to_string(c.ks.size()) + "_" + std::to_string(c.depth_calls),
+                                              [&] { tb = halo::test::run_chain_verify_tick(*vk.model, batch, true); });
+        EXPECT_EQ(get_rows_dispatches(pb), c.depth_calls * a + c.verify_calls * b)
+            << what << ": expected " << c.depth_calls << " depth GET_ROWS of " << a << " dispatch(es) + " << c.verify_calls
+            << " verify calls of " << b << "; " << pb.shown;
+        ASSERT_EQ(tb.draft.seqs.size(), c.ks.size()) << what;
+        std::vector<std::int32_t> d1;
+        for (std::size_t i = 0; i < c.ks.size(); ++i) {
+            const std::vector<halo::test::ChainVerifySeq> one{ready(prompts[i], c.ks[i], alone_keep)};
+            const halo::test::ChainVerifyTick ta = halo::test::run_chain_verify_tick(*vk.model, one, true);
+            const auto& got = tb.draft.seqs[i].argmax;
+            const auto& want = ta.draft.seqs.at(0).argmax;
+            ASSERT_EQ(got.size(), want.size()) << what << " sequence " << i << ": draft count in the batch vs alone";
+            ASSERT_FALSE(want.empty()) << what << " sequence " << i << ": drafted nothing alone";
+            d1.push_back(want[0].index);
+            for (std::size_t d = 0; d < want.size(); ++d) {
+                EXPECT_EQ(got[d].index, want[d].index)
+                    << what << " sequence " << i << " depth " << d + 1 << ": draft id in the batch differs from the same "
+                    << "sequence drafting alone (depth gather read another sequence's or depth's id?)";
+            }
+            ASSERT_EQ(tb.verify.seqs.at(i).argmax.size(), ta.verify.seqs.at(0).argmax.size()) << what << " sequence " << i;
+            for (std::size_t r = 0; r < ta.verify.seqs[0].argmax.size(); ++r) {
+                EXPECT_EQ(tb.verify.seqs[i].argmax[r].index, ta.verify.seqs[0].argmax[r].index)
+                    << what << " sequence " << i << " verify row " << r << ": target differs in the batch vs alone (row "
+                    << "embedded from the wrong device id?)";
+            }
+        }
+        // Without distinct depth-1 winners a gather that swaps or duplicates sequences' ids stays green.
+        for (std::size_t i = 0; i < d1.size(); ++i) {
+            for (std::size_t m = i + 1; m < d1.size(); ++m) {
+                EXPECT_NE(d1[i], d1[m]) << what << ": sequences " << i << " and " << m << " draft the same depth-1 id " << d1[i]
+                                        << " alone, so this case cannot tell their ids apart (pick other prompts)";
+            }
+        }
+    }
+}
+
 // ---- next.md step 2: reduced MTP draft vocabulary (Qwen35Options::mtp_draft_vocab) on the device ----
 
 namespace {
