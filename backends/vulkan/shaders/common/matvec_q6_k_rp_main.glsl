@@ -15,7 +15,8 @@
 //   [208 nb, 210 nb)   d   : f16 per block (2 * blk)
 //
 // Included once. Expects from the includer: the bindings wq / wq2 / wq4 (same buffer, u32 /
-// uvec2 / uvec4 views), push constants, BATCHED, MAX_VEC, red[] / redb[], Q6KBlock, and
+// uvec2 / uvec4 views), push constants, BATCHED, MAX_VEC, Q6KBlock, redb[] +
+// tree_finish1() / tree_finish() (common/matvec_tree_reduce.glsl), and
 //   Q6K_FN        -> function-name token (pasted as q6k_<Q6K_FN>)
 
 #define Q6K_PASTE2(a, b) a##b
@@ -90,13 +91,7 @@ void Q6K_PASTE(q6k_, Q6K_FN)(const uint row, const uint row_off) {
             const Q6KBlock b = Q6K_PASTE(q6k_dequant_, Q6K_FN)(row_off, blk, nblocks, itid, v_im, is);
             acc1 = Q6K_PASTE(q6k_apply_, Q6K_FN)(b, pc.x_off + blk * 256u + y_off, acc1);
         }
-        red[tid] = acc1;
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
-        }
-        if (tid == 0u) y[pc.y_off + row] = red[0];
+        tree_finish1(tid, row, acc1);
         return;
     }
 
@@ -109,23 +104,9 @@ void Q6K_PASTE(q6k_, Q6K_FN)(const uint row, const uint row_off) {
         for (uint t = 0u; t < MAX_VEC; ++t)
             if (t < pc.n_vec) acc[t] = Q6K_PASTE(q6k_apply_, Q6K_FN)(b, xb + t * pc.x_stride, acc[t]);
     }
-    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
-    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
-    // to log2 WG+1).
     for (uint t = 0u; t < MAX_VEC; ++t)
         if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
-    barrier();
-    for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s) {
-            for (uint t = 0u; t < MAX_VEC; ++t)
-                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
-        }
-        barrier();
-    }
-    if (tid == 0u) {
-        for (uint t = 0u; t < MAX_VEC; ++t)
-            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
-    }
+    tree_finish(tid, row);  // common/matvec_tree_reduce.glsl
 }
 
 #undef Q6K_PASTE

@@ -9,12 +9,14 @@
 // The float expression in q5k_apply is identical in the decode and batched paths and in
 // both LD32 instantiations, so vector t of a batch, the n_vec = 1 matvec, and the
 // dense/arena views are bitwise identical (VkHead / VkViews gates). The shared-memory
-// reduction tree is the same one as matvec_quant_main.glsl.
+// reduction tree is the one every tree-built gemv
+// uses: tree_finish1() / tree_finish() of common/matvec_tree_reduce.glsl.
 //
 // Included twice WITHOUT an include guard. Expects from the includer:
 //   LD32(bo)      -> uint: 4 weight bytes at 4-aligned (fast) or arbitrary (slow) byte off
 //   Q5K_FN        -> function-name token (pasted as q5k_<Q5K_FN>)
-// plus the bindings, push constants, BATCHED, MAX_VEC, red[], redb[] from the .comp. With
+// plus the bindings, push constants, BATCHED, MAX_VEC, redb[] and
+// tree_finish1() / tree_finish() (common/matvec_tree_reduce.glsl, included by the .comp). With
 // -DHALO_SUBGROUP_REDUCE the tree entry q5k_<Q5K_FN> is not compiled (the .comp then has no
 // BATCHED, MAX_VEC, red[] or redb[]): matvec_q5_k_sg_main.glsl, included at the end, is the
 // entry instead and needs NV, g_acc[] and sg_finish() from common/matvec_sg_reduce.glsl
@@ -125,13 +127,7 @@ void Q5K_PASTE(q5k_, Q5K_FN)(const uint row, const uint row_off) {
         // Single-wave workgroups + barrier-free subgroupAdd were tried (llama's structure):
         // decode measured ~4% slower than this tree at WG=256 (batched ~30% faster at
         // WG=64/128). Decode wins overall; keep the tree (identical order in both paths).
-        red[tid] = acc1;
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
-        }
-        if (tid == 0u) y[pc.y_off + row] = red[0];
+        tree_finish1(tid, row, acc1);
         return;
     }
 
@@ -144,23 +140,9 @@ void Q5K_PASTE(q5k_, Q5K_FN)(const uint row, const uint row_off) {
         for (uint t = 0u; t < MAX_VEC; ++t)
             if (t < pc.n_vec) acc[t] = Q5K_PASTE(q5k_apply_, Q5K_FN)(b, xb + t * pc.x_stride, acc[t]);
     }
-    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
-    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
-    // to log2 WG+1).
     for (uint t = 0u; t < MAX_VEC; ++t)
         if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
-    barrier();
-    for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s) {
-            for (uint t = 0u; t < MAX_VEC; ++t)
-                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
-        }
-        barrier();
-    }
-    if (tid == 0u) {
-        for (uint t = 0u; t < MAX_VEC; ++t)
-            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
-    }
+    tree_finish(tid, row);  // common/matvec_tree_reduce.glsl
 }
 #endif  // !HALO_SUBGROUP_REDUCE
 

@@ -51,8 +51,9 @@ float halo_gemv_out(uint row, float v) { return v; }
 // variants (VkHead bitwise gate).
 layout(constant_id = 1) const uint BATCHED = 1;
 
-shared float red[WG];
-shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
+// tree_finish1() / tree_finish() store halo_gemv_out(row, sum): GDN gates epilogue, else identity.
+#define HALO_TREE_OUT(row, v) halo_gemv_out(row, v)
+#include "matvec_tree_reduce.glsl"  // tree_finish1() / tree_finish()
 
 // Per-type one-time workgroup setup (e.g. the IQ3_S shared grid); empty for most types.
 #ifndef HALO_DEQUANT_SETUP
@@ -91,13 +92,7 @@ void main() {
 #else
         for (uint c = tid; c < pc.cols; c += WG) acc1 += halo_dequant(row_off, c) * x[pc.x_off + c];
 #endif
-        red[tid] = acc1;
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
-        }
-        if (tid == 0u) y[pc.y_off + row] = halo_gemv_out(row, red[0]);
+        tree_finish1(tid, row, acc1);
         return;
     }
 
@@ -125,23 +120,9 @@ void main() {
             if (t < pc.n_vec) acc[t] += w * x[pc.x_off + t * pc.x_stride + c];
     }
 #endif
-    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
-    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
-    // to log2 WG+1).
     for (uint t = 0u; t < MAX_VEC; ++t)
         if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
-    barrier();
-    for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s) {
-            for (uint t = 0u; t < MAX_VEC; ++t)
-                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
-        }
-        barrier();
-    }
-    if (tid == 0u) {
-        for (uint t = 0u; t < MAX_VEC; ++t)
-            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = halo_gemv_out(row, redb[t * WG]);
-    }
+    tree_finish(tid, row);  // common/matvec_tree_reduce.glsl
 }
 
 #endif

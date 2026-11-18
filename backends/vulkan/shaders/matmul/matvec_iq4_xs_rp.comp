@@ -24,8 +24,7 @@ layout(push_constant) uniform Push {
 layout(constant_id = 1) const uint BATCHED = 1;
 const uint MAX_VEC = 8u;
 
-shared float red[WG];
-shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
+#include "matvec_tree_reduce.glsl"  // tree_finish1() / tree_finish()
 
 // kvalues_iq4nl staged in shared memory (llama's init_iq_shmem): dynamic indexing into a
 // const array lowers to scratch loads on ACO; LDS lookups are ~1 op each.

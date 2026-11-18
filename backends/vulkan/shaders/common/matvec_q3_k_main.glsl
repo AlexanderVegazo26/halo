@@ -10,12 +10,14 @@
 // The float expression in q3k_apply is identical in the decode and batched paths and in
 // both LD32 instantiations, so vector t of a batch, the n_vec = 1 matvec, and the
 // dense/arena views are bitwise identical (VkHead / VkViews gates). The shared-memory
-// reduction tree is the same one as matvec_quant_main.glsl.
+// reduction tree is the one every tree-built gemv
+// uses: tree_finish1() / tree_finish() of common/matvec_tree_reduce.glsl.
 //
 // Included twice WITHOUT an include guard. Expects from the includer:
 //   LD32(bo)      -> uint: 4 weight bytes at even (fast) or arbitrary (slow) byte offset
 //   Q3K_FN        -> function-name token (pasted as q3k_<Q3K_FN>)
-// plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp.
+// plus the bindings, push constants, BATCHED, MAX_VEC from the .comp,
+// and redb[] + tree_finish1() / tree_finish() (common/matvec_tree_reduce.glsl, via the .comp).
 
 #define Q3K_PASTE2(a, b) a##b
 #define Q3K_PASTE(a, b) Q3K_PASTE2(a, b)
@@ -109,13 +111,7 @@ void Q3K_PASTE(q3k_, Q3K_FN)(const uint row, const uint row_off) {
             const Q3KBlock b = Q3K_PASTE(q3k_dequant_, Q3K_FN)(row_off + blk * 110u, v_im, v_in, q_off);
             acc1 = Q3K_PASTE(q3k_apply_, Q3K_FN)(b, pc.x_off + blk * 256u + y_off, acc1);
         }
-        red[tid] = acc1;
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
-        }
-        if (tid == 0u) y[pc.y_off + row] = red[0];
+        tree_finish1(tid, row, acc1);
         return;
     }
 
@@ -128,23 +124,9 @@ void Q3K_PASTE(q3k_, Q3K_FN)(const uint row, const uint row_off) {
         for (uint t = 0u; t < MAX_VEC; ++t)
             if (t < pc.n_vec) acc[t] = Q3K_PASTE(q3k_apply_, Q3K_FN)(b, xb + t * pc.x_stride, acc[t]);
     }
-    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
-    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
-    // to log2 WG+1).
     for (uint t = 0u; t < MAX_VEC; ++t)
         if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
-    barrier();
-    for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s) {
-            for (uint t = 0u; t < MAX_VEC; ++t)
-                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
-        }
-        barrier();
-    }
-    if (tid == 0u) {
-        for (uint t = 0u; t < MAX_VEC; ++t)
-            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
-    }
+    tree_finish(tid, row);  // common/matvec_tree_reduce.glsl
 }
 
 #undef Q3K_PASTE

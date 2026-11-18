@@ -38,8 +38,7 @@ const uint MAX_VEC = 8u;
 #endif
 
 #ifndef HALO_SUBGROUP_REDUCE
-shared float red[WG];
-shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
+#include "matvec_tree_reduce.glsl"  // tree_finish1() / tree_finish()
 #endif
 
 HALO_DEFINE_BYTE_READERS(wq)

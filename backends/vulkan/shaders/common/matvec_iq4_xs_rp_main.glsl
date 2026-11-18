@@ -12,7 +12,8 @@
 //   [128 nb, 136 nb)   hdr : per block uvec2 = original bytes 0..7 (d | scales_h, scales_l[4])
 //
 // Included once. Expects from the includer: the bindings wq2 / wq4 (same buffer, uvec2 /
-// uvec4 views), push constants, BATCHED, MAX_VEC, red[] / redb[], sh_kv[], QI4Block, and
+// uvec4 views), push constants, BATCHED, MAX_VEC, sh_kv[], QI4Block, redb[] +
+// tree_finish1() / tree_finish() (common/matvec_tree_reduce.glsl), and
 //   IQ4_FN        -> function-name token (pasted as iq4_<IQ4_FN>)
 
 #define IQ4_PASTE2(a, b) a##b
@@ -70,13 +71,7 @@ void IQ4_PASTE(iq4_, IQ4_FN)(const uint row, const uint row_off) {
             const QI4Block b = IQ4_PASTE(iq4_dequant_, IQ4_FN)(row_off, blk, nblocks, ib32);
             acc1 = IQ4_PASTE(iq4_apply_, IQ4_FN)(b, pc.x_off + blk * 256u + 32u * ib32, acc1);
         }
-        red[tid] = acc1;
-        barrier();
-        for (uint s = WG / 2u; s > 0u; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            barrier();
-        }
-        if (tid == 0u) y[pc.y_off + row] = red[0];
+        tree_finish1(tid, row, acc1);
         return;
     }
 
@@ -89,23 +84,9 @@ void IQ4_PASTE(iq4_, IQ4_FN)(const uint row, const uint row_off) {
         for (uint t = 0u; t < MAX_VEC; ++t)
             if (t < pc.n_vec) acc[t] = IQ4_PASTE(iq4_apply_, IQ4_FN)(b, xb + t * pc.x_stride, acc[t]);
     }
-    // One shared reduction tree for all n_vec vectors (same per-vector add order as a
-    // serial tree, so results are bitwise unchanged; barriers drop from n_vec*(log2 WG+2)
-    // to log2 WG+1).
     for (uint t = 0u; t < MAX_VEC; ++t)
         if (t < pc.n_vec) redb[t * WG + tid] = acc[t];
-    barrier();
-    for (uint s = WG / 2u; s > 0u; s >>= 1) {
-        if (tid < s) {
-            for (uint t = 0u; t < MAX_VEC; ++t)
-                if (t < pc.n_vec) redb[t * WG + tid] += redb[t * WG + tid + s];
-        }
-        barrier();
-    }
-    if (tid == 0u) {
-        for (uint t = 0u; t < MAX_VEC; ++t)
-            if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
-    }
+    tree_finish(tid, row);  // common/matvec_tree_reduce.glsl
 }
 
 #undef IQ4_PASTE
