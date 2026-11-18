@@ -28,12 +28,7 @@ layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform Push {
-    uint rows;
-    uint cols;
-    uint n_vec;
-    uint w_off;     // sub-alignment remainder of the W view (bytes)
-    uint w_stride;  // row stride of W (bytes)
-    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides
+#include "matvec_push_core.glsl"
 } pc;
 
 const uint TM = 32u;  // tokens per subgroup tile

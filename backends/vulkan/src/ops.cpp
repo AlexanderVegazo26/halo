@@ -200,6 +200,18 @@ std::uint32_t Ops::fused_norm_max_cols() const noexcept {
     return std::numeric_limits<std::uint32_t>::max();
 }
 
+namespace {
+// Host copy of shaders/common/matvec_push_core.glsl: the 9 leading words of every gemv / matmul_cm push block.
+// The coopmat GEMM pushes it alone; the fused-norm and plain/_gates matvec push it as their first member, so the
+// field order lives in one place on each side.
+struct GemvPushCore {
+    std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
+};
+static_assert(sizeof(GemvPushCore) == 9 * 4 && offsetof(GemvPushCore, w_off) == 3 * 4 &&
+                  offsetof(GemvPushCore, x_off) == 5 * 4 && offsetof(GemvPushCore, y_stride) == 8 * 4,
+              "GemvPushCore must match shaders/common/matvec_push_core.glsl word for word");
+}  // namespace
+
 void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool repacked,
                     std::optional<std::uint32_t> slab_row0) {
     HALO_CHECK(a.rows > 0 && a.cols > 0 && a.n_vec > 0, ErrorCode::Kernel, "{}: empty shape {}x{} n_vec={}", op,
@@ -267,9 +279,7 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     // (Never on repacked weights: matmul_cm reads the raw GGUF blocks; those run the _rp matvec.)
     if (a.allow_gemm && !repacked && a.n_vec > k_gemv_max_vec && ctx_->coopmat_enabled() &&
         (a.wtype == DType::Q4_K || a.wtype == DType::Q5_K || a.wtype == DType::Q6_K)) {
-        struct CmPush {
-            std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
-        };
+        using CmPush = GemvPushCore;  // matmul_cm_main.glsl's push block is matvec_push_core.glsl alone
         constexpr std::uint32_t cm_wg = 64;  // matmul_cm_main.glsl WG (constant_id 0)
         constexpr std::uint32_t cm_tile = 32;  // TM = TN in matmul_cm_main.glsl: one tile per subgroup
         const Kernel& kcm = kernel(detail::weight_shader("matmul_cm", a.wtype), 3, sizeof(CmPush), {{0, cm_wg}},
@@ -301,30 +311,35 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
         // inv_rms once per workgroup and the main reads (x * inv_rms) * norm_w element by element (HALO_X).
         const Operand onw = operand(a.norm_w, 1, std::uint64_t{a.cols} * k_f32, Access::Floats, align, op, "norm_w");
         require_disjoint(oy, "y", {{&onw, "norm_w"}}, op);
-        struct NPush {  // = shaders/common/matvec_io.glsl's HALO_FUSE_NORM push block
-            std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride, xr_off, nw_off;
+        struct NPush {  // = shaders/common/matvec_io.glsl's HALO_FUSE_NORM push block: the core + this tail
+            GemvPushCore core;
+            std::uint32_t xr_off, nw_off;
             float eps;
         };
         static_assert(sizeof(NPush) == 12 * 4 && offsetof(NPush, eps) == 11 * 4,
-                      "NPush must match the HALO_FUSE_NORM push block of shaders/common/matvec_io.glsl");
+                      "NPush must match matvec_push_core.glsl + matvec_io.glsl's HALO_FUSE_NORM tail");
         const Kernel& kn = kernel(shader + "_normed", 4, sizeof(NPush), {{0, wg}, {1, 0u}}, {wg, 1, 1});
         const std::array nbindings{ow.binding, ox.binding, oy.binding, onw.binding};
         const DeviceInfo& ninfo = ctx_->info();
         // x_off = 0: the main's x indices are element indices of the row; the raw view remainder is xr_off.
-        const NPush npush{a.rows, a.cols, 1, ow.off, ow.stride, 0, 0, oy.off, oy.stride, ox.off, onw.off, a.norm_eps};
+        const NPush npush{
+            {a.rows, a.cols, 1, ow.off, ow.stride, 0, 0, oy.off, oy.stride}, ox.off, onw.off, a.norm_eps};
         stream.dispatch(kn, nbindings, npush, grid_1d(a.rows, ninfo.max_workgroup_count[0], ninfo.max_workgroup_count[1]),
                         0b100);  // y written
         return;
     }
     // The trailing gate_* words exist only in the _gates shaders' push block (GemvArgs::gate_n_v).
     struct Push {
-        std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride;
+        GemvPushCore core;
         std::uint32_t gate_n_v, dt_off, sa_off, gate_row0;
     };
     constexpr std::size_t plain_push = offsetof(Push, gate_n_v);
+    static_assert(plain_push == sizeof(GemvPushCore) && sizeof(Push) == 13 * 4 && offsetof(Push, gate_row0) == 12 * 4,
+                  "Push must match matvec_push_core.glsl + matvec_quant_main.glsl's HALO_GDN_GATES tail "
+                  "(gate_n_v, dt_off, sa_off, gate_row0)");
     const std::size_t push_bytes = gates ? sizeof(Push) : plain_push;
     std::array<BufferBinding, 5> bindings{ow.binding, ox.binding, oy.binding, {}, {}};
-    Push push{a.rows, a.cols, 0, ow.off, ow.stride, 0, ox.stride, 0, oy.stride, a.gate_n_v, 0, 0, gate_row0};
+    Push push{{a.rows, a.cols, 0, ow.off, ow.stride, 0, ox.stride, 0, oy.stride}, a.gate_n_v, 0, 0, gate_row0};
     if (gates) {
         const std::uint64_t vrow = std::uint64_t{a.gate_n_v} * k_f32;
         const Operand odt = operand(a.gate_dt_bias, 1, vrow, Access::Floats, align, op, "gate_dt_bias");
@@ -355,9 +370,9 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
     for (std::uint32_t t0 = 0; t0 < a.n_vec; t0 += k_gemv_max_vec) {
         const std::uint32_t n = std::min(k_gemv_max_vec, a.n_vec - t0);
         const Kernel& kc = sg_reduce ? kernel(shader + "_sg", 3, plain_push, {{0, wg}, {2, n}}, {wg, 1, 1}) : k;
-        push.n_vec = n;
-        push.x_off = ox.off + t0 * ox.stride;
-        push.y_off = oy.off + t0 * oy.stride;
+        push.core.n_vec = n;
+        push.core.x_off = ox.off + t0 * ox.stride;
+        push.core.y_off = oy.off + t0 * oy.stride;
         stream.dispatch(kc, bound, std::as_bytes(std::span(&push, 1)).first(push_bytes), groups, 0b100);  // y written
     }
 }

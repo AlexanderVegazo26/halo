@@ -16,12 +16,7 @@ layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform Push {
-    uint rows;
-    uint cols;
-    uint n_vec;     // 1..MAX_VEC
-    uint w_off;     // sub-alignment remainder of the W view (quantized: bytes; F32: elements)
-    uint w_stride;  // row stride of W (same unit)
-    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+#include "matvec_push_core.glsl"
 #ifdef HALO_GDN_GATES
     uint gate_n_v;        // rows [0, gate_n_v) are beta rows, [gate_n_v, 2 gate_n_v) alpha rows
     uint dt_off, sa_off;  // element remainders of the dt_bias / ssm_a views
