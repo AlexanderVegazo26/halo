@@ -865,16 +865,18 @@ bool fuse_norm = false;
                                                {}});
         std::vector<std::byte> words(n * backend::kArgmaxResultBytes);
         be->download(*st.s, res, std::span(words));
-        st.sync();
-        const std::vector<backend::ArgmaxResult> best = backend::decode_argmax(words);
+        // Full logits rows ride the same submission as the argmax words (next.md step 4: one
+        // submit and one fence wait per forward; a second sync here cost every sampled,
+        // temperature > 0, request an extra fence wait per token).
         for (std::size_t i = 0; i < n; ++i) {
-            reqs[i].out->argmax[reqs[i].slot] = cpu::TopKEntry{best[i].index, best[i].value};
             if (reqs[i].full) {
                 be->download(*st.s, rows_at(logits, i, n_vocab),
                              std::as_writable_bytes(std::span(&reqs[i].out->logits[reqs[i].slot * n_vocab], n_vocab)));
             }
         }
-        if (any_full) st.sync();
+        st.sync();
+        const std::vector<backend::ArgmaxResult> best = backend::decode_argmax(words);
+        for (std::size_t i = 0; i < n; ++i) reqs[i].out->argmax[reqs[i].slot] = cpu::TopKEntry{best[i].index, best[i].value};
         st.cost.weight_bytes += vocab_rows == n_vocab ? bytes : bytes / n_vocab * vocab_rows;
         st.cost.activation_bytes += cpu::traffic_matmul(n, E, vocab_rows, 0).total();
     }

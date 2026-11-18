@@ -7,9 +7,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -115,6 +119,59 @@ ErrorStats compare(std::span<const float> got, std::span<const double> ref, TolF
 inline void report(const std::string& what, const ErrorStats& s) {
     std::cout << "[vk-err] " << what << ": n=" << s.count << " max_abs=" << s.max_abs
               << " max_rel=" << s.max_rel << " max_err/bound=" << s.max_ratio << "\n";
+}
+
+/// Runs `body` with HALO_VK_OP_TIMINGS pointed at a fresh file named after the current test and
+/// `tag`, restores the variable, and returns the profile's marker lines ("# wait", "# transfer
+/// <bytes>") plus the whole profile for failure messages.
+struct Profile {
+    std::vector<std::string> marks;
+    std::string shown;
+    [[nodiscard]] std::size_t transfers() const {
+        return static_cast<std::size_t>(
+            std::count_if(marks.begin(), marks.end(), [](const std::string& m) { return m.starts_with("# transfer"); }));
+    }
+};
+template <class F>
+inline Profile op_timings_profile(const std::string& tag, F&& body) {
+    const std::filesystem::path path =
+        std::filesystem::path(::testing::TempDir()) /
+        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "_" + tag +
+         ".txt");
+    std::filesystem::remove(path);
+    // Restores the variable and removes the file even when `body` throws, so a failing op
+    // cannot leave later tests of this binary profiling into a stale file.
+    struct Restore {
+        std::filesystem::path path;
+        std::optional<std::string> old;
+        Restore(std::filesystem::path p, std::optional<std::string> o) : path(std::move(p)), old(std::move(o)) {}
+        Restore(const Restore&) = delete;
+        Restore& operator=(const Restore&) = delete;
+        ~Restore() {
+            if (old) {
+                ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
+            } else {
+                ::unsetenv("HALO_VK_OP_TIMINGS");
+            }
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    };
+    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
+    const Restore restore{path, old_env ? std::optional<std::string>(old_env) : std::nullopt};
+    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+    body();
+    ::unsetenv("HALO_VK_OP_TIMINGS");  // stop profiling before reading the file (Restore puts the old value back)
+    Profile r;
+    r.shown = "profile " + path.string() + ":";
+    {
+        std::ifstream in(path);
+        for (std::string l; std::getline(in, l);) {
+            r.shown += "\n  " + l;
+            if (l.starts_with('#')) r.marks.push_back(l);
+        }
+    }
+    return r;
 }
 
 }  // namespace halo::vulkan::test

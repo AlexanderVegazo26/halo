@@ -55,6 +55,8 @@ namespace hb = halo::backend;
 namespace hm = halo::models;
 using halo::kv_cache::KvPool;
 using halo::test::TestSeq;
+using halo::vulkan::test::op_timings_profile;
+using halo::vulkan::test::Profile;
 
 namespace {
 
@@ -562,6 +564,67 @@ TEST(VulkanPushDescriptors, PrefillIsBitwiseTheDescriptorSetPrefill) {
             << c.file << ": push descriptors changed the prefill logits (rel L2 " << rel_l2(a.seqs[0].logits, b.seqs[0].logits) << ")";
         EXPECT_TRUE(pd.kv_pool->read_all() == ds.kv_pool->read_all()) << c.file << ": push descriptors changed the trunk KV";
     }
+}
+
+// next.md step 4 (one submit and one fence wait per forward): the LM head used to download a request's full
+// logits rows only after waiting for the argmax words, so every forward or MTP step with a LogitsMode::Full row
+// (every sampled, temperature > 0, token) paid a second submit and fence wait. Pass condition: a decode step and
+// an MTP step that each want Full logits complete with exactly one "# wait" in their HALO_VK_OP_TIMINGS profile,
+// and the delivered row is the one the argmax read: its first maximum has the argmax's index and bit-identical
+// value (so the rows arrived at that one wait, not zeros or a stale buffer).
+TEST(VulkanForwardFences, FullLogitsRideTheArgmaxFenceWait) {
+    if (auto why = halo::vulkan::test::no_device_reason()) GTEST_SKIP() << "Vulkan unavailable: " << *why;
+    const Case model{"tiny-f32.gguf", hm::GdnPath::Auto};
+    const auto nm = load_case(model);
+    if (!nm) GTEST_SKIP() << model.file << " missing or not loadable over Vulkan (see output)";
+    Side vk(hb::make_vulkan_backend(vk_context(false)), *nm);
+    const std::size_t V = vk.model->n_vocab();
+    ASSERT_EQ(prefill70(vk, hm::GdnPath::Auto).seqs.size(), 1u);  // not profiled: a 70-row prefill may split
+
+    const auto expect_row_matches_argmax = [&](const hm::StepResult& r, const char* what) {
+        ASSERT_EQ(r.seqs.size(), 1u) << what;
+        const hm::SeqOutput& o = r.seqs[0];
+        ASSERT_EQ(o.argmax.size(), 1u) << what;
+        ASSERT_EQ(o.logits.size(), V) << what << ": one Full row of n_vocab logits";
+        const auto first_max = std::max_element(o.logits.begin(), o.logits.end());
+        const auto idx = static_cast<std::int32_t>(first_max - o.logits.begin());
+        EXPECT_EQ(o.argmax[0].index, idx) << what << ": argmax index vs the first maximum of the delivered logits row";
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(o.argmax[0].value), std::bit_cast<std::uint32_t>(*first_max))
+            << what << ": argmax value " << o.argmax[0].value << " vs the delivered row's maximum " << *first_max;
+    };
+
+    const auto t = tokens(1, V, 10);
+    const std::vector<std::size_t> r0{0};
+    hm::StepResult dec;
+    const Profile pd = op_timings_profile("decode", [&] {
+        std::vector<hm::SeqStep> st{hm::SeqStep{t, {}, &vk.seqs[0]->kv, &vk.seqs[0]->gdn, r0, hm::LogitsMode::Full, true, 0,
+                                                hm::GdnPath::Auto}};
+        vk.model->forward(st, dec);
+    });
+    expect_row_matches_argmax(dec, "decode");
+    EXPECT_EQ(pd.marks, std::vector<std::string>{"# wait"})
+        << model.file << ": a one-row decode wanting Full logits should submit once and wait on one fence (argmax words "
+        << "and logits row in the same submission); " << pd.shown;
+
+    if (!vk.model->has_mtp()) GTEST_SKIP() << model.file << " has no MTP block: MTP half not run";
+    ASSERT_EQ(dec.seqs[0].hidden.size(), vk.model->n_embd()) << "decode hidden row for the MTP step";
+    // Not profiled: the MTP pool attaches to the backend at its first use and uploads this test's sentinel
+    // fill (KvPool::attach: one submit + wait of its own that a production pool, never host-written, skips).
+    const auto tw = tokens(1, V, 49), tm = tokens(1, V, 50);
+    const auto pos = static_cast<std::int32_t>(vk.seqs[0]->kv.length());
+    hm::StepResult warm, mtp;
+    {
+        std::vector<hm::MtpStep> st{hm::MtpStep{tw, dec.seqs[0].hidden, &vk.seqs[0]->mtp_kv, pos, r0, hm::LogitsMode::Argmax}};
+        vk.model->mtp_forward(st, warm);
+    }
+    const Profile pm = op_timings_profile("mtp", [&] {
+        std::vector<hm::MtpStep> st{
+            hm::MtpStep{tm, dec.seqs[0].hidden, &vk.seqs[0]->mtp_kv, pos + 1, r0, hm::LogitsMode::Full, true}};
+        vk.model->mtp_forward(st, mtp);
+    });
+    expect_row_matches_argmax(mtp, "mtp");
+    EXPECT_EQ(pm.marks, std::vector<std::string>{"# wait"})
+        << model.file << ": an MTP step wanting Full logits should submit once and wait on one fence; " << pm.shown;
 }
 
 // The GEMM is gated on the batch size (n_vec > 8), but a forward's gemvs carry the rows of every step in it:
