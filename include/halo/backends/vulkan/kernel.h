@@ -122,9 +122,11 @@ public:
     /// gfx1151 / RADV). The dispatch past that submits the full one and goes on recording into
     /// the stream's second command buffer behind a full barrier, without waiting: the host
     /// blocks only when a recording needs a third buffer (the oldest is then waited for and
-    /// reused) and in wait(). (With HALO_VK_OP_TIMINGS, when the free timestamp slots can't
-    /// hold another full buffer's dispatch timestamps, the split waits as before and the
-    /// recording's timestamps start over; a caller's own timestamp() calls are not budgeted.)
+    /// reused) and in wait(). Timestamps (HALO_VK_OP_TIMINGS) don't add waits: the query pool is
+    /// a ring, and a split reads back the slots of the parts it knows are done and reuses them,
+    /// so a profiled recording of any length waits exactly where an unprofiled one does. (Only
+    /// when one part's own timestamps fill the pool past room for another full buffer's -- a
+    /// caller's own timestamp() calls are not budgeted -- does the split wait as before.)
     void dispatch(const Kernel& kernel, std::span<const BufferBinding> buffers,
                   std::span<const std::byte> push, GroupCount groups, std::uint64_t write_mask = ~0ULL);
 
@@ -143,8 +145,9 @@ public:
     /// all previously recorded work, like a dispatch.
     void fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std::uint32_t value);
 
-    /// Record a timestamp after all previously recorded work; returns its slot, or nullopt
-    /// when the queue has no timestamp support or the slots are exhausted.
+    /// Record a timestamp after all previously recorded work; returns its id within the current
+    /// recording (for elapsed_ns), or nullopt when the queue has no timestamp support or the
+    /// recording holds max_timestamps not yet read back (see dispatch()).
     std::optional<std::uint32_t> timestamp();
 
     /// Submit the recording (no-op if nothing was recorded). Non-blocking.
@@ -169,7 +172,7 @@ public:
         wait();
     }
 
-    /// Nanoseconds between two timestamp slots of the last completed submission
+    /// Nanoseconds between two timestamp ids of the last completed recording
     /// (ticks * timestampPeriod), or nullopt if unavailable.
     [[nodiscard]] std::optional<double> elapsed_ns(std::uint32_t begin, std::uint32_t end) const;
 
@@ -199,6 +202,12 @@ private:
     void allocate_split_buffer();
     /// Reset `cmd` and `pools` (both idle) and begin recording into `cmd`.
     void begin_command_buffer(VkCommandBuffer cmd, std::span<const VkDescriptorPool> pools);
+    /// Calls fn(first slot, count, first id) for the query-pool slots of timestamp ids
+    /// [first, last): id i lives in slot i % max_timestamps_, so a range wraps at most once.
+    template <typename Fn>
+    void for_timestamp_slots(std::uint32_t first, std::uint32_t last, Fn&& fn) const;
+    /// Read the (completed) timestamps of ids [first, last) into harvested_values_.
+    void read_timestamps(std::uint32_t first, std::uint32_t last);
     void release() noexcept;
 
     std::shared_ptr<Context> ctx_;
@@ -218,8 +227,15 @@ private:
     std::uint32_t split_waits_ = 0;
     VkQueryPool queries_ = VK_NULL_HANDLE;
     std::uint32_t max_timestamps_ = 0;
+    // Timestamp ids of the current recording: [0, used_timestamps_) were written, the parts before
+    // the current command buffer's (ids < part_first_timestamp_) are done once split_submit() has
+    // waited for the other buffer, and ids < harvested_timestamps_ are already read back into
+    // harvested_values_ and their slots reset for reuse (the pool is a ring, see dispatch()).
     std::uint32_t used_timestamps_ = 0;
-    std::vector<std::uint64_t> timestamp_values_;
+    std::uint32_t part_first_timestamp_ = 0;
+    std::uint32_t harvested_timestamps_ = 0;
+    std::vector<std::uint64_t> harvested_values_;
+    std::vector<std::uint64_t> timestamp_values_;  // the last completed recording's, by id
     std::vector<VkDescriptorPool> desc_pools_;
     std::size_t current_pool_ = 0;
     State state_ = State::Idle;

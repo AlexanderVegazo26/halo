@@ -504,35 +504,51 @@ std::vector<std::string> op_timings_profile(const std::string& tag, const std::f
 // barrier; only a third buffer's worth waits (for the oldest, which is then reused). So a 600-dispatch
 // chain completes with one fence wait (two before) and an 1100-dispatch chain with two (three before),
 // and every dependent dispatch still sees its predecessor's output across the splits: the result is
-// bit for bit a chain that submits and waits every 100 dispatches.
+// bit for bit a chain that submits and waits every 100 dispatches. Profiling doesn't add waits: the
+// 8192 timestamp slots are a ring that each split refills from the parts already done, so a
+// 5000-dispatch chain (10 command buffers, 10000 timestamps) waits 9 times like an unprofiled one
+// (8 before: past ~4096 dispatches the split fell back to a full wait), and every kernel line is
+// still the time of its own dispatch.
 TEST(VkStream, SubmitSplitKeepsRecordingWithoutAFenceWait) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     const bool timestamps = ctx->info().timestamps_supported();
-    for (const int n : {600, 1100}) {
+    for (const int n : {600, 1100, 5000}) {
         const std::vector<float> want = rms_norm_chain(ctx, n, 100).first;
         std::vector<float> got;
         const std::vector<std::string> lines = op_timings_profile(std::to_string(n), [&] {
             got = rms_norm_chain(ctx, n).first;
         });
-        std::size_t waits = 0, kernels = 0, other = 0;
-        std::string shown;
+        std::size_t waits = 0, kernels = 0, other = 0, implausible = 0;
+        std::string shown, first_implausible;
         for (const std::string& l : lines) {
             if (l == "# wait") {
                 ++waits;
                 shown += "\n  # wait (after " + std::to_string(kernels) + " kernel lines)";
             } else if (l.starts_with("rms_norm ")) {
+                // A dispatch's own begin/end timestamps: a slot read from the wrong part gives a
+                // wrapped or stale delta (far beyond a second), one never read back gives 0.
+                const double ns = std::strtod(l.c_str() + 9, nullptr);
+                if (!(ns > 0.0 && ns < 1e9) && implausible++ == 0)
+                    first_implausible = "kernel line " + std::to_string(kernels) + ": '" + l + "'";
                 ++kernels;
             } else if (!l.starts_with("# transfer ")) {  // staged input uploads, see VkContext.OpTimings*
                 ++other;
                 shown += "\n  " + l;
             }
         }
-        const std::size_t want_waits = n > 1024 ? 2 : 1;
-        EXPECT_EQ(waits, want_waits) << n << " dispatches in one recording should need " << want_waits
-                                     << " fence wait(s): the split submits without waiting, only a third "
-                                     << "command buffer waits for the oldest; profile:" << shown;
+        // ceil(n / 512) command buffers: the first split waits for nothing, each later one for
+        // the oldest buffer, then the final wait.
+        const std::size_t buffers = (static_cast<std::size_t>(n) + 511) / 512;
+        const std::size_t want_waits = buffers - 1;
+        EXPECT_EQ(waits, want_waits) << n << " dispatches in one recording (" << buffers << " command buffers) "
+                                     << "should need " << want_waits << " fence wait(s) with HALO_VK_OP_TIMINGS "
+                                     << "as without: the split submits without waiting, only a third command "
+                                     << "buffer waits for the oldest, and the timestamp slots are reused, not "
+                                     << "waited out; profile:" << shown;
         EXPECT_EQ(kernels, timestamps ? static_cast<std::size_t>(n) : 0u)
             << "every dispatch of the " << n << "-dispatch chain should have its kernel line in the profile";
+        EXPECT_EQ(implausible, 0u) << implausible << " of " << kernels << " kernel times of the " << n
+                                   << "-dispatch chain are outside (0, 1 s); first: " << first_implausible;
         EXPECT_EQ(other, 0u) << "unexpected profile lines:" << shown;
         ASSERT_EQ(got.size(), want.size());
         std::size_t diff = 0, first = got.size();
@@ -545,6 +561,39 @@ TEST(VkStream, SubmitSplitKeepsRecordingWithoutAFenceWait) {
                             << " dependent rms_norm dispatches split without a wait vs flushed every 100; first at "
                             << first << ": split " << (first < got.size() ? got[first] : 0.0f) << " vs flushed "
                             << (first < got.size() ? want[first] : 0.0f);
+    }
+}
+
+// The timestamp slots are a ring that only a submit split refills: a recording that never splits
+// gets exactly max_timestamps ids, then nullopt (an id past that would overwrite a slot whose
+// value was not read back yet), and the ids it got still time their own work.
+TEST(VkStream, TimestampsRunOutAtThePoolSizeWithinOneCommandBuffer) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    if (!ctx->info().timestamps_supported()) GTEST_SKIP() << "the compute queue has no timestamps";
+    constexpr std::uint32_t pool = 4;
+    hv::Buffer a = hv::Buffer::create(ctx, 1 << 20, hv::MemoryUsage::DeviceLocal);
+    hv::Buffer b = hv::Buffer::create(ctx, 1 << 20, hv::MemoryUsage::DeviceLocal);
+    hv::Stream s(ctx, pool);
+    std::vector<std::optional<std::uint32_t>> ids;
+    for (std::uint32_t i = 0; i <= pool; ++i) {
+        ids.push_back(s.timestamp());
+        s.copy(a, 0, b, 0, a.size());
+    }
+    s.submit_and_wait();
+    std::string shown;
+    for (const auto& id : ids) shown += " " + (id ? std::to_string(*id) : std::string("nullopt"));
+    for (std::uint32_t i = 0; i < pool; ++i) {
+        EXPECT_EQ(ids[i], std::optional<std::uint32_t>(i))
+            << "timestamp " << i << " of a " << pool << "-slot pool should get id " << i << "; ids:" << shown;
+    }
+    EXPECT_FALSE(ids[pool].has_value()) << "timestamp " << pool << " of a " << pool << "-slot pool with nothing "
+                                        << "read back should be nullopt; ids:" << shown;
+    for (std::uint32_t i = 0; i + 1 < pool; ++i) {
+        const std::optional<double> ns = s.elapsed_ns(i, i + 1);
+        EXPECT_TRUE(ns.has_value()) << "elapsed_ns(" << i << ", " << i + 1 << ") returned nullopt";
+        EXPECT_GT(ns.value_or(0.0), 0.0) << "a 1 MiB copy between timestamps " << i << " and " << i + 1
+                                         << " took no time";
+        EXPECT_LT(ns.value_or(0.0), 1e9) << "a 1 MiB copy between timestamps " << i << " and " << i + 1;
     }
 }
 

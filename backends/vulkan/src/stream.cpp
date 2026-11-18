@@ -115,6 +115,9 @@ void Stream::ensure_recording() {
     current_pool_ = 0;
     if (queries_ != VK_NULL_HANDLE) vkCmdResetQueryPool(cmd_, queries_, 0, max_timestamps_);
     used_timestamps_ = 0;
+    part_first_timestamp_ = 0;
+    harvested_timestamps_ = 0;
+    harvested_values_.clear();
     op_marks_.clear();
     split_waits_ = 0;
     dispatches_ = 0;
@@ -156,12 +159,13 @@ void Stream::begin_command_buffer(VkCommandBuffer cmd, std::span<const VkDescrip
 }
 
 void Stream::split_submit() {
-    // With per-dispatch timestamps (HALO_VK_OP_TIMINGS) the recording keeps its slots across a
-    // split, so when the free slots can't hold another full command buffer's dispatch
-    // timestamps (2 each), wait here as before: wait() writes the profile and the next
-    // recording starts at slot 0.
+    // With per-dispatch timestamps (HALO_VK_OP_TIMINGS) the next part needs room for 2 per
+    // dispatch. After this split only the part being submitted holds slots that are not read
+    // back (every earlier part is done once the other buffer is waited for below), so only when
+    // that part alone leaves too little room wait here as before: wait() writes the profile and
+    // the next recording starts at slot 0.
     if (op_timings_ && queries_ != VK_NULL_HANDLE &&
-        used_timestamps_ + 2 * kMaxDispatchesPerSubmit > max_timestamps_) {
+        (used_timestamps_ - part_first_timestamp_) + 2 * kMaxDispatchesPerSubmit > max_timestamps_) {
         submit();
         wait();
         return;
@@ -181,9 +185,18 @@ void Stream::split_submit() {
         other_pending_ = false;
         ++split_waits_;
     }
+    // Every part before the one just submitted is done: read its timestamps back so the next
+    // part can reuse their slots (reset at its start, below).
+    const std::uint32_t done = part_first_timestamp_;
+    read_timestamps(harvested_timestamps_, done);
     // Begin the other buffer before swapping: if this throws, cmd_/fence_ are still the
     // submission state_ (Submitted) refers to, so wait()/discard() wait on the right fence.
     begin_command_buffer(other_cmd_, other_pools_);
+    for_timestamp_slots(harvested_timestamps_, done, [&](std::uint32_t slot, std::uint32_t count, std::uint32_t) {
+        vkCmdResetQueryPool(other_cmd_, queries_, slot, count);
+    });
+    harvested_timestamps_ = done;
+    part_first_timestamp_ = used_timestamps_;
     std::swap(cmd_, other_cmd_);
     std::swap(fence_, other_fence_);
     std::swap(desc_pools_, other_pools_);
@@ -426,10 +439,31 @@ void Stream::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, std
 std::optional<std::uint32_t> Stream::timestamp() {
     if (queries_ == VK_NULL_HANDLE) return std::nullopt;
     ensure_recording();
-    if (used_timestamps_ >= max_timestamps_) return std::nullopt;
-    const std::uint32_t slot = used_timestamps_++;
-    vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries_, slot);
-    return slot;
+    // Every slot holds a timestamp not yet read back (the ring is full).
+    if (used_timestamps_ - harvested_timestamps_ >= max_timestamps_) return std::nullopt;
+    const std::uint32_t id = used_timestamps_++;
+    vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries_, id % max_timestamps_);
+    return id;
+}
+
+template <typename Fn>
+void Stream::for_timestamp_slots(std::uint32_t first, std::uint32_t last, Fn&& fn) const {
+    while (first < last) {
+        const std::uint32_t slot = first % max_timestamps_;
+        const std::uint32_t count = std::min(last - first, max_timestamps_ - slot);
+        fn(slot, count, first);
+        first += count;
+    }
+}
+
+void Stream::read_timestamps(std::uint32_t first, std::uint32_t last) {
+    if (harvested_values_.size() < last) harvested_values_.resize(last, 0);
+    for_timestamp_slots(first, last, [&](std::uint32_t slot, std::uint32_t count, std::uint32_t id) {
+        detail::vk_check(vkGetQueryPoolResults(ctx_->device(), queries_, slot, count, count * sizeof(std::uint64_t),
+                                               harvested_values_.data() + id, sizeof(std::uint64_t),
+                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                         "vkGetQueryPoolResults");
+    });
 }
 
 void Stream::submit() {
@@ -460,14 +494,11 @@ void Stream::wait(std::uint64_t timeout_ns) {
     detail::vk_check(r, "vkWaitForFences");
     other_pending_ = false;
     state_ = State::Idle;
-    timestamp_values_.assign(used_timestamps_, 0);
-    if (used_timestamps_ > 0) {
-        detail::vk_check(vkGetQueryPoolResults(ctx_->device(), queries_, 0, used_timestamps_,
-                                               timestamp_values_.size() * sizeof(std::uint64_t),
-                                               timestamp_values_.data(), sizeof(std::uint64_t),
-                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
-                         "vkGetQueryPoolResults");
-    }
+    // The ids split_submit() has not read back yet, after the ones it has.
+    read_timestamps(harvested_timestamps_, used_timestamps_);
+    timestamp_values_ = std::move(harvested_values_);
+    harvested_values_.clear();
+    harvested_timestamps_ = used_timestamps_;
     if (op_timings_) {
         // One "# wait" line per completed fence wait, after that submission's dispatches, so a
         // profile also counts fences (scripts/op_profile.py: fence waits, dispatches per wait).
