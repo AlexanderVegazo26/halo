@@ -35,10 +35,10 @@ set(HALO_VK_SHADERS
   matmul/matvec_q5_k_rp  # planar-repacked weights (opt-in HALO_REPACK=1; gemv variant kGemvRepacked)
   matmul/matvec_q6_k_rp
   matmul/matvec_iq4_xs_rp
-  matmul/matvec_q4_k_sg  # subgroupAdd batched variants (opt-in HALO_SUBGROUP_REDUCE=1; batched n_vec > 1 only)
-  matmul/matvec_q5_k_sg
-  matmul/matvec_q6_k_sg
-  matmul/matvec_iq4_xs_sg
+  matmul/matvec_q4_k_sg=matmul/matvec_q4_k:HALO_SUBGROUP_REDUCE  # subgroupAdd-reduction variants (opt-in HALO_SUBGROUP_REDUCE=1; every chunk, n_vec 1..8)
+  matmul/matvec_q5_k_sg=matmul/matvec_q5_k:HALO_SUBGROUP_REDUCE
+  matmul/matvec_q6_k_sg=matmul/matvec_q6_k:HALO_SUBGROUP_REDUCE
+  matmul/matvec_iq4_xs_sg=matmul/matvec_iq4_xs:HALO_SUBGROUP_REDUCE
   matmul/matvec_q4_k_normed=matmul/matvec_q4_k:HALO_FUSE_NORM  # rms_norm fused into the decode matvec prologue (opt-in HALO_FUSE_NORM=1)
   matmul/matvec_q5_k_normed=matmul/matvec_q5_k:HALO_FUSE_NORM
   matmul/matvec_q6_k_normed=matmul/matvec_q6_k:HALO_FUSE_NORM

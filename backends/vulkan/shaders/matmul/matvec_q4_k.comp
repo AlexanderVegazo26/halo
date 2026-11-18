@@ -1,4 +1,5 @@
 #version 450
+#include "matvec_variant_prologue.glsl"
 // QUANT_GEMV / MATMUL, ggml Q4_K weights: y[t][r] = sum_c W[r,c] * x[t][c]. Per-type main:
 // common/matvec_q4_k_main.glsl (llama.cpp mul_mat_vec_q4_k port: 16 threads/block, SWAR
 // dequant, sub-block scale application; shared with neither the other matvec types nor
@@ -9,6 +10,12 @@
 // NORMED variant matvec_q4_k_normed (opt-in HALO_FUSE_NORM=1, decode n_vec == 1 only): this file
 // compiled with -DHALO_FUSE_NORM (backends/vulkan/CMakeLists.txt): y = W * (rms_norm(x) * nw), the
 // per-type main's input reads go through HALO_X; prologue in common/matvec_normed.glsl.
+// SUBGROUP variant matvec_q4_k_sg (opt-in HALO_SUBGROUP_REDUCE=1; the host then runs it for EVERY
+// chunk, n_vec == 1 included, see ops.cpp): this file compiled with -DHALO_SUBGROUP_REDUCE: the
+// dequant/apply code is the unmodified common/matvec_q4_k_main.glsl, but the cross-thread reduction
+// is subgroupAdd (+ a shared step when the workgroup spans several subgroups) with the chunk's
+// vector count as the specialization constant NV, see common/matvec_sg_reduce.glsl and
+// matvec_q4_k_sg_main.glsl. Not bitwise equal to the plain build (reduction order).
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
@@ -37,8 +44,13 @@ layout(push_constant) uniform Push {
 #endif
 } pc;
 
+#ifdef HALO_SUBGROUP_REDUCE
+// Not a specialization constant here: only the (unused) tree bodies of the included main read it.
+const uint BATCHED = 0u;
+#else
 // Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
 layout(constant_id = 1) const uint BATCHED = 1;
+#endif
 const uint MAX_VEC = 8u;
 
 #ifdef HALO_FUSE_NORM
@@ -51,6 +63,10 @@ shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all
 
 HALO_DEFINE_BYTE_READERS(wq)
 
+#ifdef HALO_SUBGROUP_REDUCE
+#include "matvec_sg_reduce.glsl"
+#endif
+
 struct Q4KBlock {
     vec4 qA, qB, qC, qD;  // q nibbles: elements y_off+{0..3}, +32, and +128/+160
     vec2 dm;              // (d, dmin)
@@ -61,6 +77,9 @@ struct Q4KBlock {
 #define LD32(bo) (wq[(bo) >> 2])
 #define Q4K_FN fast
 #include "matvec_q4_k_main.glsl"
+#ifdef HALO_SUBGROUP_REDUCE
+#include "matvec_q4_k_sg_main.glsl"
+#endif
 #undef LD32
 #undef Q4K_FN
 
@@ -68,6 +87,9 @@ struct Q4KBlock {
     (read_u8(bo) | (read_u8((bo) + 1u) << 8) | (read_u8((bo) + 2u) << 16) | (read_u8((bo) + 3u) << 24))
 #define Q4K_FN slow
 #include "matvec_q4_k_main.glsl"
+#ifdef HALO_SUBGROUP_REDUCE
+#include "matvec_q4_k_sg_main.glsl"
+#endif
 #undef LD32
 #undef Q4K_FN
 
@@ -80,7 +102,7 @@ void main() {
     const uint row_off = pc.w_off + row * pc.w_stride;
     // Uniform branch: 144-byte blocks keep every row at the same alignment as w_off.
     if ((row_off & 3u) == 0u)
-        q4k_fast(row, row_off);
+        HALO_MV_ENTRY(q4k, fast)(row, row_off);
     else
-        q4k_slow(row, row_off);
+        HALO_MV_ENTRY(q4k, slow)(row, row_off);
 }

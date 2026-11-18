@@ -1,10 +1,11 @@
-// Shared tail of the matvec_*_sg shaders (HALO_SUBGROUP_REDUCE=1): batched (n_vec > 1)
+// Shared tail of the matvec_*_sg shaders (HALO_SUBGROUP_REDUCE=1; every chunk, n_vec 1..8):
 // cross-thread reduction with subgroupAdd instead of the shared-memory tree of
-// matvec_*_main.glsl. Included ONCE by a matvec_<type>_sg.comp, after its bindings / push
-// constants / WG, and before the per-type matvec_<type>_sg_main.glsl bodies.
+// matvec_*_main.glsl. Included ONCE by matvec_<type>.comp when compiled with
+// -DHALO_SUBGROUP_REDUCE (the matvec_<type>_sg variant in backends/vulkan/CMakeLists.txt), after
+// its bindings / push constants / WG, and before the per-type matvec_<type>_sg_main.glsl bodies.
 //
-// The includer must have `#extension GL_KHR_shader_subgroup_basic : enable` and
-// `#extension GL_KHR_shader_subgroup_arithmetic : enable` before any other token.
+// The includer must enable GL_KHR_shader_subgroup_basic and GL_KHR_shader_subgroup_arithmetic
+// before any other token (common/matvec_variant_prologue.glsl does).
 //
 // Correct for ANY workgroup size and subgroup size >= 32 (the host gates on that): each
 // subgroup reduces its own lanes with subgroupAdd; when the workgroup holds more than one
@@ -15,9 +16,10 @@
 // NUMERICS: the per-thread partials are bitwise the ones of the tree shaders (the dequant
 // and apply functions are the very same ones); only the ORDER of the WG-wide sum differs
 // (subgroupAdd's hardware order instead of the halving tree), so results agree with the
-// tree shaders and with the n_vec == 1 matvec to a few ulps, not bitwise.
+// tree shaders to a few ulps, not bitwise. A vector's arithmetic doesn't depend on NV, so a batch
+// row is still bitwise its own n_vec == 1 _sg matvec (the host never mixes the two, ops.cpp).
 
-// Exact vector count of this dispatch (host: 2..8, one pipeline per count): every vector loop
+// Exact vector count of this dispatch (host: 1..8, one pipeline per count): every vector loop
 // below has a compile-time trip count and unrolls, keeping acc[] in registers.
 layout(constant_id = 2) const uint NV = 4;
 
