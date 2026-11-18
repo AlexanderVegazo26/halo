@@ -14,9 +14,11 @@
 // Included twice WITHOUT an include guard. Expects from the includer:
 //   LD32(bo)      -> uint: 4 weight bytes at 4-aligned (fast) or arbitrary (slow) byte off
 //   Q4K_FN        -> function-name token (pasted as q4k_<Q4K_FN>)
-// plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp. With
-// -DHALO_SUBGROUP_REDUCE it also includes matvec_q4_k_sg_main.glsl at its end, which needs
-// NV, g_acc[] and sg_finish() from common/matvec_sg_reduce.glsl (included by the .comp first).
+// plus the bindings, push constants, BATCHED, MAX_VEC, red[], redb[] from the .comp. With
+// -DHALO_SUBGROUP_REDUCE the tree entry q4k_<Q4K_FN> is not compiled (the .comp then has no
+// BATCHED, MAX_VEC, red[] or redb[]): matvec_q4_k_sg_main.glsl, included at the end, is the
+// entry instead and needs NV, g_acc[] and sg_finish() from common/matvec_sg_reduce.glsl
+// (included by the .comp first).
 
 // Input element i of the vector being dotted. Default: the x buffer; the _normed shaders define
 // HALO_X(i) to normalize x on the fly (HALO_FUSE_NORM: matmul/matvec_<type>.comp built with -DHALO_FUSE_NORM).
@@ -85,6 +87,9 @@ float Q4K_PASTE(q4k_apply_, Q4K_FN)(const Q4KBlock b, const uint xb, const float
     return part;
 }
 
+// Tree-reduction entry (shared-memory halving tree); the HALO_SUBGROUP_REDUCE build uses
+// q4k_sg_<Q4K_FN> from matvec_q4_k_sg_main.glsl instead and never compiles this one.
+#ifndef HALO_SUBGROUP_REDUCE
 void Q4K_PASTE(q4k_, Q4K_FN)(const uint row, const uint row_off) {
     const uint tid = gl_LocalInvocationID.x;
     const uint itid = tid & 15u;
@@ -140,6 +145,7 @@ void Q4K_PASTE(q4k_, Q4K_FN)(const uint row, const uint row_off) {
             if (t < pc.n_vec) y[pc.y_off + t * pc.y_stride + row] = redb[t * WG];
     }
 }
+#endif  // !HALO_SUBGROUP_REDUCE
 
 #undef Q4K_PASTE
 #undef Q4K_PASTE2

@@ -1,7 +1,10 @@
-// HALO_SUBGROUP_REDUCE batched body of matvec_q5_k: same thread mapping, dequant and apply as
-// the batched branch of matvec_q5_k_main.glsl (which includes this file at its end, after
-// q5k_dequant_<FN> / q5k_apply_<FN>), then the subgroupAdd tail
-// (matvec_sg_reduce.glsl). Included twice (FAST / SLOW) like the original; same includer contract.
+// HALO_SUBGROUP_REDUCE entry of matvec_q5_k (every n_vec, 1..NV): same thread mapping, dequant and
+// apply as the batched branch of the tree entry in matvec_q5_k_main.glsl, then the subgroupAdd tail
+// (matvec_sg_reduce.glsl). matvec_q5_k_main.glsl includes this file at its end, after
+// q5k_dequant_<FN> / q5k_apply_<FN>, and compiles no tree entry in this build. Included twice
+// (FAST / SLOW) like the main. Includer contract: the bindings, push constants and WG from the
+// .comp, LD32 / Q5K_FN, and NV, g_acc[], sg_finish() from matvec_sg_reduce.glsl; the .comp
+// declares no BATCHED, MAX_VEC, red[] or redb[] in this build.
 #define Q5K_PASTE2(a, b) a##b
 #define Q5K_PASTE(a, b) Q5K_PASTE2(a, b)
 

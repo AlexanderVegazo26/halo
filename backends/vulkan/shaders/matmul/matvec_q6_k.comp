@@ -25,22 +25,23 @@ layout(local_size_x_id = 0) in;
 
 #include "matvec_io.glsl"  // Wq/X(or XR+NW)/Y bindings + push block
 
-#ifdef HALO_SUBGROUP_REDUCE
-// Not a specialization constant here: only the (unused) tree bodies of the included main read it.
-const uint BATCHED = 0u;
-#else
+#ifndef HALO_SUBGROUP_REDUCE
+// Tree-reduction build only: the HALO_SUBGROUP_REDUCE build compiles no tree body (see the
+// per-type _main.glsl) and takes its vector count from NV (common/matvec_sg_reduce.glsl).
 // Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
 layout(constant_id = 1) const uint BATCHED = 1;
-#endif
 const uint MAX_VEC = 8u;
+#endif
 
 #ifdef HALO_FUSE_NORM
 // HALO_FUSE_NORM prologue: norm_prologue() + HALO_X (input normalized as it is read).
 #include "matvec_normed.glsl"
 #endif
 
+#ifndef HALO_SUBGROUP_REDUCE
 shared float red[WG];
 shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
+#endif
 
 HALO_DEFINE_BYTE_READERS(wq)
 
