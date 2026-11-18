@@ -60,6 +60,8 @@ using halo::speculative::Speculator;
 using halo::speculative::StepRequest;
 using halo::speculative::Tick;
 using halo::state::SequenceState;
+using halo::vulkan::test::op_timings_profile;
+using halo::vulkan::test::Profile;
 
 namespace {
 
@@ -518,6 +520,55 @@ TEST_F(VulkanSpec, TreeChainWinsOrBothWrongEqualsPlainDecode) {
         prefill(off2, *ref, pr);
         (void)feed_plain(off2, *ref, std::span(g).first(m + kept));
         expect_same_state(sp, *s, off2, *ref, chain_right ? "chain win vs plain" : "both wrong vs plain");
+    }
+}
+
+// next.md step 4 (one submit and one fence per tick): how many fence waits one greedy speculative tick
+// costs on the device, per draft path, so the "drafts + verify in one submission" cut has a pinned
+// baseline to move. Each tick runs depth-1 MTP over the accepted rows, the deeper drafts, and the trunk
+// verify forward; every Qwen35 forward / MTP step / draft chain submits once and waits on one fence.
+// Pass condition: every profiled steady-state tick (after a warm-up tick that attaches the MTP KV pool)
+// has exactly `waits` "# wait" lines and no "# transfer" line (no staged per-step upload), for k = 1..3
+// on the per-depth host path (k MTP steps + 1 verify) and with chained drafts (1 chain + 1 verify).
+TEST_F(VulkanSpec, SpeculativeTickFenceWaitsPerDraftPath) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    const VkModel vk(ctx, *nm_, /*reuse=*/false);
+    ASSERT_TRUE(vk.model->has_mtp()) << "tiny-f32.gguf has no MTP head";
+    ASSERT_TRUE(vk.be->limits().lm_head_ids) << "the Vulkan backend must support device token ids, or chain silently falls back";
+    const Toks pr = prompt("p0");
+    constexpr std::size_t k_profiled = 3;
+    for (const Flags& f : {k_host, k_variants[0], k_variants[1], k_variants[2]}) {
+        for (std::size_t k = 1; k <= 3; ++k) {
+            SCOPED_TRACE(std::string(f.name) + " k=" + std::to_string(k));
+            auto sp = vk.spec(GateMode::Always, f.device_hidden, f.chain);
+            auto s = vk.seq();
+            StepRequest pre;
+            pre.seq = s.get();
+            pre.prefill = pr;
+            Toks toks = step1(sp, pre).out.at(0).tokens;
+            ASSERT_FALSE(toks.empty()) << "prefill emitted no token";
+            const auto tick = [&] {
+                StepRequest r;
+                r.seq = s.get();
+                r.token = toks.back();
+                r.max_draft = k;
+                r.max_emit = k + 1;
+                const Tick t = step1(sp, r);
+                if (t.out.at(0).drafts.size() != k) {
+                    ADD_FAILURE() << "tick drafted " << t.out[0].drafts.size() << " tokens, wanted " << k;
+                }
+                toks.insert(toks.end(), t.out.at(0).tokens.begin(), t.out.at(0).tokens.end());
+            };
+            tick();  // warm-up, not profiled: the first MTP step attaches the MTP KV pool (its own submit + wait)
+            for (std::size_t i = 0; i < k_profiled; ++i) {
+                const Profile p = op_timings_profile(std::to_string(k) + "_" + std::to_string(i), tick);
+                const std::size_t want = f.chain ? 2 : k + 1;
+                EXPECT_EQ(p.marks, std::vector<std::string>(want, "# wait"))
+                    << f.name << " k=" << k << " steady tick " << i << ": expected " << want << " fence waits ("
+                    << (f.chain ? "1 draft chain + 1 verify" : "k MTP steps + 1 verify") << ") and no '# transfer' line, got "
+                    << p.marks.size() << " markers (" << p.transfers() << " transfers); " << p.shown;
+            }
+        }
     }
 }
 

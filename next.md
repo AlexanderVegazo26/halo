@@ -57,7 +57,7 @@ The run was 44 forwards: 1 prefill, 15 verify (R=3) and 28 MTP drafts. That come
 - **Chain the drafts on the GPU.**
   - The draft 1 argmax index feeds `get_rows` directly, using device ids, for draft 2.
   - Draft 2 and verify token ids are also produced on the device.
-  - Result: drafts plus verify become **one submit and one fence per tick**, down from 6.
+  - Result: drafts plus verify become **one submit and one fence per tick**. **Measured 2026-11-18 (tiny f32 model, RADV):** a steady greedy tick waits on k + 1 fences on the per-depth path (k MTP steps + the verify forward; with or without `HALO_MTP_DEVICE_HIDDEN`), and on 2 with `HALO_MTP_CHAIN` (the draft chain + the verify forward) for every k, with no `# transfer` line in either (VulkanSpec.SpeculativeTickFenceWaitsPerDraftPath pins these counts). So the default k = 2 tick costs 3 fences, and the chain already cuts it to 2: the remaining step is recording the verify forward behind the chain, reading the draft ids from the chain's device ids.
   - Touch points: `src/speculative/speculative.cpp:119-304` and the `Backend` interface (`include/halo/backend/backend.h`).
 - **Reuse the stream.**
   - `Step` creates a new `Stream` for every forward (`qwen35.cpp:237`), with its own command pool, fence and descriptor pools. Keep a small per-model pool of streams. **Implemented (opt-in):** `HALO_STREAM_REUSE=1` / `Qwen35Options::reuse_streams` pools them (`acquire_stream` / `release_stream`; VulkanSpec.StreamReuseIsBitwiseNeutral); the first idle-GPU sweep measured it at -2.0% (one run, within noise).
