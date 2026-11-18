@@ -52,15 +52,14 @@ Stream::Stream(std::shared_ptr<Context> ctx, std::uint32_t max_timestamps) : ctx
         cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cai.commandPool = pool_;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 2;  // the recording one and the one a submit split hands over to
-        std::array<VkCommandBuffer, 2> cmds{};
-        detail::vk_check(vkAllocateCommandBuffers(dev, &cai, cmds.data()), "vkAllocateCommandBuffers");
-        cmd_ = cmds[0];
-        other_cmd_ = cmds[1];
+        // One command buffer and fence: the second pair a submit split hands over to is created
+        // by the first split (allocate_split_buffer), so streams that never pass 512 dispatches
+        // (every decode forward) don't pay for it.
+        cai.commandBufferCount = 1;
+        detail::vk_check(vkAllocateCommandBuffers(dev, &cai, &cmd_), "vkAllocateCommandBuffers");
         VkFenceCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         detail::vk_check(vkCreateFence(dev, &fci, nullptr, &fence_), "vkCreateFence");
-        detail::vk_check(vkCreateFence(dev, &fci, nullptr, &other_fence_), "vkCreateFence");
         if (ctx_->info().timestamps_supported() && max_timestamps > 0) {
             VkQueryPoolCreateInfo qpi{};
             qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -123,6 +122,27 @@ void Stream::ensure_recording() {
     state_ = State::Recording;
 }
 
+void Stream::allocate_split_buffer() {
+    const VkDevice dev = ctx_->device();
+    VkCommandBufferAllocateInfo cai{};
+    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool = pool_;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    detail::vk_check(vkAllocateCommandBuffers(dev, &cai, &cmd), "vkAllocateCommandBuffers");
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    const VkResult r = vkCreateFence(dev, &fci, nullptr, &fence);
+    if (r != VK_SUCCESS) {
+        vkFreeCommandBuffers(dev, pool_, 1, &cmd);
+        detail::throw_vk(r, "vkCreateFence");
+    }
+    other_cmd_ = cmd;
+    other_fence_ = fence;
+}
+
 void Stream::begin_command_buffer(VkCommandBuffer cmd, std::span<const VkDescriptorPool> pools) {
     const VkDevice dev = ctx_->device();
     detail::vk_check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
@@ -146,6 +166,8 @@ void Stream::split_submit() {
         wait();
         return;
     }
+    // Before submit(): if this throws, the recording is untouched and still Recording.
+    if (other_cmd_ == VK_NULL_HANDLE) allocate_split_buffer();
     submit();
     if (other_pending_) {
         // The other command buffer still runs the part of this recording before the previous

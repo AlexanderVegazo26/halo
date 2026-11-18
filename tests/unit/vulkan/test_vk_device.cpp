@@ -410,7 +410,7 @@ namespace {
 /// every that many dispatches instead (no split). Returns the final rows and the stream's
 /// descriptor pool count.
 std::pair<std::vector<float>, std::size_t> rms_norm_chain(const std::shared_ptr<hv::Context>& ctx, int n = 600,
-                                                          int flush_every = 0) {
+                                                          int flush_every = 0, bool* split_buffer = nullptr) {
     constexpr std::uint32_t rows = 4, cols = 256;
     constexpr std::uint64_t region = 4096;  // bytes; rows * cols * 4, aligned for any device's offset rule
     std::vector<float> x0(2 * rows * cols), w(cols);
@@ -426,6 +426,7 @@ std::pair<std::vector<float>, std::size_t> rms_norm_chain(const std::shared_ptr<
         if (flush_every > 0 && (i + 1) % flush_every == 0) s.submit_and_wait();
     }
     s.submit_and_wait();
+    if (split_buffer != nullptr) *split_buffer = s.has_split_buffer();
     return {download<float>(xb, x0.size()), s.descriptor_pool_count()};
 }
 
@@ -544,6 +545,35 @@ TEST(VkStream, SubmitSplitKeepsRecordingWithoutAFenceWait) {
                             << " dependent rms_norm dispatches split without a wait vs flushed every 100; first at "
                             << first << ": split " << (first < got.size() ? got[first] : 0.0f) << " vs flushed "
                             << (first < got.size() ? want[first] : 0.0f);
+    }
+}
+
+// next.md step 4 (stream setup cost): a Stream is created per forward by default, and a decode
+// forward records ~400 dispatches, so it never splits. The second command buffer and fence a split
+// continues in are therefore created by the first split, not by the constructor: up to 512
+// dispatches the stream has none, past 512 it has one, and the split chain is still bit for bit a
+// chain flushed every 100 dispatches (which never splits either).
+TEST(VkStream, SecondCommandBufferIsCreatedOnlyByASubmitSplit) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    for (const int n : {1, 512, 513, 1100}) {
+        bool flushed_split = true, split = false;
+        const std::vector<float> want = rms_norm_chain(ctx, n, 100, &flushed_split).first;
+        const std::vector<float> got = rms_norm_chain(ctx, n, 0, &split).first;
+        EXPECT_FALSE(flushed_split) << n << " dispatches submitted every 100 never split, yet the stream "
+                                    << "created a second command buffer";
+        EXPECT_EQ(split, n > 512) << n << " dispatches in one recording: the second command buffer should "
+                                  << (n > 512 ? "exist (the 513th dispatch splits)" : "not exist (no split)");
+        ASSERT_EQ(got.size(), want.size());
+        std::size_t diff = 0, first = got.size();
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            if (std::bit_cast<std::uint32_t>(got[i]) != std::bit_cast<std::uint32_t>(want[i])) {
+                if (diff++ == 0) first = i;
+            }
+        }
+        EXPECT_EQ(diff, 0u) << diff << " of " << got.size() << " floats differ after " << n
+                            << " dependent rms_norm dispatches in one recording vs flushed every 100; first at "
+                            << first << ": one recording " << (first < got.size() ? got[first] : 0.0f)
+                            << " vs flushed " << (first < got.size() ? want[first] : 0.0f);
     }
 }
 

@@ -179,6 +179,9 @@ public:
     [[nodiscard]] std::size_t descriptor_pool_count() const noexcept {
         return desc_pools_.size() + other_pools_.size();
     }
+    /// True once a submit split (see dispatch()) has created the stream's second command buffer
+    /// and fence; a stream that never records more than 512 dispatches never creates them.
+    [[nodiscard]] bool has_split_buffer() const noexcept { return other_cmd_ != VK_NULL_HANDLE; }
 
 private:
     enum class State { Idle, Recording, Submitted, Hung };
@@ -192,6 +195,8 @@ private:
     /// The submit split in dispatch(): submit the recording and continue it in the other
     /// command buffer (waiting for that one first if a previous split left it in flight).
     void split_submit();
+    /// Create the second command buffer and fence for split_submit() (first split only).
+    void allocate_split_buffer();
     /// Reset `cmd` and `pools` (both idle) and begin recording into `cmd`.
     void begin_command_buffer(VkCommandBuffer cmd, std::span<const VkDescriptorPool> pools);
     void release() noexcept;
@@ -199,7 +204,8 @@ private:
     std::shared_ptr<Context> ctx_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     // The command buffer being recorded, its fence and descriptor pools (desc_pools_ below),
-    // and the other set split_submit() swaps in. other_pending_: the other command buffer was
+    // and the other set split_submit() swaps in (other_cmd_ / other_fence_ stay null until the
+    // first split, see allocate_split_buffer). other_pending_: the other command buffer was
     // submitted by a split of the current recording and has not been waited for.
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
