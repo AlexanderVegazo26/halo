@@ -301,10 +301,12 @@ void Ops::gemv_impl(Stream& stream, const GemvArgs& a, std::string_view op, bool
         // inv_rms once per workgroup and the main reads (x * inv_rms) * norm_w element by element (HALO_X).
         const Operand onw = operand(a.norm_w, 1, std::uint64_t{a.cols} * k_f32, Access::Floats, align, op, "norm_w");
         require_disjoint(oy, "y", {{&onw, "norm_w"}}, op);
-        struct NPush {
+        struct NPush {  // = shaders/common/matvec_io.glsl's HALO_FUSE_NORM push block
             std::uint32_t rows, cols, n_vec, w_off, w_stride, x_off, x_stride, y_off, y_stride, xr_off, nw_off;
             float eps;
         };
+        static_assert(sizeof(NPush) == 12 * 4 && offsetof(NPush, eps) == 11 * 4,
+                      "NPush must match the HALO_FUSE_NORM push block of shaders/common/matvec_io.glsl");
         const Kernel& kn = kernel(shader + "_normed", 4, sizeof(NPush), {{0, wg}, {1, 0u}}, {wg, 1, 1});
         const std::array nbindings{ow.binding, ox.binding, oy.binding, onw.binding};
         const DeviceInfo& ninfo = ctx_->info();

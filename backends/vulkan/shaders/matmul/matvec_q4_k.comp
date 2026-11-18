@@ -21,28 +21,7 @@
 layout(constant_id = 0) const uint WG = 256;
 layout(local_size_x_id = 0) in;
 
-layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
-#ifdef HALO_FUSE_NORM
-layout(std430, binding = 1) readonly buffer XR { float xr[]; };  // raw (un-normed) input
-layout(std430, binding = 3) readonly buffer NW { float nw[]; };  // norm weight
-#else
-layout(std430, binding = 1) readonly buffer X { float x[]; };
-#endif
-layout(std430, binding = 2) writeonly buffer Y { float y[]; };
-
-layout(push_constant) uniform Push {
-    uint rows;
-    uint cols;
-    uint n_vec;     // 1..MAX_VEC
-    uint w_off;     // sub-alignment remainder of the W view (bytes)
-    uint w_stride;  // row stride of W (bytes)
-    uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
-#ifdef HALO_FUSE_NORM
-    uint xr_off;    // element remainder of the raw x view
-    uint nw_off;    // element remainder of the norm-weight view
-    float eps;
-#endif
-} pc;
+#include "matvec_io.glsl"  // Wq/X(or XR+NW)/Y bindings + push block
 
 #ifdef HALO_SUBGROUP_REDUCE
 // Not a specialization constant here: only the (unused) tree bodies of the included main read it.
