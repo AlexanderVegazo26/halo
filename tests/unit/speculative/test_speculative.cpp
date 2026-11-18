@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 
@@ -772,6 +773,61 @@ TEST_F(Spec, ChainedTickFusesDraftAndVerifyAndEqualsTheSeparatePhases) {
         want.insert(want.end(), greedy.begin(), greedy.end());
         EXPECT_EQ(out[i], want) << "chained speculative output must be plain greedy decoding";
     }
+}
+
+// A NaN-poisoned draft depth in a fused tick (draft_verify): the verify has already run every row when the
+// poison is seen, so the tick must keep going without the drafts at and past the poisoned depth. They are
+// not continuations of anything (the device chain fed id 0 past it). A NaN in the carried trunk hidden
+// poisons the depth-1 MTP row, so every depth of that chain is poisoned. For that sequence: no draft is
+// offered or counted, the verify rows fed for MTP catch-up are x plus the placeholder 0 the fused call
+// embedded (never a -1 id), the trunk's own target is emitted (plain greedy decoding), and the next tick
+// still works. A healthy sequence in the same batch drafts as usual.
+TEST_F(Spec, FusedTickWithAPoisonedDraftDepthEmitsTheTrunkTokenAndDropsTheDrafts) {
+    SpecConfig c;
+    c.max_draft = 3;
+    c.gate.mode = GateMode::Always;
+    c.chain = true;
+    Speculator fused(model(), c);
+    auto host = spec(GateMode::Off);
+    const Toks p0 = prompt("p0"), p1 = prompt("p1");
+    auto bad = seq(), good = seq(), bad_plain = seq(), good_plain = seq();
+    Toks out_bad = prefill(fused, *bad, p0), out_good = prefill(fused, *good, p1);
+    const Toks ref_bad = prefill(host, *bad_plain, p0), ref_good = prefill(host, *good_plain, p1);
+    ASSERT_EQ(out_bad, ref_bad) << "prefill differs (poisoned sequence, before the poison)";
+    ASSERT_EQ(out_good, ref_good) << "prefill differs (healthy sequence)";
+    ASSERT_FALSE(bad->last_hidden.empty()) << "the MTP model must carry a trunk hidden after the prefill";
+    bad->last_hidden.at(0) = std::numeric_limits<float>::quiet_NaN();  // only the MTP reads it
+    for (std::size_t tick = 0; tick < 2; ++tick) {
+        const std::string what = "tick " + std::to_string(tick);
+        std::array<StepRequest, 2> r;
+        r[0].seq = bad.get();
+        r[0].token = out_bad.back();
+        r[0].max_draft = 3;
+        r[0].max_emit = 4;
+        r[1].seq = good.get();
+        r[1].token = out_good.back();
+        r[1].max_draft = 2;
+        r[1].max_emit = 4;
+        const auto ticks0 = fused.metrics().fused_ticks, drafted0 = fused.metrics().drafted;
+        Tick t;
+        ASSERT_NO_THROW(fused.step(r, t)) << what << ": a poisoned draft depth must not fail the fused tick";
+        EXPECT_EQ(fused.metrics().fused_ticks, ticks0 + 1) << what << ": the tick must take the fused path";
+        EXPECT_TRUE(t.out[0].drafts.empty()) << what << ": poisoned sequence offered drafts " << ::testing::PrintToString(t.out[0].drafts);
+        EXPECT_EQ(t.seqs[0].k, 3u) << what << ": the verify ran x + 3 draft rows, s.k must stay that row count";
+        EXPECT_EQ(t.seqs[0].fed, (Toks{out_bad.back(), 0, 0, 0})) << what << ": rows fed past the poison must be the embedded placeholder";
+        EXPECT_EQ(t.out[0].accepted, 0u) << what << ": nothing to accept";
+        EXPECT_EQ(t.out[1].drafts.size(), 2u) << what << ": the healthy sequence must still draft k = 2";
+        EXPECT_EQ(fused.metrics().drafted - drafted0, t.out[1].drafts.size()) << what << ": only drafts that exist are counted";
+        ASSERT_EQ(t.out[0].tokens.size(), 1u) << what << ": poisoned sequence emits exactly the trunk's target";
+        out_bad.push_back(t.out[0].tokens.front());
+        out_good.insert(out_good.end(), t.out[1].tokens.begin(), t.out[1].tokens.end());
+    }
+    const Toks greedy_bad = feed_plain(host, *bad_plain, std::span(out_bad).subspan(ref_bad.size() - 1, out_bad.size() - ref_bad.size()));
+    EXPECT_EQ(Toks(out_bad.begin() + static_cast<std::ptrdiff_t>(ref_bad.size()), out_bad.end()), greedy_bad)
+        << "poisoned sequence: emitted tokens must be plain greedy decoding";
+    const Toks greedy_good = feed_plain(host, *good_plain, std::span(out_good).subspan(ref_good.size() - 1, out_good.size() - ref_good.size()));
+    EXPECT_EQ(Toks(out_good.begin() + static_cast<std::ptrdiff_t>(ref_good.size()), out_good.end()), greedy_good)
+        << "healthy sequence: emitted tokens must be plain greedy decoding";
 }
 
 // Review R-5(b): the draft chain against llama.cpp, the only executable MTP reference (D-005).
