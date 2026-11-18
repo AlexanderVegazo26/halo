@@ -6,13 +6,21 @@
 // instantiated twice: FAST reads the (4-aligned) weight words directly; SLOW handles
 // arbitrary byte offsets (VkViews arena gate) via HALO_DEFINE_BYTE_READERS with identical
 // integer content, so both produce bitwise-identical results.
+// NORMED variant matvec_iq4_xs_normed (opt-in HALO_FUSE_NORM=1, decode n_vec == 1 only): this file
+// compiled with -DHALO_FUSE_NORM (backends/vulkan/CMakeLists.txt): y = W * (rms_norm(x) * nw), the
+// per-type main's input reads go through HALO_X; prologue in common/matvec_normed.glsl.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Wq { uint wq[]; };
+#ifdef HALO_FUSE_NORM
+layout(std430, binding = 1) readonly buffer XR { float xr[]; };  // raw (un-normed) input
+layout(std430, binding = 3) readonly buffer NW { float nw[]; };  // norm weight
+#else
 layout(std430, binding = 1) readonly buffer X { float x[]; };
+#endif
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform Push {
@@ -22,11 +30,21 @@ layout(push_constant) uniform Push {
     uint w_off;     // sub-alignment remainder of the W view (bytes)
     uint w_stride;  // row stride of W (bytes)
     uint x_off, x_stride, y_off, y_stride;  // element remainders / vector strides (S-1)
+#ifdef HALO_FUSE_NORM
+    uint xr_off;    // element remainder of the raw x view
+    uint nw_off;    // element remainder of the norm-weight view
+    float eps;
+#endif
 } pc;
 
 // Specialization constant 1 (host: 0 when n_vec == 1): see matvec_quant_main.glsl.
 layout(constant_id = 1) const uint BATCHED = 1;
 const uint MAX_VEC = 8u;
+
+#ifdef HALO_FUSE_NORM
+// HALO_FUSE_NORM prologue: norm_prologue() + HALO_X (input normalized as it is read).
+#include "matvec_normed.glsl"
+#endif
 
 shared float red[WG];
 shared float redb[BATCHED != 0u ? MAX_VEC * WG : 1u];  // batched reduction (all vectors at once)
@@ -61,6 +79,9 @@ struct QI4Block {
 void main() {
     const uint row = halo_group_id();
     if (row >= pc.rows) return;
+#ifdef HALO_FUSE_NORM
+    norm_prologue();
+#endif
     if (gl_LocalInvocationID.x < 16u) sh_kv[gl_LocalInvocationID.x] = KVALUES[gl_LocalInvocationID.x];
     barrier();
     const uint row_off = pc.w_off + row * pc.w_stride;

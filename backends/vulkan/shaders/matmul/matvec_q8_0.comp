@@ -1,4 +1,5 @@
 #version 450
+// Also built with -DHALO_GDN_GATES as matvec_q8_0_gates (backends/vulkan/CMakeLists.txt variant entry).
 // QUANT_GEMV / MATMUL, ggml Q8_0 weights: y[t][r] = sum_c W[r,c] * x[t][c]. Dequantization:
 // common/dequant_q8_0.glsl (shared with get_rows_q8_0); body: common/matvec_quant_main.glsl.
 #include "halo_common.glsl"

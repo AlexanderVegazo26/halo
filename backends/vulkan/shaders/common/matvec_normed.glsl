@@ -1,4 +1,4 @@
-// HALO_FUSE_NORM prologue shared by the matmul/matvec_<type>_normed.comp shaders
+// HALO_FUSE_NORM prologue of the matvec_<type>_normed shaders (matvec_<type>.comp + -DHALO_FUSE_NORM)
 // (y = W * (rms_norm(x) * nw), decode n_vec == 1 only). Include it after the shader's bindings
 // and push block and before the per-type main: it needs `xr` (raw input), `nw` (norm weight),
 // `WG` and `pc.{cols, xr_off, nw_off, eps}`, and it defines HALO_X for the main.

@@ -29,7 +29,8 @@ layout(push_constant) uniform Push {
 #endif
 } pc;
 
-// GDN gates epilogue (matvec_<type>_gates, next.md step 6): the gemv over qwen35's fused beta|alpha rows
+// GDN gates epilogue (matvec_<type>_gates: matvec_<type>.comp built with -DHALO_GDN_GATES; next.md
+// step 6): the gemv over qwen35's fused beta|alpha rows
 // (HALO_FUSE_GEMV=ba) writes the gated values itself instead of a separate gdn_gates dispatch:
 //   beta rows: sigmoid(y);  alpha row j: ssm_a[j] * softplus(y + dt_bias[j])
 // with exactly eltwise/gdn_gates.comp's expressions, so the output is bit for bit gemv then gdn_gates.

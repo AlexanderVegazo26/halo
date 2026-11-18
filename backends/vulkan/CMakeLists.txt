@@ -20,12 +20,14 @@ endif()
 set(HALO_VK_TARGET_ENV vulkan1.3)
 
 # name  ->  shaders/<path>.comp   (name must be unique; it is the lookup key at runtime)
+# A variant entry `<name>=<path>:<DEFINE>[=<value>][,...]` compiles shaders/<path>.comp again with
+# those -D defines (one source, no hand-kept copy); its registry name is <name>'s file name.
 set(HALO_VK_SHADERS
   norm/rms_norm
   matmul/matvec_f32
   matmul/matvec_q8_0
-  matmul/matvec_f32_gates  # GDN gates epilogue on the fused beta|alpha gemv (HALO_FUSE_GEMV=ba)
-  matmul/matvec_q8_0_gates
+  matmul/matvec_f32_gates=matmul/matvec_f32:HALO_GDN_GATES  # GDN gates epilogue on the fused beta|alpha gemv (HALO_FUSE_GEMV=ba)
+  matmul/matvec_q8_0_gates=matmul/matvec_q8_0:HALO_GDN_GATES
   matmul/matvec_q4_k
   matmul/matvec_q5_k
   matmul/matvec_q6_k
@@ -37,10 +39,10 @@ set(HALO_VK_SHADERS
   matmul/matvec_q5_k_sg
   matmul/matvec_q6_k_sg
   matmul/matvec_iq4_xs_sg
-  matmul/matvec_q4_k_normed  # rms_norm fused into the decode matvec prologue (opt-in HALO_FUSE_NORM=1)
-  matmul/matvec_q5_k_normed
-  matmul/matvec_q6_k_normed
-  matmul/matvec_iq4_xs_normed
+  matmul/matvec_q4_k_normed=matmul/matvec_q4_k:HALO_FUSE_NORM  # rms_norm fused into the decode matvec prologue (opt-in HALO_FUSE_NORM=1)
+  matmul/matvec_q5_k_normed=matmul/matvec_q5_k:HALO_FUSE_NORM
+  matmul/matvec_q6_k_normed=matmul/matvec_q6_k:HALO_FUSE_NORM
+  matmul/matvec_iq4_xs_normed=matmul/matvec_iq4_xs:HALO_FUSE_NORM
   matmul/matvec_iq4_nl
   matmul/matvec_q3_k
   matmul/matvec_iq3_s
@@ -86,8 +88,31 @@ file(MAKE_DIRECTORY ${_gen_dir} ${CMAKE_CURRENT_BINARY_DIR}/spirv)
 set(_gen_sources)
 set(_decls "")
 set(_entries "")
-foreach(rel IN LISTS HALO_VK_SHADERS)
-  get_filename_component(_name ${rel} NAME)
+foreach(_entry IN LISTS HALO_VK_SHADERS)
+  set(rel ${_entry})
+  set(_defs)
+  set(_deps)
+  if(_entry MATCHES "^([^=:]+)=([^=:]+):([A-Za-z_][A-Za-z0-9_]*(=[^,=:]*)?(,[A-Za-z_][A-Za-z0-9_]*(=[^,=:]*)?)*)$")
+    set(_variant ${CMAKE_MATCH_1})
+    set(rel ${CMAKE_MATCH_2})
+    string(REPLACE "," ";" _dlist "${CMAKE_MATCH_3}")
+    foreach(_d IN LISTS _dlist)
+      list(APPEND _defs -D${_d})
+    endforeach()
+    get_filename_component(_name ${_variant} NAME)
+    # The define list lives in this file, so a variant rebuilds when it changes (Makefile
+    # generators don't track command lines).
+    set(_deps ${CMAKE_CURRENT_LIST_FILE})
+  elseif(_entry MATCHES "[=:]")
+    message(FATAL_ERROR "HALO_VK_SHADERS entry '${_entry}': expected <name>=<path>:<DEFINE>[=<value>][,...] "
+                        "(values without ',', '=' or ':')")
+  else()
+    get_filename_component(_name ${rel} NAME)
+  endif()
+  list(JOIN _defs " " _defs_shown)
+  if(_defs_shown)
+    string(PREPEND _defs_shown " ")
+  endif()
   set(_src ${_shader_dir}/${rel}.comp)
   set(_spv ${CMAKE_CURRENT_BINARY_DIR}/spirv/${_name}.spv)
   set(_cpp ${_gen_dir}/spv_${_name}.cpp)
@@ -101,11 +126,11 @@ foreach(rel IN LISTS HALO_VK_SHADERS)
   add_custom_command(
     OUTPUT ${_spv}
     COMMAND ${HALO_GLSLC} --target-env=${HALO_VK_TARGET_ENV} -O -Werror
-            -I ${_shader_dir}/common -MD -MF ${_spv}.d -o ${_spv} ${_src}
+            -I ${_shader_dir}/common ${_defs} -MD -MF ${_spv}.d -o ${_spv} ${_src}
     ${_val_cmd}
-    DEPENDS ${_src}
+    DEPENDS ${_src} ${_deps}
     DEPFILE ${_spv}.d
-    COMMENT "glslc ${rel}.comp"
+    COMMENT "glslc ${rel}.comp${_defs_shown}"
     VERBATIM)
   add_custom_command(
     OUTPUT ${_cpp}

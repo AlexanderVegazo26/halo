@@ -18,7 +18,7 @@
 // plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp.
 
 // Input element i of the vector being dotted. Default: the x buffer; the _normed shaders define
-// HALO_X(i) to normalize x on the fly (HALO_FUSE_NORM, matmul/matvec_<type>_normed.comp).
+// HALO_X(i) to normalize x on the fly (HALO_FUSE_NORM: matmul/matvec_<type>.comp built with -DHALO_FUSE_NORM).
 #ifndef HALO_X
 #define HALO_X(i) x[i]
 #endif
