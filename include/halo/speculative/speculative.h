@@ -271,11 +271,11 @@ public:
     /// backend with Limits::lm_head_ids) and at least one sequence drafts from the MTP: the draft chain and
     /// the trunk verify go through Qwen35::mtp_draft_chain_verify, the verify rows embedding the drafts from
     /// device memory (next.md step 4). Otherwise exactly draft() then verify(). Either way the tick ends
-    /// Verified with the same outputs and state. A poisoned (NaN) draft depth differs: draft()'s
-    /// mtp_draft_chain fails the tick with Error(Api), while the fused verify has already run every row, so
-    /// tick.seqs[i].k stays the requested count and out[i].drafts stops before the poisoned depth
-    /// (acceptance never reaches past it). On an exception every sequence is at its pre-tick state, as for
-    /// draft() / verify().
+    /// Verified with the same outputs and state. A poisoned (NaN) draft depth drops that sequence's drafts
+    /// at and past it either way (mtp_draft_chain reports it as -1, never Error(Api)); only tick.seqs[i].k
+    /// differs: draft() cuts k to the usable drafts, while the fused verify has already run every row, so
+    /// k stays the requested count and out[i].drafts stops before the poisoned depth (acceptance never
+    /// reaches past it). On an exception every sequence is at its pre-tick state, as for draft() / verify().
     void draft_verify(std::span<const StepRequest> reqs, Tick& tick);
     /// n_keep: optional per-request override, 1 <= n_keep[i] <= tick.out[i].n_keep (a
     /// rollback to fewer rows; Error(Api) otherwise, nothing changed). Ignored for prefill.
