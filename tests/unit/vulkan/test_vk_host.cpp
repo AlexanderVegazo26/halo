@@ -56,7 +56,7 @@ TEST(VkShaders, AllExpectedShadersEmbeddedWithValidHashes) {
                                          "get_rows_iq3_s", "topk",          "gated_delta_rule_chunked",
                                          "gdn_gcheck",     "matmul_cm_q4_k", "matmul_cm_q5_k",
                                          "matmul_cm_q6_k", "matvec_q5_k_rp", "matvec_q6_k_rp",
-                                         "matvec_q4_k_sg", "matvec_q5_k_sg", "matvec_q6_k_sg", "matvec_iq4_xs_sg", "argmax_ids",
+                                         "matvec_q4_k_sg", "matvec_q5_k_sg", "matvec_q6_k_sg", "matvec_iq4_xs_sg", "argmax_ids", "argmax_ids_scatter",
                                          "matvec_iq4_xs_rp", "matvec_q4_k_normed", "matvec_q5_k_normed",
                                          "matvec_q6_k_normed", "matvec_iq4_xs_normed", "kv_write_f16", "kv_write_q8",    "attention_f16",
                                          "attention_q8", "attention_tree", "matvec_f32_gates", "matvec_q8_0_gates"};

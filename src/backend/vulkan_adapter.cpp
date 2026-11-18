@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <initializer_list>
 #include <deque>
 #include <format>
 #include <limits>
@@ -885,6 +886,20 @@ public:
             ids = r.get(a.ids, 1, mul_u64(g.n_vec, 4, r.op(), "ids"), 4, Access::Write, "ids");
             for (const Ref* o : {&x, &w, &y, &res}) r.no_overlap(ids, *o);
         }
+        HALO_CHECK(a.ids_slots.empty() == a.ids_scatter.empty() && (a.ids_scatter.empty() || !a.ids.empty()), ErrorCode::Api,
+                   "LM_HEAD: ids_slots and ids_scatter go together, and only with ids");
+        Ref slots{}, scat{};
+        if (!a.ids_scatter.empty()) {
+            // The whole view is an output (a writable import is mirrored back over all of it).
+            const std::uint64_t scat_bytes = a.ids_scatter.view_bytes() / 4 * 4;
+            HALO_CHECK(scat_bytes >= 4, ErrorCode::Api, "LM_HEAD: ids_scatter of {} bytes holds no int32",
+                       a.ids_scatter.view_bytes());
+            slots = r.get(a.ids_slots, 1, mul_u64(g.n_vec, 4, r.op(), "ids_slots"), 4, Access::Read, "ids_slots");
+            scat = r.get(a.ids_scatter, 1, scat_bytes, 4, Access::Write, "ids_scatter");
+            for (const Ref* o : std::initializer_list<const Ref*>{&x, &w, &y, &res, &ids, &slots}) r.no_overlap(scat, *o);
+            // ids_slots is read in the dispatch that writes ids (and after result/logits): no aliasing.
+            for (const Ref* o : std::initializer_list<const Ref*>{&y, &res, &ids}) r.no_overlap(*o, slots);
+        }
         if (g.n_vec == 0 || g.rows == 0) return;
         hv::LmHeadArgs l;
         l.gemv = hg;
@@ -892,6 +907,10 @@ public:
         l.result = res.view;
         l.valid_rows = a.valid_rows;
         if (!a.ids.empty()) l.ids = ids.view;
+        if (!a.ids_scatter.empty()) {
+            l.ids_slots = slots.view;
+            l.ids_scatter = scat.view;
+        }
         ops_.lm_head(st.s(), l);
     }
 

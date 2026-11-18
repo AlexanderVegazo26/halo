@@ -134,6 +134,11 @@ struct TensorRef {
     [[nodiscard]] bool empty() const noexcept { return buffer == nullptr; }
     /// Whole buffer, dense.
     [[nodiscard]] static TensorRef of(const Buffer& b) noexcept { return {&b, 0, 0, 0}; }
+    /// Bytes the view covers: `bytes`, or (bytes == 0) the rest of the buffer from `offset` (0 past its end).
+    [[nodiscard]] std::uint64_t view_bytes() const noexcept {
+        if (bytes != 0 || buffer == nullptr) return bytes;
+        return buffer->bytes() > offset ? buffer->bytes() - offset : 0;
+    }
     /// The same buffer from `offset` + `delta` bytes on; a bounded view (bytes != 0) shrinks
     /// by delta. Error(Kernel) if delta reaches past a bounded view's end (the result would
     /// otherwise become bytes == 0, i.e. unbounded), or on offset overflow.
@@ -445,6 +450,13 @@ struct LmHeadArgs {
     /// (NaN logit / no result) writes id 0 -- always a valid row -- while its result triple still carries
     /// the poison for the host to reject. Empty = not written.
     TensorRef ids{};
+    /// Optional, with `ids` (Limits::lm_head_ids): vector t's id is ALSO written to int32 element
+    /// ids_slots[t] of ids_scatter, in the same op (no extra dispatch). ids_slots: n_vec uint32, read
+    /// when the op runs (e.g. a host import). A draft chain uses it to keep every sequence's ids of all
+    /// depths side by side for the verify. Both set or both empty. A slot past ids_scatter's end is a
+    /// caller bug: the CPU backend throws Error(Api) when the op runs, Vulkan drops that write.
+    TensorRef ids_slots{};
+    TensorRef ids_scatter{};
 };
 
 /// ARGMAX (cpu::argmax per vector): logits n_vec rows of [n]; result as LmHeadArgs.

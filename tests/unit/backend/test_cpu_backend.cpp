@@ -571,6 +571,37 @@ TEST_F(CpuBackendTest, LmHeadValidRowsExcludesPaddedRowsFromArgmaxButNotFromLogi
     EXPECT_EQ(decode_argmax(res2)[0].index, 17) << "with no clamp, the larger (padded) logit wins as before";
 }
 
+TEST_F(CpuBackendTest, LmHeadIdsScatterRejectsASlotPastTheScatterEnd) {
+    const std::size_t V = 12, E = 4, n = 2;
+    auto w = rnd(V * E, 43), x = rnd(n * E, 44);
+    std::vector<std::byte> res(n * kArgmaxResultBytes);
+    std::vector<std::int32_t> ids(n), scatter(3, -7);
+    std::vector<std::uint32_t> ok{2, 0}, past{1, 3};
+    LmHeadArgs a{};
+    a.gemv = {DType::F32, imp(w), imp(x), {}, V, E, n, {}};
+    a.result = imp_bytes(res);
+    a.ids = imp(ids);
+    a.ids_scatter = imp(scatter);
+    a.ids_slots = imp(ok);
+    be->lm_head(*st, a);
+    const auto best = decode_argmax(res);
+    EXPECT_EQ(scatter, (std::vector<std::int32_t>{best[1].index, -7, best[0].index})) << "slots {2, 0} of a 3-element scatter";
+    a.ids_slots = imp(past);
+    const auto res0 = res;
+    const auto ids0 = ids;
+    std::fill(scatter.begin(), scatter.end(), -7);
+    EXPECT_THROW(be->lm_head(*st, a), halo::Error) << "slot 3 of a 3-element ids_scatter must be rejected, not written past its end";
+    EXPECT_EQ(scatter, (std::vector<std::int32_t>(3, -7))) << "a rejected call must not write scatter[1] before it finds slot 3";
+    EXPECT_EQ(ids, ids0) << "a rejected call must leave ids as they were";
+    EXPECT_EQ(res, res0) << "a rejected call must leave the result words as they were";
+    // ids_slots is read after ids is written: aliasing them is rejected (12-element scatter, so every id is in range).
+    std::vector<std::int32_t> wide(V, -7);
+    a.ids_scatter = imp(wide);
+    a.ids_slots = a.ids;
+    EXPECT_THROW(be->lm_head(*st, a), halo::Error) << "ids_slots aliasing ids must be rejected";
+    EXPECT_EQ(wide, (std::vector<std::int32_t>(V, -7))) << "ids_slots aliasing ids: nothing scattered";
+}
+
 TEST_F(CpuBackendTest, GetRowsAndCopyEqualDequantizeRow) {
     const std::size_t rows = 10, cols = 32;
     auto t = rnd(rows * cols, 30);

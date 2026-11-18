@@ -693,7 +693,10 @@ TEST_F(VulkanSpec, ChainedDraftIdsAreGatheredOneGetRowsPerAdjacentRun) {
         std::vector<std::size_t> ks;
         std::size_t depth_calls, verify_calls;
     };
-    for (const Batch& c : {Batch{{2, 2}, 2, 6}, Batch{{2, 3}, 3, 6}, Batch{{3, 1, 3}, 4, 10}}) {
+    // Verify: per drafting sequence one host call (its x, after the previous sequence's rows) and one call for its
+    // d1..dk, read from the chain's sequence-major copies (LmHeadArgs::ids_scatter); depth-major ids alone
+    // interleave the sequences, one call per id (6, 6 and 10 here).
+    for (const Batch& c : {Batch{{2, 2}, 2, 4}, Batch{{2, 3}, 3, 4}, Batch{{3, 1, 3}, 4, 6}}) {
         std::string what = "k = [";
         for (std::size_t i = 0; i < c.ks.size(); ++i) what += (i ? ", " : "") + std::to_string(c.ks[i]);
         what += ']';

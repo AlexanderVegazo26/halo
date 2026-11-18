@@ -79,6 +79,7 @@ set(HALO_VK_SHADERS
   reduce/argmax_partial
   reduce/argmax_final
   reduce/argmax_ids  # dense int32 winning ids of the argmax results (LmHeadArgs::ids, HALO_MTP_CHAIN)
+  argmax_ids_scatter=reduce/argmax_ids:HALO_IDS_SCATTER  # + a copy of each id at its slot (LmHeadArgs::ids_scatter)
 )
 
 set(_shader_dir ${CMAKE_CURRENT_SOURCE_DIR}/shaders)

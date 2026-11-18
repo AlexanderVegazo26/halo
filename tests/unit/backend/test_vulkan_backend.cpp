@@ -497,6 +497,66 @@ TEST(VulkanBackend, GemvGetRowsLmHeadArgmaxTopKCopyMatchCpu) {
     for (std::uint32_t i = 0; i < n_vec; ++i) EXPECT_EQ(vb[i].index, cb[i].index) << "lm_head vector " << i;
 }
 
+// LmHeadArgs::ids_scatter (argmax_ids_scatter): each vector's id also lands at its slot, in the same op;
+// untouched scatter elements keep their contents, a poisoned (NaN) vector writes id 0 to both outputs.
+TEST(VulkanBackend, LmHeadIdsScatterWritesEachIdAtItsSlotLikeCpu) {
+    HALO_VK_CONTEXT_OR_SKIP(ctx);
+    Pair p = make_pair(ctx);
+    const std::uint32_t rows = 40, cols = 16, n_vec = 4;
+    auto w = randn(std::size_t{rows} * cols, 31);
+    std::vector<float> x(std::size_t{n_vec} * cols, 0.0f);
+    // Vector t is one-hot at column t and row 7t+3 holds the only large value there: winners 3, 10, 17, 24.
+    for (std::uint32_t t = 0; t < n_vec; ++t) {
+        x[std::size_t{t} * cols + t] = 1.0f;
+        w[std::size_t{7 * t + 3} * cols + t] = 50.0f;
+    }
+    x[std::size_t{2} * cols + 5] = std::nanf("");  // vector 2 is poisoned: id 0 everywhere it is written
+    const std::vector<std::uint32_t> slots{5, 0, 3, 6};
+    const std::vector<std::int32_t> sentinel(8, -7);
+    const auto run = [&](hb::Backend& be) {
+        Dev d(be);
+        const hb::TensorRef rw = d.put(w), rx = d.put(x), sl = d.import_ro(std::as_bytes(std::span(slots)));
+        const hb::TensorRef res = d.zeros(n_vec * hb::kArgmaxResultBytes), ids = d.zeros(n_vec * 4), scat = d.put(sentinel);
+        hb::LmHeadArgs a{hb::GemvArgs{halo::DType::F32, rw, rx, {}, rows, cols, n_vec, {}}, res, {}, {}};
+        a.ids = ids;
+        a.ids_slots = sl;
+        a.ids_scatter = scat;
+        be.lm_head(*d.s, a);
+        return std::pair{d.get<std::int32_t>(ids, n_vec), d.get<std::int32_t>(scat, sentinel.size())};
+    };
+    const auto [c_ids, c_scat] = run(*p.cpu);
+    const auto [v_ids, v_scat] = run(*p.vk);
+    const std::vector<std::int32_t> want_ids{3, 10, 0, 24};
+    const std::vector<std::int32_t> want_scat{10, -7, -7, 0, -7, 3, 24, -7};  // slot 5 <- 3, 0 <- 10, 3 <- 0 (NaN), 6 <- 24
+    EXPECT_EQ(c_ids, want_ids) << "CPU dense ids (vector 2 is NaN-poisoned -> 0)";
+    EXPECT_EQ(c_scat, want_scat) << "CPU scatter: each id at slots {5, 0, 3, 6}, other elements untouched (-7)";
+    EXPECT_EQ(v_ids, want_ids) << "Vulkan dense ids with a scatter (argmax_ids_scatter must still write ids)";
+    EXPECT_EQ(v_scat, want_scat) << "Vulkan scatter: each id at slots {5, 0, 3, 6}, other elements untouched (-7)";
+
+    // Argument rules, both backends: slots and scatter go together, and only with ids.
+    for (hb::Backend* be : {p.cpu.get(), p.vk.get()}) {
+        Dev d(*be);
+        const hb::TensorRef rw = d.put(w), rx = d.put(x), sl = d.import_ro(std::as_bytes(std::span(slots)));
+        const hb::TensorRef res = d.zeros(n_vec * hb::kArgmaxResultBytes), ids = d.zeros(n_vec * 4), scat = d.zeros(8 * 4);
+        const hb::LmHeadArgs base{hb::GemvArgs{halo::DType::F32, rw, rx, {}, rows, cols, n_vec, {}}, res, {}, {}};
+        hb::LmHeadArgs no_slots = base, no_ids = base, no_scatter = base;
+        no_slots.ids = ids;
+        no_slots.ids_scatter = scat;
+        no_ids.ids_slots = sl;
+        no_ids.ids_scatter = scat;
+        no_scatter.ids = ids;
+        no_scatter.ids_slots = sl;
+        EXPECT_THROW(be->lm_head(*d.s, no_slots), halo::Error) << hb::to_string(be->kind()) << ": ids_scatter without ids_slots";
+        EXPECT_THROW(be->lm_head(*d.s, no_ids), halo::Error) << hb::to_string(be->kind()) << ": ids_scatter without ids";
+        EXPECT_THROW(be->lm_head(*d.s, no_scatter), halo::Error) << hb::to_string(be->kind()) << ": ids_slots without ids_scatter";
+        hb::LmHeadArgs slots_alias_ids = base;  // the same dispatch writes ids and reads ids_slots
+        slots_alias_ids.ids = ids;
+        slots_alias_ids.ids_slots = ids;
+        slots_alias_ids.ids_scatter = scat;
+        EXPECT_THROW(be->lm_head(*d.s, slots_alias_ids), halo::Error) << hb::to_string(be->kind()) << ": ids_slots aliasing ids";
+    }
+}
+
 TEST(VulkanBackend, RopeKvWriteAttentionMatchCpu) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
     Pair p = make_pair(ctx);

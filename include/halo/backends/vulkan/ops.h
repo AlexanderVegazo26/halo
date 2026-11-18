@@ -501,6 +501,11 @@ struct LmHeadArgs {
     /// device after the argmax so they can feed get_rows without a host round trip. A poisoned (NaN)
     /// vector writes id 0; its result triple still carries the poison. Empty = not written.
     BufferView ids{};
+    /// Optional, with `ids` (argmax_ids_scatter): vector t's id is also written to element slots[t] of
+    /// ids_scatter (slots: n_vec uint32; e.g. a draft chain's sequence-major slots). Both set or both
+    /// empty; a slot at/past ids_scatter's element count is dropped (the shader cannot fault).
+    BufferView ids_slots{};
+    BufferView ids_scatter{};
 };
 
 /// [TOP_K] (cpu::top_k, per vector): the k largest logits, value descending, ties by lower

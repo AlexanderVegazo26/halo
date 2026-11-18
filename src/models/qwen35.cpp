@@ -1317,6 +1317,7 @@ struct ChainDepth {
     std::vector<std::size_t> last_row;  // per participant: its row in `hbuf` (head input / next hidden)
     TensorRef hbuf{}, ids{};            // ids: one device int32 winning id per participant (when recorded)
     std::vector<std::byte> words;       // argmax result words, downloaded at the sync
+    std::vector<std::uint32_t> slots;   // per participant: its id's element in ChainRec::seq_ids (when kept)
 };
 
 /// A validated draft chain (mtp_draft_chain, mtp_draft_chain_verify). The host vectors are read by recorded
@@ -1328,6 +1329,11 @@ struct ChainRec {
     std::vector<std::int32_t> ids1, pos1;
     std::vector<std::vector<std::int32_t>> pos_d;
     std::vector<ChainDepth> depths;
+    // Every drafting sequence's ids of depths 1..k side by side (sequence si at seq_base[si]), written by the
+    // same argmax_ids op as each depth's ids (LmHeadArgs::ids_scatter), so the fused verify embeds one
+    // sequence's drafts with one GET_ROWS in any batch. Empty when the depth-major ids already are that.
+    TensorRef seq_ids{};
+    std::vector<std::size_t> seq_base;
 };
 
 /// Every check of a draft chain, before any state is touched.
@@ -1427,9 +1433,10 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
     depths.assign(std::max<std::size_t>(max_k, 1), {});
 
     // Every depth's device winning ids live in ONE buffer, depth after depth (each depth's participants in
-    // sequence order). A sequence's ids for depths d..d+m sit side by side when it is the last participant at
-    // depth d and the only one at d+1..d+m (e.g. a lone drafting sequence's d1..dk), and the verify embeds
-    // each such run with one GET_ROWS (record_forward joins adjacent ids).
+    // sequence order): depth d >= 2 gathers runs of participants consecutive at d-1 with one GET_ROWS. A lone
+    // drafting sequence's d1..dk are then side by side already; with two or more, rc.seq_ids (below) keeps
+    // sequence-major copies, so the verify embeds each sequence's drafts with one GET_ROWS (record_forward
+    // joins adjacent ids).
     const auto wants_ids = [&](std::size_t d) { return ids_every_depth || d < max_k; };
     std::size_t n_ids = 0;
     for (std::size_t d = 1; d <= max_k; ++d) {
@@ -1442,10 +1449,25 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
     }
     std::size_t ids_used = 0;
 
+    // The depth-major buffer interleaves sequences by depth once two or more sequences draft; the verify
+    // then wants each sequence's ids together too (sequence-major copies, written by the same op).
+    const auto n_drafting = static_cast<std::size_t>(std::count_if(k.begin(), k.end(), [](std::size_t ks) { return ks > 0; }));
+    rc.seq_ids = {};
+    rc.seq_base.assign(n_seq, 0);
+    if (ids_every_depth && n_drafting > 1) {
+        std::size_t n_seq_ids = 0;
+        for (std::size_t si = 0; si < n_seq; ++si) {
+            rc.seq_base[si] = n_seq_ids;
+            n_seq_ids += k[si];
+        }
+        st.arena.push_back(I.be->allocate(n_seq_ids * sizeof(std::int32_t), backend::Tier::Vram));
+        rc.seq_ids = TensorRef::of(*st.arena.back());
+    }
+
     // Head over one row per participant: no host round trip. Winning ids stay on the device (`want_ids`)
     // for the next depth's GET_ROWS; the result words are downloaded at the single sync.
     const std::size_t vocab_rows = (I.draft_vocab == 0 || I.draft_vocab > I.n_vocab) ? I.n_vocab : I.draft_vocab;
-    const auto head_rows = [&](ChainDepth& D, bool want_ids) {
+    const auto head_rows = [&](ChainDepth& D, std::size_t d, bool want_ids) {
         const std::size_t n = D.at.size();
         const TensorRef xs = st.alloc(n * E);
         for (std::size_t i = 0; i < n; ++i) {
@@ -1460,13 +1482,22 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
             D.ids.bytes = n * sizeof(std::int32_t);
             ids_used += n;
         }
+        TensorRef slots;
+        if (want_ids && !rc.seq_ids.empty()) {
+            // Depth d of sequence si -> element seq_base[si] + d - 1 (D.slots outlives the sync with rc).
+            D.slots.resize(n);
+            for (std::size_t i = 0; i < n; ++i) D.slots[i] = u32(rc.seq_base[D.at[i]] + d - 1);
+            slots = st.import_ro(std::as_bytes(std::span(D.slots)));
+        }
         I.be->lm_head(*st.s, backend::LmHeadArgs{backend::GemvArgs{M.lm_head.ref.type(), TensorRef::of(*M.lm_head.buf), xs,
                                                                    TensorRef{}, u32(vocab_rows), u32(E), u32(n), {}},
                                                  res,
                                                  u32(std::min<std::size_t>(I.valid_vocab, vocab_rows)),
                                                  {},
                                                  {},
-                                                 D.ids});
+                                                 D.ids,
+                                                 slots,
+                                                 slots.empty() ? TensorRef{} : rc.seq_ids});
         D.words.resize(n * backend::kArgmaxResultBytes);
         I.be->download(*st.s, res, std::span(D.words));
         const std::uint64_t bytes = M.lm_head.ref.n_bytes();
@@ -1500,7 +1531,7 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
             D.at.push_back(si);
             D.last_row.push_back(seqs[si].r0 + seqs[si].n - 1);
         }
-        if (!D.at.empty()) head_rows(D, wants_ids(1));
+        if (!D.at.empty()) head_rows(D, 1, wants_ids(1));
     }
 
     // ---- depth d >= 2: one row per sequence still drafting; token and hidden come from depth d-1
@@ -1545,17 +1576,22 @@ void record_chain(const Impl& I, Impl::Step& st, std::span<const MtpStep> steps,
                 }
             });
         for (std::size_t i = 0; i < Rd; ++i) steps[D.at[i]].kv->commit(1);
-        head_rows(D, wants_ids(d));
+        head_rows(D, d, wants_ids(d));
     }
 }
 
-/// The device id of sequence `si`'s depth-`d` draft (recorded with ids for that depth).
+/// The device id of sequence `si`'s depth-`d` draft (recorded with ids for that depth): its sequence-major
+/// copy when the chain kept one, so a sequence's d1..dk are adjacent for record_forward's joined GET_ROWS.
 TensorRef chain_draft_id(const ChainRec& rc, std::size_t si, std::size_t d) {
     const ChainDepth& D = rc.depths.at(d - 1);
     const auto it = std::lower_bound(D.at.begin(), D.at.end(), si);
     HALO_CHECK(it != D.at.end() && *it == si && !D.ids.empty(), ErrorCode::Api,
                "draft chain: sequence {} has no device id at depth {}", si, d);
-    return D.ids.shifted(static_cast<std::size_t>(it - D.at.begin()) * sizeof(std::int32_t));
+    const std::size_t i = static_cast<std::size_t>(it - D.at.begin());
+    if (!D.slots.empty()) {
+        return TensorRef{rc.seq_ids.buffer, rc.seq_ids.offset + D.slots.at(i) * sizeof(std::int32_t), sizeof(std::int32_t), 0};
+    }
+    return D.ids.shifted(i * sizeof(std::int32_t));
 }
 
 /// After the chain's sync: every depth's winners into out.seqs[i].argmax, in depth order. A poisoned

@@ -4,6 +4,10 @@
 // device memory (HALO_MTP_CHAIN). A poisoned or empty vector (nan word set / index 0xFFFFFFFF)
 // writes id 0 -- a valid row -- so a downstream get_rows never faults; the triple itself still
 // carries the poison and the host, which downloads the words at the end of the tick, rejects it.
+//
+// HALO_IDS_SCATTER (variant argmax_ids_scatter, LmHeadArgs::ids_slots / ids_scatter): each id is
+// also written to scatter[slots[i]], e.g. a draft chain's sequence-major slot, so one sequence's ids
+// of every depth sit side by side for a single get_rows. A slot at/past scatter_count is dropped.
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 64;
@@ -11,11 +15,20 @@ layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer Words { uint words[]; };
 layout(std430, binding = 1) writeonly buffer Ids { int ids[]; };
+#ifdef HALO_IDS_SCATTER
+layout(std430, binding = 2) readonly buffer Slots { uint slots[]; };
+layout(std430, binding = 3) writeonly buffer Scatter { int scatter[]; };
+#endif
 
 layout(push_constant) uniform Push {
     uint count;
     uint w_off;  // word remainder of the result view
     uint i_off;  // element remainder of the ids view
+#ifdef HALO_IDS_SCATTER
+    uint s_off;          // element remainder of the slots view
+    uint d_off;          // element remainder of the scatter view
+    uint scatter_count;  // elements of the scatter view
+#endif
 } pc;
 
 void main() {
@@ -23,5 +36,10 @@ void main() {
     if (i >= pc.count) return;
     const uint idx = words[pc.w_off + 3u * i];
     const uint nan = words[pc.w_off + 3u * i + 2u];
-    ids[pc.i_off + i] = (nan != 0u || idx == 0xFFFFFFFFu) ? 0 : int(idx);
+    const int id = (nan != 0u || idx == 0xFFFFFFFFu) ? 0 : int(idx);
+    ids[pc.i_off + i] = id;
+#ifdef HALO_IDS_SCATTER
+    const uint slot = slots[pc.s_off + i];
+    if (slot < pc.scatter_count) scatter[pc.d_off + slot] = id;
+#endif
 }

@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <format>
 #include <limits>
 #include <new>
@@ -689,8 +690,32 @@ public:
             ids_out = r.get(a.ids, 1, mul_u64(g.n_vec, 4, r.op(), "ids"), 4, Access::Write, "ids");
             for (const Operand* o : {&x, &w, &y, &res}) r.no_overlap(ids_out, *o);
         }
+        HALO_CHECK(a.ids_slots.empty() == a.ids_scatter.empty() && (a.ids_scatter.empty() || !a.ids.empty()), ErrorCode::Api,
+                   "LM_HEAD: ids_slots and ids_scatter go together, and only with ids");
+        Operand slots{}, scat{};
+        if (!a.ids_scatter.empty()) {
+            // The whole view is an output (a writable import is mirrored back over all of it).
+            const std::uint64_t scat_bytes = a.ids_scatter.view_bytes() / 4 * 4;
+            HALO_CHECK(scat_bytes >= 4, ErrorCode::Api, "LM_HEAD: ids_scatter of {} bytes holds no int32",
+                       a.ids_scatter.view_bytes());
+            slots = r.get(a.ids_slots, 1, mul_u64(g.n_vec, 4, r.op(), "ids_slots"), 4, Access::Read, "ids_slots");
+            scat = r.get(a.ids_scatter, 1, scat_bytes, 4, Access::Write, "ids_scatter");
+            for (const Operand* o : std::initializer_list<const Operand*>{&x, &w, &y, &res, &ids_out, &slots}) r.no_overlap(scat, *o);
+            // ids_slots is read after ids/result/logits are written: it must not alias them either.
+            for (const Operand* o : std::initializer_list<const Operand*>{&y, &res, &ids_out}) r.no_overlap(*o, slots);
+        }
         const std::size_t n = g.n_vec, E = g.cols, n_vocab = g.rows;
         if (n == 0) return;
+        if (scat.wbase != nullptr) {
+            // Every slot is checked before any output is written, so a rejected call changes nothing.
+            const std::size_t n_scat = scat.extent / 4;
+            for (std::size_t i = 0; i < n; ++i) {
+                std::uint32_t slot = 0;
+                std::memcpy(&slot, slots.base + i * 4, 4);
+                HALO_CHECK(slot < n_scat, ErrorCode::Api, "LM_HEAD: ids_slots[{}] = {} is past the {} ids_scatter elements", i, slot,
+                           n_scat);
+            }
+        }
         // M2: rows at/after valid_rows (GGUF LM-head padding past the tokenizer's real
         // vocabulary) are excluded from the argmax. The full logits row (gemv.y), if
         // requested, is unaffected -- every row still gets its raw value.
@@ -732,6 +757,15 @@ public:
             // LmHeadArgs::ids: dense winning ids; a poisoned vector (index -1) writes 0, a valid row.
             auto* out = reinterpret_cast<std::int32_t*>(ids_out.wbase);
             for (std::size_t i = 0; i < n; ++i) out[i] = best[i].index < 0 ? 0 : best[i].index;
+        }
+        if (scat.wbase != nullptr) {
+            // LmHeadArgs::ids_scatter: the same ids again, each at its slot.
+            auto* out = reinterpret_cast<std::int32_t*>(scat.wbase);
+            for (std::size_t i = 0; i < n; ++i) {
+                std::uint32_t slot = 0;
+                std::memcpy(&slot, slots.base + i * 4, 4);  // validated above
+                out[slot] = best[i].index < 0 ? 0 : best[i].index;
+            }
         }
     }
 

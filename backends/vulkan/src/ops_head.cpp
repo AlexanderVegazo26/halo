@@ -72,11 +72,25 @@ void Ops::lm_head(Stream& stream, const LmHeadArgs& a) {
         oids = operand(a.ids, 1, std::uint64_t{g.n_vec} * 4, Access::Floats, align, op, "ids");
         require_disjoint(oids, "ids", {{&ow, "W"}, {&ox, "x"}, {&ows, "workspace"}, {&ores, "result"}}, op);
     }
+    const bool scatter = !a.ids_scatter.empty();
+    HALO_CHECK(scatter == !a.ids_slots.empty() && (!scatter || !a.ids.empty()), ErrorCode::Kernel,
+               "{}: ids_slots and ids_scatter go together, and only with ids", op);
+    Operand oslots{}, oscat{};
+    if (scatter) {
+        HALO_CHECK(a.ids_scatter.bytes >= 4 && a.ids_scatter.bytes / 4 <= 0xFFFFFFFFu, ErrorCode::Kernel,
+                   "{}: ids_scatter needs an explicit size of 1 .. 2^32-1 int32 (got {} bytes)", op, a.ids_scatter.bytes);
+        oslots = operand(a.ids_slots, 1, std::uint64_t{g.n_vec} * 4, Access::Floats, align, op, "ids_slots");
+        oscat = operand(a.ids_scatter, 1, a.ids_scatter.bytes, Access::Floats, align, op, "ids_scatter");
+        require_disjoint(oscat, "ids_scatter",
+                         {{&ow, "W"}, {&ox, "x"}, {&ows, "workspace"}, {&ores, "result"}, {&oids, "ids"}, {&oslots, "ids_slots"}},
+                         op);
+    }
     BufferView logits = in_ws ? BufferView(*a.workspace.buffer, a.workspace.offset, g.n_vec * logit_row) : g.y;
     if (!in_ws) {
         const Operand oy = operand(g.y, g.n_vec, logit_row, Access::Floats, align, op, "y (logits)");
         require_disjoint(oy, "y (logits)", {{&ow, "W"}, {&ox, "x"}, {&ows, "workspace"}, {&ores, "result"}}, op);
         if (!a.ids.empty()) require_disjoint(oids, "ids", {{&oy, "y (logits)"}}, op);
+        if (scatter) require_disjoint(oscat, "ids_scatter", {{&oy, "y (logits)"}}, op);
     }
     const std::uint64_t l_stride = in_ws ? logit_row : vec_stride(g.y, g.n_vec, logit_row);
     const std::uint64_t scratch_base = a.workspace.offset + (in_ws ? g.n_vec * logit_row : 0);
@@ -98,12 +112,21 @@ void Ops::lm_head(Stream& stream, const LmHeadArgs& a) {
         struct IdsPush {
             std::uint32_t count, w_off, i_off;
         } ip{g.n_vec, ores.off, oids.off};
-        const Kernel& kids = kernel("argmax_ids", 2, sizeof(IdsPush), {{0, wg}}, {wg, 1, 1});
         const DeviceInfo& info = ctx_->info();
-        const std::array bids{ores.binding, oids.binding};
-        stream.dispatch(kids, bids, ip,
-                        grid_1d(ceil_div(g.n_vec, wg), info.max_workgroup_count[0], info.max_workgroup_count[1]),
-                        0b10);  // ids written
+        const auto grid = grid_1d(ceil_div(g.n_vec, wg), info.max_workgroup_count[0], info.max_workgroup_count[1]);
+        if (!scatter) {
+            const Kernel& kids = kernel("argmax_ids", 2, sizeof(IdsPush), {{0, wg}}, {wg, 1, 1});
+            const std::array bids{ores.binding, oids.binding};
+            stream.dispatch(kids, bids, ip, grid, 0b10);  // ids written
+        } else {
+            struct ScatterPush {
+                IdsPush ids;
+                std::uint32_t s_off, d_off, scatter_count;
+            } sp{ip, oslots.off, oscat.off, static_cast<std::uint32_t>(a.ids_scatter.bytes / 4)};
+            const Kernel& kids = kernel("argmax_ids_scatter", 4, sizeof(ScatterPush), {{0, wg}}, {wg, 1, 1});
+            const std::array bids{ores.binding, oids.binding, oslots.binding, oscat.binding};
+            stream.dispatch(kids, bids, sp, grid, 0b1010);  // ids + scatter written
+        }
     }
 }
 

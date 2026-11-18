@@ -1021,7 +1021,8 @@ public:
 
     void lm_head(Stream& s, const LmHeadArgs& a) override {
         HipStream& st = stream(s, "LM_HEAD");
-        HALO_CHECK(a.ids.empty(), ErrorCode::Unsupported, "LM_HEAD: device-side winning ids are not supported on the hip backend");
+        HALO_CHECK(a.ids.empty() && a.ids_scatter.empty() && a.ids_slots.empty(), ErrorCode::Unsupported,
+                   "LM_HEAD: device-side winning ids are not supported on the hip backend");
         const hip::Ops& ops = select_lm_head(a.gemv.kernel, a.kernel);
         check_status_ref(a.status, OpId::LmHead);
         const Resolver r(this, "LM_HEAD");
