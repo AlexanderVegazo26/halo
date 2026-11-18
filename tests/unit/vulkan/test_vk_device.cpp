@@ -8,8 +8,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <functional>
 #include <iostream>
 #include <numeric>
 #include <optional>
@@ -27,6 +25,8 @@
 
 namespace hv = halo::vulkan;
 using hv::test::download;
+using hv::test::op_timings_profile;
+using hv::test::Profile;
 using hv::test::upload;
 
 TEST(VkDevice, DescribeReportsDriverPolicyAndMemoryHonestly) {
@@ -254,14 +254,7 @@ TEST(VkStream, CopyTimestampsAndReuse) {
 // (and dispatches per fence) from the profile alone. A wait() with nothing submitted adds nothing.
 TEST(VkStream, OpTimingsProfileMarksEachFenceWaitAfterItsDispatches) {
     HALO_VK_CONTEXT_OR_SKIP(ctx);
-    const std::filesystem::path path =
-        std::filesystem::path(::testing::TempDir()) /
-        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".txt");
-    std::filesystem::remove(path);
-    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
-    const std::optional<std::string> old = old_env ? std::optional<std::string>(old_env) : std::nullopt;
-    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
-    {
+    const Profile prof = op_timings_profile("fences", [&] {
         constexpr std::uint32_t rows = 2, cols = 64;
         const std::vector<float> x(rows * cols, 0.5f), w(cols, 1.0f);
         hv::Buffer xb = upload(ctx, std::span<const float>(x));
@@ -275,26 +268,13 @@ TEST(VkStream, OpTimingsProfileMarksEachFenceWaitAfterItsDispatches) {
         s.wait();             // nothing in flight: no marker
         s.copy(xb, 0, yb, 0, xb.size());
         s.submit_and_wait();  // submission 2: a copy, no dispatch
-    }
-    if (old) {
-        ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
-    } else {
-        ::unsetenv("HALO_VK_OP_TIMINGS");
-    }
-    std::vector<std::string> lines;
-    {
-        std::ifstream in(path);
-        for (std::string l; std::getline(in, l);) lines.push_back(l);
-    }
-    std::filesystem::remove(path);
-    std::string got;
-    for (const std::string& l : lines) got += "\n  " + l;
+    });
     // Kernel lines reduced to their name. The input uploads may be staged ("# transfer <bytes>",
     // depending on the device's memory types); VkContext.OpTimingsProfileMarksEachTransferFence*
     // pins those, so this Stream test ignores them.
     std::vector<std::string> shape;
-    shape.reserve(lines.size());
-    for (const std::string& l : lines) {
+    shape.reserve(prof.lines.size());
+    for (const std::string& l : prof.lines) {
         if (l.starts_with("# transfer ")) continue;
         shape.push_back(l.starts_with('#') ? l : l.substr(0, l.find(' ')));
     }
@@ -302,8 +282,8 @@ TEST(VkStream, OpTimingsProfileMarksEachFenceWaitAfterItsDispatches) {
         ctx->info().timestamps_supported()
             ? std::vector<std::string>{"rms_norm", "rms_norm", "# wait", "# wait"}
             : std::vector<std::string>{"# wait", "# wait"};
-    EXPECT_EQ(shape, want) << "profile " << path << " should hold each submission's dispatch lines followed by one "
-                           << "'# wait' per completed fence wait (2 here; the idle wait() adds none); got:" << got;
+    EXPECT_EQ(shape, want) << "the profile should hold each submission's dispatch lines followed by one "
+                           << "'# wait' per completed fence wait (2 here; the idle wait() adds none); " << prof.shown;
 }
 
 // HALO_VK_OP_TIMINGS (next.md step 4): staged uploads/downloads wait on the context's transfer
@@ -315,48 +295,32 @@ TEST(VkContext, OpTimingsProfileMarksEachTransferFenceWithItsBytes) {
     opts.force_staging = true;
     opts.staging_bytes = 4096;
     HALO_VK_CONTEXT_OR_SKIP(ctx, opts);
-    const std::filesystem::path path =
-        std::filesystem::path(::testing::TempDir()) /
-        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".txt");
-    std::filesystem::remove(path);
-    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
-    const std::optional<std::string> old = old_env ? std::optional<std::string>(old_env) : std::nullopt;
     std::vector<std::uint8_t> src(10000);
     for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::uint8_t>(i * 37u + 11u);
     hv::Buffer a = hv::Buffer::create(ctx, src.size(), hv::MemoryUsage::DeviceLocal);
     hv::Buffer b = hv::Buffer::create(ctx, src.size(), hv::MemoryUsage::DeviceLocal);
-    ::unsetenv("HALO_VK_OP_TIMINGS");
-    a.upload(std::span<const std::uint8_t>(src));  // unset: no profile written
-    const bool written_while_unset = std::filesystem::exists(path);
-    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
     std::vector<std::uint8_t> got(5000);
-    {
-        b.upload(std::span<const std::uint8_t>(src));          // 4096 + 4096 + 1808
-        b.download(std::span<std::uint8_t>(got), 3000);        // 4096 + 904
+    bool written_while_unset = false;
+    std::string unset_path;
+    const Profile prof = op_timings_profile("transfers", [&](const std::filesystem::path& path) {
+        ::unsetenv("HALO_VK_OP_TIMINGS");
+        a.upload(std::span<const std::uint8_t>(src));  // unset: no profile written
+        written_while_unset = std::filesystem::exists(path);
+        unset_path = path.string();
+        ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
+        b.upload(std::span<const std::uint8_t>(src));    // 4096 + 4096 + 1808
+        b.download(std::span<std::uint8_t>(got), 3000);  // 4096 + 904
         hv::Stream s(ctx);
         s.copy(a, 0, b, 0, a.size());
         s.submit_and_wait();  // a Stream fence: "# wait", not a transfer
-    }
-    if (old) {
-        ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
-    } else {
-        ::unsetenv("HALO_VK_OP_TIMINGS");
-    }
-    std::vector<std::string> lines;
-    {
-        std::ifstream in(path);
-        for (std::string l; std::getline(in, l);) lines.push_back(l);
-    }
-    std::filesystem::remove(path);
-    EXPECT_FALSE(written_while_unset) << "a staged upload with HALO_VK_OP_TIMINGS unset created " << path;
+    });
+    EXPECT_FALSE(written_while_unset) << "a staged upload with HALO_VK_OP_TIMINGS unset created " << unset_path;
     EXPECT_EQ(got, std::vector<std::uint8_t>(src.begin() + 3000, src.begin() + 8000)) << "staged round trip";
     const std::vector<std::string> want{"# transfer 4096", "# transfer 4096", "# transfer 1808",
                                         "# transfer 4096", "# transfer 904",  "# wait"};
-    std::string shown;
-    for (const std::string& l : lines) shown += "\n  " + l;
-    EXPECT_EQ(lines, want) << "profile " << path << " should hold one '# transfer <bytes>' per staged chunk "
-                           << "(upload 10000 B, download 5000 B at 4 KiB staging) and one '# wait' for the "
-                           << "Stream fence; got:" << shown;
+    EXPECT_EQ(prof.lines, want) << "the profile should hold one '# transfer <bytes>' per staged chunk "
+                                << "(upload 10000 B, download 5000 B at 4 KiB staging) and one '# wait' for the "
+                                << "Stream fence; " << prof.shown;
 }
 
 TEST(VkKernel, DispatchValidatesBindingsPushAndGroups) {
@@ -464,41 +428,6 @@ TEST(VkStream, PushDescriptorsBindTheSameBuffersWithoutDescriptorSets) {
                         << (first < got.size() ? want[first] : 0.0f);
 }
 
-namespace {
-
-/// Runs `body` with HALO_VK_OP_TIMINGS pointed at a fresh file named after the current test plus
-/// `tag`, restores the variable (also when `body` throws) and returns the profile's lines.
-std::vector<std::string> op_timings_profile(const std::string& tag, const std::function<void()>& body) {
-    const std::filesystem::path path =
-        std::filesystem::path(::testing::TempDir()) /
-        ("halo_op_timings_" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "_" +
-         tag + ".txt");
-    std::filesystem::remove(path);
-    const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
-    struct Restore {
-        std::optional<std::string> old;
-        ~Restore() {
-            if (old) {
-                ::setenv("HALO_VK_OP_TIMINGS", old->c_str(), 1);
-            } else {
-                ::unsetenv("HALO_VK_OP_TIMINGS");
-            }
-        }
-    } restore{old_env ? std::optional<std::string>(old_env) : std::nullopt};
-    ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
-    body();
-    ::unsetenv("HALO_VK_OP_TIMINGS");
-    std::vector<std::string> lines;
-    {
-        std::ifstream in(path);
-        for (std::string l; std::getline(in, l);) lines.push_back(l);
-    }
-    std::filesystem::remove(path);
-    return lines;
-}
-
-}  // namespace
-
 // next.md step 4: the 512-dispatch submit split no longer makes the host wait mid-recording. The
 // full command buffer is submitted and recording goes on in the stream's second one behind a full
 // barrier; only a third buffer's worth waits (for the oldest, which is then reused). So a 600-dispatch
@@ -515,12 +444,12 @@ TEST(VkStream, SubmitSplitKeepsRecordingWithoutAFenceWait) {
     for (const int n : {600, 1100, 5000}) {
         const std::vector<float> want = rms_norm_chain(ctx, n, 100).first;
         std::vector<float> got;
-        const std::vector<std::string> lines = op_timings_profile(std::to_string(n), [&] {
+        const Profile prof = op_timings_profile(std::to_string(n), [&] {
             got = rms_norm_chain(ctx, n).first;
         });
         std::size_t waits = 0, kernels = 0, other = 0, implausible = 0;
         std::string shown, first_implausible;
-        for (const std::string& l : lines) {
+        for (const std::string& l : prof.lines) {
             if (l == "# wait") {
                 ++waits;
                 shown += "\n  # wait (after " + std::to_string(kernels) + " kernel lines)";

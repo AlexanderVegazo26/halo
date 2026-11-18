@@ -22,6 +22,7 @@
 #include <sstream>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "halo/backends/vulkan/buffer.h"
@@ -122,9 +123,12 @@ inline void report(const std::string& what, const ErrorStats& s) {
 }
 
 /// Runs `body` with HALO_VK_OP_TIMINGS pointed at a fresh file named after the current test and
-/// `tag`, restores the variable, and returns the profile's marker lines ("# wait", "# transfer
-/// <bytes>") plus the whole profile for failure messages.
+/// `tag`, restores the variable, and returns the profile: every line, the marker lines ("# wait",
+/// "# transfer <bytes>") and the whole profile for failure messages. A `body` taking a
+/// `const std::filesystem::path&` gets the profile file (e.g. to check nothing is written while the
+/// variable is unset).
 struct Profile {
+    std::vector<std::string> lines;
     std::vector<std::string> marks;
     std::string shown;
     [[nodiscard]] std::size_t transfers() const {
@@ -160,7 +164,11 @@ inline Profile op_timings_profile(const std::string& tag, F&& body) {
     const char* old_env = std::getenv("HALO_VK_OP_TIMINGS");
     const Restore restore{path, old_env ? std::optional<std::string>(old_env) : std::nullopt};
     ::setenv("HALO_VK_OP_TIMINGS", path.c_str(), 1);
-    body();
+    if constexpr (std::is_invocable_v<F&, const std::filesystem::path&>) {
+        body(path);
+    } else {
+        body();
+    }
     ::unsetenv("HALO_VK_OP_TIMINGS");  // stop profiling before reading the file (Restore puts the old value back)
     Profile r;
     r.shown = "profile " + path.string() + ":";
@@ -169,6 +177,7 @@ inline Profile op_timings_profile(const std::string& tag, F&& body) {
         for (std::string l; std::getline(in, l);) {
             r.shown += "\n  " + l;
             if (l.starts_with('#')) r.marks.push_back(l);
+            r.lines.push_back(l);
         }
     }
     return r;
