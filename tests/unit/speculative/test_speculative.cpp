@@ -19,6 +19,7 @@
 #include <numeric>
 #include <stdexcept>
 
+#include "../bitwise.h"
 #include "../models/tiny_golden.h"
 #include "chain_verify_case.h"
 #include "halo/backends/cpu/ops.h"
@@ -144,18 +145,19 @@ halo::kv_cache::SequenceKv& mtp_kv_of(SequenceState& s) {
     return *s.mtp_kv;
 }
 
-/// Bitwise equality of two sequences' complete state (flushes both MTP queues first).
+/// Bitwise equality of two sequences' complete state (flushes both MTP queues first). Bit patterns, not
+/// float ==, so a NaN row (a poisoned sequence's MTP KV) equals itself and a failure names the first float.
 void expect_same_state(Speculator& sp, SequenceState& a, SequenceState& b) {
     SequenceState* both[] = {&a, &b};
     sp.flush_mtp(both);
     EXPECT_EQ(a.length(), b.length());
-    EXPECT_TRUE(dump_kv(a.kv) == dump_kv(b.kv)) << "trunk KV rows differ";
-    EXPECT_TRUE(a.gdn.snapshot().data == b.gdn.snapshot().data) << "GDN recurrent/conv state differs";
-    EXPECT_TRUE(a.last_hidden == b.last_hidden) << "carried trunk hidden (pending_h) differs";
+    EXPECT_TRUE(halo::test::bitwise(dump_kv(a.kv), dump_kv(b.kv), "trunk KV rows"));
+    EXPECT_TRUE(halo::test::bitwise(a.gdn.snapshot().data, b.gdn.snapshot().data, "GDN recurrent/conv state"));
+    EXPECT_TRUE(halo::test::bitwise(a.last_hidden, b.last_hidden, "carried trunk hidden (pending_h)"));
     ASSERT_TRUE(a.mtp_kv && b.mtp_kv) << "both sequences must keep their MTP KV";
     EXPECT_EQ(mtp_kv_of(a).length(), mtp_kv_of(b).length());
     EXPECT_EQ(mtp_kv_of(a).length() + 1, a.length()) << "MTP KV must hold positions 1..L-1 after a flush";
-    EXPECT_TRUE(dump_kv(mtp_kv_of(a)) == dump_kv(mtp_kv_of(b))) << "MTP KV rows differ";
+    EXPECT_TRUE(halo::test::bitwise(dump_kv(mtp_kv_of(a)), dump_kv(mtp_kv_of(b)), "MTP KV rows"));
 }
 
 /// Oracle drafts: the true continuation g[m+1 .. m+k] with a wrong token at depth `wrong`
@@ -827,6 +829,91 @@ TEST_F(Spec, FusedTickWithAPoisonedDraftDepthEmitsTheTrunkTokenAndDropsTheDrafts
         << "poisoned sequence: emitted tokens must be plain greedy decoding";
     const Toks greedy_good = feed_plain(host, *good_plain, std::span(out_good).subspan(ref_good.size() - 1, out_good.size() - ref_good.size()));
     EXPECT_EQ(Toks(out_good.begin() + static_cast<std::ptrdiff_t>(ref_good.size()), out_good.end()), greedy_good)
+        << "healthy sequence: emitted tokens must be plain greedy decoding";
+}
+
+// The separate draft() + verify() + commit() phases with chained drafts (Qwen35::mtp_draft_chain) treat a
+// NaN-poisoned draft depth like the per-depth path and the fused tick do: the sequence offers no draft and
+// verifies only x, instead of the chain throwing Error(Api) and failing the whole batch (the slice-118
+// phase/fused divergence). Same poison seam as above (a NaN in the carried trunk hidden, which only the MTP
+// reads, poisons depth 1 and so every depth). Per tick the chained phases must equal the per-depth phases:
+// drafts, verified row count, fed rows, emitted tokens, drafts counted; and afterwards the full sequence
+// state. A healthy batch-mate still drafts, and both sequences emit plain greedy decoding.
+TEST_F(Spec, PhasedChainedDraftWithAPoisonedDepthOffersNoDraftsLikeThePerDepthPath) {
+    SpecConfig c;
+    c.max_draft = 3;
+    c.gate.mode = GateMode::Always;
+    c.chain = true;
+    Speculator chained(model(), c);
+    c.chain = false;
+    Speculator per_depth(model(), c);
+    auto host = spec(GateMode::Off);
+    const Toks p0 = prompt("p0"), p1 = prompt("p1");
+    // [0]: chained phases, [1]: per-depth phases.
+    std::array<std::unique_ptr<SequenceState>, 2> bad{seq(), seq()}, good{seq(), seq()};
+    auto bad_plain = seq(), good_plain = seq();
+    std::array<Toks, 2> out_bad{prefill(chained, *bad[0], p0), prefill(per_depth, *bad[1], p0)};
+    std::array<Toks, 2> out_good{prefill(chained, *good[0], p1), prefill(per_depth, *good[1], p1)};
+    const Toks ref_bad = prefill(host, *bad_plain, p0), ref_good = prefill(host, *good_plain, p1);
+    for (std::size_t side = 0; side < 2; ++side) {
+        ASSERT_EQ(out_bad[side], ref_bad) << "side " << side << ": prefill differs (poisoned sequence, before the poison)";
+        ASSERT_EQ(out_good[side], ref_good) << "side " << side << ": prefill differs (healthy sequence)";
+        ASSERT_FALSE(bad[side]->last_hidden.empty()) << "the MTP model must carry a trunk hidden after the prefill";
+        bad[side]->last_hidden.at(0) = std::numeric_limits<float>::quiet_NaN();  // only the MTP reads it
+    }
+    const std::array<Speculator*, 2> sp{&chained, &per_depth};
+    for (std::size_t tick = 0; tick < 2; ++tick) {
+        std::array<Tick, 2> t;
+        std::array<std::size_t, 2> drafted{};
+        for (std::size_t side = 0; side < 2; ++side) {
+            const std::string what = "tick " + std::to_string(tick) + (side == 0 ? " chained" : " per-depth");
+            std::array<StepRequest, 2> r;
+            r[0].seq = bad[side].get();
+            r[0].token = out_bad[side].back();
+            r[0].max_draft = 3;
+            r[0].max_emit = 4;
+            r[1].seq = good[side].get();
+            r[1].token = out_good[side].back();
+            r[1].max_draft = 2;
+            r[1].max_emit = 4;
+            const auto drafted0 = sp[side]->metrics().drafted;
+            ASSERT_NO_THROW(sp[side]->draft(r, t[side])) << what << ": a poisoned draft depth must not fail the draft phase";
+            ASSERT_NO_THROW(sp[side]->verify(r, t[side])) << what;
+            ASSERT_NO_THROW(sp[side]->commit(r, t[side])) << what;
+            drafted[side] = sp[side]->metrics().drafted - drafted0;
+            EXPECT_TRUE(t[side].out[0].drafts.empty())
+                << what << ": poisoned sequence offered drafts " << ::testing::PrintToString(t[side].out[0].drafts);
+            EXPECT_EQ(t[side].seqs[0].k, 0u) << what << ": nothing to verify past x";
+            EXPECT_EQ(t[side].seqs[0].fed, Toks{out_bad[side].back()}) << what << ": only x is fed";
+            EXPECT_EQ(t[side].out[1].drafts.size(), 2u) << what << ": the healthy sequence must still draft k = 2";
+            ASSERT_EQ(t[side].out[0].tokens.size(), 1u) << what << ": poisoned sequence emits exactly the trunk's target";
+            out_bad[side].push_back(t[side].out[0].tokens.front());
+            out_good[side].insert(out_good[side].end(), t[side].out[1].tokens.begin(), t[side].out[1].tokens.end());
+        }
+        const std::string what = "tick " + std::to_string(tick) + " chained vs per-depth";
+        EXPECT_EQ(chained.metrics().fused_ticks, 0u) << what << ": the separate phases never fuse";
+        for (std::size_t i = 0; i < 2; ++i) {
+            EXPECT_EQ(t[0].out[i].drafts, t[1].out[i].drafts) << what << " sequence " << i << ": drafts";
+            EXPECT_EQ(t[0].seqs[i].fed, t[1].seqs[i].fed) << what << " sequence " << i << ": fed rows";
+            EXPECT_EQ(t[0].out[i].tokens, t[1].out[i].tokens) << what << " sequence " << i << ": emitted tokens";
+        }
+        EXPECT_EQ(drafted[0], drafted[1]) << what << ": drafts counted";
+    }
+    {
+        SCOPED_TRACE("poisoned sequence: chained vs per-depth state");
+        expect_same_state(chained, *bad[0], *bad[1]);
+    }
+    {
+        SCOPED_TRACE("healthy sequence: chained vs per-depth state");
+        expect_same_state(chained, *good[0], *good[1]);
+    }
+    const Toks greedy_bad =
+        feed_plain(host, *bad_plain, std::span(out_bad[0]).subspan(ref_bad.size() - 1, out_bad[0].size() - ref_bad.size()));
+    EXPECT_EQ(Toks(out_bad[0].begin() + static_cast<std::ptrdiff_t>(ref_bad.size()), out_bad[0].end()), greedy_bad)
+        << "poisoned sequence: emitted tokens must be plain greedy decoding";
+    const Toks greedy_good =
+        feed_plain(host, *good_plain, std::span(out_good[0]).subspan(ref_good.size() - 1, out_good[0].size() - ref_good.size()));
+    EXPECT_EQ(Toks(out_good[0].begin() + static_cast<std::ptrdiff_t>(ref_good.size()), out_good[0].end()), greedy_good)
         << "healthy sequence: emitted tokens must be plain greedy decoding";
 }
 

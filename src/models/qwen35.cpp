@@ -1525,17 +1525,15 @@ TensorRef chain_draft_id(const ChainRec& rc, std::size_t si, std::size_t d) {
 }
 
 /// After the chain's sync: every depth's winners into out.seqs[i].argmax, in depth order. A poisoned
-/// (NaN) winner is Error(Api) when `poison_is_error`; otherwise it and every deeper draft of that
-/// sequence (fed id 0 on the device, not a continuation of anything) are reported with index -1.
-void decode_chain(const ChainRec& rc, StepResult& out, bool poison_is_error, const char* what) {
+/// (NaN) winner and every deeper draft of that sequence (fed id 0 on the device, not a continuation of
+/// anything) are reported with index -1, never as an error: the chain already ran every depth.
+void decode_chain(const ChainRec& rc, StepResult& out) {
     std::vector<char> poisoned(out.seqs.size(), 0);
     for (std::size_t d = 1; d <= rc.max_k; ++d) {
         const ChainDepth& D = rc.depths[d - 1];
         const std::vector<backend::ArgmaxResult> best = backend::decode_argmax(D.words);
         for (std::size_t i = 0; i < D.at.size(); ++i) {
             const std::size_t si = D.at[i];
-            HALO_CHECK(!poison_is_error || best[i].index >= 0, ErrorCode::Api,
-                       "{} step {}: draft depth {} is poisoned (NaN logit / no result), token id {}", what, si, d, best[i].index);
             poisoned[si] = static_cast<char>(poisoned[si] != 0 || best[i].index < 0);
             out.seqs[si].argmax.push_back(cpu::TopKEntry{poisoned[si] != 0 ? -1 : best[i].index, best[i].value});
         }
@@ -1675,7 +1673,7 @@ void Qwen35::mtp_draft_chain(std::span<const MtpStep> steps, std::span<const std
         record_chain(I, st, steps, k, rc, false);
         // ---- the one submit / fence of the chain, then decode every depth's winners ----------------
         st.sync();
-        decode_chain(rc, out, true, what);
+        decode_chain(rc, out);
     } catch (...) {
         for (std::size_t si = 0; si < steps.size(); ++si) steps[si].kv->truncate(rc.len0[si]);
         throw;
@@ -1737,7 +1735,7 @@ void Qwen35::mtp_draft_chain_verify(std::span<const MtpStep> mtp, std::span<cons
         // ---- the one submit / fence of the tick: chain + verify ------------------------------
         st.sync();
         verify_out.cost = total;
-        if (!mtp.empty()) decode_chain(rc, draft_out, false, what);
+        if (!mtp.empty()) decode_chain(rc, draft_out);
         commit_forward(verify);
     } catch (...) {
         for (std::size_t si = 0; si < mtp.size(); ++si) mtp[si].kv->truncate(rc.len0[si]);

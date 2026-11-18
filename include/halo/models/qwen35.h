@@ -291,8 +291,9 @@ public:
     /// Greedy drafts are identical to the equivalent mtp_forward sequence (same ops, same order).
     /// KV: on success each MTP KV grew by tokens.size() + k[i] - 1 rows (as the unchained sequence
     /// leaves it); on Error every touched MTP KV is truncated back to its length on entry. A poisoned
-    /// (NaN) draft is reported as Error(Api) after the sync, like the unchained path's next-depth
-    /// token check.
+    /// (NaN) draft is not an error: its argmax entry and every deeper one of that sequence carry index -1
+    /// (the device fed id 0 past it, so the deeper drafts continue nothing), as mtp_forward reports a
+    /// NaN row; the MTP KV still grew by every depth's row.
     void mtp_draft_chain(std::span<const MtpStep> steps, std::span<const std::size_t> k, StepResult& out) const;
 
     /// A speculative tick in ONE submit / fence wait (next.md step 4): mtp_draft_chain(mtp, k) and then
@@ -304,9 +305,9 @@ public:
     /// step is linked at most once, and only to the same sequence's verify (the chain's x row at MTP
     /// position L = the verify's trunk KV length, Error(Api) otherwise). Results: draft_out as
     /// mtp_draft_chain's and verify_out as forward's, each with its own cost, bitwise those of the two
-    /// calls made one after the other with the drafts as host tokens -- except that a poisoned (NaN)
-    /// draft is not an error here: its argmax entry and every deeper one of that sequence carry index -1.
-    /// The poisoned depth's verify row embedded id 0 (LmHeadArgs::ids) and the deeper drafts were drafted
+    /// calls made one after the other with the drafts as host tokens. A poisoned (NaN) draft is reported
+    /// as by mtp_draft_chain (index -1 for it and every deeper one of that sequence), and the poisoned
+    /// depth's verify row embedded id 0 (LmHeadArgs::ids) and the deeper drafts were drafted
     /// from it, so those verify rows continue nothing and the caller keeps none of them.
     /// On Error nothing changes: every touched MTP KV is truncated back and the trunk KV / GDN state is
     /// committed only after the sync. Requires Limits::lm_head_ids and an MTP block (Error(Unsupported)).
