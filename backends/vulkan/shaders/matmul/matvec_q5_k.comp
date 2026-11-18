@@ -12,10 +12,11 @@
 // per-type main's input reads go through HALO_X; prologue in common/matvec_normed.glsl.
 // SUBGROUP variant matvec_q5_k_sg (opt-in HALO_SUBGROUP_REDUCE=1; the host then runs it for EVERY
 // chunk, n_vec == 1 included, see ops.cpp): this file compiled with -DHALO_SUBGROUP_REDUCE: the
-// dequant/apply code is the unmodified common/matvec_q5_k_main.glsl, but the cross-thread reduction
+// dequant/apply code is common/matvec_q5_k_main.glsl, but the cross-thread reduction
 // is subgroupAdd (+ a shared step when the workgroup spans several subgroups) with the chunk's
 // vector count as the specialization constant NV, see common/matvec_sg_reduce.glsl and
-// matvec_q5_k_sg_main.glsl. Not bitwise equal to the plain build (reduction order).
+// matvec_q5_k_sg_main.glsl (which the _main.glsl includes at its end in this build). Not
+// bitwise equal to the plain build (reduction order).
 #include "halo_common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
@@ -56,9 +57,6 @@ struct Q5KBlock {
 #define LD32(bo) (wq[(bo) >> 2])
 #define Q5K_FN fast
 #include "matvec_q5_k_main.glsl"
-#ifdef HALO_SUBGROUP_REDUCE
-#include "matvec_q5_k_sg_main.glsl"
-#endif
 #undef LD32
 #undef Q5K_FN
 
@@ -66,9 +64,6 @@ struct Q5KBlock {
     (read_u8(bo) | (read_u8((bo) + 1u) << 8) | (read_u8((bo) + 2u) << 16) | (read_u8((bo) + 3u) << 24))
 #define Q5K_FN slow
 #include "matvec_q5_k_main.glsl"
-#ifdef HALO_SUBGROUP_REDUCE
-#include "matvec_q5_k_sg_main.glsl"
-#endif
 #undef LD32
 #undef Q5K_FN
 

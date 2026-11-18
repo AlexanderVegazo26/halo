@@ -15,7 +15,9 @@
 // Included twice WITHOUT an include guard. Expects from the includer:
 //   LD32(bo)      -> uint: 4 weight bytes at 4-aligned (fast) or arbitrary (slow) byte off
 //   Q6K_FN        -> function-name token (pasted as q6k_<Q6K_FN>)
-// plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp.
+// plus the bindings, push constants, BATCHED, MAX_VEC, red[] from the .comp. With
+// -DHALO_SUBGROUP_REDUCE it also includes matvec_q6_k_sg_main.glsl at its end, which needs
+// NV, g_acc[] and sg_finish() from common/matvec_sg_reduce.glsl (included by the .comp first).
 
 // Input element i of the vector being dotted. Default: the x buffer; the _normed shaders define
 // HALO_X(i) to normalize x on the fly (HALO_FUSE_NORM: matmul/matvec_<type>.comp built with -DHALO_FUSE_NORM).
@@ -136,3 +138,9 @@ void Q6K_PASTE(q6k_, Q6K_FN)(const uint row, const uint row_off) {
 
 #undef Q6K_PASTE
 #undef Q6K_PASTE2
+
+// HALO_SUBGROUP_REDUCE build (the matvec_q6_k_sg variant): the subgroupAdd body for this
+// same instantiation (FN / LD32), after the dequant/apply helpers above that it calls.
+#ifdef HALO_SUBGROUP_REDUCE
+#include "matvec_q6_k_sg_main.glsl"
+#endif

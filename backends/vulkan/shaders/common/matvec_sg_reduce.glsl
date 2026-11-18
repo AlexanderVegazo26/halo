@@ -2,7 +2,8 @@
 // cross-thread reduction with subgroupAdd instead of the shared-memory tree of
 // matvec_*_main.glsl. Included ONCE by matvec_<type>.comp when compiled with
 // -DHALO_SUBGROUP_REDUCE (the matvec_<type>_sg variant in backends/vulkan/CMakeLists.txt), after
-// its bindings / push constants / WG, and before the per-type matvec_<type>_sg_main.glsl bodies.
+// its bindings / push constants / WG, and before its matvec_<type>_main.glsl includes (each of
+// those includes the per-type matvec_<type>_sg_main.glsl body at its end, which uses this file).
 //
 // The includer must enable GL_KHR_shader_subgroup_basic and GL_KHR_shader_subgroup_arithmetic
 // before any other token (common/matvec_variant_prologue.glsl does).

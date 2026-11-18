@@ -1,6 +1,6 @@
 // HALO_SUBGROUP_REDUCE batched body of matvec_q5_k: same thread mapping, dequant and apply as
-// the batched branch of matvec_q5_k_main.glsl (which the .comp includes unmodified just before
-// this file, for q5k_dequant_<FN> / q5k_apply_<FN>), then the subgroupAdd tail
+// the batched branch of matvec_q5_k_main.glsl (which includes this file at its end, after
+// q5k_dequant_<FN> / q5k_apply_<FN>), then the subgroupAdd tail
 // (matvec_sg_reduce.glsl). Included twice (FAST / SLOW) like the original; same includer contract.
 #define Q5K_PASTE2(a, b) a##b
 #define Q5K_PASTE(a, b) Q5K_PASTE2(a, b)
