@@ -35,6 +35,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# HALO_TOOLCHAIN=<prefix> puts a glslc from <prefix>/bin (and its libshaderc) on the path first.
+source "$HERE/../toolchain-env.sh"
 fail=0
 need() {  # need <command> <apt hint>
   if ! command -v "$1" >/dev/null 2>&1; then echo "MISSING $1  ($2)"; fail=1; else echo "ok      $1: $(command -v "$1")"; fi

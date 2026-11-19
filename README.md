@@ -114,6 +114,9 @@ backend is **on by default** (`HALO_BUILD_VULKAN=ON`) and needs the Vulkan heade
 plus `glslc`; configure fails without them, so either install them (on Ubuntu 24.04:
 `libvulkan-dev glslc spirv-tools`) or pass `-DHALO_BUILD_VULKAN=OFF`. HIP is off by default and
 needs ROCm.
+A glslc that is not on the system path (for example a shaderc tarball unpacked under
+`~/halo-toolchain/usr`) works with `HALO_TOOLCHAIN=~/halo-toolchain/usr scripts/build.sh`: the
+script puts its `bin/` on `PATH` and its `lib/x86_64-linux-gnu` (libshaderc) on `LD_LIBRARY_PATH`.
 Third-party sources (nlohmann_json, minja, cpp-httplib, googletest) are fetched by CMake with
 pinned SHA-256 hashes — nothing is vendored, nothing is fetched unpinned.
 

@@ -71,6 +71,9 @@ sudo apt install cmake ninja-build clang glslc libvulkan-dev libsqlite3-dev pkg-
                  binutils spirv-tools git
 ```
 
+A glslc outside the system path: set `HALO_TOOLCHAIN=<prefix>` (its `bin/glslc` plus
+`lib/x86_64-linux-gnu`); `scripts/evox2/build-native.sh` and `scripts/build.sh` export both.
+
 plus the ROCm HIP SDK for your ROCm (it must provide `/opt/rocm/llvm/bin/clang++` and
 `/opt/rocm/lib/cmake/hip/hip-config.cmake`). The native build downloads nlohmann/json,
 minja, cpp-httplib and googletest (pinned by SHA-256 in `cmake/HaloDeps.cmake`), so it needs

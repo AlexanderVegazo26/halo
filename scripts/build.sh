@@ -2,8 +2,11 @@
 # Build + test HALO inside WSL/Linux. Sources may live on /mnt/c; the build tree lives on
 # the Linux filesystem for speed.
 #   scripts/build.sh [--asan] [--no-test] [extra cmake args...]
+#   HALO_TOOLCHAIN=<prefix> uses a glslc under <prefix>/bin (scripts/toolchain-env.sh).
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=toolchain-env.sh
+source "$SRC/scripts/toolchain-env.sh"
 BUILD="${HALO_BUILD_DIR:-$HOME/halo-build}"
 TEST=1
 ARGS=()
